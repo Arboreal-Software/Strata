@@ -1,3 +1,4 @@
+#include "window_session_elastic_test_mocks.hpp"
 #include "strata/core/window_restore.hpp"
 #include "strata/core/window_allocator.hpp"
 #include "strata/core/window_selection.hpp"
@@ -50,6 +51,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation&,Sessi
 struct Runtime : NativeRuntimeAttachment {};
 template<class Fn>void isolated(Fn fn){const auto p=fork();check(p>=0,"fork");if(!p){fn();std::exit(0);}int status=0;check(waitpid(p,&status,0)==p&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"isolated initial case");}
 int main(){
+    strata::core::window_test::check_fixed_kv_elastic_mock_contract();
     const auto g=window_test::geometry();const auto key=window_test::metadata().key;
     WindowResources capacity{{100000,100000},32<<20,10000,0,0,2},zero{{0,0},0,0,0,0,0};
     std::vector<NativeSessionRequest> requests{{0,0,4,true},{1,4,8,false}};

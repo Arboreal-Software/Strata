@@ -1,3 +1,4 @@
+#include "window_session_elastic_test_mocks.hpp"
 #include "strata/core/window_allocator.hpp"
 #include "strata/core/window_restore.hpp"
 #include "strata/core/conversation_snapshot.hpp"
@@ -58,6 +59,7 @@ bool conversation_snapshot_validate(const SavedConversation&,const SessionState&
 ConversationRestore conversation_snapshot_restore(const SavedConversation&,SessionState&,const ModelGeometry&,const QsaState*,std::string&){++restore_writes;return ConversationRestore::restored;}
 }
 int main(int argc,char** argv){
+    strata::core::window_test::check_fixed_kv_elastic_mock_contract();
     ModelGeometry g;g.n_layers=8;g.qsa_interval=4;
     WindowResources capacity{{100000,100000},100000,10000,0,0,2},zero{{0,0},0,0,0,0,0};
     const std::vector<NativeSessionRequest> requests{{0,0,4,true},{1,4,8,false}};
