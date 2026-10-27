@@ -65,6 +65,10 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry&, int64_t ma
 NativeAllocationResult allocate_native_sessions(const ModelGeometry&, int64_t max_cells, int64_t k,
     const std::vector<NativeSessionRequest>&, std::vector<std::unique_ptr<SessionState>>& fresh,
     WindowBudget&, NativeSessionAllocation& out);
+// Before dropping the last owner, callers must close/join every host producer
+// and prevent new graph/stream submissions. Retirement drains all owned stage
+// devices before freeing pinned or borrowed targets. Uses from additional
+// devices must be drained by the caller; this allocator does not discover them.
 // Failed initialization or failed release retains allocations AND accounting
 // until worker restart. This count is an operational fault signal, not a cache.
 uint64_t native_session_quarantine_count();

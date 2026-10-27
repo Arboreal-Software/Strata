@@ -1,3 +1,4 @@
+#include "window_session_elastic_test_mocks.hpp"
 #include "strata/core/window_allocator.hpp"
 #include "strata/core/window_restore.hpp"
 #include "strata/core/conversation_snapshot.hpp"
@@ -5,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <functional>
 #include <thread>
 #include <sys/wait.h>
@@ -12,6 +14,10 @@
 using namespace strata::core;
 static int current_device=0,mallocs=0,frees=0,inits=0,fail_malloc=0,fail_init=0;
 static bool fail_free=false;
+static int device_calls=0,host_frees=0,fail_drain_device=-1,fail_set_target=-1;
+static bool check_retirement_order=false;
+static std::set<int> drained_devices;
+static void check_gang_drained();
 static std::function<void()> during_drain,during_free;
 static int restore_writes=0;
 static std::map<void*,int> device_allocations;
@@ -21,19 +27,29 @@ template<class Fn>static void isolated(Fn fn){
     if(pid==0){fn();std::exit(0);}
     int status=0;check(waitpid(pid,&status,0)==pid&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"isolated failure case");
 }
-extern "C" cudaError_t cudaGetDevice(int* p){*p=current_device;return cudaSuccess;}
-extern "C" cudaError_t cudaSetDevice(int d){current_device=d;return cudaSuccess;}
+extern "C" cudaError_t cudaGetDevice(int* p){++device_calls;*p=current_device;return cudaSuccess;}
+extern "C" cudaError_t cudaSetDevice(int d){++device_calls;if(d==fail_set_target)return cudaErrorUnknown;current_device=d;return cudaSuccess;}
 extern "C" cudaError_t cudaMalloc(void** p,size_t n){
+    ++device_calls;
     if(++mallocs==fail_malloc)return cudaErrorMemoryAllocation;
     *p=std::malloc(n);device_allocations[*p]=current_device;return *p?cudaSuccess:cudaErrorMemoryAllocation;
 }
 extern "C" cudaError_t cudaFree(void* p){
+    check_gang_drained();
     if(during_free)during_free();
     if(fail_free)return cudaErrorUnknown;
     check(device_allocations.at(p)==current_device,"release selects owning device");
     device_allocations.erase(p);std::free(p);++frees;return cudaSuccess;
 }
-extern "C" cudaError_t cudaDeviceSynchronize(){if(during_drain)during_drain();return cudaSuccess;}
+static void check_gang_drained(){
+    if(check_retirement_order)check(drained_devices==std::set<int>{0,1},"all gang devices drain before any pinned/device free");
+}
+extern "C" cudaError_t cudaDeviceSynchronize(){
+    ++device_calls;if(during_drain)during_drain();
+    if(current_device==fail_drain_device)return cudaErrorUnknown;
+    if(check_retirement_order)drained_devices.insert(current_device);
+    return cudaSuccess;
+}
 extern "C" const char* cudaGetErrorString(cudaError_t){return "injected allocator CUDA error";}
 namespace strata::kernels { std::size_t native_q8_1_bytes(int,int){return 4096;} }
 extern "C" cudaError_t cudaGetLastError(){return cudaSuccess;}
@@ -52,15 +68,56 @@ uint64_t session_init_private(const ModelGeometry& g,int64_t,int64_t,void* arena
     uploads.qsa.resize(size_t(g.n_qsa_layers()));uploads.qsa[size_t(s.qsa_ord0)].rope_cos.resize(8);
     if(inits==fail_init){uploads.error="injected partial init";return 0;}return 1024;
 }
-bool qsa_state_release_host(QsaState& q,std::string&){std::free(q.host_step);q.host_step=nullptr;return true;}
+bool qsa_state_release_host(QsaState& q,std::string&){check_gang_drained();++host_frees;std::free(q.host_step);q.host_step=nullptr;return true;}
 void session_release(SessionState&){}
 bool conversation_snapshot_validate(const SavedConversation&,const SessionState&,const ModelGeometry&,const QsaState*,std::string&){return true;}
 ConversationRestore conversation_snapshot_restore(const SavedConversation&,SessionState&,const ModelGeometry&,const QsaState*,std::string&){++restore_writes;return ConversationRestore::restored;}
 }
 int main(int argc,char** argv){
+    strata::core::window_test::check_fixed_kv_elastic_mock_contract();
     ModelGeometry g;g.n_layers=8;g.qsa_interval=4;
     WindowResources capacity{{100000,100000},100000,10000,0,0,2},zero{{0,0},0,0,0,0,0};
     const std::vector<NativeSessionRequest> requests{{0,0,4,true},{1,4,8,false}};
+    if(argc>1&&std::string(argv[1])=="--retirement-drain"){
+        // Actual allocator Storage/owner/budget, mocked CUDA and session buffers.
+        // Producer closure is caller-established; no callback submits new work.
+        {
+            WindowBudget budget(capacity,zero);NativeSessionAllocation out;
+            check(bool(allocate_native_sessions(g,16,1,requests,budget,out)),"retirement drain fixture");
+            current_device=7;drained_devices.clear();check_retirement_order=true;
+            const auto before_host=host_frees;
+            out={};check_retirement_order=false;
+            check(drained_devices==std::set<int>{0,1}&&host_frees==before_host+2&&current_device==7,
+                  "all stages drain before host release and original device restored");
+            check(device_allocations.empty()&&budget.snapshot().reserved==zero,"normal retirement releases actual complete owner and quota");
+        }
+        for(int scenario=0;scenario<5;++scenario)isolated([&]{
+            WindowBudget budget(capacity,zero);NativeSessionAllocation out;
+            check(bool(allocate_native_sessions(g,16,1,requests,budget,out)),"failed drain fixture");
+            auto* a=out.stages()[0].session;auto* b=out.stages()[1].session;
+            std::weak_ptr<const ReservationLease> lease=out.reservation();
+            const auto held=budget.snapshot().reserved;const auto old_frees=frees,old_host_frees=host_frees;
+            current_device=7;drained_devices.clear();check_retirement_order=true;
+            if(scenario<2)fail_drain_device=scenario;
+            else fail_set_target=scenario==4?7:scenario-2;
+            out={};
+            check(!lease.expired()&&a->qsa_states[a->qsa_ord0].host_step&&b->qsa_states[b->qsa_ord0].host_step,
+                  "failed drain/select/restore retains actual session owner and pinned targets");
+            check(frees==old_frees&&host_frees==old_host_frees&&budget.snapshot().reserved==held&&native_session_quarantine_count()==1,
+                  "no borrowed free or quota release before full gang drain and restoration");
+            if(scenario!=4)check(current_device==7,"failed drain/select restores original device");
+            const auto calls=device_calls;out={};check(device_calls==calls,"uncertain retired owner is not retried");
+        });
+        {
+            auto small=capacity;small.device_bytes[1]=1;WindowBudget budget(small,zero);NativeSessionAllocation out;
+            const auto before=device_calls;
+            check(allocate_native_sessions(g,16,1,requests,budget,out).status==NativeAllocationStatus::budget_refused,
+                  "host-only gang admission refuses");
+            check(device_calls==before&&out.stages().empty()&&budget.snapshot().reserved==zero,
+                  "host-only unwind performs no device work");
+        }
+        std::puts("window_allocator retirement drain tests passed");return 0;
+    }
     if(argc>1&&std::string(argv[1])=="--transfer"){
         auto fresh_pair=[] {
             std::vector<std::unique_ptr<SessionState>> sessions;

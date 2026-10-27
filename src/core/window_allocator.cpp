@@ -57,6 +57,17 @@ bool add(uint64_t& total,uint64_t amount) {
     total+=amount;return true;
 }
 bool release(Storage& storage) {
+    // Host producers must already be closed by the caller. Drain the complete
+    // gang before releasing any pinned staging or cross-stage borrowed target;
+    // a later stage can still be using an earlier stage's storage.
+    for(const auto& stage:storage.stages) {
+        if(!stage.session)continue;
+        if(!stage.arena&&!stage.session->qsa_states&&!stage.ple_embedding&&!stage.ple_scratch&&!stage.ple_native_key)continue;
+        WindowDeviceScope device(stage.device);
+        const bool drained=device.ok()&&cudaDeviceSynchronize()==cudaSuccess;
+        const bool restored=device.finish(); // attempt even when drain failed
+        if(!drained||!restored)return false;
+    }
     for(auto& stage:storage.stages) {
         if(!stage.session)continue; // host preparation refused before ownership transfer
         if(!stage.arena&&!stage.session->qsa_states&&!stage.ple_embedding&&!stage.ple_scratch&&!stage.ple_native_key)continue;
