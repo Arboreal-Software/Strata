@@ -1933,25 +1933,32 @@ class StrataEngine:
         if not ok:
             return
         held_ctl = self.ctl if ok is True else ok
-        epoch = self._capture_epoch()
-        slots = epoch.slots
-        holding, born = True, epoch.gen                  # (the engine it now has the control lines of)
-        btrace("ctl acquired")
-        slot, gen0, reserved = None, None, None
-        phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
-        stop_sent = False
-        sent = False
-        def acquired_control():
-            nonlocal holding, born, epoch, slots, held_ctl
-            holding = True
-            held_ctl = self.ctl if ok is True else ok
-            if sent and self.gen != born:
-                raise EngineDied("the engine changed after this request was admitted")
-            epoch = self._capture_epoch(born if sent else None)
+        # Acquisition succeeded, but epoch capture and setup can still fail
+        # before the request's normal cleanup is initialized. Release the exact
+        # acquired lock even if a successor has replaced self.ctl meanwhile.
+        try:
+            epoch = self._capture_epoch()
             slots = epoch.slots
-            born = epoch.gen
-        yields, solo_again, refused = 0, 0, 0
-        admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
+            holding, born = True, epoch.gen                  # (the engine it now has the control lines of)
+            btrace("ctl acquired")
+            slot, gen0, reserved = None, None, None
+            phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
+            stop_sent = False
+            sent = False
+            def acquired_control():
+                nonlocal holding, born, epoch, slots, held_ctl
+                holding = True
+                held_ctl = self.ctl if ok is True else ok
+                if sent and self.gen != born:
+                    raise EngineDied("the engine changed after this request was admitted")
+                epoch = self._capture_epoch(born if sent else None)
+                slots = epoch.slots
+                born = epoch.gen
+            yields, solo_again, refused = 0, 0, 0
+            admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
+        except BaseException:
+            held_ctl.release()
+            raise
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:

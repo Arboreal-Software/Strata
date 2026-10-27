@@ -38,6 +38,56 @@ def replace(e):
 
 
 class EngineEpochTests(unittest.TestCase):
+    def test_unpublished_epoch_releases_actual_acquired_control_once(self):
+        e = batch_engine()
+        acquired = mock.Mock(wraps=threading.Lock())
+        successor = threading.Lock()
+        successor.acquire()
+        e.ctl = acquired
+        # Capture the original epoch, then install a child that has not reached
+        # READY. Exercise the real _capture_epoch refusal after acquisition.
+        e._capture_epoch()
+        replace(e)
+        e._stdin_closing = True
+        def take(*args, **kwargs):
+            acquired.acquire()
+            e.ctl = successor
+            if False:
+                yield None
+            return acquired
+        e._take_control = take
+        gen = e.generate_batched([1, 2], 3, {}, threading.Event())
+        try:
+            with self.assertRaisesRegex(server.EngineDied, "ready process epoch"):
+                next(gen)
+            self.assertFalse(acquired.locked())
+            self.assertTrue(successor.locked())
+            self.assertEqual(e.proc.stdin.text, "")
+            self.assertEqual(e.slot_claims, {0})
+            gen.close()
+            acquired.release.assert_called_once_with()
+        finally:
+            gen.close()
+            successor.release()
+
+    def test_control_setup_trace_failure_releases_control_once(self):
+        # Both allocation errors and generator termination must leave no lock
+        # behind before the normal request-finally locals exist.
+        for error in (MemoryError("trace allocation"), GeneratorExit()):
+            with self.subTest(error=type(error).__name__):
+                e = batch_engine()
+                acquired = mock.Mock(wraps=threading.Lock())
+                e.ctl = acquired
+                gen = e.generate_batched([1, 2], 3, {}, threading.Event())
+                with mock.patch.object(server, "btrace", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        next(gen)
+                gen.close()
+                self.assertFalse(acquired.locked())
+                acquired.release.assert_called_once_with()
+                self.assertEqual(e.proc.stdin.text, "")
+                self.assertEqual(e.slot_claims, set())
+
     def test_paused_batch_reader_never_consumes_successor(self):
         e = batch_engine()
         e.lines.put("DONE 0 2 1 1 length")
@@ -214,6 +264,7 @@ class EngineEpochTests(unittest.TestCase):
 
     def test_cleanup_releases_captured_control_lock_only(self):
         e = batch_engine()
+        e.ctl = mock.Mock(wraps=threading.Lock())
         e.slot_busy = [False, False]
         e._shorter_waiting = lambda plen: False
         e.lines.put("PP 1 2 3 4")
@@ -226,6 +277,8 @@ class EngineEpochTests(unittest.TestCase):
         e.ctl.acquire()
         gen.close()
         self.assertFalse(old_ctl.locked())
+        gen.close()
+        old_ctl.release.assert_called_once_with()
         self.assertTrue(e.ctl.locked())
         e.ctl.release()
 
