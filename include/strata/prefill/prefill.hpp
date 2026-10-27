@@ -61,8 +61,13 @@ public:
     /// `why` (optional): on a decline (false, `err` empty) the reason, a static string.
     bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                   std::string& err, const char** why = nullptr);
+    // Owner-thread/quiescent only, including process-wide policy writers.
+    // Does not resolve lazy configuration; incomplete and not a compatibility seal.
+    core::PrefillCpuShareObservation cpu_share_policy() const noexcept;
     Prefill();
     ~Prefill();
+    /// CUDA ownership mode: configure before init; cleanup uncertainty terminates the worker.
+    bool set_strict_retirement(bool enabled, std::string& error);
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
 
@@ -254,6 +259,8 @@ public:
     static void arm_cpu_share(bool applies, bool by_default = false);
 
 private:
+    bool strict_retirement_ = false;
+    bool retirement_init_started_ = false;
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool

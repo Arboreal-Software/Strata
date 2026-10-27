@@ -138,6 +138,13 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
     return true;
 }
 
+bool NativeDense::enable_inventory_capture(const NativeInventoryLimits& limits,
+    std::shared_ptr<const ReservationLease> reservation,std::shared_ptr<const void> inputs,std::string& error) {
+    (void)limits;(void)reservation;(void)inputs;
+    error="SYCL native inventory capture requires an actual backend load producer";
+    return false;
+}
+
 NativeDense::~NativeDense() {
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
     if (scratch_) sycl::free(scratch_, dpct::get_in_order_queue());

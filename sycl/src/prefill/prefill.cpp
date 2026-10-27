@@ -1029,7 +1029,20 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
     return res;
 }
 }  // namespace
+// Unsupported producer: absence of observed state is not a disabled policy.
+// Default record stays unresolved/unknown/incomplete; no lazy config reads.
+core::PrefillCpuShareObservation Prefill::cpu_share_policy() const noexcept {
+    return {};
+}
+
 Prefill::Prefill() : impl_(new Impl) {}
+bool Prefill::set_strict_retirement(bool enabled, std::string& error) {
+    if (retirement_init_started_) { error = "strict retirement must be configured before init"; return false; }
+    if (enabled) { error = "strict retirement is unsupported by SYCL"; return false; }
+    strict_retirement_ = enabled;
+    return true;
+}
+
 Prefill::~Prefill() { release(); }
 
 void Prefill::reset() {
@@ -1181,6 +1194,7 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
                    const core::ExpertCache *cache, const int32_t *host_res,
                    int64_t chunk, void *stream, std::string &err, void *borrow,
                    uint64_t borrow_bytes, bool borrow_spill) try {
+    retirement_init_started_ = true;
     if (borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout (--prefill-head-alias) is not in the SYCL port";
         return false;

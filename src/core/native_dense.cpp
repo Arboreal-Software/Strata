@@ -9,11 +9,13 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <stdexcept>
 #include <memory>
 #include <set>
 #include <cmath>
@@ -34,7 +36,14 @@ namespace {
 constexpr uint64_t kAllocGranule = 2ull << 20;
 constexpr uint64_t kSmallAlloc = 1ull << 20;
 uint64_t alloc_bytes(uint64_t bytes) {
+    if(bytes>=kSmallAlloc && bytes>UINT64_MAX-(kAllocGranule-1))
+        throw std::overflow_error("native allocation rounding overflow");
     return bytes < kSmallAlloc ? bytes : (bytes + kAllocGranule - 1) / kAllocGranule * kAllocGranule;
+}
+void add_allocation(uint64_t& total,uint64_t bytes) {
+    const auto charge=alloc_bytes(bytes);
+    if(charge>UINT64_MAX-total)throw std::overflow_error("native allocation total overflow");
+    total+=charge;
 }
 int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
 bool in_range(const std::string& name) {
@@ -164,7 +173,24 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
-struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
+// DevicePtr exists only within load. Nestable thread-local scope keeps its
+// deleter stateless (no larger default Pending allocations) and charges an
+// unwind failure only to the actual opt-in load on this thread.
+thread_local bool* inventory_unwind_uncertain=nullptr;
+struct InventoryUnwindScope {
+    bool* previous;
+    explicit InventoryUnwindScope(bool* current):previous(inventory_unwind_uncertain){inventory_unwind_uncertain=current;}
+    ~InventoryUnwindScope(){inventory_unwind_uncertain=previous;}
+};
+struct DeviceFree {
+    void operator()(void* p) const {
+        if(!p)return;
+        const auto status=cudaFree(p);
+        if(inventory_unwind_uncertain&&status!=cudaSuccess) {
+            *inventory_unwind_uncertain=true;std::fprintf(stderr,"native inventory load cleanup uncertain; input authority retained\n");
+        }
+    }
+};
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
     WeightRef* ref;
@@ -252,7 +278,34 @@ static void* g_hc_scratch[64][2][2] = {};     // [device][class][slot]
 static cudaEvent_t g_hc_ev[64][2] = {};        // [device][slot]: the prompt path's last reader of the slot
 static bool g_hc_ev_set[64][2] = {};
 
+static std::atomic<NativeLoadInventory*> failed_inventory{nullptr};
+bool NativeDense::enable_inventory_capture(const NativeInventoryLimits& limits,
+    std::shared_ptr<const ReservationLease> reservation,std::shared_ptr<const void> inputs,std::string& error) {
+    uint64_t required=0;
+    if(load_attempted_||release_started_||inventory_) {error="native inventory must be enabled once before load";return false;}
+    if(!native_inventory_host_bound(limits,required,error))return false;
+    if(!reservation||reservation->resources().host_bytes<required||!inputs||
+       reservation->purpose()!=ReservationPurpose::foreground) {error="native inventory requires admitted host envelope and retained input owner";return false;}
+    try {
+        auto candidate=std::make_unique<NativeLoadInventory>();
+        candidate->metadata_reservation=std::move(reservation);candidate->retained_input_bindings=std::move(inputs);
+        candidate->limits=limits;candidate->sources.reserve(size_t(limits.max_sources));candidate->records.reserve(size_t(limits.max_records));
+        inventory_=std::move(candidate);return true;
+    }catch(const std::bad_alloc&){error="native inventory allocation failed";return false;}
+}
 NativeDense::~NativeDense() {
+    if(inventory_&&!release_started_&&!release_failed_) {
+        try {std::string error;if(!release_checked(error))std::fprintf(stderr,"native inventory retirement: %s\n",error.c_str());}
+        catch(...) {release_started_=release_failed_=true;std::fprintf(stderr,"native inventory retirement uncertain\n");}
+    }
+    if(release_failed_) {
+        // Explicit failed retirement may never release its input authority. No
+        // allocation/owner destruction on this uncertainty path.
+        if(auto* p=inventory_.release()) {
+            auto* head=failed_inventory.load();do {p->quarantined_next=head;}while(!failed_inventory.compare_exchange_weak(head,p));
+        }
+        return;
+    } // uncertain explicit retirement must never retry frees
     for (auto& dev : g_hc_scratch)
         for (auto& cl : dev)
             for (void*& b : cl)
@@ -262,8 +315,44 @@ NativeDense::~NativeDense() {
     for (void* p : weights_) cudaFree(p);
 }
 
+bool NativeDense::owns_weight_span(const void* base,uint64_t bytes) const {
+    if(release_started_||!weight_spans_valid_||!base||!bytes)return false;
+    for(const auto& span:weight_spans_)if(span.first==base&&bytes<=span.second)return true;
+    return false;
+}
+
+bool NativeDense::release_checked(std::string& error) {
+    if(release_failed_&&!release_started_) {
+        release_started_=true;error="native inventory load cleanup failed; worker quarantine required";return false;
+    }
+    if(release_started_) {
+        if(release_failed_)error="native model retirement failed; worker quarantine required";
+        return !release_failed_;
+    }
+    release_started_=true;release_failed_=true;
+    // From here the object cannot execute again, including after partial release.
+    for(const void* p:packed_keys_)strata::kernels::native_q8_0_packed_unregister(p);
+    packed_keys_.clear();
+    auto free_one=[&](void*& p) {
+        if(!p)return true;
+        const auto status=cudaFree(p);
+        if(status!=cudaSuccess) {
+            error=std::string("native model release failed: ")+cudaGetErrorString(status);return false;
+        }
+        for(auto& dev:g_hc_scratch)for(auto& cl:dev)for(void*& b:cl)if(b==p)b=nullptr;
+        p=nullptr;return true;
+    };
+    if(!free_one(scratch_))return false;
+    for(void*& p:weights_)if(!free_one(p))return false;
+    weights_.clear();bytes_=0;allocated_=0;release_failed_=false;return true;
+}
+
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+    if(release_started_){err="retired native model cannot be loaded again";return false;}
+    if(load_attempted_){err="native model load already attempted; use a fresh owner";return false;}
+    load_attempted_=true;
+    weight_spans_valid_=false;
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -272,14 +361,54 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
+        InventoryUnwindScope unwind_scope(inventory_?&release_failed_:nullptr);
+        if(inventory_) {
+            const auto& limits=inventory_->limits;
+            if(shards.size()>limits.max_sources){err="native inventory source count bound";return false;}
+            for(const auto& path:shards)if(path.size()>limits.max_string_bytes){err="native inventory source string bound";return false;}
+            for(const auto& path:shards)inventory_->sources.push_back(path);
+            inventory_->layer_lo=layer_lo;inventory_->layer_hi=layer_hi;
+            inventory_->global_layer_lo=g_layer_lb;inventory_->global_layer_hi=g_layer_le;
+            inventory_->include_ple_key=include_ple_key;
+        }
+        auto append_inventory=[&](const strata::TensorInfo* tensor,const strata::GgufFile* file,
+            size_t ordinal,const std::string& name,const WeightRef& ref,uint64_t runtime_bytes,
+            NativeLoadLayout layout,NativeLoadConversion conversion)->size_t {
+            if(!inventory_)return SIZE_MAX;
+            const auto& limits=inventory_->limits;
+            if(inventory_->records.size()>=limits.max_records||name.size()>limits.max_string_bytes||
+               (tensor?tensor->shape.size():size_t(2))>limits.max_rank)
+                throw std::runtime_error("native inventory record/string/shape bound");
+            NativeTensorLoadRecord record;record.name=name;record.runtime_bytes=runtime_bytes;
+            record.runtime_layout=layout;record.conversion=conversion;
+            if(tensor) {
+                record.source_ordinal=ordinal;record.source_type=tensor->type;record.source_shape=tensor->shape;
+                if(tensor->offset>UINT64_MAX-file->data_start())throw std::runtime_error("native inventory absolute offset overflow");
+                record.source_offset=file->data_start()+tensor->offset;record.source_bytes=strata::tensor_payload_bytes(*tensor);
+            } else {
+                record.source=NativeLoadSource::unresolved_canonical;record.source_shape={uint64_t(ref.ne0),uint64_t(ref.ne1)};
+                record.source_offset=ref.src_off;record.source_bytes=ref.src_bytes;
+                record.canonical={ref.file_id,int64_t(ref.kind),ref.code_bits,ref.code_bias,ref.group_elems,ref.act_kind,
+                    ref.src_off,ref.src_bytes,ref.codes_bytes,ref.scales_bytes,ref.offset_bytes,
+                    ref.scales_fp16,ref.has_offset,ref.codebook_iq4nl};
+                inventory_->has_unresolved_canonical=true;
+            }
+            inventory_->records.push_back(std::move(record));return inventory_->records.size()-1;
+        };
         std::vector<Pending> pending;
+        // At most one HC allocation per table entry, plus four shared HC scratch
+        // buffers. Reserve ownership metadata before any such device allocation.
+        if(table.table_.size()>weights_.max_size()-4)
+            throw std::length_error("native HC ownership metadata overflow");
+        weights_.reserve(table.table_.size()+4);
         std::set<std::string> seen;
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
-        for (const auto& path : shards) {
+        for (size_t source_ordinal=0;source_ordinal<shards.size();++source_ordinal) {
+            const auto& path=shards[source_ordinal];
             strata::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
             const auto* number = gguf.get("split.no");
@@ -363,6 +492,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
+                const auto receipt=append_inventory(&tensor,&gguf,source_ordinal,tensor.name,ref,bytes,
+                    NativeLoadLayout::gguf_native,NativeLoadConversion::identity);
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
@@ -373,7 +504,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                allocated += alloc_bytes(bytes);
+                add_allocation(allocated,bytes);
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
                 // copy stays: the prompt path's GEMMs read it).
                 DevicePtr packed;
@@ -392,7 +523,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         err = "native dense packed upload " + tensor.name + ": " + cudaGetErrorString(packed_status);
                         return false;
                     }
+                    add_allocation(allocated,bytes);
                 }
+                if(inventory_&&packed)inventory_->records[receipt].q8_packed_helper_bytes=bytes;
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
             }
             if (hc_q8_env())
@@ -409,17 +542,22 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         err = "native dense (STRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
                     }
                     const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
+                    append_inventory(&tensor,&gguf,source_ordinal,tensor.name,ref,bytes,NativeLoadLayout::hc_q8_0,
+                        f32_inject?NativeLoadConversion::f32_to_q8_0_host:NativeLoadConversion::identity);
                     void* p = nullptr;
                     std::vector<uint8_t> q8;
                     if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
-                    if (cudaMalloc(&p, bytes) != cudaSuccess ||
-                        cudaMemcpy(p, f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
-                                   cudaMemcpyHostToDevice) != cudaSuccess) {
-                        err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
+                    if(cudaMalloc(&p,bytes)!=cudaSuccess) {
+                        err="native dense (STRATA_HC_Q8) allocation "+tensor.name;return false;
                     }
-                    ref.hc_q8 = p;
-                    weights_.push_back(p);
-                    hc_q8_bytes += bytes;
+                    weights_.push_back(p); // pre-reserved; owns p even if upload fails
+                    add_allocation(allocated,bytes);
+                    if(cudaMemcpy(p,f32_inject?static_cast<const void*>(q8.data()):gguf.tensor_data(tensor),
+                                  bytes,cudaMemcpyHostToDevice)!=cudaSuccess) {
+                        err="native dense (STRATA_HC_Q8) upload "+tensor.name;return false;
+                    }
+                    ref.hc_q8=p;
+                    hc_q8_bytes+=bytes;
                 }
         }
         if (hc_q8_env()) {
@@ -437,6 +575,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense (STRATA_HC_Q8): " + name + " is not a bf16 matrix"; return false;
                 }
                 const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
+                append_inventory(nullptr,nullptr,0,name,ref,bytes,NativeLoadLayout::hc_q8_0,
+                    skipped?NativeLoadConversion::bf16_to_q8_0_host:NativeLoadConversion::bf16_to_q8_0_device);
                 void* p = nullptr;
                 if (cudaMalloc(&p, bytes) != cudaSuccess) { err = "native dense (STRATA_HC_Q8) alloc " + name; return false; }
                 weights_.push_back(p);
@@ -452,7 +592,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 ref.hc_q8 = p;
                 hc_q8_bytes += bytes;
-                allocated += alloc_bytes(bytes);
+                add_allocation(allocated,bytes);
                 ++made;
             }
             if (made && (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)) {
@@ -470,6 +610,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         void* b = nullptr;
                         if (cudaMalloc(&b, (size_t) elems * 2) != cudaSuccess) { err = "native dense (STRATA_HC_Q8): scratch alloc"; return false; }
                         weights_.push_back(b);
+                        add_allocation(allocated,(uint64_t)elems*2);
                         g_hc_scratch[dev][c][i] = b;
                     }
                 for (int i = 0; i < 2; ++i)
@@ -483,23 +624,43 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
         if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
+        add_allocation(allocated,strata::kernels::native_q8_1_bytes(max_in));
         // All checks and allocations finish before publishing any reference.
-        weights_.reserve(pending.size());
+        const size_t packed_pending=static_cast<size_t>(std::count_if(pending.begin(),pending.end(),
+            [](const Pending& item){return bool(item.packed);}));
+        if(pending.size()>weights_.max_size()-weights_.size() ||
+           packed_pending>weights_.max_size()-weights_.size()-pending.size() ||
+           pending.size()>weight_spans_.max_size()-weight_spans_.size() ||
+           packed_pending>packed_keys_.max_size()-packed_keys_.size())
+            throw std::length_error("native dense ownership metadata overflow");
+        weights_.reserve(weights_.size()+pending.size()+packed_pending);
+        packed_keys_.reserve(packed_keys_.size()+packed_pending);
+        weight_spans_.reserve(weight_spans_.size()+pending.size());
         uint64_t packed_bytes = 0;
         size_t packed_count = 0;
         for (auto& item : pending) {
-            item.ref->native_data = item.data.get();
-            item.ref->native_type = item.type;
-            item.ref->native_q8_1 = scratch.get();
-            if (item.packed) {
-                strata::kernels::native_q8_0_packed_register(item.data.get(), item.packed.get(), (int) item.ref->ne0,
-                                                             (int) item.ref->ne1);
-                packed_keys_.push_back(item.data.get());
-                packed_bytes += item.bytes;
-                ++packed_count;
-                weights_.push_back(item.packed.release());
+            const void* data=item.data.get();
+            const void* packed=item.packed.get();
+            // Reserve above means these inserts cannot allocate. Keep RAII until
+            // each pointer is recorded, even if this code later changes capacity.
+            if(packed) {
+                weights_.push_back(item.packed.get());
+                (void)item.packed.release();
             }
-            weights_.push_back(item.data.release());
+            weights_.push_back(item.data.get());
+            (void)item.data.release();
+            weight_spans_.emplace_back(data,item.bytes);
+            if(packed) {
+                // Registry insertion may allocate. Its cleanup identity and both
+                // device allocations must already belong to this object.
+                packed_keys_.push_back(data);
+                strata::kernels::native_q8_0_packed_register(data,packed,(int)item.ref->ne0,(int)item.ref->ne1);
+                packed_bytes+=item.bytes;
+                ++packed_count;
+            }
+            item.ref->native_data=data;
+            item.ref->native_type=item.type;
+            item.ref->native_q8_1=scratch.get();
         }
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
@@ -507,6 +668,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
         allocated_ = allocated;
+        weight_spans_valid_=true;
+        inventory_complete_=bool(inventory_);
         if (hc_q8_env())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
                          (double) hc_q8_bytes / 1073741824.0);

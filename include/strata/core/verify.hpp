@@ -78,8 +78,13 @@ struct VerifyHits {
 
 class Verifier {
 public:
+    friend struct VerifierDrainTestPeer;
+    // Quiescent partial observation: custom pool callback applicability is unverified.
+    RouteTailPolicyObservation route_tail_policy() const noexcept;
     Verifier() = default;
     ~Verifier();
+    /// CUDA ownership mode: configure before init; cleanup uncertainty terminates the worker.
+    bool set_strict_retirement(bool enabled, std::string& error);
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
@@ -260,6 +265,17 @@ public:
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
 
+    enum class SnapshotDrain { pending, drained, unhealthy, unsupported };
+    /// Opt-in snapshot preparation. Caller exclusively owns execution and has stopped
+    /// and joined all host producers, including pipeline peers and expert/PLE tasks.
+    /// Polls this verifier and its next_ chain without waiting. An error remains terminal
+    /// for this object's lifetime. Drained is NOT a logical common-cut certificate:
+    /// caller must still reconcile every stage's accepted/forwarded state and bindings.
+    SnapshotDrain poll_snapshot_drain(std::string& err);
+    bool snapshot_binding_matches(const SessionState* session, int device) const {
+        return ss_ == session && device_ == device;
+    }
+
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
     // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven
     // without blocking the host, so one host thread keeps a window in flight on each stage (the batch pipeline's
@@ -369,6 +385,8 @@ public:
     std::string route_stats_report();
 
 private:
+    bool strict_retirement_ = false;
+    bool retirement_init_started_ = false;
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
@@ -600,6 +618,8 @@ private:
     void pcie_balance_window(int64_t steps, int G);
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
+    std::string commit_failure_;         // failed commit cannot become a successful later wait
+    std::string snapshot_failure_;       // failed drain cannot certify a later snapshot
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)

@@ -1,3 +1,4 @@
+#include "strata/core/strict_retirement.hpp"
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -625,6 +626,40 @@ const uint16_t* Gemm::unpad_x(const uint16_t* X, int64_t T, int64_t K, int64_t l
         return nullptr;
     }
     return unpadded_x_;
+}
+
+void Gemm::retire_strict() {
+    int device = -1;
+    core::retirement_check(true, cudaGetDevice(&device), "Gemm retirement device");
+#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+    delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_); mmq_ctx_ = nullptr;
+    core::retirement_check(true, cudaSetDevice(device), "Gemm device after MMQ retirement");
+    if (mmq_buf_) { core::retirement_check(true, cudaFree(mmq_buf_), "Gemm MMQ buffer"); mmq_buf_ = nullptr; }
+#endif
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    if (auto* state = static_cast<HipLtState*>(hipblaslt_state_)) {
+        if (state->handle && hipblasLtDestroy(state->handle) != HIPBLAS_STATUS_SUCCESS) core::retirement_failed("Gemm hipBLASLt handle");
+        state->handle = nullptr; delete state; hipblaslt_state_ = nullptr;
+    }
+#endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    if (auto* state = static_cast<RocBlasState*>(rocblas_state_)) {
+        if (state->handle && rocblas_destroy_handle(state->handle) != rocblas_status_success) core::retirement_failed("Gemm rocBLAS handle");
+        state->handle = nullptr; delete state; rocblas_state_ = nullptr;
+    }
+#endif
+    if (handle_) {
+        if (cublasDestroy((cublasHandle_t)handle_) != CUBLAS_STATUS_SUCCESS) core::retirement_failed("Gemm BLAS handle");
+        handle_ = nullptr;
+    }
+    if (tc_w_) { core::retirement_check(true, cudaFree(tc_w_), "Gemm weight conversion"); tc_w_ = nullptr; }
+    if (tc_x_) { core::retirement_check(true, cudaFree(tc_x_), "Gemm input conversion"); tc_x_ = nullptr; }
+    if (unpadded_x_) { core::retirement_check(true, cudaFree(unpadded_x_), "Gemm unpadded input"); unpadded_x_ = nullptr; }
+    if (!external_) {
+        if (scratch_) core::retirement_check(true, cudaFree(scratch_), "Gemm scratch");
+        if (workspace_) core::retirement_check(true, cudaFree(workspace_), "Gemm workspace");
+    }
+    scratch_ = nullptr; workspace_ = nullptr;
 }
 
 Gemm::~Gemm() {

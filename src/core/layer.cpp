@@ -2,6 +2,7 @@
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
 #include "strata/core/pin_budget.hpp"
+#include "strata/core/strict_retirement.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -582,10 +583,10 @@ uint64_t g_kv_host_bytes = 0;
 // staging buffers. Elsewhere cudaHostAlloc stays first. Either way the other method is the fallback when the first
 // is refused. STRATA_KV_HOST_REGISTER=1/0 forces registering first or cudaHostAlloc first. Like the cudaHostAlloc
 // copy it lives as long as the process.
-uint8_t* kv_host_alloc(uint64_t bytes) {
-    auto host_alloc = [](uint64_t n) -> uint8_t* {
+uint8_t* kv_host_alloc(uint64_t bytes, QsaState::HostAllocation& kind) {
+    auto host_alloc = [&kind](uint64_t n) -> uint8_t* {
         uint8_t* h = nullptr;
-        if (strata::core::host_alloc_guarded((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) return h;
+        if (strata::core::host_alloc_guarded((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) { kind = QsaState::HostAllocation::cuda_alloc; return h; }
         (void) cudaGetLastError();
         return nullptr;
     };
@@ -597,7 +598,7 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
         if (e != nullptr && (e[0] == '0' || e[0] == '1')) return e[0] == '1';
         return std::filesystem::exists("/dev/dxg");
     }();
-    auto register_anon = [](uint64_t n) -> uint8_t* {
+    auto register_anon = [&kind](uint64_t n) -> uint8_t* {
         void* m = mmap(nullptr, (size_t) n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m == MAP_FAILED) return nullptr;
         if (cudaHostRegister(m, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
@@ -610,6 +611,7 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
             std::fprintf(stderr, "strata: KV streaming: the host copy is pinned with cudaHostRegister\n");
             said = true;
         }
+        kind = QsaState::HostAllocation::registered_mapping;
         return (uint8_t*) m;
     };
     if (register_first) {
@@ -770,6 +772,8 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+// Serialized by the runtime allocator, like qsa_state_init and its global mode settings.
+void qsa_host_account_release(uint64_t bytes) { g_kv_host_bytes -= bytes; }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
@@ -790,12 +794,104 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     return align_up16(n) + 256;
 }
 
-uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+bool qsa_private_host_plan(const ModelGeometry& g,int64_t cells,bool with_rope,QsaPrivateHostPlan& out) {
+    if (cells <= 0 || cells > INT32_MAX || qsa_kv_elastic()) return false;
+    const auto s = qsa_shapes(g);
+    if (s.page_size <= 0 || s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || s.n_rot <= 0 || s.n_rot % 2)
+        return false;
+    const auto plan = kv_plan(s,cells,0);
+    QsaPrivateHostPlan result;
+    auto add = [](uint64_t& n,uint64_t x) {
+        if (x > UINT64_MAX-n) return false;
+        n += x;return true;
+    };
+    // Native host allocations have page granularity even for tiny staging
+    // arrays. Round each independent allocation conservatively to 64 KiB.
+    auto pinned = [&](uint64_t bytes) {
+        constexpr uint64_t alignment = 65536;
+        if (bytes > UINT64_MAX-(alignment-1)) return false;
+        return add(result.pinned_bytes,(bytes+alignment-1)/alignment*alignment);
+    };
+    if (!pinned(strata::kernels::qsa_step_bytes()+sizeof(int32_t)) || !pinned(uint64_t(s.n_head)*4)) return false;
+    if (plan.mode != 0) {
+        const int format = g_kv_hybrid ? strata::kernels::kKvHybrid :
+                           g_kv_q4 ? strata::kernels::kKvQ4 : g_kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+        const uint64_t block = strata::kernels::kv_block_bytes(s,format);
+        if (!block || uint64_t(plan.pages) > (UINT64_MAX-1024)/block ||
+            !pinned(uint64_t(plan.pages)*block+1024)) return false;
+    }
+    // Fresh vector capacities are bounded conservatively at twice requested
+    // storage for the supported builder; all remain retained on failed uploads.
+    if (with_rope) {
+        const uint64_t row = uint64_t(s.n_rot)*sizeof(float)*2;
+        if (uint64_t(cells) > UINT64_MAX/row || !add(result.upload_bytes,uint64_t(cells)*row)) return false;
+    }
+    if (plan.mode == 0 && !add(result.upload_bytes,uint64_t(plan.pages)*sizeof(int32_t)*2)) return false;
+    out = result;return true;
+}
+
+bool qsa_elastic_plan(const ModelGeometry& g,int64_t cells,QsaElasticFormat format,bool rotate,
+    int64_t initial,int device,uint64_t granularity,QsaElasticPlan& out) {
+    const auto s=qsa_shapes(g);
+    if(cells<=0||cells>INT32_MAX||initial<=0||initial>cells||device<0||!granularity||
+       granularity>uint64_t(INT64_MAX)||s.page_size<=0||s.page_size>INT32_MAX||s.n_head_kv<=0||
+       s.head_dim<=0||s.head_dim>INT32_MAX||s.n_head<=0||s.n_head>INT32_MAX||s.n_head_kv>INT32_MAX||
+       s.idx_block<=1||s.idx_block>INT32_MAX||s.idx_dim<=0||s.idx_dim>INT32_MAX||
+       s.n_rot<=0||s.n_rot>INT32_MAX||s.n_rot%2||s.head_dim%strata::kernels::KV_Q8_GROUP)return false;
+    if(format!=QsaElasticFormat::f16&&format!=QsaElasticFormat::int8&&format!=QsaElasticFormat::q4&&format!=QsaElasticFormat::hybrid)return false;
+    QsaElasticPlan p;p.format=format;p.rotate=rotate;p.device=device;p.cells=cells;p.initial_cells=initial;
+    p.page_size=s.page_size;p.slots=(cells+s.page_size-1)/s.page_size;p.granularity=granularity;
+    auto mul=[](uint64_t a,uint64_t b,uint64_t& n){if(b&&a>UINT64_MAX/b)return false;n=a*b;return true;};
+    auto add=[](uint64_t& n,uint64_t x){if(x>UINT64_MAX-n)return false;n+=x;return true;};
+    auto rounded=[&](uint64_t n,uint64_t a,uint64_t& result){if(!a||n>UINT64_MAX-(a-1))return false;return mul((n+a-1)/a,a,result);};
+    uint64_t rows,codes,scales,packed,half;
+    if(!mul(uint64_t(s.n_head_kv),uint64_t(s.page_size),rows)||!mul(rows,uint64_t(s.head_dim),codes)||
+       !mul(rows,uint64_t(s.head_dim/strata::kernels::KV_Q8_GROUP)*2,scales)||
+       !mul(rows,strata::kernels::kv_q4_bytes_per_head(int(s.head_dim)),packed)||!mul(codes,2,half))return false;
+    if(format==QsaElasticFormat::f16){p.arrays=2;p.per_slot={half,half,0,0};}
+    else if(format==QsaElasticFormat::int8){p.arrays=4;p.per_slot={codes,codes,scales,scales};}
+    else if(format==QsaElasticFormat::q4){p.arrays=2;p.per_slot={packed,packed,0,0};}
+    else {p.arrays=3;p.per_slot={codes,scales,packed,0};}
+    const uint64_t live=uint64_t((initial+s.page_size-1)/s.page_size);
+    for(size_t i=0;i<p.arrays;++i){uint64_t bytes,aligned,init;
+        p.offsets[i]=p.virtual_bytes;
+        if(!p.per_slot[i]||!mul(uint64_t(p.slots),p.per_slot[i],bytes)||!rounded(bytes,granularity,aligned)||
+           !add(p.virtual_bytes,aligned)||!mul(live,p.per_slot[i],bytes)||!rounded(bytes,granularity,init)||
+           !add(p.initial_chunks,init/granularity))return false;
+    }
+    if(p.virtual_bytes>SIZE_MAX||p.virtual_bytes/granularity>uint64_t(INT64_MAX))return false;
+    uint64_t n=0,x;
+    for(auto dims:{std::array<uint64_t,2>{uint64_t(p.slots),4},
+                   {uint64_t(s.idx_block-1),uint64_t(s.idx_dim)*4},
+                   {1,uint64_t(s.idx_dim)*4},{uint64_t(cells/s.idx_block+2),uint64_t(s.idx_dim)*4},
+                   {1,16},{1,strata::kernels::qsa_step_bytes()+16},{uint64_t(s.n_head),4}})
+        if(!mul(dims[0],dims[1],x)||!add(n,x))return false;
+    if(!rounded(n,16,p.other_bytes)||!add(p.other_bytes,256))return false;
+    if(!mul(uint64_t(cells),uint64_t(s.n_rot)*4,x)||!add(n,x)||!rounded(n,16,p.first_bytes)||!add(p.first_bytes,256))return false;
+    uint64_t a,b;if(!rounded(strata::kernels::qsa_step_bytes()+4,65536,a)||!rounded(uint64_t(s.n_head)*4,65536,b)||!add(a,b))return false;p.pinned_bytes=a;
+    if(!mul(uint64_t(p.slots),8,p.other_upload)||!mul(uint64_t(cells),uint64_t(s.n_rot)*8,x))return false;
+    p.first_upload=p.other_upload;if(!add(p.first_upload,x))return false;
+    out=p;return true;
+}
+bool qsa_elastic_plan_matches(const ModelGeometry& g,const QsaElasticPlan& p){
+    QsaElasticPlan n;if(!qsa_elastic_plan(g,p.cells,p.format,p.rotate,p.initial_cells,p.device,p.granularity,n))return false;
+    return n.slots==p.slots&&n.page_size==p.page_size&&n.virtual_bytes==p.virtual_bytes&&n.initial_chunks==p.initial_chunks&&
+        n.first_bytes==p.first_bytes&&n.other_bytes==p.other_bytes&&n.pinned_bytes==p.pinned_bytes&&
+        n.first_upload==p.first_upload&&n.other_upload==p.other_upload&&n.arrays==p.arrays&&n.offsets==p.offsets&&n.per_slot==p.per_slot;
+}
+bool qsa_private_host_plan(const ModelGeometry& g,int64_t cells,bool rope,QsaPrivateHostPlan& out,const QsaElasticPlan* plan){
+    if(!plan)return qsa_private_host_plan(g,cells,rope,out);
+    if(plan->cells!=cells||!qsa_elastic_plan_matches(g,*plan))return false;
+    QsaPrivateHostPlan result;result.pinned_bytes=plan->pinned_bytes;result.upload_bytes=rope?plan->first_upload:plan->other_upload;out=result;return true;
+}
+
+static uint64_t qsa_state_init_impl(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                        const QsaState* share_rope, int64_t ring_cells, QsaInitUploads* uploads, QsaElasticView* owned=nullptr) {
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const KvPlan p = owned ? KvPlan{0,owned->plan().slots,owned->plan().slots,max_cells/s.idx_block+2} : kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
+    if(!owned) {
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
@@ -806,12 +902,26 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.kv_q4 = false;
     }
     st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
+    }
+    if(owned) {
+        st.kv_int8=owned->plan().format==QsaElasticFormat::int8;
+        st.kv_q4=owned->plan().format==QsaElasticFormat::q4;
+        st.kv_hybrid=owned->plan().format==QsaElasticFormat::hybrid;
+        st.kv_rot=st.kv_q4||(st.kv_int8&&owned->plan().rotate);
+    }
+    st.owned_elastic=owned;
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
-    if (g_kv_elastic && p.mode == 0) {
+    if(owned) {
+        auto* b=owned->base();const auto& o=owned->plan().offsets;
+        if(st.kv_hybrid){st.k_q=(int8_t*)(b+o[0]);st.k_scale=(uint16_t*)(b+o[1]);st.v_q4=b+o[2];}
+        else if(st.kv_q4){st.k_q4=b+o[0];st.v_q4=b+o[1];}
+        else if(st.kv_int8){st.k_q=(int8_t*)(b+o[0]);st.v_q=(int8_t*)(b+o[1]);st.k_scale=(uint16_t*)(b+o[2]);st.v_scale=(uint16_t*)(b+o[3]);}
+        else {st.k_pool=(uint16_t*)(b+o[0]);st.v_pool=(uint16_t*)(b+o[1]);}
+    } else if (g_kv_elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
         const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -907,8 +1017,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if ((h = kv_host_alloc(bytes)) == nullptr ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+        h = kv_host_alloc(bytes, st.host_allocation_kind);
+        if (h) {
+            st.host_allocation = h;
+            st.host_allocation_bytes = bytes;
+            g_kv_host_bytes += bytes;
+        }
+        if (h == nullptr || cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
@@ -916,7 +1031,6 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
-        g_kv_host_bytes += bytes;
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
@@ -934,6 +1048,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             st.host.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
             st.host.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
         }
+    }
+    if (uploads) {
+        if (!qsa_upload_private_initial_state(st, int(s.n_rot), share_rope == nullptr, *uploads)) return 0;
+        return c.used;
     }
     // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its
     // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
@@ -964,11 +1082,41 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     return c.used;
 }
 
+uint64_t qsa_state_init(const ModelGeometry& g, int64_t cells, void* base, QsaState& st,
+                        const QsaState* share_rope, int64_t ring_cells) {
+    return qsa_state_init_impl(g,cells,base,st,share_rope,ring_cells,nullptr);
+}
+uint64_t qsa_state_init_private(const ModelGeometry& g, int64_t cells, void* base, QsaState& st,
+                                QsaInitUploads& uploads, const QsaState* share_rope) {
+    // Elastic pools still have process-global ownership. Do not claim they are
+    // private until their allocator supports individually retained owners.
+    if (qsa_kv_elastic() || uploads.started || st.host_step || st.host_pos || st.host_allocation) {
+        uploads.error = "private QSA initialization requires fresh state and owned non-elastic pools";
+        return 0;
+    }
+    const auto bytes = qsa_state_init_impl(g,cells,base,st,share_rope,0,&uploads);
+    if (!bytes && uploads.error.empty()) uploads.error = "private QSA allocation failed";
+    return bytes;
+}
+
+uint64_t qsa_state_init_private(const ModelGeometry& g,int64_t cells,void* base,QsaState& st,
+    QsaInitUploads& uploads,const QsaState* shared,QsaElasticView* owned) {
+    if(!owned)return qsa_state_init_private(g,cells,base,st,uploads,shared);
+    if(!base||!owned->healthy()||!owned->base()||owned->plan().cells!=cells||!qsa_elastic_plan_matches(g,owned->plan())||
+       uploads.started||st.host_step||st.host_pos||st.host_allocation||st.owned_elastic){uploads.error="invalid owned elastic QSA binding";return 0;}
+    if(!owned->claim_state(&st)){uploads.error="owned elastic QSA pool already bound";return 0;}
+    const auto used=qsa_state_init_impl(g,cells,base,st,shared,0,&uploads,owned);
+    if(!used&&uploads.error.empty())uploads.error="owned elastic QSA initialization failed";
+    return used;
+}
+
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
+    if(st.owned_elastic&&!st.owned_elastic->healthy())
+        retirement_failed("reset of unhealthy owned elastic KV");
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
-    const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+    const int64_t live_slots = st.owned_elastic ? st.owned_elastic->committed_slots() : (st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots);
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
@@ -993,6 +1141,44 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+}
+
+bool qsa_state_zero_checked(const QsaState& st, const ModelGeometry& g, void* stream, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    (void)st; (void)g; (void)stream;
+    error = "checked private reset is unsupported on Metal"; return false;
+#else
+    if(st.owned_elastic&&!st.owned_elastic->healthy()){error="owned elastic KV unhealthy";return false;}
+    const QsaShapes s = qsa_shapes(g);
+    cudaStream_t cs = (cudaStream_t) stream;
+    // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
+    const int64_t live_slots = st.owned_elastic ? st.owned_elastic->committed_slots() : (st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots);
+    const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
+    if (st.kv_hybrid) {
+        if (cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+        if (cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+        if (cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+    } else if (st.kv_q4) {
+        if (cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+        if (cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+    } else if (st.kv_int8) {
+        if (cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+        if (cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+        if (cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+        if (cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+    } else {
+        if (cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+        if (cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+    }
+    // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
+    // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
+    // carries the unwritten cells past the end, which nothing reads.
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    if (cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+    if (cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+    if (cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs) != cudaSuccess) { error = "qsa_state_zero_checked: reset submission failed"; return false; }
+    return true;
+#endif
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
@@ -1580,13 +1766,15 @@ bool ple_issue_token(const PleRun& p, std::string& err) {
     if (!p.ready()) { err = "ple_issue_token: the PLE run is not ready"; return false; }
     uint32_t rows[strata::kernels::PLE_N_HEADS];
     strata::kernels::ngram_rows(p.token, p.prev, 1, p.consts, rows);
-    if (!p.table->issue(rows)) { err = "ple_issue_token: the previous token's rows were never collected"; return false; }
+    const bool issued = p.read_context ? p.read_context->issue(rows) : p.table->issue(rows);
+    if (!issued) { err = "ple_issue_token: pending or invalidated row context"; return false; }
     return true;
 }
 
 bool ple_finish_token(const PleRun& p, void* stream, std::string& err) {
     if (!p.ready()) { err = "ple_finish_token: the PLE run is not ready"; return false; }
-    if (!p.table->collect(p.emb_host, err)) { err = "ple_finish_token: " + err; return false; }
+    const bool collected = p.read_context ? p.read_context->collect(p.emb_host,err) : p.table->collect(p.emb_host,err);
+    if (!collected) { err = "ple_finish_token: " + err; return false; }
     if (cudaMemcpyAsync(p.emb_dev, p.emb_host, (size_t) strata::kernels::NG_N_EMBD * sizeof(float),
                         cudaMemcpyHostToDevice, (cudaStream_t) stream) != cudaSuccess) {
         err = "ple_finish_token: the row upload failed";

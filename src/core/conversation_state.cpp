@@ -298,14 +298,12 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
     return true;
 }
 
-bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+static bool snapshot_fill_private(SavedConversation& captured, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes) {
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
-    // Build into a new object so a failure cannot publish a partial snapshot.
-    SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
@@ -323,8 +321,23 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
                                        std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    return true;
+}
+
+bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+                                const SessionState& ss, const ModelGeometry& g,
+                                const QsaState* draft, std::string& error,
+                                ConversationKvReuse reuse, size_t* reused_bytes) {
+    SavedConversation captured;
+    if (!snapshot_fill_private(captured,view,ss,g,draft,error,std::move(reuse),reused_bytes)) return false;
     image = std::move(captured);
     return true;
+}
+
+bool conversation_snapshot_save_private(SavedConversation& captured, const ConversationView& view,
+                                        const SessionState& ss, const ModelGeometry& g,
+                                        std::string& error) {
+    return snapshot_fill_private(captured,view,ss,g,nullptr,error,{},nullptr);
 }
 
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,

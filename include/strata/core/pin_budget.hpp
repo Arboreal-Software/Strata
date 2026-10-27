@@ -209,6 +209,16 @@ inline cudaError_t host_alloc_guarded(void** p, size_t bytes, unsigned flags) {
     }
 }
 
+/// Keep simulated pinned capacity charged until the driver confirms release.
+inline cudaError_t host_free_guarded(void* pointer) {
+    if (!pointer) return cudaSuccess;
+    auto& state = pin_detail::st();
+    std::lock_guard lock(state.mu);
+    const auto status = cudaFreeHost(pointer);
+    if (status == cudaSuccess) pin_detail::sim_uncharge(state,pointer);
+    return status;
+}
+
 /// The sentence every hard failure ends with, so the app can recognise it in the log.
 inline std::string pin_exhausted_hint() {
     auto& s = pin_detail::st();

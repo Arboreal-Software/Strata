@@ -1,5 +1,6 @@
 // src/ngram/ple_reader.cpp - see include/strata/ngram/ple_reader.hpp.
 #include "strata/ngram/ple_reader.hpp"
+#include "strata/ngram/ticket_id.hpp"
 #include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 
@@ -423,8 +425,9 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     Impl& m = *impl_;
     std::unique_lock<std::mutex> lk(m.mu, std::defer_lock);
     if (m.threaded) lk.lock();
-    const uint32_t id = m.next_ticket++;
-    if (m.next_ticket == 0) m.next_ticket = 1;
+    if(!m.file.is_open() || !m.error.empty())
+        throw std::runtime_error("PleReader: submission requires an open healthy reader");
+    const uint32_t id = detail::take_ticket_id(m.next_ticket);
     const double now = now_us();
     const bool rearm = m.keep_us > 0 && (m.last_issue_us <= 0 || now - m.last_issue_us > m.keep_window_us);
     m.last_issue_us = now;
@@ -495,7 +498,7 @@ bool PleReader::collect(Ticket t, std::string& err) {
         });
         it = m.tickets.find(t.id);
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-        if (!m.error.empty()) { err = m.error; return false; }
+        if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
         m.stats.wait_us += now_us() - start;
         m.tickets.erase(it);
         return true;
@@ -508,7 +511,7 @@ bool PleReader::collect(Ticket t, std::string& err) {
         it = m.tickets.find(t.id);
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
     }
-    if (!m.error.empty()) { err = m.error; return false; }
+    if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
     m.stats.wait_us += now_us() - start;
     m.tickets.erase(it);
     return true;

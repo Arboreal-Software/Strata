@@ -1,4 +1,5 @@
 #pragma once
+#include "strata/core/expert_tier_open_observer.hpp"
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
@@ -30,7 +31,7 @@ public:
     bool open(int device, int slots, int64_t layers, int64_t experts,
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
-              std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false);
+              std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false, ExpertTierOpenObserver* observer = nullptr);
     void close();
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),

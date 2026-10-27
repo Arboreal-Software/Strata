@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include "strata/core/native_load_inventory.hpp"
 #include <set>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace strata::core {
 class WeightTable;
@@ -17,7 +19,22 @@ struct WeightRef;
 class NativeDense {
 public:
     NativeDense() = default;
+    // Explicit opt-in BEFORE load, using the early caller budget and real input
+    // owner. Reservation is dedicated to this inventory; caller must not pledge
+    // the same lease to another allocation. Default path allocates no inventory.
+    // Refusal changes no state.
+    bool enable_inventory_capture(const NativeInventoryLimits&,
+        std::shared_ptr<const ReservationLease>,std::shared_ptr<const void>,std::string&);
+    // Borrow only while retaining this loader/stage; no view after failure or
+    // retirement. SYCL has no producer yet and returns nullptr.
+    const NativeLoadInventory* loaded_inventory() const noexcept {
+        return inventory_complete_&&!release_started_?inventory_.get():nullptr;
+    }
     ~NativeDense();
+    // Opt-in owner retirement. Caller proves quiescence and selects the owning
+    // device first. Failure is sticky: retain this object and its accounting in
+    // worker quarantine; do not execute, reload, or retry uncertain frees.
+    bool release_checked(std::string& error);
     NativeDense(const NativeDense&) = delete;
     NativeDense& operator=(const NativeDense&) = delete;
     /// With layer_hi >= 0, only the `blk.<l>.` matrices with layer_lo <= l < layer_hi are uploaded (a layer
@@ -55,10 +72,26 @@ public:
     uint64_t weight_bytes() const { return bytes_; }
     /// What the device lost to `load`: each matrix rounded up to the granule `cudaMalloc` backs it with.
     uint64_t allocated_bytes() const { return allocated_; }
+    // Only original native weight allocations published by load; excludes
+    // mutable scratch and packed helper buffers. Retired objects prove no spans.
+    bool owns_weight_span(const void* base, uint64_t bytes) const;
+    // An untouched instance is valid for a canonical-only model. A failed or
+    // retired native load must never be adopted as a usable model stage.
+    bool ready_for_adoption() const {return !release_started_&&(!load_attempted_||weight_spans_valid_);}
     size_t tensor_count() const { return weights_.size() - packed_keys_.size(); }
 
 private:
+    friend struct NativeDenseReleaseTestAccess;
+    // Declared first: destroyed after allocation/registration metadata. The
+    // destructor body retires native allocations before releasing these leases.
+    std::unique_ptr<NativeLoadInventory> inventory_;
+    bool inventory_complete_=false;
+    bool load_attempted_ = false;
+    bool weight_spans_valid_ = false;
+    bool release_started_ = false;
+    bool release_failed_ = false;
     std::vector<void*> weights_;
+    std::vector<std::pair<const void*,uint64_t>> weight_spans_;
     std::vector<const void*> packed_keys_;   // GGUF-layout pointers registered with STRATA_Q8_PACKED=1
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;

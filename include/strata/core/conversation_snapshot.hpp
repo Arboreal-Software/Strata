@@ -106,6 +106,11 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
+// Opt-in transaction capture into a fresh PRIVATE destination, without draft KV.
+// On failure retain this destination and the source until all work is known drained
+// or the runtime confirms device teardown. Never publish a partially filled image.
+bool conversation_snapshot_save_private(SavedConversation& captured, const ConversationView&,
+                                        const SessionState&, const ModelGeometry&, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.

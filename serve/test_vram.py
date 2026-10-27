@@ -39,6 +39,7 @@ class EngineCommand(unittest.TestCase):
         e.proc.poll.return_value = None
         e.proc.stdin = io.StringIO()
         e.ended = False
+        e._stdin_closing = False
         e.lines = queue.Queue()
         for r in replies:
             e.lines.put(r)

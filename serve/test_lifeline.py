@@ -166,3 +166,65 @@ class HardFallback(unittest.TestCase):
         self.assertIsNone(engine.proc)
         if os.name == "posix":
             self.assertEqual(victim.returncode, -signal.SIGKILL, "it ignored SIGTERM, so only the kill ended it")
+
+
+class PortableIdentity(unittest.TestCase):
+    """Portable identity uses birth time, never the process's changing run state."""
+    birth = "Tue Oct 27 10:11:12 2026"
+
+    @staticmethod
+    def watcher_start():
+        import ast
+        from serve import lifeline
+        tree = ast.parse(lifeline._WATCHER)
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "start_of")
+        namespace = {"subprocess": subprocess}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "<watcher-start>", "exec"), namespace)
+        return namespace["start_of"]
+
+    def test_parent_and_standalone_watcher_share_stable_identity(self):
+        from unittest import mock
+        from serve import lifeline
+        watcher = self.watcher_start()
+        for status in ("R", "S", "Ss", "S+", "T", "I", "R<"):
+            with self.subTest(status=status), mock.patch.object(subprocess, "run", return_value=mock.Mock(stdout=f"  {self.birth} {status}\n")):
+                self.assertEqual(lifeline._start_token(123), "s:" + self.birth)
+                self.assertEqual(watcher(123), "s:" + self.birth)
+
+    def test_zombies_dead_and_malformed_rows_do_not_identify_a_process(self):
+        from unittest import mock
+        from serve import lifeline
+        watcher = self.watcher_start()
+        for row in [self.birth + " " + status for status in ("Z", "Z+", "Zs", "Z<", "X", "X+")] + ["", "no process", self.birth, self.birth + " S\n" + self.birth + " S"]:
+            with self.subTest(row=row), mock.patch.object(subprocess, "run", return_value=mock.Mock(stdout=row)):
+                self.assertEqual(lifeline._start_token(123), "")
+                self.assertIsNone(watcher(123))
+
+    def test_reused_pid_birth_time_does_not_match(self):
+        from unittest import mock
+        from serve import lifeline
+        with mock.patch.object(subprocess, "run", return_value=mock.Mock(stdout=self.birth + " S")):
+            first = lifeline._start_token(123)
+        with mock.patch.object(subprocess, "run", return_value=mock.Mock(stdout="Tue Oct 27 10:11:13 2026 S")):
+            self.assertNotEqual(first, self.watcher_start()(123))
+
+    @unittest.skipUnless(POSIX, "test-owned stop/continue signals require POSIX")
+    def test_one_live_pid_keeps_identity_while_stopped(self):
+        from serve import lifeline
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        try:
+            token = lifeline._start_token(child.pid)
+            self.assertTrue(token)
+            os.kill(child.pid, signal.SIGSTOP)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                state = subprocess.run(["ps", "-o", "stat=", "-p", str(child.pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+                if state.startswith("T"):
+                    break
+                time.sleep(.01)
+            self.assertTrue(state.startswith("T"), "test child reached stopped state")
+            self.assertEqual(lifeline._start_token(child.pid), token)
+        finally:
+            os.kill(child.pid, signal.SIGCONT)
+            child.terminate()
+            child.wait(timeout=5)

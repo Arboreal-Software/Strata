@@ -219,9 +219,12 @@ std::string ple_format_list() {
 static_assert(PLE_ROW_BYTES_MAX >= PLE_ROW_BYTES && PLE_ROW_BYTES_MAX >= PLE_ROW_BYTES_FP8, "row buffers too small");
 
 struct PleTable::Impl {
+    uint64_t generation = 0;
+    bool close_failed = false;
     GgufFile* file = nullptr;
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
+    uint64_t source_offset = 0, source_bytes = 0;
     const PleFormatInfo* fmt = &ple_format_info(PleFormat::IQ4_NL);   // the table's format (#296: Q5_0 is one of them)
     mutable uint64_t bytes_read = 0;
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
@@ -253,7 +256,9 @@ bool PleTable::open(const std::string& gguf_path, std::string& err) {
 }
 
 bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     close();
+    if (impl_->generation == UINT64_MAX) { err = "PLE table generation exhausted"; return false; }
     try {
         impl_->file = new GgufFile(gguf_path);
     } catch (const std::exception& e) {
@@ -337,6 +342,8 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         return false;
     }
     impl_->data = impl_->file->tensor_data(*t);        // only a table that fits the file is mapped
+    impl_->source_offset = impl_->file->data_start() + t->offset;
+    impl_->source_bytes = need;
     if (io.mode == PleIo::Direct) {
         // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of
         // the table can enter this process's working set or the file cache through it.
@@ -449,8 +456,12 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
 }
 
 void PleTable::close() {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);
+    if (impl_->generation != UINT64_MAX) ++impl_->generation;
+    impl_->close_failed = true;
     wait_prefetches();
     impl_->reader.close();
+    impl_->close_failed = false;
     impl_->pending = false;
     impl_->locked = false;   // the unmap below releases the lock
     impl_->mode = PleIo::Mmap;
@@ -458,15 +469,26 @@ void PleTable::close() {
     impl_->file = nullptr;
     impl_->data = nullptr;
     impl_->n_rows = 0;
+    impl_->source_offset = impl_->source_bytes = 0;
     impl_->rb = PLE_ROW_BYTES;
     impl_->fmt = &ple_format_info(PleFormat::IQ4_NL);
     impl_->scale = 1.0f;
     impl_->bytes_read = 0;
 }
 
-bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
+bool PleTable::is_open() const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mu);
+    return !impl_->close_failed && (impl_->data != nullptr || impl_->reader.is_open());
+}
 bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const { return impl_->fmt->name; }
+bool PleTable::resolved_table(PleResolvedTable& out) const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mu);
+    if(impl_->close_failed || (!impl_->data && !impl_->reader.is_open()))return false;
+    out={impl_->fmt->id,impl_->mode,impl_->scale,impl_->rb,impl_->n_rows,
+         impl_->source_offset,impl_->source_bytes,impl_->generation};
+    return true;
+}
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
@@ -679,6 +701,88 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
     // values occupy [h*160, (h+1)*160).  A head-fastest layout would put element (d, h) at d*16 + h and needs
     // a real transpose - a reshape of the same flat buffer compares equal and would make the check vacuous.
     for (int h = 0; h < PLE_N_HEADS; ++h) read_row(rows16[h], out2560 + (size_t) h * PLE_HEAD_DIM);
+}
+
+struct PleReadContext::Impl {
+    std::shared_ptr<PleTable> owner;
+    std::shared_ptr<const void> lifetime_guard;
+    uint64_t generation = 0;
+    bool pending = false;
+    bool untracked = false;
+    strata::ngram::PleReader::Ticket ticket;
+    uint32_t rows[PLE_N_HEADS] = {};
+    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    Impl* next_quarantined = nullptr;
+};
+PleReadContext::PleReadContext(std::shared_ptr<PleTable> table,std::shared_ptr<const void> guard)
+    : impl_(std::make_unique<Impl>()) {
+    if(!table)throw std::invalid_argument("PLE read context requires a retained table");
+    std::lock_guard<std::recursive_mutex> lock(table->impl_->mu);
+    if(!table->is_open()||table->impl_->close_failed)throw std::invalid_argument("PLE read context requires an open healthy table");
+    impl_->generation=table->impl_->generation;
+    impl_->owner=std::move(table);impl_->lifetime_guard=std::move(guard);
+}
+PleReadContext::~PleReadContext() {
+    if(!impl_)return;
+    try {
+        auto& table=*impl_->owner->impl_;
+        std::lock_guard<std::recursive_mutex> lock(table.mu);
+        if(impl_->untracked||table.close_failed)throw 0;
+        if(impl_->pending&&impl_->generation==table.generation&&table.mode==PleIo::Direct) {
+            std::string error;
+            // collect returns only once this ticket's IO has drained, including
+            // ordinary IO failures. Explicit close already joined stale tickets.
+            (void)table.reader.collect(impl_->ticket,error);
+        }
+    } catch(...) {
+        // An exceptional join is not completion proof. Retain raw destinations,
+        // shared table and caller's reservation guard until process restart.
+        static std::mutex mutex;static Impl* quarantined=nullptr;
+        std::lock_guard lock(mutex);
+        impl_->next_quarantined=quarantined;quarantined=impl_.release();
+    }
+}
+PleTable* PleReadContext::table() const {return impl_->owner.get();}
+bool PleReadContext::pending() const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->owner->impl_->mu);
+    return impl_->pending;
+}
+bool PleReadContext::issue(const uint32_t* rows) {
+    auto& table=*impl_->owner->impl_;
+    std::lock_guard<std::recursive_mutex> lock(table.mu);
+    if(!rows||impl_->pending||table.close_failed||impl_->generation!=table.generation||!impl_->owner->is_open())return false;
+    std::memcpy(impl_->rows,rows,sizeof impl_->rows);
+    // Mark pending before issue: exceptional partial submission must retain its
+    // output buffer until reader close, not destroy it as an unstarted request.
+    impl_->pending=true;
+    if(table.mode==PleIo::Direct) {
+        try {impl_->ticket=table.reader.issue(impl_->rows,PLE_N_HEADS,impl_->raw);}
+        catch(...) {
+            // No ticket was returned, so close joins every possible partial read
+            // before this context's buffer can be reused or released.
+            impl_->untracked=true;
+            impl_->owner->close();
+            impl_->untracked=false;impl_->pending=false;throw;
+        }
+    }
+    return true;
+}
+bool PleReadContext::collect(float* output,std::string& error) {
+    auto& table=*impl_->owner->impl_;
+    std::lock_guard<std::recursive_mutex> lock(table.mu);
+    if(!output||!impl_->pending){error="PLE context collect without pending output";return false;}
+    if(impl_->generation!=table.generation){impl_->pending=false;error="PLE context invalidated by table close";return false;}
+    if(table.mode==PleIo::Direct) {
+        const bool ok=table.reader.collect(impl_->ticket,error);
+        impl_->pending=false;
+        if(!ok)return false;
+        for(int h=0;h<PLE_N_HEADS;++h)table.decode(impl_->raw+size_t(h)*table.rb,output+size_t(h)*PLE_HEAD_DIM);
+        table.bytes_read+=uint64_t(PLE_N_HEADS)*table.rb;
+    } else {
+        for(int h=0;h<PLE_N_HEADS;++h)impl_->owner->read_row(impl_->rows[h],output+size_t(h)*PLE_HEAD_DIM);
+        impl_->pending=false;
+    }
+    return true;
 }
 
 }  // namespace strata::kernels

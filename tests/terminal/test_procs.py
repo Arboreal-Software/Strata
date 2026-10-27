@@ -138,5 +138,22 @@ class Procs(unittest.TestCase):
         self.assertIsNone(procs.start_token(orphan_pid))
 
 
+class PortableStartToken(unittest.TestCase):
+    def token(self, output):
+        with mock.patch.object(procs.sys, "platform", "darwin"), mock.patch.object(procs, "WINDOWS", False), \
+             mock.patch.object(procs, "psutil", None), mock.patch.object(procs.subprocess, "run", return_value=mock.Mock(stdout=output)):
+            return procs.start_token(123)
+
+    def test_state_is_liveness_not_identity(self):
+        birth = "Tue Oct 27 10:11:12 2026"
+        for state in ("R", "S", "Ss+", "T", "I"):
+            self.assertEqual(self.token(birth + " " + state), "s:" + birth)
+        self.assertNotEqual(self.token(birth + " S"), self.token("Tue Oct 27 10:11:13 2026 S"))
+
+    def test_zombie_and_invalid_rows_are_unverifiable(self):
+        for row in ("Tue Oct 27 10:11:12 2026 Z+", "Tue Oct 27 10:11:12 2026 Zs", "Tue Oct 27 10:11:12 2026 X", "", "missing", "Tue Oct 27 10:11:12 2026"):
+            self.assertIsNone(self.token(row))
+
+
 if __name__ == "__main__":
     unittest.main()

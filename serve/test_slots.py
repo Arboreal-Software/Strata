@@ -85,6 +85,7 @@ class FakeEngine(StrataEngine):
         super().__init__("strata", ["--max-context", "65536"], lazy=True)
         self.max_context = 65536
         self.unloaded, self.ended = False, False
+        self._stdin_closing = False
         self.lines = queue.Queue()
         self.fail = False
         self.script = None
@@ -117,6 +118,7 @@ class Slots(unittest.TestCase):
 
     def fresh_engine(self):
         self.engine.ended = False
+        self.engine._stdin_closing = False
         old = getattr(self.engine.proc, "player", None)
         if old is not None:                          # the previous scripted engine has finished...
             self.engine.proc.killed = True

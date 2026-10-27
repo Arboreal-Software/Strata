@@ -44,6 +44,18 @@ except ImportError:  # pragma: no cover - the Linux /proc fallback below still i
 
 # ---------------------------------------------------------------------------------------------- identity
 
+def ps_start_token(output: str) -> str | None:
+    """Canonical birth token from one ``ps -o lstart=,stat=`` row.
+
+    Status is mutable, so it only determines liveness. Keep these rules in sync
+    with the standalone (``python -S``) lifeline watcher's ``start_of``.
+    """
+    fields = output.split()
+    if len(fields) != 6 or fields[5][0] in "ZX":
+        return None
+    return "s:" + " ".join(fields[:5])
+
+
 def start_token(pid: int) -> str | None:
     """A string that is the same for the lifetime of one process and different for a later process with the same
     PID. None when there is no such process or its start cannot be read."""
@@ -75,7 +87,7 @@ def start_token(pid: int) -> str | None:
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    return ps_start_token(out)
 
 
 def started_epoch(pid: int) -> float | None:

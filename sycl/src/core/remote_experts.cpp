@@ -161,7 +161,9 @@ void RemoteExperts::close() {
 bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          const std::vector<std::pair<int32_t, int32_t>> &ranked,
                          const ExpertCache &primary, ExpertSource &source,
-                         std::vector<uint8_t> &claimed, std::string &err, bool /*auto_size*/) try {
+                         std::vector<uint8_t> &claimed, std::string &err, bool /*auto_size*/, ExpertTierOpenObserver* observer) try {
+    ExpertTierOpenTransaction observation(observer);
+    if(observer) {err="SYCL remote open inventory is unsupported";return false;}
     close();
     if (strata::kernels::cpu::hadamard_spec().any()) {   // APR: this helper does not rotate the expert input yet (SYCL)
         err = "second-GPU experts: Hadamard-folded (Gyro) experts are not supported on a second Intel GPU yet";

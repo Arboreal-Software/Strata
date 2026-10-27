@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 // src/core/vmm.cpp - SYCL port: no virtual memory management.
 //
 // Upstream's vmm.cpp reaches the CUDA driver's cuMem* functions through cudaGetDriverEntryPointByVersion; Level Zero
@@ -12,6 +14,9 @@ bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
 VmmChunk vmm_chunk_new() { return 0; }
 void vmm_chunk_free(VmmChunk) {}
+void vmm_chunk_retire(VmmChunk h, bool strict) {
+    if (strict && h) { std::fputs("strata: SYCL VMM retirement unsupported\n", stderr); std::_Exit(1); }
+}
 
 bool VmmRange::reserve(uint64_t) { return false; }
 void VmmRange::release() {

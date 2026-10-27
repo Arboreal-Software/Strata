@@ -114,6 +114,10 @@ void native_q8_0_packed_unregister(const void* gguf_weights);
 bool native_q6_k_packed_enabled();
 bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what);
 void native_q6_k_unpack(const void* weights);
+/// Additional registry-owned storage; caller drains users and selects the owner
+/// device before release. Failed frees retain the entry for quarantine.
+size_t native_head_packed_allocation_bytes(const void* weights);
+bool native_head_packed_release_checked(const void* weights);
 
 /// STRATA_Q6_PLANAR (SYCL port; =0 turns it off): the Q6_K output heads stored as planes - ql (128 B), qh (64 B), the scales
 /// (16 B, each lane's pair adjacent), d (2 B) of every 210-byte block - so the decode kernel's weight loads are single

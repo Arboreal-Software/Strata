@@ -14,6 +14,7 @@
 // The tier follows the conversation like the primary's: `adapt` swaps the most-routed experts that neither card
 // holds into the peer's least-used slots (per layer, so a slot keeps its layer's blob size).
 #pragma once
+#include "strata/core/expert_tier_open_observer.hpp"
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
@@ -43,7 +44,7 @@ public:
     /// as fit in the card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count).
     bool open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-              std::string& err);
+              std::string& err, ExpertTierOpenObserver* observer = nullptr);
     void close();
     bool valid() const { return device_ >= 0; }
     int device() const { return device_; }
@@ -72,6 +73,8 @@ public:
     /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
     void apply_pending(bool wait);
+    // Owned callers refuse uncertain completion before publishing residency.
+    void apply_pending(bool wait, bool checked_completion);
 
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)

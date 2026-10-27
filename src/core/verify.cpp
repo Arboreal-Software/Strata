@@ -1,3 +1,4 @@
+#include "strata/core/strict_retirement.hpp"
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"
@@ -54,6 +55,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/diagnostic_readers.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
@@ -449,16 +451,16 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
 }  // namespace
 
 namespace {
-std::atomic<const Verifier*> g_diag_verifier{nullptr};
+constexpr int kLiveMax = 16;
+DiagnosticReaders<Verifier, kLiveMax> g_verifier_readers;
 void diag_active_verifier(std::FILE* f) {
-    if (const Verifier* v = g_diag_verifier.load()) v->diag(f);
+    if (auto v = g_verifier_readers.acquire_latest()) v->diag(f);
 }
 // #267: every live verifier (a layer split has one per stage), for the release before the engine ends
-constexpr int kLiveMax = 16;
-std::atomic<Verifier*> g_live[kLiveMax];
+
 void release_live_verifiers(std::FILE* f) {
-    for (auto& slot : g_live)
-        if (Verifier* v = slot.load()) {
+    for (int index = 0; index < kLiveMax; ++index)
+        if (auto v = g_verifier_readers.acquire((size_t) index)) {
             const Clock::time_point t0 = Clock::now();
             const bool done = v->release_gpu_waits(5000);
             if (f != nullptr)
@@ -604,61 +606,76 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 
+bool Verifier::set_strict_retirement(bool enabled, std::string& error) {
+    if (retirement_init_started_) { error = "strict retirement must be configured before init"; return false; }
+#if defined(STRATA_GPU_METAL)
+    if (enabled) { error = "strict retirement is unsupported by Metal"; return false; }
+#endif
+    strict_retirement_ = enabled;
+    return true;
+}
+
+RouteTailPolicyObservation Verifier::route_tail_policy() const noexcept {
+    return observe_tail_skip_policy();
+}
+
 Verifier::~Verifier() {
+    g_verifier_readers.retire(this);   // before Metal/device/member cleanup, outside the registry lock
+    StrictRetirementDevice retirement(strict_retirement_ && device_ >= 0, device_);
 #if defined(STRATA_GPU_METAL)
     strata::metal_engine::window_destroy(metal_);
     metal_ = nullptr;
 #endif
-    const Verifier* self = this;
-    g_diag_verifier.compare_exchange_strong(self, nullptr);
-    for (auto& slot : g_live) {
-        Verifier* me = this;
-        slot.compare_exchange_strong(me, nullptr);
-    }
-    if (cs_) cudaStreamSynchronize(cs_);
-    if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (cs_) retirement_check(strict_retirement_, cudaStreamSynchronize(cs_), "Verifier cleanup");
+    if (sh_cs_) retirement_check(strict_retirement_, cudaStreamSynchronize(sh_cs_), "Verifier cleanup");
     for (auto& e : exec_)
-        if (e) cudaGraphExecDestroy(e);
+        if (e) retirement_check(strict_retirement_, cudaGraphExecDestroy(e), "Verifier cleanup");
     for (auto& e : exec_nr_)
-        if (e) cudaGraphExecDestroy(e);
-    if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+        if (e) retirement_check(strict_retirement_, cudaGraphExecDestroy(e), "Verifier cleanup");
+    if (commit_exec_) retirement_check(strict_retirement_, cudaGraphExecDestroy(commit_exec_), "Verifier cleanup");
     for (auto& kv : exec_bm_)
-        if (kv.second) cudaGraphExecDestroy(kv.second);
+        if (kv.second) retirement_check(strict_retirement_, cudaGraphExecDestroy(kv.second), "Verifier cleanup");
     for (auto& kv : commit_bm_)
-        if (kv.second) cudaGraphExecDestroy(kv.second);
-    if (arena_b_) cudaFree(arena_b_);
-    if (h_commitb_) cudaFreeHost(h_commitb_);
-    if (qcnt_) cudaFree(qcnt_);
-    if (d_spec_) cudaFree(d_spec_);
+        if (kv.second) retirement_check(strict_retirement_, cudaGraphExecDestroy(kv.second), "Verifier cleanup");
+    if (arena_b_) retirement_check(strict_retirement_, cudaFree(arena_b_), "Verifier cleanup");
+    if (h_commitb_) retirement_check(strict_retirement_, cudaFreeHost(h_commitb_), "Verifier cleanup");
+    if (qcnt_) retirement_check(strict_retirement_, cudaFree(qcnt_), "Verifier cleanup");
+    if (d_spec_) retirement_check(strict_retirement_, cudaFree(d_spec_), "Verifier cleanup");
     if (tap_file_) std::fclose(tap_file_);
-    if (tap_dev_) cudaFree(tap_dev_);
-    if (tap_scratch_) cudaFree(tap_scratch_);
-    if (h_tap_) cudaFreeHost(h_tap_);
-    if (logit_bias_device_) cudaFree(logit_bias_device_);
-    if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
-    if (sh_cs_) cudaStreamDestroy(sh_cs_);
-    if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
-    if (side_) cudaStreamDestroy(side_);
-    if (side2_) cudaStreamDestroy(side2_);
+    if (tap_dev_) retirement_check(strict_retirement_, cudaFree(tap_dev_), "Verifier cleanup");
+    if (tap_scratch_) retirement_check(strict_retirement_, cudaFree(tap_scratch_), "Verifier cleanup");
+    if (h_tap_) retirement_check(strict_retirement_, cudaFreeHost(h_tap_), "Verifier cleanup");
+    if (logit_bias_device_) retirement_check(strict_retirement_, cudaFree(logit_bias_device_), "Verifier cleanup");
+    if (cs_ && cs_ != ext_stream_) retirement_check(strict_retirement_, cudaStreamDestroy(cs_), "Verifier cleanup");   // set_stream: the stage's stream, shared, not ours
+    if (sh_cs_) retirement_check(strict_retirement_, cudaStreamDestroy(sh_cs_), "Verifier cleanup");
+    if (copy_) { retirement_check(strict_retirement_, cudaStreamSynchronize(copy_), "Verifier cleanup"); retirement_check(strict_retirement_, cudaStreamDestroy(copy_), "Verifier cleanup"); }
+    if (side_) retirement_check(strict_retirement_, cudaStreamDestroy(side_), "Verifier cleanup");
+    if (side2_) retirement_check(strict_retirement_, cudaStreamDestroy(side2_), "Verifier cleanup");
     for (cudaEvent_t e : {mfork_, mjoin_, pfork_, pjoin_})
-        if (e) cudaEventDestroy(e);
-    if (commit_done_) cudaEventDestroy(commit_done_);
-    if (ev_done_) cudaEventDestroy(ev_done_);
-    if (ev_commit_) cudaEventDestroy(ev_commit_);
-    if (prof_pin_) cudaFreeHost(prof_pin_);
-    if (ev_fork_) cudaEventDestroy(ev_fork_);
-    if (ev_join_) cudaEventDestroy(ev_join_);
+        if (e) retirement_check(strict_retirement_, cudaEventDestroy(e), "Verifier cleanup");
+    if (commit_done_) retirement_check(strict_retirement_, cudaEventDestroy(commit_done_), "Verifier cleanup");
+    if (ev_done_) retirement_check(strict_retirement_, cudaEventDestroy(ev_done_), "Verifier cleanup");
+    if (ev_commit_) retirement_check(strict_retirement_, cudaEventDestroy(ev_commit_), "Verifier cleanup");
+    if (prof_pin_) retirement_check(strict_retirement_, cudaFreeHost(prof_pin_), "Verifier cleanup");
+    if (ev_fork_) retirement_check(strict_retirement_, cudaEventDestroy(ev_fork_), "Verifier cleanup");
+    if (ev_join_) retirement_check(strict_retirement_, cudaEventDestroy(ev_join_), "Verifier cleanup");
     for (cudaStream_t s : df_side_)
-        if (s) cudaStreamDestroy(s);
-    if (df_fork_) cudaEventDestroy(df_fork_);
+        if (s) retirement_check(strict_retirement_, cudaStreamDestroy(s), "Verifier cleanup");
+    if (df_fork_) retirement_check(strict_retirement_, cudaEventDestroy(df_fork_), "Verifier cleanup");
     for (cudaEvent_t e : df_join_)
-        if (e) cudaEventDestroy(e);
-    if (arena_) cudaFree(arena_);
-    if (hcount_d_) cudaFree(hcount_d_);
+        if (e) retirement_check(strict_retirement_, cudaEventDestroy(e), "Verifier cleanup");
+    if (strict_retirement_) {
+        // Separately allocated optional buffers; none are arena slices.
+        for (void* p : {static_cast<void*>(rs_dev_), static_cast<void*>(prof_),
+                       static_cast<void*>(skip_), static_cast<void*>(slot_off_d_)})
+            if (p) retirement_check(true, cudaFree(p), "Verifier optional buffer");
+    }
+    if (arena_) retirement_check(strict_retirement_, cudaFree(arena_), "Verifier cleanup");
+    if (hcount_d_) retirement_check(strict_retirement_, cudaFree(hcount_d_), "Verifier cleanup");
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
     for (void* h : hosts)
-        if (h) cudaFreeHost(h);
+        if (h) retirement_check(strict_retirement_, cudaFreeHost(h), "Verifier cleanup");
 }
 
 // STRATA_TAP_FILE: one record per row of the window: int32 position, int32 input token, then n_taps x n_embd floats
@@ -694,14 +711,11 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
-    g_diag_verifier.store(this);
+    retirement_init_started_ = true;
+    (void) g_verifier_readers.publish(this);   // fixed capacity, best effort as before
     diag_verify_fn().store(&diag_active_verifier);
-    for (auto& slot : g_live) {
-        Verifier* none = nullptr;
-        if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
-    }
     release_gpu_fn().store(&release_live_verifiers);
-    cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
+    retirement_check(strict_retirement_, cudaGetDevice(&device_), "Verifier init device");   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
@@ -1070,7 +1084,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (cudaMalloc((void**) &qcnt_, sizeof(unsigned) * (size_t) (g.n_embd / 32)) != cudaSuccess ||
             cudaMemset(qcnt_, 0, sizeof(unsigned) * (size_t) (g.n_embd / 32)) != cudaSuccess) {
             cudaGetLastError();
-            if (qcnt_) cudaFree(qcnt_);
+            if (qcnt_) retirement_check(strict_retirement_, cudaFree(qcnt_), "Verifier replacement cleanup");
             qcnt_ = nullptr;
         }
     }
@@ -2470,7 +2484,7 @@ bool Verifier::capture(int T, std::string& err) {
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
         err = rerr;
         return false;
     }
@@ -2576,7 +2590,7 @@ bool Verifier::capture(int T, std::string& err) {
     }
 #endif
     const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
-    cudaGraphDestroy(graph);
+    retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
@@ -2702,15 +2716,15 @@ bool Verifier::capture_commit(std::string& err) {
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
         return false;
     }
     if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
         err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    cudaGraphDestroy(graph);
+    retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
     return true;
 }
 
@@ -3384,6 +3398,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     return strata::metal_engine::window_commit(metal_, n_keep, err);
 #endif
     const OnDevice on_device(device_);
+    if (!commit_failure_.empty()) { err = commit_failure_; return false; }
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
@@ -3415,16 +3430,16 @@ bool Verifier::commit(int n_keep, std::string& err) {
         if (ct.on) cudaEventRecord(ct.b, cs_);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
         if (ct.on) { cudaEventRecord(ct.e, cs_); ct.pending = true; }
-        if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+        if (le != cudaSuccess) { err = commit_failure_ = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
         if (!g_commit_async || next_ != nullptr) {
             const cudaError_t se = cudaStreamSynchronize(cs_);
-            if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+            if (se != cudaSuccess) { err = commit_failure_ = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
             const cudaError_t re = cudaEventRecord(commit_done_, cs_);
-            if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
+            if (re != cudaSuccess) { err = commit_failure_ = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
             (void) cudaStreamQuery(cs_);
             commit_pending_ = true;
         }
@@ -3437,21 +3452,6 @@ bool Verifier::commit(int n_keep, std::string& err) {
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
 }
-
-bool Verifier::wait_commit(std::string& err) {
-#if defined(STRATA_GPU_METAL)
-    (void) err;
-    return true;
-#endif
-    if (commit_pending_) {
-        const OnDevice on_device(device_);
-        commit_pending_ = false;
-        const cudaError_t se = cudaEventSynchronize(commit_done_);
-        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
-    }
-    return next_ == nullptr || next_->wait_commit(err);
-}
-
 
 // ================================ BATCH WINDOWS (see init_slots) ================================
 
@@ -3509,12 +3509,12 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok || ce != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
     const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
-    cudaGraphDestroy(graph);
+    retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
     if (!made) return false;
     cudaGraphUpload(ex, cs_);
     cudaStreamSynchronize(cs_);
@@ -3626,16 +3626,16 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
         return false;
     }
     if (ce != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
         err = std::string("verify: batch commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
     const bool made = instantiate_evicting(cex, graph, bkey(rows, S, hbase), "verify: batch commit instantiate: ", err);
-    cudaGraphDestroy(graph);
+    retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
     return made;
 }
 
@@ -3655,12 +3655,12 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
         return false;
     }
     const auto old_key = old->first;
-    if (old->second) cudaGraphExecDestroy(old->second);
+    if (old->second) retirement_check(strict_retirement_, cudaGraphExecDestroy(old->second), "Verifier replacement cleanup");
     exec_bm_.erase(old);
     bm_used_.erase(old_key);
     auto commit_old = commit_bm_.find(old_key);
     if (commit_old != commit_bm_.end()) {
-        if (commit_old->second) cudaGraphExecDestroy(commit_old->second);
+        if (commit_old->second) retirement_check(strict_retirement_, cudaGraphExecDestroy(commit_old->second), "Verifier replacement cleanup");
         commit_bm_.erase(commit_old);
     }
     evicted = true;

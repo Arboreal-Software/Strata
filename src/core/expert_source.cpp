@@ -1,3 +1,4 @@
+#include "strata/core/expert_retirement.hpp"
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -736,11 +737,11 @@ struct NumaComplementPlacement {
 #endif
 
 /// #286: an unbuffered file handle - a HANDLE on Windows, an O_DIRECT descriptor (as a pointer-sized integer) on Linux.
-void close_direct(void* h) {
+void close_direct(void* h, bool checked = false) {
 #if defined(_WIN32)
-    CloseHandle((HANDLE) h);
+    if(!CloseHandle((HANDLE) h)&&checked) ExpertSourceCapture::close_failed();
 #else
-    ::close((int) (intptr_t) h);
+    if(::close((int) (intptr_t) h)!=0&&checked) ExpertSourceCapture::close_failed();
 #endif
 }
 
@@ -933,6 +934,18 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 }  // namespace
 
 // ================================ THE FILE-BACKED SOURCE ================================
+
+bool FileExpertSource::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if(inventory_&&!enabled){error="captured expert source requires strict retirement";return false;}
+    if (retirement_open_started_) { error = "strict retirement must be configured before open"; return false; }
+#if defined(STRATA_GPU_METAL)
+    if (enabled) { error = "strict expert retirement is unsupported by Metal"; return false; }
+#endif
+    if (enabled && !valid_retirement_topology(devices, error)) return false;
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
+    return true;
+}
 
 FileExpertSource::~FileExpertSource() { close(); }
 
@@ -1350,6 +1363,11 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
+    if(inventory_&&!inventory_->begin(pack_dir,gguf_,n_layers,n_expert,false,err))return false;
+    inventory_closed_=false;
+
+    retirement_open_started_ = true;
+    retirement_capture_device(strict_retirement_, retirement_consumers_, retirement_device_);
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
     const auto& layout = strata::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
@@ -1420,7 +1438,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         }
     }
     const std::string path = pack_dir + "/experts.bin";
-    if (layout.native && !gguf_.empty() && !std::filesystem::exists(path)) {
+    if (layout.native && !gguf_.empty() && (inventory_?!inventory_->packed_present():!std::filesystem::exists(path))) {
         // CS-T: no experts.bin - the model's GGUF shards, read in place
         blobs_ = (int64_t) blob_count;
         n_layers_ = n_layers;
@@ -1429,9 +1447,11 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         layer_blob_bytes_ = std::move(layer_blob_bytes);
         if (!open_gguf(err)) { close(); return false; }
         record_inputs(path, gguf_, layout, true);
+        if(inventory_&&!inventory_->publish(err))return false;
         return true;
     }
 
+    if(inventory_&&!inventory_->allows(path)){err="expert packed file is not declared";return false;}
 #if defined(_WIN32)
     // UTF-8 -> UTF-16: the pack may live under a path with non-ASCII characters, and `CreateFileA` would
     // silently mangle it into a file-not-found.
@@ -1492,7 +1512,8 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     struct stat st{};
-    if (fstat(fd, &st) != 0) { ::close(fd); err = "FileExpertSource: cannot stat " + path; return false; }
+    if(inventory_&&!inventory_->validate_fd(path,fd)) {if(::close(fd))ExpertSourceCapture::close_failed();err="expert packed descriptor differs from immutable binding";return false;}
+    if (fstat(fd, &st) != 0) { if(::close(fd)!=0&&inventory_)ExpertSourceCapture::close_failed(); err = "FileExpertSource: cannot stat " + path; return false; }
     if (st.st_size < 0 || (uint64_t) st.st_size != want) {
         char buf[400];
         std::snprintf(buf, sizeof buf,
@@ -1500,12 +1521,12 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
                       "the pack this geometry came from",
                       path.c_str(), (unsigned long long) (st.st_size < 0 ? 0 : st.st_size),
                       (unsigned long long) want);
-        ::close(fd);
+        if(::close(fd)!=0&&inventory_)ExpertSourceCapture::close_failed();
         err = buf;
         return false;
     }
     void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
-    if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
+    if (view == MAP_FAILED) { if(::close(fd)!=0&&inventory_)ExpertSourceCapture::close_failed(); err = "FileExpertSource: mmap failed on " + path; return false; }
     fd_ = fd;
     base_ = (const uint8_t*) view;
     paths_.assign(1, path);   // #286: open_direct opens it again with O_DIRECT
@@ -1517,25 +1538,34 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     layer_offsets_ = std::move(layer_offsets);
     layer_blob_bytes_ = std::move(layer_blob_bytes);
     record_inputs(path, gguf_, layout, false);
+    if(inventory_) {
+        for(int64_t l=0;l<n_layers;++l)if(!inventory_->record(uint64_t(l),0,path,layer_offsets_[size_t(l)],layer_blob_bytes_[size_t(l)],
+            layer_blob_bytes_[size_t(l)],layer_offsets_[size_t(l)],layer_blob_bytes_[size_t(l)],ExpertSourceTransfer::mapped_packed,0)) {
+            err="expert mapped packed span invalid";return false;
+        }
+        if(!inventory_->publish(err))return false;
+    }
     return true;
 }
 
 void FileExpertSource::close() {
+    if(inventory_)inventory_->invalidate();
     prefetch_end();
     ram_stop();
     io_stop();
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
     inputs_.clear();
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
+        if (complement_pinned_ && !complement_registered_) retirement_check(strict_retirement_, cudaFreeHost(complement_arena_), "expert source cleanup/drain");
         else {
-            if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
+            if (complement_registered_) retirement_check(strict_retirement_, cudaHostUnregister(complement_arena_), "expert source cleanup/drain");
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             std::free(complement_arena_);
         }
     }
     if (xstage_ != nullptr) {
-        if (xstage_pinned_) (void) cudaFreeHost(xstage_);
+        if (xstage_pinned_) retirement_check(strict_retirement_, cudaFreeHost(xstage_), "expert source cleanup/drain");
         else std::free(xstage_);
     }
     xstage_ = nullptr;
@@ -1563,12 +1593,12 @@ void FileExpertSource::close() {
     if (!maps_.empty()) {
         for (Map& m : maps_) {
 #if defined(_WIN32)
-            if (m.base != nullptr && !m.closed) UnmapViewOfFile((LPCVOID) m.base);
+            if (m.base != nullptr && !m.closed) if (!UnmapViewOfFile((LPCVOID) m.base) && strict_retirement_) retirement_failed("expert host mapping release");
             if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
             if (m.file != nullptr) CloseHandle((HANDLE) m.file);
 #else
-            if (m.base != nullptr && !m.closed) munmap((void*) m.base, (size_t) m.bytes);
-            if (m.fd >= 0) ::close(m.fd);
+            if (m.base != nullptr && !m.closed) if (munmap((void*) m.base, (size_t) m.bytes) != 0 && strict_retirement_) retirement_failed("expert host mapping release");
+            if (m.fd >= 0 && ::close(m.fd)!=0 && inventory_) ExpertSourceCapture::close_failed();
 #endif
         }
         maps_.clear();
@@ -1579,14 +1609,14 @@ void FileExpertSource::close() {
     role_bytes_.clear();
     role_file_.clear();
     paths_.clear();
-    for (void* h : direct_) close_direct(h);
+    for (void* h : direct_) close_direct(h,bool(inventory_));
     direct_.clear();
-    for (void* h : pdirect_) close_direct(h);
+    for (void* h : pdirect_) close_direct(h,bool(inventory_));
     pdirect_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         // the buffers' last copies end before they are freed (#1237)
-        if (!stage_ev_.empty()) (void) cudaDeviceSynchronize();
+        if (!stage_ev_.empty()) retirement_check(strict_retirement_, cudaDeviceSynchronize(), "expert source cleanup/drain");
         stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
@@ -1612,15 +1642,15 @@ void FileExpertSource::close() {
     io_pf_jobs_.store(0); io_pf_blobs_.store(0); io_pf_skips_.store(0); io_pf_dropped_.store(0);
     io_pf_used_.store(0); io_pf_unused_.store(0); io_crit_us_.store(0); io_crit_n_.store(0);
 #if defined(_WIN32)
-    if (base_ != nullptr && !unmapped_) UnmapViewOfFile((LPCVOID) base_);
+    if (base_ != nullptr && !unmapped_) if (!UnmapViewOfFile((LPCVOID) base_) && strict_retirement_) retirement_failed("expert host mapping release");
     unmapped_ = false;
     if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
     if (file_ != nullptr) CloseHandle((HANDLE) file_);
     mapping_ = nullptr;
     file_ = nullptr;
 #else
-    if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
-    if (fd_ >= 0) ::close(fd_);
+    if (base_ != nullptr) if (munmap((void*) base_, (size_t) mapped_bytes_) != 0 && strict_retirement_) retirement_failed("expert host mapping release");
+    if (fd_ >= 0 && ::close(fd_)!=0 && inventory_) ExpertSourceCapture::close_failed();
     fd_ = -1;
 #endif
     base_ = nullptr;
@@ -1631,6 +1661,7 @@ void FileExpertSource::close() {
     layer_offsets_.clear();
     layer_blob_bytes_.clear();
     reads_ = 0;
+    inventory_closed_=true;
 }
 
 
@@ -1654,11 +1685,28 @@ bool ExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uin
 // is three slices of three tensors, possibly in two shards (UD-Q4_K_XL's layer 11).  Nothing is read at open; a
 // blob is assembled when it is asked for (`blob`, into a small pool of buffers) or copied where it is needed
 // (`copy_blob`: the RAM copy, the prompt path's pinned stager buffers).
+namespace {
+bool inventory_gguf_paths(ExpertSourceCapture* capture,const std::string& primary,const strata::kernels::cpu::ExpertLayout& layout) {
+    if(!capture)return true;
+    const auto cut=primary.find_last_of("/\\");const std::string dir=cut==std::string::npos?std::string():primary.substr(0,cut+1);
+    for(int64_t l=0;l<layout.n_layers;++l)for(int r=0;r<3;++r) {
+        const size_t i=size_t(l*3+r);const auto path=layout.gguf_file.size()>i&&!layout.gguf_file[i].empty()?dir+layout.gguf_file[i]:primary;
+        if(!capture->allows(path)||size_t(l)>=layout.fmt.size()||size_t(l)>=layout.bytes.size()||i>=layout.gguf_off.size())return false;
+        const auto& fm=layout.fmt[size_t(l)];const uint64_t blob=layout.bytes[size_t(l)];
+        if(fm.down_off>blob||!fm.up_off||fm.up_off>UINT64_MAX/2||2*fm.up_off>fm.down_off)return false;
+        const uint64_t per=r<2?fm.up_off:blob-fm.down_off;
+        if(!capture->range_allowed(path,layout.gguf_off[i],per,uint64_t(layout.n_expert)))return false;
+    }
+    return true;
+}
+}
 bool FileExpertSource::open_gguf(std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
+    if(!inventory_gguf_paths(inventory_.get(),gguf_,lay)){err="expert role path is not a declared immutable input";return false;}
     if (!check_experts_gguf(gguf_, lay, err)) { err = "FileExpertSource: " + err; return false; }
     const size_t cut = gguf_.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : gguf_.substr(0, cut + 1);
+    if(inventory_) {maps_.reserve(size_t(inventory_->max_sources()));paths_.reserve(size_t(inventory_->max_sources()));}
     std::map<std::string, size_t> index;
     role_ptr_.assign((size_t) (3 * n_layers_), nullptr);
     role_bytes_.assign((size_t) (3 * n_layers_), 0);
@@ -1701,12 +1749,13 @@ bool FileExpertSource::open_gguf(std::string& err) {
                 const int fd = ::open(path.c_str(), O_RDONLY);
                 struct stat st{};
                 if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0) {
-                    if (fd >= 0) ::close(fd);
+                    if (fd >= 0) if(::close(fd)!=0&&inventory_)ExpertSourceCapture::close_failed();
                     err = "FileExpertSource: cannot open " + path;
                     return false;
                 }
+                if(inventory_&&!inventory_->validate_fd(path,fd)){if(::close(fd))ExpertSourceCapture::close_failed();err="expert role descriptor differs from immutable binding";return false;}
                 void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-                if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: cannot map " + path; return false; }
+                if (view == MAP_FAILED) { if(::close(fd)!=0&&inventory_)ExpertSourceCapture::close_failed(); err = "FileExpertSource: cannot map " + path; return false; }
                 m.fd = fd;
                 m.bytes = (uint64_t) st.st_size;
                 m.base = (const uint8_t*) view;
@@ -1724,6 +1773,10 @@ bool FileExpertSource::open_gguf(std::string& err) {
             }
             role_ptr_[i] = m.base + (size_t) at;
             role_bytes_[i] = per[r];
+            if(inventory_&&!inventory_->record(uint64_t(l),uint64_t(r),path,at,per[r],per[r],
+                r==0?0:r==1?fm.up_off:fm.down_off,lay.bytes[size_t(l)],ExpertSourceTransfer::mapped_roles,it->second)) {
+                err="expert mapped role span invalid";return false;
+            }
         }
     }
     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
@@ -1791,7 +1844,8 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
 #define STAGE_PIN_DEFAULT 0
 constexpr uint64_t kStagePinFloor = 3ull << 30;   // RAM left available after a pinned stage buffer
 void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
-    if (pinned) (void) cudaFreeHost(p);
+    ExpertResourceDevice selected(strict_retirement && pinned && p, device);
+    if (pinned) retirement_check(strict_retirement, cudaFreeHost(p), "expert stage buffer");
     else delete[] p;
 }
 
@@ -1802,7 +1856,7 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
-bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahead) {
+bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahead) try {
     constexpr uint64_t kStageSeq = 256;
     const uint64_t seq = ++stage_seq_;
     auto it = stage_of_.find(key);
@@ -1846,9 +1900,15 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
         uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
         if (raw == nullptr) return false;
-        stage_buf_.emplace_back(raw, StageBufFree{pinned});
+        int allocation_device = -1;
+        if (strict_retirement_ && pinned) retirement_check(true, cudaGetDevice(&allocation_device), "stage allocation device");
+        if (strict_retirement_) {
+            std::unique_ptr<uint8_t[], StageBufFree> candidate(raw, StageBufFree{pinned, true, allocation_device});
+            stage_buf_.push_back(std::move(candidate));
+        } else stage_buf_.emplace_back(raw, StageBufFree{pinned});
         stage_idx_[raw] = stage_buf_.size() - 1;
         stage_ev_.push_back(nullptr);
+        if (strict_retirement_) stage_ev_device_.push_back(-1);
         stage_ev_live_.push_back(0);
         if (pinned && !stage_pin_said_) {
             stage_pin_said_ = true;
@@ -1877,9 +1937,13 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         if (v < stage_ev_live_.size() && stage_ev_live_[v]) {
             stage_ev_live_[v] = 0;
             if (stage_ev_[v] != nullptr) {
-                if (cudaEventQuery((cudaEvent_t) stage_ev_[v]) == cudaErrorNotReady) {
+                ExpertResourceDevice selected(strict_retirement_, strict_retirement_ ? stage_ev_device_[v] : -1);
+                const cudaError_t ready = cudaEventQuery((cudaEvent_t)stage_ev_[v]);
+                if (strict_retirement_ && ready != cudaSuccess && ready != cudaErrorNotReady)
+                    retirement_failed("stage event readiness query");
+                if (ready == cudaErrorNotReady) {
                     stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
-                    (void) cudaEventSynchronize((cudaEvent_t) stage_ev_[v]);
+                    retirement_check(strict_retirement_, cudaEventSynchronize((cudaEvent_t) stage_ev_[v]), "expert source cleanup/drain");
                 }
                 (void) cudaGetLastError();
             }
@@ -1892,6 +1956,9 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     stage_of_[key] = v;
     fill = true;
     return false;
+} catch (...) {
+    if (strict_retirement_) retirement_failed("stage ownership metadata allocation");
+    throw;
 }
 
 // 149 STRATA_IO_PF_GATE: whether this thread reads for the decode (the dispatch's thread, and the fetch threads it starts)
@@ -2035,29 +2102,48 @@ void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {
     if (it == stage_idx_.end()) return;                 // not a stage buffer: the mapping or the resident arena
     const size_t v = it->second;
     if (!stage_buf_[v].get_deleter().pinned) return;    // pageable: the driver copied it before the call returned
+    if (strict_retirement_) {
+        int reader_device = -1;
+        retirement_capture_device(true, retirement_consumers_, reader_device);
+    }
+    if (strict_retirement_ && stage_ev_[v] && stage_ev_live_[v]) {
+        ExpertResourceDevice previous(true, stage_ev_device_[v]);
+        retirement_check(true, cudaEventSynchronize((cudaEvent_t)stage_ev_[v]), "prior stage DMA reader");
+        stage_ev_live_[v] = 0;
+    }
     if (stage_ev_[v] == nullptr) {
         cudaEvent_t ev = nullptr;
         if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
             (void) cudaGetLastError();
-            (void) cudaStreamSynchronize((cudaStream_t) stream);   // no event: wait for the copy itself
+            retirement_check(strict_retirement_, cudaStreamSynchronize((cudaStream_t) stream), "expert source cleanup/drain");   // no event: wait for the copy itself
             return;
         }
         stage_ev_[v] = ev;
+        if (strict_retirement_) {
+            retirement_check(true, cudaGetDevice(&stage_ev_device_[v]), "stage event device");
+            if (std::find(retirement_consumers_.begin(), retirement_consumers_.end(), stage_ev_device_[v]) == retirement_consumers_.end())
+                retirement_failed("stage consumer absent from retirement topology");
+        }
     }
     if (cudaEventRecord((cudaEvent_t) stage_ev_[v], (cudaStream_t) stream) != cudaSuccess) {
         (void) cudaGetLastError();
-        (void) cudaStreamSynchronize((cudaStream_t) stream);
+        retirement_check(strict_retirement_, cudaStreamSynchronize((cudaStream_t) stream), "expert source cleanup/drain");
         return;
     }
     stage_ev_live_[v] = 1;
 }
 
 void FileExpertSource::stage_free_events() {
-    for (void*& e : stage_ev_)
-        if (e != nullptr) { (void) cudaEventDestroy((cudaEvent_t) e); e = nullptr; }
-    stage_ev_.clear();
-    stage_ev_live_.clear();
-    stage_idx_.clear();
+    for (size_t i = 0; i < stage_ev_.size(); ++i) {
+        void*& e = stage_ev_[i];
+        if (!e) continue;
+        if (strict_retirement_ && i >= stage_ev_device_.size()) retirement_failed("missing stage event ownership");
+        ExpertResourceDevice selected(strict_retirement_, strict_retirement_ ? stage_ev_device_[i] : -1);
+        retirement_check(strict_retirement_, cudaEventDestroy((cudaEvent_t)e), "expert stage event");
+        e = nullptr;
+    }
+    stage_ev_.clear(); stage_ev_device_.clear();
+    stage_ev_live_.clear(); stage_idx_.clear();
 }
 
 const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
@@ -2432,10 +2518,11 @@ bool FileExpertSource::open_direct(std::string& why) {
         const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
         if (fd < 0) {
             why += "; cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + "), read through the file cache";
-            for (void* d : direct_) close_direct(d);
+            for (void* d : direct_) close_direct(d,bool(inventory_));
             direct_.clear();
             return false;
         }
+        if(inventory_&&!inventory_->validate_fd(path,fd)){if(::close(fd))ExpertSourceCapture::close_failed();why="expert direct reopen differs from immutable source";return false;}
         direct_.push_back((void*) (intptr_t) fd);
     }
     if (role_ptr_.empty()) {   // experts.bin: blob() now assembles into the stage buffers, sized for the largest blob
@@ -2458,10 +2545,11 @@ bool FileExpertSource::open_prompt_direct(std::string& why) {
         const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
         if (fd < 0) {
             why = "cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
-            for (void* d : pdirect_) close_direct(d);
+            for (void* d : pdirect_) close_direct(d,bool(inventory_));
             pdirect_.clear();
             return false;
         }
+        if(inventory_&&!inventory_->validate_fd(path,fd)){if(::close(fd))ExpertSourceCapture::close_failed();why="expert direct reopen differs from immutable source";return false;}
         pdirect_.push_back((void*) (intptr_t) fd);
     }
     return true;
@@ -2514,7 +2602,7 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
     if (ub == !direct_.empty()) return ub;
     if (ub) return open_direct(why);
     // through the file cache after all: the mapped reads take over (staged() stays true for the GGUF in place)
-    for (void* d : direct_) close_direct(d);
+    for (void* d : direct_) close_direct(d,bool(inventory_));
     direct_.clear();
     return false;
 #else
@@ -2524,6 +2612,7 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
 }
 
 bool FileExpertSource::drop_mapping(std::string& why) {
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
 #if defined(_WIN32)
     if (direct_.empty()) { why = "the reads are not unbuffered"; return false; }
     if (!role_ptr_.empty() || !maps_.empty()) {
@@ -2533,7 +2622,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
         if (unmapped_) { why = "already closed"; return true; }
         for (Map& m : maps_) {
             if (m.closed) continue;
-            if (m.base != nullptr && !UnmapViewOfFile((LPCVOID) m.base)) { why = "UnmapViewOfFile failed"; return false; }
+            if (m.base != nullptr && !UnmapViewOfFile((LPCVOID) m.base)) { if (strict_retirement_) retirement_failed("expert mapping replacement"); why = "UnmapViewOfFile failed"; return false; }
             m.closed = true;   // m.base stays: the read offsets are taken from it
             if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
             m.mapping = nullptr;
@@ -2548,7 +2637,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
         return true;
     }
     if (base_ == nullptr || unmapped_) { why = base_ == nullptr ? "not open" : "already closed"; return unmapped_; }
-    if (!UnmapViewOfFile((LPCVOID) base_)) { why = "UnmapViewOfFile failed"; return false; }
+    if (!UnmapViewOfFile((LPCVOID) base_)) { if (strict_retirement_) retirement_failed("expert mapping replacement"); why = "UnmapViewOfFile failed"; return false; }
     unmapped_ = true;
     if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
     mapping_ = nullptr;
@@ -2566,7 +2655,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
     if (unmapped_) { why = "already closed"; return true; }
     for (Map& m : maps_) {
         if (m.closed) continue;
-        if (m.base != nullptr && munmap((void*) m.base, (size_t) m.bytes) != 0) { why = "munmap failed"; return false; }
+        if (m.base != nullptr && munmap((void*) m.base, (size_t) m.bytes) != 0) { if (strict_retirement_) retirement_failed("expert mapping replacement"); why = "munmap failed"; return false; }
         m.closed = true;
         if (m.fd >= 0) ::close(m.fd);
         m.fd = -1;
@@ -2619,7 +2708,7 @@ bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
             return true;
         }
         fail = "an unbuffered read of the first blob failed or differed from the mapping";
-        for (void* d : direct_) close_direct(d);
+        for (void* d : direct_) close_direct(d,bool(inventory_));
         direct_.clear();
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_blob_ = 0;
@@ -2634,6 +2723,7 @@ bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
 }
 
 bool FileExpertSource::end_startup_unbuffered(std::string& why) {
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
     if (!startup_ub_) return true;
     startup_ub_ = false;
     // the view first: closing the unbuffered handles beside a buffered one purges nothing
@@ -2641,10 +2731,11 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
         why += ": the file tier reads it unbuffered";
         return false;   // as after drop_mapping: every read goes through read_direct
     }
-    for (void* d : direct_) close_direct(d);
+    for (void* d : direct_) close_direct(d,bool(inventory_));
     direct_.clear();
     {   // the mapped tier hands out the mapping: the startup's stage buffers go
         std::lock_guard<std::mutex> lk(stage_mu_);
+        if (strict_retirement_) stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
         stage_epoch_.clear();
@@ -3467,7 +3558,8 @@ bool FileExpertSource::pin_cache_complement(
         err = "FileExpertSource: the GPU expert cache is not fully filled";
         return false;
     }
-    const cudaError_t sync = cudaDeviceSynchronize();
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
+    const cudaError_t sync = retirement_result(strict_retirement_, cudaDeviceSynchronize(), "expert source cleanup/drain");
     if (sync != cudaSuccess) {
         err = std::string("FileExpertSource: GPU expert cache is not ready: ") + cudaGetErrorString(sync);
         (void) cudaGetLastError();
@@ -3689,9 +3781,9 @@ bool FileExpertSource::pin_cache_complement(
 #endif
     auto release = [&]() {
         if (arena == nullptr) return;
-        if (pinned_ok) (void) cudaFreeHost(arena);
+        if (pinned_ok) retirement_check(strict_retirement_, cudaFreeHost(arena), "expert source cleanup/drain");
         else {
-            if (partial_pin > 0) (void) cudaHostUnregister(arena);
+            if (partial_pin > 0) retirement_check(strict_retirement_, cudaHostUnregister(arena), "expert source cleanup/drain");
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             std::free(arena);
         }
@@ -3795,7 +3887,7 @@ bool FileExpertSource::pin_cache_complement(
                 } else {
                     note = std::string("no device alias (") + cudaGetErrorString(aliased) + ")";
                     (void) cudaGetLastError();
-                    (void) cudaFreeHost(arena);
+                    retirement_check(strict_retirement_, cudaFreeHost(arena), "expert source cleanup/drain");
                     arena = nullptr;
                 }
             } else {
@@ -3899,7 +3991,7 @@ bool FileExpertSource::pin_cache_complement(
                                 partial_pin = w;
                             } else {
                                 (void) cudaGetLastError();
-                                (void) cudaHostUnregister(arena);
+                                retirement_check(strict_retirement_, cudaHostUnregister(arena), "expert source cleanup/drain");
                                 if (stop == nullptr) stop = "no device alias";
                             }
                         } else {
@@ -3942,7 +4034,7 @@ bool FileExpertSource::pin_cache_complement(
                                 partial_pin = w;
                             } else {
                                 (void) cudaGetLastError();
-                                (void) cudaHostUnregister(arena);
+                                retirement_check(strict_retirement_, cudaHostUnregister(arena), "expert source cleanup/drain");
                             }
                             break;
                         }
@@ -4182,8 +4274,9 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
     uint64_t blob = 0;
     for (const uint64_t b : layer_blob_bytes_) blob = std::max(blob, b);
     if (blob == 0 || n <= 0) { err = "FileExpertSource: no expert geometry for the exchange buffers"; return false; }
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
     if (xstage_ != nullptr) {
-        if (xstage_pinned_) (void) cudaFreeHost(xstage_);
+        if (xstage_pinned_) retirement_check(strict_retirement_, cudaFreeHost(xstage_), "expert source cleanup/drain");
         else std::free(xstage_);
         xstage_ = nullptr;
         xstage_cap_ = 0;
@@ -4629,6 +4722,39 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
 
 // ================================ THE ADAPTER ================================
 
+namespace {
+class HostExecutionScope {
+    ExpertDispatch& d_;
+    ExpertHostExecutionObserver* observer_;
+    uint64_t ticket_=0,batch_=0;
+    bool active_=false;
+    bool refused() noexcept {d_.failed=true;d_.fail="host execution observation refused";d_.fail_layer=d_.layers;return false;}
+public:
+    explicit HostExecutionScope(ExpertDispatch& d) noexcept:d_(d),observer_(d.host_execution_observer){}
+    HostExecutionScope(const HostExecutionScope&)=delete;
+    HostExecutionScope& operator=(const HostExecutionScope&)=delete;
+    HostExecutionScope(HostExecutionScope&&)=delete;
+    HostExecutionScope& operator=(HostExecutionScope&&)=delete;
+    ~HostExecutionScope(){if(active_)observer_->abort_layer(ticket_);}
+    bool begin(int64_t tokens,int64_t width,bool multi) noexcept {
+        if(!observer_)return true;
+        if(tokens<=0||width<=0||uint64_t(width)>uint64_t(INT64_MAX)/uint64_t(tokens))return refused();
+        if(!observer_->begin_layer(&d_,d_.src,d_.pool,d_.layers,uint64_t(tokens),uint64_t(width),multi,ticket_))return refused();
+        active_=true;return true;
+    }
+    bool row(ExpertHostCpuRow row) noexcept {
+        if(!observer_)return true;
+        row.batch=batch_;
+        return observer_->cpu_row(ticket_,row)||refused();
+    }
+    bool submit(int64_t jobs,ExpertHostPoolEntry entry) noexcept {
+        return !observer_||observer_->cpu_batch_submitted(ticket_,batch_,uint64_t(jobs),entry)||refused();
+    }
+    void completed() noexcept {if(observer_)observer_->cpu_batch_completed(ticket_,batch_);++batch_;}
+    void finish() noexcept {if(active_){observer_->end_host_dispatch(ticket_);active_=false;}}
+};
+}
+
 void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                           int64_t k, float* out) {
     (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
@@ -4652,6 +4778,8 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         d.fail_layer = d.layers;
         return;
     }
+    HostExecutionScope observation(d);
+    if(!observation.begin(1,k,false))return;
     if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
 
     d.src->begin_layer(d.layers, ids, k);
@@ -4735,11 +4863,15 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         j.out = out + (size_t) i * (size_t) n_embd;
         j.weight = 1.0f;            // clause 2: a diagnostic field, NOT the router weight
         j.slot = (int) i;
+        if(d.host_execution_observer && !observation.row({uint64_t(i),0,uint64_t(i),0,uint64_t(njobs-1),0,e,b,0,0,false,
+            ExpertHostActivation::q8_1,d.split_rows?ExpertHostPoolEntry::single_split:ExpertHostPoolEntry::single}))return;
     }
 
     // Plan v0.3 P4: rows of every expert across all threads (bitwise the same as `run`).
+    if(d.host_execution_observer && njobs>0 && !observation.submit(njobs,d.split_rows?ExpertHostPoolEntry::single_split:ExpertHostPoolEntry::single))return;
     if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
     else d.pool->run(d.jobs.data(), (int) njobs);
+    if(d.host_execution_observer && njobs>0)observation.completed();
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
@@ -4747,6 +4879,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
     }
+    observation.finish();
     ++d.layers;
     d.experts += k;
 }
@@ -4764,6 +4897,9 @@ namespace {
 // explicit environment value is read once; the serve start-up (generate.cpp) sets the CUDA default where it applies.
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 }  // namespace
+RouteTailPolicyObservation observe_tail_skip_policy() noexcept {
+    return route_tail_observation(g_tail_skip_rank.load(std::memory_order_relaxed));
+}
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
@@ -4786,6 +4922,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    HostExecutionScope observation(d);
+    if(!observation.begin(n_tok,k,true))return;
     if (d.lookahead != nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
@@ -5122,6 +5260,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
             jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
             jb.out[jb.nt] = row;
+            if(d.host_execution_observer && !observation.row({uint64_t(i),uint64_t(t),uint64_t(j),0,uint64_t(jo),uint64_t(jb.nt),e,jb.blob,
+                jb.fmt?uint64_t(jb.fmt->up_off):0,jb.fmt?uint64_t(jb.fmt->down_off):0,jb.fmt!=nullptr,
+                !native?ExpertHostActivation::q8_1:strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t)d.layers].gu_type)?
+                    ExpertHostActivation::any_q2:ExpertHostActivation::native,
+                native?ExpertHostPoolEntry::multi_native_split:ExpertHostPoolEntry::multi_split}))return;
             ++jb.nt;
             ++d.multi_entries;
         }
@@ -5130,8 +5273,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     {
         const auto b0 = std::chrono::steady_clock::now();
         if (njobs > 0) {
+            if(!observation.submit(njobs,native?ExpertHostPoolEntry::multi_native_split:ExpertHostPoolEntry::multi_split))return;
             if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
             else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+            observation.completed();
             ++d.cold_batches;
         }
         const auto b1 = std::chrono::steady_clock::now();
@@ -5175,8 +5320,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.plan != nullptr) d.plan->cpu_jobs = njobs;
     pt("run", njobs);
     if (njobs > 0 && npend == 0) {
+        if(!observation.submit(njobs,native?ExpertHostPoolEntry::multi_native_split:ExpertHostPoolEntry::multi_split))return;
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+        observation.completed();
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
@@ -5207,6 +5354,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
     d.multi_misses += njobs;
+    observation.finish();
     ++d.layers;
     d.experts += n_tok * k;
 }
@@ -5509,7 +5657,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 // `unbuffered` (Windows, experts_unbuffered): each chunk's 4 KiB-aligned window is read with FILE_FLAG_NO_BUFFERING into
 // an aligned buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads, bool unbuffered, const std::atomic<int>* ready, const PadMap* pad) {
+                            int threads, bool unbuffered, const std::atomic<int>* ready, const PadMap* pad, ExpertSourceCapture* capture = nullptr) {
     // where blob (l, e) goes in `dst`: packed (experts.bin) or the padded layout of pin by need
     auto dst_blob = [&lay, pad](int64_t l, int64_t e) -> uint64_t {
         return pad != nullptr ? pad->blob_off(l, e) : lay.blob_offset(l, e);
@@ -5621,8 +5769,9 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         // The guard closes the handle on every return.
         struct Closer {
             FILE* f = nullptr;
-            ~Closer() { if (f != nullptr) std::fclose(f); }
-        } file;
+            ExpertSourceCapture* capture;
+            ~Closer() { if (f != nullptr && std::fclose(f)!=0 && capture) ExpertSourceCapture::close_failed(); }
+        } file{nullptr,capture};
         std::string open_name;
         std::vector<uint8_t> buf;
         for (;;) {
@@ -5637,9 +5786,13 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                 // the handle is kept while consecutive roles share a file (every layer of a v3 pack)
                 const std::string name = expert_gguf_file(gguf, lay, l, r);
                 if (name != open_name) {
-                    if (file.f != nullptr) std::fclose(file.f);
+                    if (file.f != nullptr && std::fclose(file.f)!=0 && capture) ExpertSourceCapture::close_failed();
+                    file.f=nullptr;
                     file.f = std::fopen(name.c_str(), "rb");
                     if (file.f == nullptr) { bad = true; return; }
+#if defined(__linux__)
+                    if(capture&&!capture->validate_fd(name,fileno(file.f))){bad=true;return;}
+#endif
                     open_name = name;
                 }
                 FILE* const f = file.f;
@@ -5657,6 +5810,8 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                         std::memcpy(dst + dst_blob(l, (int64_t) e) + at[r], buf.data() + k * per[r], (size_t) per[r]);
                     }
                 }
+                if(capture&&!capture->record(uint64_t(l),uint64_t(r),name,src,per[r],per[r],dst_blob(l,0)+at[r],
+                    pad?pad->stride[size_t(l)]:blob,ExpertSourceTransfer::scatter_roles)){bad=true;return;}
             }
         }
     };
@@ -5675,12 +5830,35 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     return st;
 }
 
+bool ArenaExpertSource::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if(inventory_&&!enabled){error="captured expert source requires strict retirement";return false;}
+    if (retirement_open_started_) { error = "strict retirement must be configured before open"; return false; }
+#if defined(STRATA_GPU_METAL)
+    if (enabled) { error = "strict expert retirement is unsupported by Metal"; return false; }
+#endif
+    if (enabled && !valid_retirement_topology(devices, error)) return false;
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
+    return true;
+}
+
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err, uint64_t max_pinned_bytes,
                              const std::string& shared_arena_file) {
     close();
+    if(inventory_&&!inventory_->begin(pack_dir,gguf_,n_layers,n_expert,true,err))return false;
+    inventory_closed_=false;
+    if(inventory_) {
+        const char* mapped=std::getenv("STRATA_ARENA_MMAP");
+        if(!shared_arena_file.empty()||(mapped&&mapped[0]=='1')||threads<1||uint64_t(threads)>inventory_->max_workers()) {
+            err="verified arena capture refuses shared/mapped arenas or unadmitted reader count";return false;
+        }
+    }
+
+    retirement_open_started_ = true;
+    retirement_capture_device(strict_retirement_, retirement_consumers_, retirement_device_);
     const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
@@ -5690,17 +5868,22 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     }
     const int64_t blob = (int64_t) lay.max_blob;
     const uint64_t want = lay.total;
+    if(inventory_&&(!want||blob<=0||want>UINT64_MAX-uint64_t(blob))){err="expert arena extent overflow";return false;}
 
     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
-    const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
+    const bool from_gguf = (inventory_?!inventory_->packed_present():!std::ifstream(path, std::ios::binary)) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
     // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend
     // 34 GB and a minute of loading first.
     if (from_gguf) {
         // every (file, offset) of native_experts.txt must be the tensor it claims, of the pack's type and
         // dimensions and inside its file - before the allocation, so a pack of another model or a truncated
         // shard is a message rather than an arena of plausible wrong experts
+        if(!inventory_gguf_paths(inventory_.get(),gguf_,lay)){err="expert arena role path not a verified input";return false;}
         if (!check_experts_gguf(gguf_, lay, err)) { err = "ArenaExpertSource: " + err; return false; }
     } else {
+        if(inventory_&&!inventory_->allows(path)){err="expert arena packed source is undeclared";return false;}
+        if(inventory_)for(int64_t l=0;l<n_layers;++l)
+            if(!inventory_->range_allowed(path,lay.blob_offset(l,0),lay.blob_bytes(l),uint64_t(n_expert))){err="expert arena packed span exceeds immutable source";return false;}
         std::ifstream f(path, std::ios::binary | std::ios::ate);
         if (!f) { err = "ArenaExpertSource: cannot open " + path; return false; }
         const uint64_t got = (uint64_t) f.tellg();
@@ -5726,6 +5909,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
 #else
     static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
+    if(inventory_&&arena_mmap){err="verified capture refuses cached mapped-arena mode";return false;}
     if (arena_mmap) {
         const uint64_t file_bytes = want + (uint64_t) blob;
         uint64_t have = 0;
@@ -5811,13 +5995,20 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         padded_ = true;
         uint64_t at = 0;
         for (int64_t l = 0; l < n_layers; ++l) {
-            const uint64_t b = lay.blob_bytes(l), s = (b + 4095) & ~(uint64_t) 4095;
+            const uint64_t b = lay.blob_bytes(l);
+            if(inventory_&&(b>UINT64_MAX-4095||!b)){err="expert padded blob overflow";return false;}
+            const uint64_t s = (b + 4095) & ~(uint64_t) 4095;
+            if(inventory_&&(uint64_t(n_expert)>UINT64_MAX/s||at>UINT64_MAX-s*uint64_t(n_expert))){err="expert padded layer overflow";return false;}
             pad_.dst_off.push_back(at);
             pad_.blob.push_back(b);
             pad_.stride.push_back(s);
             at += s * (uint64_t) n_expert;
         }
         pad_.total = at;
+    }
+    if(inventory_){
+        if((padded_?pad_.total:want)>UINT64_MAX-uint64_t(blob)){err="expert arena padding overflow";return false;}
+        inventory_->mark_padded(padded_);
     }
     const uint64_t arena_bytes = padded_ ? pad_.total : want;   // the spare blob below comes on top, as before
     // Pin by need: the pairs set_pin_priority gave, as byte ranges in priority order.  Neighbours (adjacent blobs) merge
@@ -5869,9 +6060,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                    : deferred ? new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::Deferred{})
                               : new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
                                                 shared_arena_file, pack_hash);
+    std::unique_ptr<PinnedArena> pending_arena;
+    if (strict_retirement_) { a->set_strict_retirement(retirement_device_); pending_arena.reset(a); }
     if (!a->valid()) {
         const std::string why = a->note;
-        delete a;
+        if (strict_retirement_) pending_arena.reset(); else delete a;
         err = "ArenaExpertSource: the arena could not be reserved (" +
               std::to_string(want + (uint64_t) blob) + " B)" +
               (why.empty() ? std::string{} : ": " + why);
@@ -5897,30 +6090,30 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     std::thread reg;
     if (deferred) {
         int dev = 0;
-        cudaGetDevice(&dev);
-        reg = std::thread([a, &ready, dev] {
-            cudaSetDevice(dev);
+        retirement_check(strict_retirement_, cudaGetDevice(&dev), "arena registration device");
+        reg = std::thread([a, &ready, dev, strict = strict_retirement_] {
+            retirement_check(strict, cudaSetDevice(dev), "arena registration device");
             a->register_slices(ready);
         });
     }
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
     if (from_gguf) {
-        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp, padded_ ? &pad_ : nullptr);
+        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp, padded_ ? &pad_ : nullptr, inventory_.get());
     } else {
-        if (unbuffered && !padded_) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
+        if (unbuffered && !padded_) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp, inventory_.get());
         if (!unbuffered || padded_ || (!st.ok && st.error.empty()))   // unaligned ranges / the padded layout: the buffered reader
-            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp, padded_ ? &pad_ : nullptr);
+            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp, padded_ ? &pad_ : nullptr, inventory_.get());
     }
     if (reg.joinable()) reg.join();
     std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
                  why.c_str());
     if (!st.ok) {
-        delete a;
+        if (strict_retirement_) pending_arena.reset(); else delete a;
         err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
         return false;
     }
     if (st.bytes != want) {
-        delete a;
+        if (strict_retirement_) pending_arena.reset(); else delete a;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
     }
@@ -5953,6 +6146,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                      ok ? "wrote" : "could NOT write", path.c_str());
     }
     arena_ = a;
+    if (strict_retirement_) (void)pending_arena.release();
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
     // plan v0.3 P6: device aliases of the mapped registration, for the PCIe share of the misses
@@ -6006,12 +6200,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     load_read_s_ = st.read_seconds;
     load_copy_s_ = st.copy_seconds;
     record_inputs(path, gguf_, lay, from_gguf);
+    if(inventory_&&!inventory_->publish(err))return false;
     return true;
 }
 
 void ArenaExpertSource::close() {
+    if(inventory_)inventory_->invalidate();
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
 #if !defined(_WIN32)
-    if (map_ != nullptr) munmap(map_, (size_t) map_bytes_);
+    if (map_ != nullptr) if (munmap(map_, (size_t) map_bytes_) != 0 && strict_retirement_) retirement_failed("expert host mapping release");
 #endif
     map_ = nullptr;
     map_bytes_ = 0;
@@ -6023,6 +6220,7 @@ void ArenaExpertSource::close() {
     base_ = nullptr;
     blobs_ = 0;
     n_expert_ = 0;
+    inventory_closed_=true;
 }
 
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
@@ -6122,13 +6320,43 @@ const uint8_t* ArenaExpertSource::blob_at(int64_t layer, int64_t expert) const {
 // ---- Foresight swap space (see include/strata/core/foresight_swap.hpp) ------------------------------------------
 namespace strata::core {
 
+bool ForesightSwap::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if (retirement_init_started_) { error = "strict foresight retirement must be configured before init"; return false; }
+#if defined(STRATA_GPU_METAL)
+    if (enabled) { error = "strict foresight retirement is unsupported by Metal"; return false; }
+#endif
+    if (enabled && !valid_retirement_topology(devices, error)) return false;
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
+    return true;
+}
+
 bool ForesightSwap::init(int slots_per_layer, int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
                          const std::vector<int>& devices, std::string& err) {
+    if (strict_retirement_ && retirement_init_started_) { err = "strict foresight reinitialization requires a new owner"; return false; }
+    retirement_init_started_ = true;
+    if (strict_retirement_) {
+        if (slots_per_layer <= 0 || slots_per_layer > INT16_MAX || layers <= 0 || experts <= 0 ||
+            uint64_t(layers) > uint64_t(INT64_MAX) / uint64_t(slots_per_layer) ||
+            uint64_t(layers) > SIZE_MAX / sizeof(Slot) / uint64_t(slots_per_layer) ||
+            uint64_t(layers) > SIZE_MAX / sizeof(uint64_t) / uint64_t(experts) ||
+            card_of_layer.size() != uint64_t(layers) || devices.empty()) {
+            err = "invalid foresight allocation geometry"; return false;
+        }
+        for (int device : devices)
+            if (std::find(retirement_consumers_.begin(), retirement_consumers_.end(), device) == retirement_consumers_.end()) {
+                err = "foresight allocation device absent from consumer topology"; return false;
+            }
+        for (int card : card_of_layer)
+            if (card < 0 || size_t(card) >= devices.size()) { err = "invalid foresight layer/card mapping"; return false; }
+        retirement_capture_device(true, retirement_consumers_, retirement_device_);
+    }
     slots = slots_per_layer;
     n_layers = layers;
     n_expert = experts;
     const size_t ns = (size_t) (layers * slots);
     slot.reset(new Slot[ns]);
+    allocated_slots_ = ns;
     where.assign((size_t) (layers * experts), -1);
     miss_cnt.assign((size_t) (layers * experts), 0);
     miss_at.assign((size_t) (layers * experts), 0);
@@ -6145,10 +6373,23 @@ bool ForesightSwap::init(int slots_per_layer, int64_t layers, int64_t experts, c
         for (int64_t l = 0; l < layers; ++l)
             if (card_of_layer[(size_t) l] == (int) c) bytes += (uint64_t) slots * (uint64_t) lay.blob_bytes(l);
         if (bytes == 0) continue;
-        const OnDevice on(devices[c]);
+        ExpertResourceDevice strict_device(strict_retirement_, devices[c]);
+        const OnDevice on(strict_retirement_ ? -1 : devices[c]);
         cudaStream_t s = nullptr;
-        if (cudaMalloc(&card_mem[c], bytes) != cudaSuccess ||
-            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+        bool allocation_failed;
+        if (strict_retirement_) {
+            const cudaError_t allocated = cudaMalloc(&card_mem[c], bytes);
+            if (allocated != cudaSuccess && card_mem[c]) retirement_failed("ambiguous foresight allocation");
+            cudaError_t stream_status = cudaSuccess;
+            if (allocated == cudaSuccess) {
+                stream_status = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+                card_stream[c] = s; // retain before any subsequent failure
+                if (stream_status != cudaSuccess && s) retirement_failed("ambiguous foresight stream creation");
+            }
+            allocation_failed = allocated != cudaSuccess || !card_mem[c] || stream_status != cudaSuccess || !s;
+        } else allocation_failed = cudaMalloc(&card_mem[c], bytes) != cudaSuccess ||
+                                     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess;
+        if (allocation_failed) {
             cudaGetLastError();
             err = "cannot allocate " + std::to_string(bytes >> 20) + " MiB on CUDA" + std::to_string(devices[c]) +
                   " (raise --vram-reserve-mib by about that much)";
@@ -6165,7 +6406,12 @@ bool ForesightSwap::init(int slots_per_layer, int64_t layers, int64_t experts, c
                 sl.dptr = (unsigned long long) ((uint8_t*) card_mem[c] + off);
                 sl.bytes = bb;
                 cudaEvent_t ev = nullptr;
-                if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                const cudaError_t event_status = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+                if (strict_retirement_) {
+                    sl.event_device = devices[c]; sl.ev = ev;
+                    if (event_status != cudaSuccess && ev) retirement_failed("ambiguous foresight event creation");
+                }
+                if (event_status != cudaSuccess || (strict_retirement_ && !ev)) {
                     cudaGetLastError();
                     err = "cannot create the copy events";
                     return false;
@@ -6186,6 +6432,34 @@ ForesightSwap::~ForesightSwap() {
     }
     cv_.notify_all();
     if (filler_.joinable()) filler_.join();
+    if (strict_retirement_) {
+        if (retirement_device_ < 0) return; // never initialized, or rejected before allocation
+        ExpertRetirementScope retirement(true, retirement_device_, retirement_consumers_);
+        if (slot) {
+            for (uint64_t i = 0; i < allocated_slots_; ++i) {
+                Slot& sl = slot[size_t(i)];
+                if (!sl.ev) continue;
+                ExpertResourceDevice selected(true, sl.event_device);
+                retirement_check(true, cudaEventDestroy((cudaEvent_t)sl.ev), "foresight copy event");
+                sl.ev = nullptr;
+            }
+        }
+        for (size_t c = 0; c < card_dev.size(); ++c) {
+            void* stream = c < card_stream.size() ? card_stream[c] : nullptr;
+            void* memory = c < card_mem.size() ? card_mem[c] : nullptr;
+            if (!stream && !memory) continue;
+            ExpertResourceDevice selected(true, card_dev[c]);
+            if (stream) {
+                retirement_check(true, cudaStreamDestroy((cudaStream_t)stream), "foresight copy stream");
+                card_stream[c] = nullptr;
+            }
+            if (memory) {
+                retirement_check(true, cudaFree(memory), "foresight slot memory");
+                card_mem[c] = nullptr;
+            }
+        }
+        return;
+    }
     for (size_t c = 0; c < card_dev.size(); ++c) {
         const OnDevice on(card_dev[c]);
         if (card_stream[c]) cudaStreamSynchronize((cudaStream_t) card_stream[c]);
@@ -6212,10 +6486,11 @@ void ForesightSwap::fill_loop() {
         Slot& sl = slot[(size_t) idx];
         const int64_t l = idx / slots;
         const int dev = layer_dev[(size_t) l];
-        if (dev != cur_dev) { cudaSetDevice(dev); cur_dev = dev; }
+        if (dev != cur_dev) { retirement_check(strict_retirement_, cudaSetDevice(dev), "foresight filler device"); cur_dev = dev; }
         cudaStream_t s = (cudaStream_t) card_stream[(size_t) layer_card[(size_t) l]];
         if (cudaMemcpyAsync((void*) sl.dptr, sl.src, sl.bytes, cudaMemcpyHostToDevice, s) != cudaSuccess ||
             cudaEventRecord((cudaEvent_t) sl.ev, s) != cudaSuccess) {
+            if (strict_retirement_) retirement_failed("foresight copy/event submission");
             cudaGetLastError();
             if (!failed.exchange(true)) std::fprintf(stderr, "strata serve: foresight swap: a copy failed - swap space off\n");
             continue;   // never marked issued: the slot is never used
@@ -6231,8 +6506,10 @@ bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr)
     Slot& sl = slot[(size_t) (layer * slots + s)];
     if (!sl.ready) {
         if (!sl.loading || !sl.issued.load(std::memory_order_acquire)) { ++pending; return false; }
+        ExpertResourceDevice selected(strict_retirement_, sl.event_device);
         const cudaError_t q = cudaEventQuery((cudaEvent_t) sl.ev);
         if (q != cudaSuccess) {
+            if (strict_retirement_ && q != cudaErrorNotReady) retirement_failed("foresight event readiness");
             if (q != cudaErrorNotReady) cudaGetLastError();
             ++pending;
             return false;
@@ -6241,7 +6518,7 @@ bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr)
         sl.loading = false;
         if (verify) {   // test mode: the bytes the GPU will read must be the expert's own
             std::vector<uint8_t> back((size_t) sl.bytes);
-            const OnDevice on(layer_dev[(size_t) layer]);
+            const OnDevice on(strict_retirement_ ? -1 : layer_dev[(size_t) layer]);
             const bool same = cudaMemcpy(back.data(), (const void*) sl.dptr, (size_t) sl.bytes, cudaMemcpyDeviceToHost) ==
                                   cudaSuccess && std::memcmp(back.data(), sl.src, (size_t) sl.bytes) == 0;
             if (same) ++verify_ok;
@@ -6315,8 +6592,13 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
         Slot& sl = slot[(size_t) (layer * slots + s)];
         if (sl.loading) {   // copied in but never asked for since: landed long ago -> an ordinary candidate
             if (sl.last_ref + (uint64_t) depth > now || !sl.issued.load(std::memory_order_acquire)) continue;
+            ExpertResourceDevice selected(strict_retirement_, sl.event_device);
             const cudaError_t q = cudaEventQuery((cudaEvent_t) sl.ev);
-            if (q != cudaSuccess) { if (q != cudaErrorNotReady) cudaGetLastError(); continue; }
+            if (q != cudaSuccess) {
+                if (strict_retirement_ && q != cudaErrorNotReady) retirement_failed("foresight slot reuse readiness");
+                if (q != cudaErrorNotReady) cudaGetLastError();
+                continue;
+            }
             sl.loading = false;
             sl.ready = true;
         }
@@ -6358,7 +6640,8 @@ std::string ForesightSwap::report() const {
 }
 
 ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
-                                       const std::vector<int>& devices) {
+                                       const std::vector<int>& devices, bool strict_retirement,
+                                       const std::vector<int>& consumer_devices) {
     const char* v = std::getenv("STRATA_FS_SLOTS");
     const int slots = v ? std::atoi(v) : 0;
     if (slots <= 0) return nullptr;
@@ -6368,20 +6651,24 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
         return nullptr;
     }
     auto* f = new ForesightSwap();
+    std::unique_ptr<ForesightSwap> pending;
+    if (strict_retirement) pending.reset(f);
     auto env_int = [](const char* name, int def, int lo) { const char* e = std::getenv(name); const int x = e ? std::atoi(e) : def; return x < lo ? lo : x; };
     f->budget = env_int("STRATA_FS_BUDGET", 32, 1);
     f->admit = env_int("STRATA_FS_ADMIT", 1, 1);
     f->depth = env_int("STRATA_FS_DEPTH", 4, 2);
     f->verify = env_int("STRATA_FS_VERIFY", 0, 0) != 0;
     std::string err;
-    if (!f->init(std::min(slots, 64), layers, experts, card_of_layer, devices, err)) {
+    if ((strict_retirement && !f->set_strict_retirement(true, consumer_devices, err)) ||
+        !f->init(std::min(slots, 64), layers, experts, card_of_layer, devices, err)) {
         std::fprintf(stderr, "strata serve: foresight swap: %s - swap space off\n", err.c_str());
-        delete f;
+        if (strict_retirement) pending.reset(); else delete f;
         return nullptr;
     }
     std::fprintf(stderr, "strata serve: foresight swap: %d slots per layer on %zu card(s), up to %d copies per card and "
                          "window, admit after %d miss(es), reuse after %d windows\n",
                  f->slots, devices.size(), f->budget, f->admit, f->depth);
+    if (strict_retirement) (void)pending.release();
     return f;
 }
 

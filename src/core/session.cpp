@@ -53,7 +53,7 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
+static uint64_t session_bytes_impl(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi,const QsaElasticPlan* elastic=nullptr) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
@@ -66,7 +66,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+        n += (elastic?elastic->first_bytes:qsa_state_bytes(g, max_cells, true)) + (uint64_t) (q_n - 1) * (elastic?elastic->other_bytes:qsa_state_bytes(g, max_cells, false));
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -74,8 +74,10 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
-uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo, int64_t layer_hi) {
+uint64_t session_bytes(const ModelGeometry& g,int64_t cells,int64_t k,int64_t lo,int64_t hi){return session_bytes_impl(g,cells,k,lo,hi);}
+
+static uint64_t session_init_impl(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                      int64_t layer_lo, int64_t layer_hi, SessionInitUploads* uploads,const QsaElasticPlan* elastic=nullptr,QsaElasticView* const* views=nullptr) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;
@@ -105,7 +107,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
+    const uint64_t first = elastic?elastic->first_bytes:qsa_state_bytes(g, max_cells, true), rest = elastic?elastic->other_bytes:qsa_state_bytes(g, max_cells, false);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
@@ -113,10 +115,18 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
-    for (int64_t j = 0; j < s.qsa_alloc; ++j)
-        if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+        auto* at = qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest);
+        auto* shared = j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0];
+        const auto bytes = elastic
+            ? qsa_state_init_private(g,max_cells,at,s.qsa_states[s.qsa_ord0+j],uploads->qsa[size_t(s.qsa_ord0+j)],shared,views[j])
+            : uploads ? qsa_state_init_private(g,max_cells,at,s.qsa_states[s.qsa_ord0+j],uploads->qsa[size_t(s.qsa_ord0+j)],shared)
+            : qsa_state_init(g,max_cells,at,s.qsa_states[s.qsa_ord0+j],shared);
+        if (!bytes) {
+            if (uploads) uploads->error = uploads->qsa[size_t(s.qsa_ord0+j)].error;
             return 0;
+        }
+    }
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));
@@ -130,11 +140,83 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     return used;
 }
 
+uint64_t session_init(const ModelGeometry& g,int64_t cells,int64_t k,void* base,SessionState& s,
+                      int64_t lo,int64_t hi) {
+    return session_init_impl(g,cells,k,base,s,lo,hi,nullptr);
+}
+bool session_private_plan(const ModelGeometry& g,int64_t cells,int64_t k,int64_t lo,int64_t hi,SessionPrivatePlan& out) {
+    return session_private_plan(g,cells,k,lo,hi,out,nullptr);
+}
+bool session_private_plan(const ModelGeometry& g,int64_t cells,int64_t k,int64_t lo,int64_t hi,SessionPrivatePlan& out,const QsaElasticPlan* elastic) {
+    if (hi == -1) hi = g.n_layers;
+    if (cells <= 0 || cells > INT32_MAX || k <= 0 || lo < 0 || hi <= lo || hi > g.n_layers ||
+        g.qsa_interval <= 0 || g.n_qsa_layers() <= 0 || (!elastic&&qsa_kv_elastic())) return false;
+    if(elastic&&(elastic->cells!=cells||!qsa_elastic_plan_matches(g,*elastic)))return false;
+    const auto first = lo/g.qsa_interval;
+    const auto count = std::max<int64_t>(hi/g.qsa_interval-first,1);
+    if (first+count > g.n_qsa_layers()) return false;
+    QsaPrivateHostPlan primary,other;
+    if (!qsa_private_host_plan(g,cells,true,primary,elastic) || !qsa_private_host_plan(g,cells,false,other,elastic)) return false;
+    SessionPrivatePlan result;
+    result.device_bytes = session_bytes_impl(g,cells,k,lo,hi,elastic);
+    // Trusted validated model geometry is the same input used by session_bytes.
+    // Include the full globally indexed arrays even for a partial split stage.
+    result.host_bytes = sizeof(SessionState)+sizeof(SessionInitUploads)+1048576;
+    auto add = [](uint64_t& n,uint64_t value) {
+        if (value > UINT64_MAX-n) return false;
+        n+=value;return true;
+    };
+    const uint64_t metadata = sizeof(QsaState)+sizeof(QsaInitUploads);
+    if (uint64_t(g.n_qsa_layers()) > UINT64_MAX/metadata ||
+        !add(result.host_bytes,uint64_t(g.n_qsa_layers())*metadata)) return false;
+    for (int64_t i=0;i<count;++i) {
+        const auto& plan = i==0?primary:other;
+        if (!add(result.pinned_bytes,plan.pinned_bytes) || !add(result.host_bytes,plan.pinned_bytes) ||
+            !add(result.host_bytes,plan.upload_bytes)) return false;
+    }
+    out = result;return result.device_bytes != 0;
+}
+uint64_t session_init_private(const ModelGeometry& g,int64_t cells,int64_t k,void* base,SessionState& s,
+                              SessionInitUploads& uploads,int64_t lo,int64_t hi) {
+    return session_init_private(g,cells,k,base,s,uploads,lo,hi,nullptr,nullptr,0);
+}
+uint64_t session_init_private(const ModelGeometry& g,int64_t cells,int64_t k,void* base,SessionState& s,
+    SessionInitUploads& uploads,int64_t lo,int64_t hi,const QsaElasticPlan* elastic,QsaElasticView* const* views,size_t view_count) {
+    if (hi == -1) hi = g.n_layers;
+    if (uploads.started || s.qsa_states || s.qsa_state_arena || !base || cells <= 0 ||
+        cells > INT32_MAX || k <= 0 || lo < 0 || hi <= lo || hi > g.n_layers ||
+        g.qsa_interval <= 0 || g.n_qsa_layers() <= 0 || (!elastic&&qsa_kv_elastic())) {
+        uploads.error = "invalid, reused or unsupported private session initialization";
+        return 0;
+    }
+    uploads.started = true;
+    const auto first = lo / g.qsa_interval;
+    const auto count = std::max<int64_t>(hi / g.qsa_interval - first,1);
+    if (first + count > g.n_qsa_layers()) {
+        uploads.error = "private stage has no valid primary QSA ordinal"; return 0;
+    }
+    if(elastic) {
+        if(!views||view_count!=size_t(count)||elastic->cells!=cells||!qsa_elastic_plan_matches(g,*elastic)) {uploads.error="invalid private elastic session plan";return 0;}
+        for(size_t j=0;j<view_count;++j) {
+            if(!views[j]||!views[j]->healthy()||views[j]->plan().cells!=cells||
+               !qsa_elastic_plan_matches(g,views[j]->plan())||views[j]->plan().format!=elastic->format||
+               views[j]->plan().rotate!=elastic->rotate||views[j]->plan().device!=elastic->device) {uploads.error="private elastic view mismatch";return 0;}
+            for(size_t k=0;k<j;++k)if(views[k]==views[j]) {uploads.error="duplicate private elastic pool";return 0;}
+        }
+    }
+    try {
+        uploads.qsa.resize(size_t(g.n_qsa_layers()));
+        return session_init_impl(g,cells,k,base,s,lo,hi,&uploads,elastic,views);
+    } catch (const std::bad_alloc&) {
+        uploads.error = "private session host allocation failed"; return 0;
+    }
+}
+
 void session_release(SessionState& s) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (s.qsa_states[j].owns_rope) {
-            strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
-            s.qsa_states[j].owns_rope = false;
+        if (s.qsa_states[s.qsa_ord0 + j].owns_rope) {
+            strata::kernels::rope_table_release(s.qsa_states[s.qsa_ord0 + j].cos_tab);
+            s.qsa_states[s.qsa_ord0 + j].owns_rope = false;
         }
 }
 
@@ -181,6 +263,39 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     s.ple_token = -1;
 }
 
+bool session_zero_checked(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    (void)s; (void)R_init; (void)g; (void)stream;
+    error = "checked private reset is unsupported on Metal"; return false;
+#else
+    cudaStream_t cs = (cudaStream_t) stream;
+    // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
+    // embedding broadcast to every stream, which is the reference's own initial condition.
+    if (R_init != nullptr) {
+        for (int64_t c = 0; c < g.hc; ++c)
+            if (cudaMemcpyAsync(s.block.R + (size_t) c * g.n_embd, R_init, (size_t) g.n_embd * 4,
+                            cudaMemcpyDeviceToDevice, cs) != cudaSuccess) { error = "session_zero_checked: reset submission failed"; return false; }
+    } else {
+        if (cudaMemsetAsync(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs) != cudaSuccess) { error = "session_zero_checked: reset submission failed"; return false; }
+    }
+    // every owned GDN layer's recurrence and conv history
+    if (cudaMemsetAsync(s.gdn_state, 0, (size_t) s.gdn_alloc * gdn_state_floats(g) * 4, cs) != cudaSuccess) { error = "session_zero_checked: reset submission failed"; return false; }
+    // and every owned QSA layer's cache and indexer
+    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+        if (!qsa_state_zero_checked(s.qsa_states[s.qsa_ord0 + j], g, stream, error)) return false;
+    // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
+    // convolve over rows belonging to a different sequence - the conv reads NG_HIST previous NORMALIZED rows,
+    // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
+    // for the same reason: `ngram_rows` treats a missing predecessor as the EOS cut, which is what a sequence
+    // boundary IS.
+    if (cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(), cs) != cudaSuccess) { error = "session_zero_checked: reset submission failed"; return false; }
+    s.ple_prev[0] = -1;
+    s.ple_prev[1] = -1;
+    s.ple_token = -1;
+    return true;
+#endif
+}
+
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
 /// the direct and captured paths so the two cannot disagree about which slice a layer owns.
 void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
@@ -204,9 +319,14 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
 
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
                      SessionGraphs& gr, std::string& err, bool split, int64_t layer_lo, int64_t layer_hi) {
+    if (gr.retirement_started || gr.retirement_failed) { err = "session_capture: retired graph state"; return false; }
     if (gr.captured) return true;
+    if (gr.execs || gr.posts || gr.pending_graph || gr.pending_stream || gr.allocated_slots) {
+        err = "session_capture: partial capture requires checked retirement"; return false;
+    }
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
+    gr.allocated_slots = g.n_layers;
     gr.execs = new cudaGraphExec_t[(size_t) g.n_layers]();
     gr.posts = new cudaGraphExec_t[(size_t) g.n_layers]();
     for (int64_t i = 0; i < g.n_layers; ++i) gr.posts[i] = nullptr;
@@ -234,7 +354,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // `moe_combine` needs the pool's answer and the pool needs the router's.
         auto capture = [&](bool post, cudaGraphExec_t* out, const char* what, int half = 0,
                            int stage_prefix = 0) -> bool {
-            cudaStream_t cs = nullptr;
+            auto& cs = gr.pending_stream;
             if (cudaStreamCreate(&cs) != cudaSuccess) {
                 err = std::string("session_capture: stream create failed");
                 return false;
@@ -251,23 +371,35 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                                 : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
                                                   s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
                                                   half, stage_prefix);
-            if (!ok) {
+            if (!ok)
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
-                return false;
+            const cudaError_t ce = cudaStreamEndCapture(cs, &gr.pending_graph);
+            if (ce == cudaSuccess) {
+                const cudaError_t se = cudaStreamDestroy(cs);
+                if (se != cudaSuccess) {
+                    gr.retirement_failed = true;
+                    err = std::string("session_capture: stream destroy: ") + cudaGetErrorString(se);
+                    return false;
+                }
+                gr.pending_stream = nullptr;
             }
-            cudaGraph_t graph = nullptr;
-            const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
-            cudaStreamDestroy(cs);
+            if (!ok) return false;
             if (ce != cudaSuccess) {
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " +
                       cudaGetErrorString(ce) + " (a synchronous call in the layer?)";
                 return false;
             }
-            if (cudaGraphInstantiate(out, graph, 0) != cudaSuccess) {
+            if (cudaGraphInstantiate(out, gr.pending_graph, 0) != cudaSuccess) {
                 err = "session_capture: instantiate failed at layer " + std::to_string(l);
                 return false;
             }
-            cudaGraphDestroy(graph);
+            const cudaError_t de = cudaGraphDestroy(gr.pending_graph);
+            if (de != cudaSuccess) {
+                gr.retirement_failed = true;
+                err = std::string("session_capture: graph destroy: ") + cudaGetErrorString(de);
+                return false;
+            }
+            gr.pending_graph = nullptr;
             return true;
         };
         if (!capture(/*post=*/false, &gr.execs[l], "pre")) return false;
@@ -498,41 +630,56 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
     return true;
 }
 
-void session_graphs_free(SessionGraphs& gr) {
-    if (gr.execs) {
-        for (int64_t i = 0; i < gr.n; ++i) cudaGraphExecDestroy(gr.execs[i]);
-        delete[] gr.execs;
-    }
-    if (gr.posts) {
-        for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.posts[i] != nullptr) cudaGraphExecDestroy(gr.posts[i]);
-        delete[] gr.posts;
-    }
-    if (gr.preA) {
-        for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preA[i] != nullptr) cudaGraphExecDestroy(gr.preA[i]);
-        delete[] gr.preA;
-    }
-    if (gr.preB) {
-        for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preB[i] != nullptr) cudaGraphExecDestroy(gr.preB[i]);
-        delete[] gr.preB;
-    }
-    for (int k = 0; k < 5; ++k) {
-        if (gr.preP[k] == nullptr) continue;
-        for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preP[k][i] != nullptr) cudaGraphExecDestroy(gr.preP[k][i]);
-        delete[] gr.preP[k];
-        gr.preP[k] = nullptr;
-    }
-    gr.preA = nullptr;
-    gr.preB = nullptr;
-    gr.split_captured = false;
-    gr.posts = nullptr;
-    gr.execs = nullptr;
-    gr.parts_dev = nullptr;
-    gr.n = 0;
+bool session_graphs_free_checked(SessionGraphs& gr, std::string& err) {
+    gr.retirement_started = true;
     gr.captured = false;
+    gr.split_captured = false;
+    if (gr.retirement_failed) { err = "session graphs: prior uncertain destroy"; return false; }
+    const int64_t slots = gr.allocated_slots ? gr.allocated_slots : gr.n;
+    auto release = [&](cudaGraphExec_t*& handles) {
+        if (!handles) return true;
+        for (int64_t i = 0; i < slots; ++i) {
+            if (!handles[i]) continue;
+            const cudaError_t e = cudaGraphExecDestroy(handles[i]);
+            if (e != cudaSuccess) {
+                gr.retirement_failed = true;
+                err = std::string("session graphs: exec destroy: ") + cudaGetErrorString(e);
+                return false;
+            }
+            handles[i] = nullptr;
+        }
+        delete[] handles;
+        handles = nullptr;
+        return true;
+    };
+    if (!release(gr.execs) || !release(gr.posts) || !release(gr.preA) || !release(gr.preB)) return false;
+    for (auto& handles : gr.preP) if (!release(handles)) return false;
+    if (gr.pending_graph) {
+        const cudaError_t e = cudaGraphDestroy(gr.pending_graph);
+        if (e != cudaSuccess) {
+            gr.retirement_failed = true;
+            err = std::string("session graphs: graph destroy: ") + cudaGetErrorString(e);
+            return false;
+        }
+        gr.pending_graph = nullptr;
+    }
+    if (gr.pending_stream) {
+        const cudaError_t e = cudaStreamDestroy(gr.pending_stream);
+        if (e != cudaSuccess) {
+            gr.retirement_failed = true;
+            err = std::string("session graphs: stream destroy: ") + cudaGetErrorString(e);
+            return false;
+        }
+        gr.pending_stream = nullptr;
+    }
+    gr = SessionGraphs{};
+    err.clear();
+    return true;
+}
+
+void session_graphs_free(SessionGraphs& gr) {
+    std::string ignored;
+    (void) session_graphs_free_checked(gr, ignored);
 }
 
 bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
@@ -854,7 +1001,9 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
                            const float* y_miss_host, size_t parts_bytes, TokenGraph& tg, std::string& err,
                            const TokenHits* hits) {
     if (hits != nullptr && !hits->on()) { err = "session_capture_token: incomplete hit configuration"; return false; }
+    if (tg.retirement_started || tg.retirement_failed) { err = "session_capture_token: retired graph state"; return false; }
     if (tg.captured) return true;
+    if (tg.exec || tg.pending_graph || tg.pending_stream) { err = "session_capture_token: partial capture requires checked retirement"; return false; }
     if (s.db == nullptr || s.db->d_flag == nullptr || s.db->d_seq == nullptr) {
         err = "session_capture_token: the doorbell has no flag";
         return false;
@@ -868,10 +1017,9 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         err = "session_capture_token: the parts staging is not mapped pinned memory";
         return false;
     }
-    cudaStream_t cs = nullptr;
+    auto& cs = tg.pending_stream;
     if (cudaStreamCreate(&cs) != cudaSuccess) { err = "session_capture_token: stream create failed"; return false; }
     if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        cudaStreamDestroy(cs);
         err = "session_capture_token: begin capture failed";
         return false;
     }
@@ -903,20 +1051,33 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
         if (qsa) ++qsa_index;
     }
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
-    cudaStreamDestroy(cs);
-    if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
+    const cudaError_t ce = cudaStreamEndCapture(cs, &tg.pending_graph);
+    if (ce == cudaSuccess) {
+        const cudaError_t se = cudaStreamDestroy(cs);
+        if (se != cudaSuccess) {
+            tg.retirement_failed = true;
+            err = std::string("session_capture_token: stream destroy: ") + cudaGetErrorString(se);
+            return false;
+        }
+        tg.pending_stream = nullptr;
+    }
+    if (!ok) return false;
     if (ce != cudaSuccess) {
         err = std::string("session_capture_token: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiate(&tg.exec, graph, 0);
-    cudaGraphDestroy(graph);
+    const cudaError_t ie = cudaGraphInstantiate(&tg.exec, tg.pending_graph, 0);
     if (ie != cudaSuccess) {
         err = std::string("session_capture_token: instantiate: ") + cudaGetErrorString(ie);
         return false;
     }
+    const cudaError_t de = cudaGraphDestroy(tg.pending_graph);
+    if (de != cudaSuccess) {
+        tg.retirement_failed = true;
+        err = std::string("session_capture_token: graph destroy: ") + cudaGetErrorString(de);
+        return false;
+    }
+    tg.pending_graph = nullptr;
     tg.captured = true;
     tg.n_layers = g.n_layers;
     tg.y_src = y_miss_host;
@@ -986,9 +1147,45 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     return true;
 }
 
-void token_graph_free(TokenGraph& tg) {
-    if (tg.exec) cudaGraphExecDestroy(tg.exec);
+bool token_graph_free_checked(TokenGraph& tg, std::string& err) {
+    tg.retirement_started = true;
+    tg.captured = false;
+    if (tg.retirement_failed) { err = "token graph: prior uncertain destroy"; return false; }
+    if (tg.exec) {
+        const cudaError_t e = cudaGraphExecDestroy(tg.exec);
+        if (e != cudaSuccess) {
+            tg.retirement_failed = true;
+            err = std::string("token graph: exec destroy: ") + cudaGetErrorString(e);
+            return false;
+        }
+        tg.exec = nullptr;
+    }
+    if (tg.pending_graph) {
+        const cudaError_t e = cudaGraphDestroy(tg.pending_graph);
+        if (e != cudaSuccess) {
+            tg.retirement_failed = true;
+            err = std::string("token graph: graph destroy: ") + cudaGetErrorString(e);
+            return false;
+        }
+        tg.pending_graph = nullptr;
+    }
+    if (tg.pending_stream) {
+        const cudaError_t e = cudaStreamDestroy(tg.pending_stream);
+        if (e != cudaSuccess) {
+            tg.retirement_failed = true;
+            err = std::string("token graph: stream destroy: ") + cudaGetErrorString(e);
+            return false;
+        }
+        tg.pending_stream = nullptr;
+    }
     tg = TokenGraph{};
+    err.clear();
+    return true;
+}
+
+void token_graph_free(TokenGraph& tg) {
+    std::string ignored;
+    (void) token_graph_free_checked(tg, ignored);
 }
 
 }  // namespace strata::core

@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "strata/core/vmm.hpp"
+#include "strata/core/expert_profile_inventory.hpp"
 
 namespace strata::core {
 
@@ -52,7 +53,8 @@ inline constexpr int32_t kNotResident = -1;
 /// The frequency table is not returned: it is the profile's own working, and the engine measures `h` by
 /// running rather than by re-deriving what the file claims.
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
-                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
+                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err,
+                         ExpertProfileCapture* capture = nullptr);
 
 /// #477 (--expert-profile-save): what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair -
 /// the experts resident in VRAM now first (where the swaps left the cache), then the rest; within each, by `heat`
@@ -83,6 +85,8 @@ struct BlobPart { const uint8_t* p; uint64_t n; uint64_t at; };
 
 class ExpertCache {
 public:
+    /// Configure before open; callers seal producers before close. Mode/topology persist across reopen.
+    bool set_strict_retirement(bool enabled, const std::vector<int>& consumer_devices, std::string& error);
     ExpertCache() = default;
     ~ExpertCache();
     ExpertCache(const ExpertCache&) = delete;
@@ -193,6 +197,9 @@ public:
     /// orders it.  Returns false if the indices are out of range rather than reading past the arena.
     /// `bytes` (plan v0.3 P6): the blob's own size when it is smaller than the slot (a native pack); 0 = the slot.
     bool fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes = 0);
+    /// Exact submitted extent only; caller must confirm stream completion before publication.
+    bool fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err,
+                   int64_t bytes, uint64_t* submitted_bytes);
 
     /// **THE SAME COPY, BUT BLOCKING, AND THE PROFILE FILL NEEDS IT.**  `fill_slot` is asynchronous because on
     /// the token path the fill and the kernel that reads it are ordered by one stream and waiting would be a
@@ -201,6 +208,10 @@ public:
     /// against a `cudaStreamNonBlocking` one.  The first version used the async form and `verify_slot` refused
     /// the whole run with "slot 0 differs from the arena at byte 0" - which is the check doing its job.
     bool fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
+    /// Exact clamped copy extent, written only after successful blocking completion.
+    /// On refusal/error the caller's completed_bytes value remains unchanged.
+    bool fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err,
+                            int64_t bytes, uint64_t* completed_bytes);
     /// perf-review D-4: `fill_slot_blocking`'s copy on the same (legacy) stream, but queued: many slots are refilled
     /// with one `sync_queued` at the end instead of a wait per slot. Same ordering against earlier work, same bytes.
     bool fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
@@ -234,6 +245,10 @@ public:
     }
 
 private:
+    bool strict_retirement_ = false;
+    bool retirement_open_started_ = false;
+    int retirement_device_ = -1;
+    std::vector<int> retirement_consumers_;
 #if defined(STRATA_USE_HIP)
     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
     uint8_t* blocking_staging_ = nullptr;

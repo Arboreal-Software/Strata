@@ -150,7 +150,15 @@ catch (sycl::exception const &exc) {
 }
 
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
-                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
+                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err,
+                         ExpertProfileCapture* capture) {
+    if(capture) {
+        capture->complete_=false;
+        if(capture->attempt_generation_==UINT64_MAX) {err.clear();return false;}
+        ++capture->attempt_generation_;
+        err="SYCL profile producer does not support inventory capture";
+        return false;
+    }
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) {
         err = "read_expert_profile: cannot open " + path;
@@ -275,6 +283,14 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
         err = "write_expert_profile: cannot write " + path;
         return false;
     }
+    return true;
+}
+
+bool ExpertCache::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if (retirement_open_started_) { error = "strict retirement must be configured before open"; return false; }
+    if (enabled) { error = "strict expert retirement is unsupported by SYCL"; return false; }
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
     return true;
 }
 
@@ -606,6 +622,7 @@ void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
     close();
+    retirement_open_started_ = true;
     if (n_slots <= 0) {
         err = "ExpertCache: n_slots must be positive";
         return false;
@@ -720,6 +737,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
 bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
                              std::string& err) {
+    retirement_open_started_ = true;
     if (slot_bytes.empty()) { err = "ExpertCache: no slots"; return false; }
     int64_t mx = 0;
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
@@ -830,7 +848,12 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t *host_blob,
-                            void *stream, std::string &err, int64_t bytes) try {
+                            void *stream, std::string &err, int64_t bytes) {
+    return fill_slot(slot,host_blob,stream,err,bytes,nullptr);
+}
+
+bool ExpertCache::fill_slot(int32_t slot, const uint8_t *host_blob,
+                            void *stream, std::string &err, int64_t bytes, uint64_t* submitted_bytes) try {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -867,6 +890,7 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t *host_blob,
               dpct::get_error_string_dummy(e);
         return false;
     }
+    if(submitted_bytes)*submitted_bytes=uint64_t(n);
     ++fills_;
     return true;
 }
@@ -877,7 +901,12 @@ catch (sycl::exception const &exc) {
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t *host_blob,
-                                     std::string &err, int64_t bytes) try {
+                                     std::string &err, int64_t bytes) {
+    return fill_slot_blocking(slot,host_blob,err,bytes,nullptr);
+}
+
+bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t *host_blob,
+                                     std::string &err, int64_t bytes, uint64_t* completed_bytes) try {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -905,7 +934,12 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t *host_blob,
     synchronization behavior.
     */
     const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(dst, host_blob, n).wait());
+        DPCT_CHECK_ERROR(([&]() {
+            auto copied=dpct::get_in_order_queue().memcpy(dst, host_blob, n);
+            // Receipt callers require asynchronous errors to be delivered before
+            // certifying completion. Preserve the legacy wait for null output.
+            if(completed_bytes)copied.wait_and_throw();else copied.wait();
+        })());
 #endif
     /*
     DPCT1000: Error handling if-stmt was detected but could not be
@@ -924,6 +958,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t *host_blob,
               dpct::get_error_string_dummy(e);
         return false;
     }
+    if(completed_bytes)*completed_bytes=uint64_t(n);
     ++fills_;
     return true;
 }

@@ -40,6 +40,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <stdexcept>
 #include <type_traits>
 #include <string>
@@ -49,6 +51,7 @@
 #include <cmath>
 
 namespace strata::kernels {
+static bool q6_planar_ownership_failed(const void* weights);
 namespace {
 
 #ifndef STRATA_MMVQ_UNROLL
@@ -2784,6 +2787,7 @@ struct Q6Packed {
     void *base; const int * ql; const int * qh; const int8_t * sc;
     const sycl::half * d;
     int n_in, n_out;
+    bool release_failed = false;
 };
 std::unordered_map<const void*, Q6Packed>& q6_packed_registry() {
     static std::unordered_map<const void*, Q6Packed> registry;
@@ -2838,6 +2842,9 @@ deduced. You need to update this code.
 
 bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& registry = q6_packed_registry();
+    if (q6_planar_ownership_failed(weights)) throw std::runtime_error("planar ownership quarantined");
+    const auto known = registry.find(weights);
+    if (known != registry.end() && known->second.release_failed) throw std::runtime_error("packed ownership quarantined");
     if (registry.empty() || g_q6_bypass || (ncols > 1 && !g_multi_exact)) return false;
     const auto found = registry.find(weights);
     if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out) return false;
@@ -2968,6 +2975,7 @@ void q6_planar_launch(const Q6Planar& w, const Q81Block* x, float* y, dpct::queu
 // every registered matrix is served here whatever the column count (more than 8: in chunks of 8), so a converted matrix is
 // never read through a GGUF-layout kernel
 bool q6_planar_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (q6_planar_ownership_failed(weights)) throw std::runtime_error("planar ownership quarantined");
     auto& registry = q6_planar_registry();
     if (registry.empty() || ncols < 1) return false;
     const auto found = registry.find(weights);
@@ -3072,12 +3080,32 @@ bool native_q6_k_is_planar(const void* weights) { return q6_planar_registry().co
 // Converts a GGUF-layout Q6_K matrix (a device allocation of the caller's) to the planar layout: a new allocation holds the
 // planes, the old one is freed, the returned pointer (the new allocation's, to be freed with sycl::free as the old one would
 // have been, after native_q6_k_unpack) is the key native_q6_k_mmvq serves it under. Not eligible or no room: `weights` back.
-void* native_q6_k_planar_adopt(void* weights, int n_in, int n_out, const char* what) try {
+// BEGIN CHECKED PLANAR ADOPTION (also compiled by the CPU transaction fixture)
+struct Q6PlanarPending {
+    void* allocation = nullptr;
+    void* source = nullptr;
+    std::size_t bytes = 0;
+    Q6PlanarPending* next = nullptr;
+};
+Q6PlanarPending* q6_planar_quarantine = nullptr;
+
+static bool q6_planar_ownership_failed(const void* weights) {
+    for (auto* pending = q6_planar_quarantine; pending; pending = pending->next)
+        if (pending->source == weights || pending->allocation == weights) return true;
+    return false;
+}
+
+void* native_q6_k_planar_adopt(void* weights, int n_in, int n_out, const char* what) {
+    if (q6_planar_quarantine) throw std::runtime_error("planar ownership quarantined; worker restart required");
     if (!weights || n_in <= 0 || n_in % 256 || n_out <= 0 || !native_q6_k_planar_enabled()) return weights;
     if (q6_planar_registry().count(weights)) return weights;
     auto& q = dpct::get_in_order_queue();
     const std::size_t nb = std::size_t(n_in / 256) * std::size_t(n_out);
     const Q6PlanarLayout l = q6_planar_layout(nb);
+    // Reserve failure-path bookkeeping before allocation or queued work. An
+    // uncertain drain/free must retain both allocation addresses without allocating.
+    std::unique_ptr<Q6PlanarPending> pending(new (std::nothrow) Q6PlanarPending);
+    if (!pending) return weights;
     void* dev = nullptr;
     try { dev = strata::malloc_device_guarded(l.total, q, what); } catch (...) { dev = nullptr; }
     if (dev == nullptr) {
@@ -3085,46 +3113,73 @@ void* native_q6_k_planar_adopt(void* weights, int n_in, int n_out, const char* w
                      l.total / 1048576.0);
         return weights;
     }
-    const uint8_t* src = static_cast<const uint8_t*>(weights);
-    uint8_t* base = static_cast<uint8_t*>(dev);
-    const std::size_t o_qh = l.o_qh, o_sc = l.o_sc, o_d = l.o_d;
-    q.parallel_for(sycl::range<1>(nb), [=](sycl::id<1> id) {
-        const std::size_t b = id[0];
-        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(src + b * 210);
-        uint16_t* qlo = reinterpret_cast<uint16_t*>(base + b * 128);
-        for (int i = 0; i < 64; ++i) qlo[i] = s16[i];
-        uint16_t* qho = reinterpret_cast<uint16_t*>(base + o_qh + b * 64);
-        for (int i = 0; i < 32; ++i) qho[i] = s16[64 + i];
-        const int8_t* sc = reinterpret_cast<const int8_t*>(src + b * 210 + 192);
-        uint8_t* sco = base + o_sc + b * 16;
-        for (int g = 0; g < 8; ++g) {
-            const int so = 8 * (g >> 2) + (g & 3);
-            sco[2 * g] = (uint8_t) sc[so]; sco[2 * g + 1] = (uint8_t) sc[so + 4];
+    pending->allocation = dev; pending->source = weights; pending->bytes = l.total;
+    bool registered = false, source_free_started = false;
+    try {
+        const uint8_t* src = static_cast<const uint8_t*>(weights);
+        uint8_t* base = static_cast<uint8_t*>(dev);
+        const std::size_t o_qh = l.o_qh, o_sc = l.o_sc, o_d = l.o_d;
+        q.parallel_for(sycl::range<1>(nb), [=](sycl::id<1> id) {
+            const std::size_t b = id[0];
+            const uint16_t* s16 = reinterpret_cast<const uint16_t*>(src + b * 210);
+            uint16_t* qlo = reinterpret_cast<uint16_t*>(base + b * 128);
+            for (int i = 0; i < 64; ++i) qlo[i] = s16[i];
+            uint16_t* qho = reinterpret_cast<uint16_t*>(base + o_qh + b * 64);
+            for (int i = 0; i < 32; ++i) qho[i] = s16[64 + i];
+            const int8_t* sc = reinterpret_cast<const int8_t*>(src + b * 210 + 192);
+            uint8_t* sco = base + o_sc + b * 16;
+            for (int g = 0; g < 8; ++g) {
+                const int so = 8 * (g >> 2) + (g & 3);
+                sco[2 * g] = (uint8_t) sc[so]; sco[2 * g + 1] = (uint8_t) sc[so + 4];
+            }
+            reinterpret_cast<uint16_t*>(base + o_d)[b] = s16[104];
+        });
+        q.wait_and_throw();
+        // All fallible registry allocation happens while the original still lives.
+        registered = q6_planar_registry().emplace(dev, q6_planar_make(dev, nb, n_in, n_out)).second;
+        if (!registered) throw std::runtime_error("planar allocation already registered");
+        source_free_started = true;
+        sycl::free(weights, q);
+        std::fprintf(stderr, "strata: STRATA_Q6_PLANAR: the %s (%d x %d) is stored as 16-byte-aligned planes (same bytes)\n", what, n_out, n_in);
+        return dev;
+    } catch (...) {
+        if (!source_free_started) {
+            try {
+                q.wait_and_throw();
+                sycl::free(dev, q);
+                if (registered) q6_planar_registry().erase(dev);
+                return weights; // proven cleanup: the untouched GGUF allocation remains valid
+            } catch (...) {}
         }
-        reinterpret_cast<uint16_t*>(base + o_d)[b] = s16[104];
-    });
-    q.wait();
-    sycl::free(weights, q);
-    q6_planar_registry()[dev] = q6_planar_make(dev, nb, n_in, n_out);
-    std::fprintf(stderr, "strata: STRATA_Q6_PLANAR: the %s (%d x %d) is stored as 16-byte-aligned planes (same bytes)\n", what, n_out, n_in);
-    return dev;
+        // Never retry an uncertain free or return the old pointer as usable after
+        // its free was attempted. The caller must treat this exception as fatal
+        // for adoption and retain its original allocation record.
+        pending->next = q6_planar_quarantine;
+        q6_planar_quarantine = pending.release();
+        throw;
+    }
 }
-catch (sycl::exception const& exc) {
-    std::fprintf(stderr, "strata: STRATA_Q6_PLANAR conversion failed: %s\n", exc.what());
-    return weights;
-}
+// END CHECKED PLANAR ADOPTION
 
 // A planar matrix's rows `rows_dev[0 .. n_sel)` as a new planar matrix (the draft head's token subset of the LM head).
-void* native_q6_k_planar_gather(const void* planar, int n_in, const int32_t* rows_dev, int64_t n_sel, const char* what) try {
+// BEGIN CHECKED PLANAR GATHER (also compiled by the CPU transaction fixture)
+void* native_q6_k_planar_gather(const void* planar, int n_in, const int32_t* rows_dev, int64_t n_sel, const char* what) {
+    if (q6_planar_ownership_failed(planar)) throw std::runtime_error("planar ownership quarantined");
     const auto found = q6_planar_registry().find(planar);
     if (found == q6_planar_registry().end() || found->second.n_in != n_in || n_sel <= 0) return nullptr;
     auto& q = dpct::get_in_order_queue();
     const int nbr = n_in / 256;
     const std::size_t nb = std::size_t(nbr) * std::size_t(n_sel);
     const Q6PlanarLayout l = q6_planar_layout(nb);
+    std::unique_ptr<Q6PlanarPending> pending(new (std::nothrow) Q6PlanarPending);
+    if (!pending) return nullptr;
     void* dev = nullptr;
     try { dev = strata::malloc_device_guarded(l.total, q, what); } catch (...) { dev = nullptr; }
     if (dev == nullptr) return nullptr;
+    pending->allocation = dev;
+    pending->source = const_cast<void*>(planar);
+    pending->bytes = l.total;
+    try {
     const Q6Planar src = found->second;
     uint8_t* base = static_cast<uint8_t*>(dev);
     const std::size_t o_qh = l.o_qh, o_sc = l.o_sc, o_d = l.o_d;
@@ -3141,18 +3196,28 @@ void* native_q6_k_planar_gather(const void* planar, int n_in, const int32_t* row
         *reinterpret_cast<sycl::int4*>(base + o_sc + b * 16) = *reinterpret_cast<const sycl::int4*>(src.sc + sb * 16);
         reinterpret_cast<uint16_t*>(base + o_d)[b] = reinterpret_cast<const uint16_t*>(src.d)[sb];
     });
-    q.wait();
-    q6_planar_registry()[dev] = q6_planar_make(dev, nb, n_in, (int) n_sel);
+    q.wait_and_throw();
+    if (!q6_planar_registry().emplace(dev, q6_planar_make(dev, nb, n_in, (int) n_sel)).second)
+        throw std::runtime_error("planar gather allocation already registered");
     std::fprintf(stderr, "strata: STRATA_Q6_PLANAR: the %s (%lld x %d) is gathered from the planar head\n", what, (long long) n_sel, n_in);
     return dev;
+    } catch (...) {
+        // Queued work may still reference the candidate and input. Retain both
+        // addresses and the candidate charge without allocating or retrying a
+        // drain/free. A caller must not fall back to using this input after an
+        // uncertain gather, nor publish a partially produced replacement.
+        pending->next = q6_planar_quarantine;
+        q6_planar_quarantine = pending.release();
+        throw;
+    }
 }
-catch (sycl::exception const& exc) {
-    std::fprintf(stderr, "strata: STRATA_Q6_PLANAR gather failed: %s\n", exc.what());
-    return nullptr;
-}
+// END CHECKED PLANAR GATHER
 
 bool native_q6_k_pack(const void *weights, int n_in, int n_out,
                       const char *what) try {
+    if (q6_planar_ownership_failed(weights)) throw std::runtime_error("planar ownership quarantined");
+    const auto known = q6_packed_registry().find(weights);
+    if (known != q6_packed_registry().end() && known->second.release_failed) throw std::runtime_error("packed ownership quarantined");
     if (!weights || n_in <= 0 || n_in % 256 || n_in / 256 < WARPS * WARP / 32 || n_out < 2048) return false;
     if (q6_packed_registry().count(weights)) return true;
     const std::size_t nb = std::size_t(n_in / 256) * std::size_t(n_out);
@@ -3326,11 +3391,38 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+bool native_head_packed_release_checked(const void* weights) {
+    for (auto* pending = q6_planar_quarantine; pending; pending = pending->next)
+        if (pending->source == weights || pending->allocation == weights) return false;
+    auto& registry = q6_packed_registry();
+    const auto found = registry.find(weights);
+    if (found != registry.end()) {
+        if (found->second.release_failed) return false;
+        try { sycl::free(found->second.base, dpct::get_in_order_queue()); }
+        catch (...) { found->second.release_failed = true; return false; }
+        registry.erase(found);
+    }
+    q6_planar_registry().erase(weights);
+    return true;
+}
+
+std::size_t native_head_packed_allocation_bytes(const void* weights) {
+    std::size_t total = 0;
+    for (auto* pending = q6_planar_quarantine; pending; pending = pending->next)
+        if (pending->source == weights) total += pending->bytes;
+    const auto found = q6_packed_registry().find(weights);
+    if (found == q6_packed_registry().end()) return total;
+    const auto& w = found->second;
+    return total + q6_planar_layout(std::size_t(w.n_in / 256) * std::size_t(w.n_out)).total;
+}
+
 void native_q6_k_unpack(const void* weights) {
+    if (q6_planar_ownership_failed(weights)) return;
     q6_planar_registry().erase(weights);   // planar matrices are the caller's allocation (native_q6_k_planar_adopt): the caller frees it
     auto& registry = q6_packed_registry();
     const auto found = registry.find(weights);
     if (found == registry.end()) return;
+    if (found->second.release_failed) return;
     sycl::free(found->second.base, dpct::get_in_order_queue());
     registry.erase(found);
 }

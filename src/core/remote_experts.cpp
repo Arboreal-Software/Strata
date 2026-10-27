@@ -135,7 +135,9 @@ void RemoteExperts::close() {
 bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          const std::vector<std::pair<int32_t, int32_t>>& ranked,
                          const ExpertCache& primary, ExpertSource& source,
-                         std::vector<uint8_t>& claimed, std::string& err, bool auto_size) {
+                         std::vector<uint8_t>& claimed, std::string& err, bool auto_size, ExpertTierOpenObserver* observer) {
+    ExpertTierOpenTransaction observation(observer);
+    if(!observation.valid(ranked.size())) {err="remote open observer storage/callbacks invalid";return false;}
     close();
     int count = 0;
     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
@@ -156,16 +158,21 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     std::vector<std::pair<int32_t, int32_t>> selected;
     selected.reserve((size_t) std::min<int64_t>(slots, layers * experts));
     std::vector<uint8_t> picked(claimed.size(), 0);
-    for (const auto& pair : ranked) {
+    bool observation_full=false;
+    for (size_t rank=0;rank<ranked.size();++rank) {
+        const auto& pair=ranked[rank];
+        auto* decision=observation.append(rank,pair.first,pair.second);
+        if(observer&&!decision){err="remote open observation overflow";close();return false;}
         if (pair.first < 0 || pair.first >= layers || pair.second < 0 || pair.second >= experts) continue;
         const size_t index = (size_t) pair.first * (size_t) experts + (size_t) pair.second;
         if (primary.slot_of(pair.first, pair.second) < 0 && !claimed[index] && !picked[index]) {
             const uint64_t bytes = lay.native ? (lay.blob_bytes(pair.first) + 255) / 256 * 256 : lay.max_blob;
-            if (auto_size && needed + bytes + (512ull << 20) > free_bytes) break;
+            if (auto_size && needed + bytes + (512ull << 20) > free_bytes) {observation_full=true;if(decision)decision->outcome=ExpertTierOpenOutcome::skipped_full;break;}
+            if(decision)decision->outcome=ExpertTierOpenOutcome::pending_copy;
             selected.push_back(pair);
             needed += bytes;
             picked[index] = 1;
-            if ((int) selected.size() >= slots) break;
+            if ((int) selected.size() >= slots) {observation_full=rank+1<ranked.size();break;}
         }
     }
     if (selected.empty()) {
@@ -187,14 +194,19 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                                      : cache_.open((int64_t) selected.size(), layers, experts,
                                                    (int64_t) lay.max_blob, err);
     if (!cache_ok) { err = "CUDA" + std::to_string(device) + " experts: " + err; close(); return false; }
+    size_t observation_cursor=0;
     for (const auto& pair : selected) {
+        auto* decision=observation.selected(observation_cursor);
+        if(observer&&!decision){err="remote open selected observation missing";close();return false;}
+        uint64_t completed_bytes=0;
         const int32_t slot = cache_.admit(pair.first, pair.second);
         const uint8_t* blob = source.blob(pair.first, pair.second);
-        if (slot < 0 || !blob || !cache_.fill_slot_blocking(slot, blob, err, (int64_t) lay.blob_bytes(pair.first))) {
+        if (slot < 0 || !blob || !cache_.fill_slot_blocking(slot, blob, err, (int64_t) lay.blob_bytes(pair.first),observer?&completed_bytes:nullptr)) {
             err = "CUDA" + std::to_string(device) + " experts: " +
                   (err.empty() ? "cache fill failed" : err);
             close(); return false;
         }
+        if(decision){decision->slot=slot;decision->bytes=completed_bytes;decision->outcome=ExpertTierOpenOutcome::copied;}
     }
     const auto& first = selected.front();
     if (!cache_.verify_slot(cache_.slot_of(first.first, first.second), source.blob(first.first, first.second),
@@ -254,6 +266,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     computed_ = 0;
     launched_layers_ = 0;
     returned_bytes_ = full_row_bytes_ = 0;
+    if(!observation.publish(device,layers,experts,uint64_t(cache_.slots()),observation_full,uint64_t(cache_.slot_guard()),cache_.per_layer_admission())){err="remote open observation refused";close();return false;}
     for (const auto& pair : selected) {
         layers_present_[(size_t) pair.first] = 1;
         claimed[(size_t) pair.first * (size_t) experts + (size_t) pair.second] = 1;
