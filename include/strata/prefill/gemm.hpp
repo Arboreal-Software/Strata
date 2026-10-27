@@ -23,6 +23,8 @@ class Gemm {
 public:
     Gemm() = default;
     ~Gemm();
+    /// CUDA/HIP: caller has selected/drained the device; failure terminates before borrowed buffers retire.
+    void retire_strict();
     Gemm(const Gemm&) = delete;
     Gemm& operator=(const Gemm&) = delete;
 

@@ -121,6 +121,10 @@ void native_q8_0_sm60_release(const void* weights);
 bool native_q6_k_packed_enabled();
 bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what);
 void native_q6_k_unpack(const void* weights);
+/// Allocations owned by the optional Q6/Q8 head packing registries. Caller must
+/// drain users and select the owning device. Failed frees retain their entry.
+std::size_t native_head_packed_allocation_bytes(const void* weights);
+bool native_head_packed_release_checked(const void* weights);
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream);

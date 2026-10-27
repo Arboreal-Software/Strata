@@ -100,12 +100,28 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo = 0, int64_t layer_hi = -1);
+// Owner must retain the session arena, QSA states and uploads on every failed
+// attempt until operation-bound drain or context teardown is established.
+struct SessionInitUploads {
+    std::vector<QsaInitUploads> qsa;
+    bool started = false;
+    std::string error;
+};
+// Session arena + QSA host allocations + retained initialization uploads and
+// metadata. PLE runtime buffers, graphs and expert handoff are priced separately.
+struct SessionPrivatePlan { uint64_t device_bytes = 0, host_bytes = 0, pinned_bytes = 0; };
+bool session_private_plan(const ModelGeometry&, int64_t max_cells, int64_t k,
+                          int64_t layer_lo, int64_t layer_hi, SessionPrivatePlan&);
+uint64_t session_init_private(const ModelGeometry&, int64_t max_cells, int64_t k, void* base,
+                              SessionState&, SessionInitUploads&, int64_t layer_lo = 0, int64_t layer_hi = -1);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
+// Checks reset submission; caller must drain before publishing the reset state.
+bool session_zero_checked(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream, std::string& error);
 
 /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.
 ///
@@ -137,6 +153,11 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
 struct SessionGraphs {
     cudaGraphExec_t* execs = nullptr;   ///< one per layer, in layer order
     int64_t n = 0;
+    int64_t allocated_slots = 0; ///< array capacity; n counts completed captures only
+    cudaStream_t pending_stream = nullptr; ///< capture stream retained through checked destruction
+    cudaGraph_t pending_graph = nullptr; ///< raw graph retained until checked destruction
+    bool retirement_started = false;
+    bool retirement_failed = false; ///< uncertain destroy: never retry or reuse
     /// **THE SECOND GRAPH PER LAYER: `moe_finish` + `gr_write`, launched AFTER the host has run the pool.**
     ///
     /// Without it the loop has to hand layer `l`'s expert vectors to layer `l+1`, which multiplies them by
@@ -304,6 +325,9 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
                                      double& ms_ffn, double& ms_post, std::string& err);
 
 /// Releases the graph execs.  The `SessionGraphs` struct holds no device memory of its own.
+/// Caller must close all producers and drain the owning device before retirement.
+/// Failure retains uncertain/unattempted handles and is sticky; success permits recapture.
+bool session_graphs_free_checked(SessionGraphs& gr, std::string& err);
 void session_graphs_free(SessionGraphs& gr);
 
 // ================================ THE HOST LOOP ================================
@@ -397,6 +421,10 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 // Same kernels, same order per layer as `session_loop`, so the token is bitwise the same.  No VRAM expert tier
 // yet (the hit decision is a host step between ring and post); the caller falls back to `session_loop` then.
 struct TokenGraph {
+    cudaStream_t pending_stream = nullptr; ///< capture stream retained through checked destruction
+    cudaGraph_t pending_graph = nullptr;
+    bool retirement_started = false;
+    bool retirement_failed = false;
     cudaGraphExec_t exec = nullptr;
     bool captured = false;
     int64_t n_layers = 0;
@@ -431,6 +459,11 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
                            const TokenHits* hits = nullptr);
 bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, TokenGraph& tg,
                        PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err);
+/// Same producer closure/device drain and sticky failure contract as session_graphs_free_checked.
+bool token_graph_free_checked(TokenGraph& tg, std::string& err);
 void token_graph_free(TokenGraph& tg);
 
+bool session_private_plan(const ModelGeometry&,int64_t,int64_t,int64_t,int64_t,SessionPrivatePlan&,const QsaElasticPlan*);
+uint64_t session_init_private(const ModelGeometry&,int64_t,int64_t,void*,SessionState&,SessionInitUploads&,
+    int64_t,int64_t,const QsaElasticPlan*,QsaElasticView* const*,size_t);
 }  // namespace strata::core

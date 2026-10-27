@@ -31,6 +31,7 @@
 // activation format for all five would be a 0.66-1.41% error on the three that matter - measured, in
 // `s_gemv_q8k_parity` and `bf16_gemv_parity`.
 #pragma once
+#include "strata/core/qsa_elastic_view.hpp"
 
 #include "strata/core/layout.hpp"
 #include "strata/core/weights.hpp"
@@ -47,6 +48,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -239,7 +241,14 @@ struct QsaState {
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
+    QsaElasticView* owned_elastic = nullptr; // borrowed from actual session allocation owner
     strata::kernels::KvHostPools host;
+    // Ownership metadata for opt-in private-session reclamation. A copied QsaState
+    // borrows these pointers; only the original allocator owner may release them.
+    void* host_allocation = nullptr;
+    uint64_t host_allocation_bytes = 0;
+    enum class HostAllocation { none, cuda_alloc, registered_mapping, unregistered_mapping };
+    HostAllocation host_allocation_kind = HostAllocation::none;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
@@ -306,6 +315,10 @@ int64_t qsa_kv_resident();
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
+// Caller has drained all GPU/CPU users and selects the owning device. Does not
+// release the device arena or RoPE registration. False retains any unfreed owner
+// metadata for recovery; do not destroy the allocator owner after a failed free.
+bool qsa_state_release_host(QsaState&, std::string& error);
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
@@ -325,6 +338,22 @@ inline int qsa_kv_format(const QsaState& st) {
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+// Private initialization owns every upload source until confirmed device drain or
+// context teardown. Never reuse a started instance after a failure.
+struct QsaInitUploads {
+    std::vector<float> rope_cos, rope_sin;
+    std::vector<int32_t> page_table;
+    bool started = false;
+    bool drained = false;
+    std::string error;
+};
+// Conservative host reservation for a fresh state and retained initialization
+// sources. Caller serializes global KV configuration with sizing/allocation.
+struct QsaPrivateHostPlan { uint64_t pinned_bytes = 0, upload_bytes = 0; };
+bool qsa_private_host_plan(const ModelGeometry&, int64_t max_cells, bool with_rope, QsaPrivateHostPlan&);
+bool qsa_upload_private_initial_state(QsaState&, int n_rot, bool owns_rope, QsaInitUploads&);
+uint64_t qsa_state_init_private(const ModelGeometry&, int64_t max_cells, void* base, QsaState&,
+                                QsaInitUploads&, const QsaState* share_rope = nullptr);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
@@ -332,6 +361,8 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+// Checks every reset submission; caller retains/drains partial state on failure.
+bool qsa_state_zero_checked(const QsaState& st, const ModelGeometry& g, void* stream, std::string& error);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
@@ -557,6 +588,9 @@ struct PleRun {
     /// Null when the PLE is not wired (no table, or a pack without `blk.1.ple_*`).  Then `block_layer_pre`
     /// SKIPS the module entirely, which is what every measurement before this change did.
     strata::kernels::PleTable* table = nullptr;
+    // Opt-in private windows own independent pending IO while retaining shared
+    // immutable table/cache lifetime. Never copy a selected window's context.
+    std::shared_ptr<strata::kernels::PleReadContext> read_context;
     strata::kernels::PleWeights w;
     /// The session's PLE state, by pointer so `block_layer_pre` needs no `SessionState`.
     const int32_t* token = nullptr;    ///< the token being decoded
@@ -571,7 +605,7 @@ struct PleRun {
     float* scratch = nullptr;
     strata::kernels::PleConsts consts;
     bool ready() const {
-        return table != nullptr && table->is_open() && hist != nullptr && emb_dev != nullptr &&
+        return table != nullptr && table->is_open() && (!read_context || read_context->table() == table) && hist != nullptr && emb_dev != nullptr &&
                emb_host != nullptr && scratch != nullptr && token != nullptr && prev != nullptr &&
                ((w.key_codes != nullptr && w.key_scales != nullptr) || w.key_bf16 != nullptr ||
                 w.key_native_data != nullptr) &&
@@ -643,4 +677,11 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
                       const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,
                       std::string& err);
 
+// Explicit private elastic plan, independent of all process-global KV switches.
+bool qsa_elastic_plan(const ModelGeometry&,int64_t cells,QsaElasticFormat,bool rotate,
+    int64_t initial_cells,int device,uint64_t granularity,QsaElasticPlan&);
+bool qsa_elastic_plan_matches(const ModelGeometry&,const QsaElasticPlan&);
+bool qsa_private_host_plan(const ModelGeometry&,int64_t,bool,QsaPrivateHostPlan&,const QsaElasticPlan*);
+uint64_t qsa_state_init_private(const ModelGeometry&,int64_t,void*,QsaState&,QsaInitUploads&,
+    const QsaState*,QsaElasticView*);
 }  // namespace strata::core

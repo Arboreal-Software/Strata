@@ -17,7 +17,8 @@ bool peer_portable() { return g_portable.load(); }
 PeerExperts::~PeerExperts() { close(); }
 
 bool PeerExperts::open(int, const std::vector<std::pair<int32_t, int32_t>>&, const ExpertCache&, ExpertSource&, int64_t,
-                       int64_t, int, int64_t, std::string& err) {
+                       int64_t, int, int64_t, std::string& err, ExpertTierOpenObserver* observer) {
+    ExpertTierOpenTransaction observation(observer);
     err = "--peer-device: the second-GPU expert tier is not ported to SYCL yet";
     return false;
 }
@@ -37,5 +38,7 @@ bool PeerExperts::finish(float*, std::string& err) {
 
 bool PeerExperts::adapt(const float*, const int32_t*, int, std::string&) { return true; }
 void PeerExperts::apply_pending(bool) {}
+// open() always refuses: no peer work can exist in this backend.
+void PeerExperts::apply_pending(bool, bool) {}
 
 }  // namespace strata::core

@@ -1,5 +1,7 @@
+#include "strata/core/strict_retirement.hpp"
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
 #include "strata/core/pinned.hpp"
+#include "strata/core/expert_source_observer.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/core/pin_budget.hpp"
 
@@ -655,6 +657,29 @@ void PinnedArena::register_slices(std::atomic<int>& ready) {
 }
 
 PinnedArena::~PinnedArena() {
+    if (strict_retirement_ && base) {
+        StrictRetirementDevice retirement(true, retirement_device_);
+        if (by_need) {
+            for (const auto& r : pin_ranges)
+                retirement_check(true, pin_unregister((uint8_t*)base + r.first), "arena registered range");
+        } else if (slice_bytes) {
+            for (uint64_t off : slice_starts)
+                retirement_check(true, pin_unregister((uint8_t*)base + off), "arena registered slice");
+        } else if (registered_bytes) retirement_check(true, pin_unregister(base), "arena registration");
+        if (by_need) {
+            for (const auto& r : locked_ranges) strata::platform::unlock_resident((uint8_t*)base + r.first, r.second);
+        } else if (locked_bytes)
+            strata::platform::unlock_resident((uint8_t*)base + (slice_bytes ? registered_bytes : 0), locked_bytes);
+        void* allocation = mapping_base ? mapping_base : base;
+        const uint64_t bytes = mapping_bytes ? mapping_bytes : capacity;
+#ifdef _WIN32
+        if (!VirtualFree(allocation, 0, MEM_RELEASE)) retirement_failed("arena host mapping");
+#else
+        if (munmap(allocation, bytes) != 0) retirement_failed("arena host mapping");
+#endif
+        base = nullptr; mapping_base = nullptr; mapping_bytes = 0;
+        return;
+    }
     if (base && by_need) {
         for (const auto& r : locked_ranges) strata::platform::unlock_resident((uint8_t*) base + r.first, r.second);
         for (const auto& r : pin_ranges) pin_unregister((uint8_t*) base + r.first);
@@ -838,11 +863,47 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
                               const std::atomic<int>* ready, const PadMap* pad) {
+    return load_experts_ranges(path,dst,layer_off,layer_bytes,threads,chunk,ready,pad,nullptr);
+}
+LoadStats load_experts_direct(const std::string& path,uint8_t* dst,const std::vector<uint64_t>& off,
+ const std::vector<uint64_t>& bytes,int threads,uint64_t chunk,const std::atomic<int>* ready,ExpertSourceReadObserver* capture) {
+    if(capture) {
+        LoadStats refused;refused.ok=false;
+#if !defined(__linux__)
+        refused.error="verified direct arena reader unsupported on this platform";
+#endif
+        return refused; // Linux direct loader already falls back to buffered ranges.
+    }
+    return load_experts_direct(path,dst,off,bytes,threads,chunk,ready);
+}
+LoadStats load_experts_ranges(const std::string& path,uint8_t* dst,const std::vector<uint64_t>& layer_off,
+ const std::vector<uint64_t>& layer_bytes,int threads,uint64_t chunk,const std::atomic<int>* ready,
+ const PadMap* pad,ExpertSourceReadObserver* capture) {
     LoadStats st;
+    if(capture&&(threads<1||uint64_t(threads)>capture->max_workers()||!chunk||layer_off.size()!=layer_bytes.size())) {
+        st.ok=false;st.error="expert observed reader bounds invalid";return st;
+    }
     const uint64_t layers = (uint64_t) layer_off.size();
+    if(capture) {
+        const uint64_t count=capture->experts();
+        if(pad&&(pad->dst_off.size()!=layers||pad->blob.size()!=layers||pad->stride.size()!=layers)) {
+            st.ok=false;st.error="expert observed padding shape mismatch";return st;
+        }
+        for(size_t l=0;l<layers;++l) {
+            const uint64_t per=layer_bytes[l]/count;
+            if(layer_bytes[l]%count||!capture->range_allowed(path,layer_off[l],per,count)||
+               (pad&&(pad->blob[l]!=per||pad->stride[l]<per||count>UINT64_MAX/pad->stride[l]||
+                pad->dst_off[l]>pad->total||pad->stride[l]*count>pad->total-pad->dst_off[l]))) {
+                st.ok=false;st.error="expert observed source/padding range invalid";return st;
+            }
+        }
+    }
     st.layers = layers;
     st.bytes = 0;
-    for (uint64_t b : layer_bytes) st.bytes += b;
+    for (uint64_t b : layer_bytes) {
+        if(capture&&b>UINT64_MAX-st.bytes){st.ok=false;st.error="expert observed byte count overflow";return st;}
+        st.bytes += b;
+    }
     if (threads < 1) threads = 1;
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -872,8 +933,14 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
         // short-read failures), so the guard is what keeps the closing correct on every path.
         struct Closer {
             FILE* f;
-            ~Closer() { if (f != nullptr) std::fclose(f); }
-        } closer{f};
+            ExpertSourceReadObserver* capture;
+            ~Closer() { if (f != nullptr && std::fclose(f)!=0 && capture) ExpertSourceReadObserver::close_failed(); }
+        } closer{f,capture};
+#if defined(__linux__)
+        if(capture&&!capture->validate_fd(path,fileno(f))) {
+            std::lock_guard<std::mutex> g(err_mu);err="expert reader descriptor differs from retained immutable input";return;
+        }
+#endif
         uint64_t read_ns = 0, copy_ns = 0;
         for (;;) {
             const uint64_t L = next_layer.fetch_add(1);
@@ -922,6 +989,14 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                                std::chrono::steady_clock::now() - t_copy).count();
                 pos += n;
                 remaining -= n;
+            }
+            if(capture) {
+                const uint64_t count=capture->experts();
+                const uint64_t per=layer_bytes[size_t(L)]/count;
+                if(layer_bytes[size_t(L)]%count||!capture->record(L,0,path,off,per,per,
+                    pad?pad->dst_off[size_t(L)]:off,pad?pad->stride[size_t(L)]:per,ExpertSourceTransfer::read_packed)) {
+                    std::lock_guard<std::mutex> g(err_mu);err="expert actual read/scatter receipt invalid";return;
+                }
             }
             layer_hash[(size_t) L] = h;
         }

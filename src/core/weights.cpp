@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <atomic>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -173,8 +175,42 @@ bool WeightTable::read_bf16_host(const std::string& name, std::vector<uint16_t>&
     return ok;
 }
 
+namespace { std::atomic<CanonicalLoadInventory*> failed_canonical_inventory{nullptr}; }
+bool WeightTable::enable_inventory_capture(const CanonicalInventoryLimits& limits,
+    std::shared_ptr<const ReservationLease> lease,std::shared_ptr<const VerifiedDriverBindings> inputs,
+    const std::string& expected_path,std::string& error) {
+    uint64_t required=0;
+    if(inventory_load_attempted_||retired_||hc_attempted_||inventory_){error="canonical inventory must be enabled once before load";return false;}
+    if(!canonical_inventory_host_bound(limits,required,error))return false;
+    if(!lease||lease->purpose()!=ReservationPurpose::foreground||lease->resources().host_bytes<required||
+       !inputs||expected_path.empty()||expected_path.size()>limits.max_string_bytes){error="canonical inventory requires reservation, bindings and bounded pack path";return false;}
+    try {
+        auto candidate=std::make_unique<CanonicalLoadInventory>();
+        candidate->metadata_reservation=std::move(lease);candidate->retained_input_bindings=std::move(inputs);
+        candidate->limits=limits;candidate->expected_pack_loader_path=expected_path;
+        candidate->records.reserve(size_t(limits.max_records));candidate->hc_records.reserve(size_t(limits.max_records));
+        inventory_=std::move(candidate);return true;
+    }catch(const std::bad_alloc&){error="canonical inventory allocation failed";return false;}
+}
+void WeightTable::quarantine_inventory() noexcept {
+    if(auto* p=inventory_.release()){
+        auto* head=failed_canonical_inventory.load();
+        do{p->quarantined_next=head;}while(!failed_canonical_inventory.compare_exchange_weak(head,p));
+    }
+}
+
 bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
                        const std::set<std::string>* skip) {
+    if(inventory_)load_complete_ = false;
+    inventory_load_attempted_ = true;
+    if (retired_ || hc_attempted_) { err = "cannot reload retired or HC-owned weight table"; return false; }
+    if (inventory_uncertain_) {err="cannot reload uncertain canonical inventory";return false;}
+    load_complete_ = false;
+    if(inventory_){
+        inventory_->records.clear();inventory_->hc_records.clear();inventory_->hc_completed=false;
+        inventory_->index_pool_bytes=inventory_->canonical_arena_bytes=inventory_->hc_allocation_bytes=0;
+        if(pack_dir!=inventory_->expected_pack_loader_path){err="canonical inventory pack argument differs from retained binding claim";return false;}
+    }
     const std::string path = pack_dir + "/index.txt";
     std::FILE* idx = std::fopen(path.c_str(), "rb");
     if (!idx) { err = "cannot open " + path + " (run tools/pack_index.py)"; return false; }
@@ -208,6 +244,27 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             std::fclose(idx);
             return false;
         }
+        if(inventory_){
+            auto& inv=*inventory_;
+            if(inv.records.size()>=inv.limits.max_records||std::strlen(name)>inv.limits.max_string_bytes||
+               kind<0||kind>5||!file_name(r.file)||r.ne0<=0||r.ne1<0||
+               uint64_t(r.ne0)>uint64_t(INT64_MAX)/uint64_t(r.ne1?r.ne1:1)||
+               r.src_bytes>UINT64_MAX-r.src_off||r.dst_bytes>UINT64_MAX-r.dst_off||
+               std::any_of(inv.records.begin(),inv.records.end(),[&](const auto& x){return x.name==name;})){
+                err="canonical inventory row bounds or duplicate identity refused";std::fclose(idx);return false;
+            }
+            try{
+                CanonicalTensorLoadRecord record;record.name=name;record.source_index_kind=kind;
+                record.normalized_kind=kind==4?1:(kind==5?3:kind);record.raw16=kind==4||kind==5;
+                record.file_id=r.file;record.source_offset=r.src_off;record.source_bytes=r.src_bytes;
+                record.index_destination_offset=r.dst_off;record.runtime_bytes=r.dst_bytes;
+                record.ne0=r.ne0;record.ne1=r.ne1;record.code_bits=r.code_bits;record.code_bias=r.code_bias;
+                record.group_elems=r.group_elems;record.activation_kind=r.act_kind;record.index_codebook=r.codebook;
+                record.index_has_offset=r.has_offset;record.index_scales_fp16=r.scales_fp16;
+                record.index_codes_bytes=r.codes_bytes;record.index_scales_bytes=r.scales_bytes;record.index_offsets_bytes=r.offset_bytes;
+                inv.records.push_back(std::move(record));
+            }catch(const std::bad_alloc&){err="canonical inventory row allocation failed";std::fclose(idx);return false;}
+        }
         r.name = name;
         // plan v0.3 P6: a standalone native pack (tools/iq_pack.py) stores 16-bit floats as they are in the GGUF:
         // index kinds 4 (BF16) and 5 (F16) are copied and take the engine forms of kinds 1 and 3
@@ -221,6 +278,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     std::fclose(idx);
 
     if (pool == 0 || rows.empty()) { err = "index.txt has no header or no rows"; return false; }
+    if(inventory_){inventory_->index_pool_bytes=pool;inventory_->index_alignment=align;}
     // Plan v0.3 P1: a skip set compacts the arena.  Kept rows are re-placed in index order at the index's
     // alignment; skipped rows keep their metadata and get no bytes.
     std::vector<bool> skipped(rows.size(), false);
@@ -229,6 +287,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         uint64_t at = 0;
         for (size_t i = 0; i < rows.size(); ++i) {
             if (skip->count(rows[i].name)) { skipped[i] = true; continue; }
+            if(inventory_&&(rows[i].dst_bytes>UINT64_MAX-(a-1)||
+               ((rows[i].dst_bytes+a-1)/a)*a>UINT64_MAX-at)) {err="canonical inventory compacted arena overflow";return false;}
             rows[i].dst_off = at;
             at += (rows[i].dst_bytes + a - 1) / a * a;
         }
@@ -239,6 +299,11 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         return false;
     }
 
+    if(inventory_){
+        inventory_->canonical_arena_bytes=pool;
+        for(size_t i=0;i<rows.size();++i){auto& record=inventory_->records[i];record.chosen=!skipped[i];record.runtime_offset=rows[i].dst_off;
+            if(record.chosen&&(rows[i].dst_off>arena_bytes||rows[i].dst_bytes>arena_bytes-rows[i].dst_off)){err="canonical inventory destination outside arena";return false;}}
+    }
     // Two pinned staging buffers, both reused.  Pinned because a 5 GB pageable upload spends its time in the
     // driver copying through a bounce buffer, and bounded by CHUNK rather than by the largest tensor.
     //
@@ -252,13 +317,16 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     // STAGE_OUT IS TWICE STAGE_IN because a conversion can now GROW: widening an fp16 scale plane to f32
     // doubles it.  Sized at CHUNK it would have written 8 MiB past the end of a pinned allocation for every
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
+    bool inventory_cleanup_failed=false;
+    auto release_stage=[&](void* p){const auto rc=cudaFreeHost(p);if(inventory_&&rc!=cudaSuccess)inventory_cleanup_failed=true;return rc;};
+    if(inventory_)inventory_uncertain_=true;
     void* stage_in = nullptr;
     void* stage_out = nullptr;
     if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
         err = "cudaHostAlloc for the staging buffers failed";
-        if (stage_in) cudaFreeHost(stage_in);
-        if (stage_out) cudaFreeHost(stage_out);
+        if (stage_in) release_stage(stage_in);
+        if (stage_out) release_stage(stage_out);
         return false;
     }
 
@@ -302,7 +370,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         if (r.code_bits != 0 && r.dst_bytes == 0) {
             // plan v0.3 P6: a native pack's row that carries a shape only - the GGUF form must serve it
             err = r.name + ": this pack holds the tensor only in its GGUF form (run with --native SHARD1)";
-            cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+            release_stage(stage_in); release_stage(stage_out);
             return false;
         }
         if (r.file != cur_file) {
@@ -310,7 +378,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             const char* fn = file_name(r.file);
             const std::string p = pack_dir + "/" + (fn ? fn : "?");
             cur = std::fopen(p.c_str(), "rb");
-            if (!cur) { err = "cannot open " + p; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+            if (!cur) { err = "cannot open " + p; release_stage(stage_in); release_stage(stage_out); return false; }
             cur_file = r.file;
 #if !defined(_WIN32)
             // ask for this file's remaining rows up front so their reads overlap
@@ -366,7 +434,12 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             }
             segs[n_segs++] = Seg{0, r.src_bytes, 0, r.dst_bytes, c};
         }
-        for (int i = 0; i < n_segs; ++i) { sum_src += segs[i].src_bytes; sum_dst += segs[i].dst_bytes; }
+        if(inventory_)for(int i=0;i<n_segs;++i){const auto& seg=segs[i];
+            if(seg.src_off>r.src_bytes||seg.src_bytes>r.src_bytes-seg.src_off||seg.dst_off>r.dst_bytes||seg.dst_bytes>r.dst_bytes-seg.dst_off||
+               seg.src_bytes>UINT64_MAX-sum_src||seg.dst_bytes>UINT64_MAX-sum_dst){bad=true;err="canonical inventory plane extent overflow";break;}
+            sum_src+=seg.src_bytes;sum_dst+=seg.dst_bytes;
+        }
+        else for (int i = 0; i < n_segs; ++i) { sum_src += segs[i].src_bytes; sum_dst += segs[i].dst_bytes; }
         // The segment list is this loop's own idea of the layout, and it is the ONLY thing standing between a
         // mis-sized plane and a wrong byte offset.  It is checked against both recorded totals, not trusted.
         if (!bad && (sum_src != r.src_bytes || sum_dst != r.dst_bytes)) {
@@ -379,14 +452,16 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             err = buf;
             bad = true;
         }
-        if (bad) { cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+        if (bad) { release_stage(stage_in); release_stage(stage_out); return false; }
 
+        if(inventory_){auto& record=inventory_->records[row_i];record.plane_count=uint32_t(n_segs);
+            for(int j=0;j<n_segs;++j){const auto& seg=segs[j];record.planes[size_t(j)]={seg.src_off,seg.src_bytes,seg.dst_off,seg.dst_bytes,static_cast<CanonicalPlaneConversion>(seg.conv)};}}
         for (int si = 0; si < n_segs; ++si) {
             const Seg& s = segs[si];
             const bool widening = (s.conv == Conv::WidenF16);
             if (widening && (s.src_bytes & 1ull)) {
                 err = r.name + ": an fp16 plane with an odd source byte count";
-                cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                release_stage(stage_in); release_stage(stage_out);
                 return false;
             }
             uint64_t done = 0;
@@ -395,11 +470,11 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                 // WIDENING NEVER SPLITS AN ELEMENT.  CHUNK is even, so a full chunk cannot, but the tail of a
                 // plane whose length is odd would - and half an fp16 is a plausible-looking scale.
                 if (widening && (n & 1ull)) {
-                    if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+                    if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; release_stage(stage_in); release_stage(stage_out); return false; }
                     n -= 1;
                 }
                 if (!read_at(cur, r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    release_stage(stage_in); release_stage(stage_out);
                     return false;
                 }
                 const uint8_t* src = (const uint8_t*) stage_in;
@@ -463,7 +538,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                 if (cudaMemcpy(dst_base + r.dst_off + out_at, host_src, out_bytes, cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
                     err = "cudaMemcpy failed for " + r.name;
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    release_stage(stage_in); release_stage(stage_out);
                     return false;
                 }
                 upload_ms += now_ms() - u0;
@@ -500,13 +575,16 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         }
     }
     if (cur) std::fclose(cur);
-    cudaFreeHost(stage_in);
-    cudaFreeHost(stage_out);
+    release_stage(stage_in);
+    release_stage(stage_out);
 
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    if(inventory_cleanup_failed){err="canonical inventory staging retirement uncertain";return false;}
+    inventory_uncertain_=false;
+    load_complete_ = true;
     return true;
 }
 
@@ -524,36 +602,68 @@ void WeightTable::hc_q8_names(int64_t n_layers, std::set<std::string>& out) {
 
 bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::string& err) {
     bytes = 0;
+    const bool canonical_ready=load_complete_;
+    if(inventory_)load_complete_=false;
+    if (!canonical_ready || retired_ || inventory_uncertain_) { err = "HC load requires a completed canonical load"; return false; }
+    if(inventory_&&pack_dir!=inventory_->expected_pack_loader_path){err="HC pack argument differs from canonical binding claim";return false;}
+    if (hc_attempted_) { bytes = hc_bytes_; load_complete_=canonical_ready; return true; }
+    hc_attempted_ = true;
+    load_complete_ = false;
     std::vector<WeightRef*> todo;
     for (auto& [name, w] : table_) {
         const bool hc = name.find(".hc_attn_down.") != std::string::npos || name.find(".hc_attn_up.") != std::string::npos ||
                         name.find(".hc_ffn_down.") != std::string::npos || name.find(".hc_ffn_up.") != std::string::npos;
         if (!hc || w.resident) continue;
         // the pack holds BF16 either promoted to f32 (4 B/elem) or as it is in the GGUF (a native pack, 2 B/elem)
-        if (w.kind != WeightKind::Bf16InF32 || w.ne0 % 32 != 0 ||
+        if (w.kind != WeightKind::Bf16InF32 || w.ne0 <= 0 || w.ne0 % 32 != 0 || w.elements <= 0 || w.elements % 32 != 0 ||
+            uint64_t(w.elements) > UINT64_MAX / 4 ||
             (w.src_bytes != (uint64_t) w.elements * 4 && w.src_bytes != (uint64_t) w.elements * 2)) {
             err = "STRATA_HC_REQ8: " + name + " is not a BF16 tensor of whole 32-value blocks";
             return false;
         }
         todo.push_back(&w);
     }
-    if (todo.empty()) return true;
+    if (todo.empty()) { if(inventory_)inventory_->hc_completed=true; load_complete_ = true; return true; }
     auto al = [](uint64_t b) { return (b + 255) & ~(uint64_t) 255; };
     uint64_t total = 0;
-    for (const WeightRef* w : todo) total += al((uint64_t) w->elements) + al((uint64_t) w->elements / 32 * 4);
+    for (const WeightRef* w : todo) {
+        const auto codes = al(uint64_t(w->elements)), scales = al(uint64_t(w->elements) / 32 * 4);
+        if (scales > UINT64_MAX - codes || codes + scales > UINT64_MAX - total) {
+            err = "HC allocation size overflow"; return false;
+        }
+        total += codes + scales;
+    }
+    std::vector<WeightRef> staged;
+    staged.reserve(todo.size());
+    if(inventory_)inventory_uncertain_=true;
+    if (cudaGetDevice(&hc_device_) != cudaSuccess) { err = "HC owning device unavailable"; return false; }
     uint8_t* dev = nullptr;
     if (cudaMalloc((void**) &dev, total) != cudaSuccess) { err = "STRATA_HC_REQ8: cudaMalloc failed"; return false; }
+    hc_allocation_ = dev;
+    hc_bytes_ = total;
     std::vector<float> src;
     std::vector<int8_t> q;
     std::vector<float> sc;
     uint64_t at = 0;
     for (WeightRef* w : todo) {
+        const CanonicalTensorLoadRecord* canonical_row=nullptr;
+        if(inventory_){
+            const auto row=std::find_if(inventory_->records.begin(),inventory_->records.end(),[&](const auto& r){auto it=table_.find(r.name);return it!=table_.end() && &it->second==w;});
+            if(row==inventory_->records.end()||row->chosen||row->file_id!=w->file_id||row->source_offset!=w->src_off||row->source_bytes!=w->src_bytes||
+               row->normalized_kind!=int(w->kind)||row->ne0!=w->ne0||row->ne1!=w->ne1||row->code_bits!=w->code_bits||row->code_bias!=w->code_bias||
+               row->group_elems!=w->group_elems||row->activation_kind!=w->act_kind||bool(row->index_codebook)!=w->codebook_iq4nl||
+               bool(row->index_has_offset)!=w->has_offset||bool(row->index_scales_fp16)!=w->scales_fp16||row->index_codes_bytes!=w->codes_bytes||
+               row->index_scales_bytes!=w->scales_bytes||row->index_offsets_bytes!=w->offset_bytes){err="HC dependency differs from actual canonical row";return false;}
+            canonical_row=&*row;
+        }
+        src.resize((size_t) w->elements);
         const char* fn = file_name(w->file_id);
         const std::string path = pack_dir + "/" + (fn ? fn : "?");
         std::FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) { err = "STRATA_HC_REQ8: cannot open " + path; return false; }
-        src.resize((size_t) w->elements);
+        std::unique_ptr<std::FILE, decltype(&std::fclose)> source_file(f, &std::fclose);
         const bool raw16 = w->src_bytes == (uint64_t) w->elements * 2;
+        if(canonical_row&&canonical_row->raw16!=raw16){err="HC source encoding differs from original index kind";return false;}
 #if defined(_WIN32)
         bool ok = _fseeki64(f, (long long) w->src_off, SEEK_SET) == 0;
 #else
@@ -569,7 +679,7 @@ bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::
         } else if (ok) {
             ok = std::fread(src.data(), 4, src.size(), f) == src.size();
         }
-        std::fclose(f);
+        source_file.reset();
         if (!ok) { err = "STRATA_HC_REQ8: cannot read the source bytes"; return false; }
         const size_t nb = src.size() / 32;
         q.resize(src.size());
@@ -581,6 +691,12 @@ bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::
             sc[b] = d;
             for (int j = 0; j < 32; ++j) q[b * 32 + j] = (int8_t) std::nearbyint(src[b * 32 + j] * id);
         }
+        CanonicalHcLoadRecord receipt;
+        if(inventory_){
+            receipt.canonical_row=uint64_t(canonical_row-inventory_->records.data());
+            receipt.conversion=raw16?CanonicalHcConversion::bf16_raw16_to_q8_host:CanonicalHcConversion::bf16_in_f32_to_q8_host;
+            receipt.codes_offset=at;receipt.codes_bytes=q.size();receipt.scales_offset=at+al(q.size());receipt.scales_bytes=sc.size()*4;
+        }
         uint8_t* codes = dev + at;
         at += al(q.size());
         float* scales = (float*) (dev + at);
@@ -590,13 +706,56 @@ bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::
             err = "STRATA_HC_REQ8: upload failed";
             return false;
         }
-        w->data = codes;
-        w->q8_scale = scales;
-        w->resident = true;
-        w->bytes = q.size() + sc.size() * 4;
+        WeightRef converted = *w;
+        converted.data = codes;
+        converted.q8_scale = scales;
+        converted.resident = true;
+        converted.bytes = q.size() + sc.size() * 4;
+        staged.push_back(converted);
+        if(inventory_)inventory_->hc_records.push_back(receipt);
     }
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = "HC load drain failed"; return false; }
+    for (size_t i = 0; i < todo.size(); ++i) *todo[i] = staged[i];
+    if(inventory_){inventory_->hc_completed=true;inventory_->hc_allocation_bytes=total;}
+    inventory_uncertain_=false;
+    load_complete_ = true;
     bytes = total;
     return true;
+}
+
+bool WeightTable::owns_auxiliary_span(const void* pointer, uint64_t bytes) const {
+    if (!load_complete_ || retired_ || !hc_allocation_ || !pointer || !bytes) return false;
+    const auto base = reinterpret_cast<uintptr_t>(hc_allocation_), p = reinterpret_cast<uintptr_t>(pointer);
+    return p >= base && p - base <= hc_bytes_ && bytes <= hc_bytes_ - (p - base);
+}
+
+bool WeightTable::release_auxiliary_checked(std::string& err) {
+    retired_ = true;
+    load_complete_ = false;
+    if (release_failed_) { err = "HC release previously failed"; return false; }
+    if (!hc_allocation_) return true;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device != hc_device_) {
+        err = "HC release requires owning device"; return false;
+    }
+    if (cudaFree(hc_allocation_) != cudaSuccess) {
+        release_failed_ = true; err = "HC release failed; retain allocation"; return false;
+    }
+    hc_allocation_ = nullptr; hc_bytes_ = 0;
+    return true;
+}
+
+WeightTable::~WeightTable() {
+    struct ReceiptGuard {WeightTable* table;~ReceiptGuard(){if(table->inventory_uncertain_||table->release_failed_||table->hc_allocation_)table->quarantine_inventory();}} guard{this};
+    if (!hc_allocation_ || release_failed_) return;
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess) return;
+    if (previous != hc_device_ && cudaSetDevice(hc_device_) != cudaSuccess) return;
+    try {
+        std::string err;
+        if (cudaDeviceSynchronize() == cudaSuccess) release_auxiliary_checked(err);
+    } catch (...) {}
+    if (previous != hc_device_ && cudaSetDevice(previous) != cudaSuccess && inventory_) inventory_uncertain_=true;
 }
 
 }  // namespace strata::core

@@ -1,6 +1,7 @@
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/diagnostic_readers.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/numa_pool.hpp"
@@ -684,9 +685,9 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 }
 
 namespace {
-std::atomic<const ExpertPool*> g_diag_pool{nullptr};
+strata::core::DiagnosticReaders<ExpertPool> g_pool_readers;
 void diag_active_pool(std::FILE* f) {
-    if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
+    if (auto p = g_pool_readers.acquire_latest()) p->diag(f);
 }
 int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -849,8 +850,6 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
-    g_diag_pool.store(this);
-    strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
     // STRATA_NUMA_SPLIT: decided here, before any worker starts (a worker counts into its slice's `parked` from its
@@ -933,6 +932,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             worker(i);
         });
     }
+    (void) g_pool_readers.publish(this);   // publish only after construction succeeds
+    strata::core::diag_pool_fn().store(&diag_active_pool);
 }
 
 std::string ExpertPool::placement_line() const {
@@ -946,8 +947,7 @@ std::string ExpertPool::placement_line() const {
 }
 
 ExpertPool::~ExpertPool() {
-    const ExpertPool* self = this;
-    g_diag_pool.compare_exchange_strong(self, nullptr);
+    g_pool_readers.retire(this);   // drain readers before member mutation and worker joins
     if (g_numa_owner == this) {
         g_numa_plan = NumaSplitPlan{};
         g_numa_owner = nullptr;

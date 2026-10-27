@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <string>
+#include <memory>
 
 namespace strata::kernels {
 
@@ -166,6 +167,18 @@ struct PleIoOptions {
 
 /// The PLE table.  Held by pointer-to-impl so this header does not drag `<windows.h>` into every
 /// translation unit that wants the hash.
+class PleReadContext;
+// Actual resolved table metadata, observed under the table lifecycle lock.
+// Caller retains the table and its verified input owner; this is not file
+// authentication or permission to read concurrently with retirement.
+struct PleResolvedTable {
+    PleFormat format=PleFormat::IQ4_NL;
+    PleIo mode=PleIo::Mmap;
+    float scale=1.0f;
+    uint32_t row_bytes=0;
+    uint64_t rows=0,source_offset=0,source_bytes=0,generation=0;
+};
+
 class PleTable {
 public:
     PleTable();
@@ -204,6 +217,8 @@ public:
     uint64_t rows() const;
     /// "IQ4_NL" or "F8_E4M3" (a GGUF from tools/ple_fp8_pack.py: type I8, strata.ple.format = f8_e4m3).
     const char* format() const;
+    // Refuses a closed/uncertain table without changing output. No allocation.
+    bool resolved_table(PleResolvedTable& out) const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values
     /// occupy `out[h*160, (h+1)*160)`, which is what `ggml_get_rows` does and what makes the result a plain
@@ -221,8 +236,28 @@ public:
     PleIo mode() const;
 
 private:
+    friend class PleReadContext;
     struct Impl;
     Impl* impl_ = nullptr;
+};
+
+// One window's pending token rows. Retains the shared table/cache owner while
+// giving each window its own ticket, raw output and row indices. Close/reopen
+// fences old contexts. Destruction joins an outstanding read before freeing its
+// output buffer; the executor should collect explicitly at its IO drain cut.
+class PleReadContext {
+public:
+    explicit PleReadContext(std::shared_ptr<PleTable>, std::shared_ptr<const void> lifetime_guard = {});
+    ~PleReadContext();
+    PleReadContext(const PleReadContext&) = delete;
+    PleReadContext& operator=(const PleReadContext&) = delete;
+    bool issue(const uint32_t* rows16);
+    bool collect(float* out2560, std::string& error);
+    bool pending() const;
+    PleTable* table() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 // ================================ THE PLE GATHER'S PREFETCH, AND ITS A/B ARM ================================

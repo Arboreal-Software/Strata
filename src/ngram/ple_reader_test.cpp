@@ -1,3 +1,6 @@
+#ifdef STRATA_TEST_WINDOW_PLE
+#include "strata/core/window_ple.hpp"
+#endif
 // src/ngram/ple_reader_test.cpp - plan v0.3 P2: the direct SSD row reader against ground truth.
 //
 //   ple_reader_test --selftest [--dir D]        synthetic table file; CPU and disk only, no model, no GPU
@@ -8,6 +11,7 @@
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
 #include "strata/kernels/ngram.hpp"
 #include "strata/ngram/ple_reader.hpp"
+#include "strata/ngram/ticket_id.hpp"
 #include "strata/platform/direct_file.hpp"
 
 #include <chrono>
@@ -345,6 +349,124 @@ void all_formats_round_trip(const std::string& dir) {
 // row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (#296, OrcaRouter's Q5_0 PLE rows) is
 // run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific, so a second row
 // size run here is the correctness evidence for lifting ngram.cpp's "Q5_0 PLE requires --ple-io mmap" refusal.
+void context_round_trip(const std::string& dir) {
+    const auto& format=k::ple_format_info(k::PleFormat::IQ4_NL);
+    const auto path=write_format_table(dir,format,256);
+    for(auto mode:{k::PleIo::Direct,k::PleIo::Mmap})for(bool threaded:{false,true}) {
+        auto table=std::make_shared<k::PleTable>();std::weak_ptr<k::PleTable> lifetime=table;
+        k::PleIoOptions options;options.mode=mode;options.io_thread=threaded;options.cache_rows=32;options.max_inflight=4;
+        std::string error;
+        const bool opened=table->open(path,error,options);CHECK(opened,"context table open: %s",error.c_str());if(!opened)continue;
+
+#ifdef STRATA_TEST_WINDOW_PLE
+        {
+            namespace c=strata::core;
+            c::WindowResources capacity;capacity.device_bytes={0};capacity.host_bytes=c::private_ple_host_headroom;
+            capacity.io_slots=c::private_ple_io_slots;capacity.shadows=1;
+            c::WindowResources baseline;baseline.device_bytes={0};
+            c::WindowBudget budget(capacity,baseline);
+            auto session_resources=baseline;session_resources.shadows=1;
+            auto session_reservation=budget.reserve(session_resources,c::ReservationPurpose::private_work).lease;
+            c::PleRun run;float buffer=0;int32_t token=0;uint16_t weight=0;
+            run.token=&token;run.prev=&token;run.hist=&buffer;
+            run.emb_host=&buffer;run.emb_dev=&buffer;run.scratch=&buffer;
+            k::PleWeights weights;weights.key_bf16=&weight;weights.value_bf16=&weight;
+            weights.norm_key=&buffer;weights.norm_query=&buffer;weights.norm_conv=&buffer;
+            weights.conv1d_f16=&weight;
+            auto owner=std::make_shared<int>(1);std::weak_ptr<int> weight_lifetime=owner;
+            auto mutable_weights=weights;mutable_weights.pre_key=&buffer;
+            CHECK(!c::bind_private_ple(run,table,mutable_weights,k::ple_artifact_consts(),owner,budget,session_reservation,error),
+                  "borrowed mutable PLE projection rejected");
+            CHECK(!run.table&&!run.read_context&&budget.snapshot().reserved.io_slots==0,
+                  "rejected binding is transactional");
+            auto native_weights=weights;native_weights.key_bf16=nullptr;
+            native_weights.key_native_data=&weight;native_weights.key_native_type=42;
+            CHECK(!c::bind_private_ple(run,table,native_weights,k::ple_artifact_consts(),owner,budget,session_reservation,error),
+                  "native key without destination scratch refused");
+            run.w.key_native_q8_1=&buffer;
+            native_weights.key_native_type=-1;
+            CHECK(!c::bind_private_ple(run,table,native_weights,k::ple_artifact_consts(),owner,budget,session_reservation,error),
+                  "unsupported native key format refused");
+            native_weights.key_native_type=42;
+            weights=native_weights;
+            CHECK(c::bind_private_ple(run,table,weights,k::ple_artifact_consts(),owner,budget,session_reservation,error),
+                  "private PLE budgeted binding: %s",error.c_str());
+            if(!run.read_context)continue;
+            CHECK(run.ready()&&run.w.key_native_q8_1==&buffer&&budget.snapshot().reserved.io_slots==c::private_ple_io_slots,
+                  "private context owns full pending row capacity");
+            c::PleRun other=run;other.table=nullptr;other.read_context.reset();
+            CHECK(!c::bind_private_ple(other,table,weights,k::ple_artifact_consts(),owner,budget,session_reservation,error)&&!other.table,
+                  "second context refused before mutating destination when budget is exhausted");
+            session_reservation.reset();
+            CHECK(budget.snapshot().reserved.shadows==1,"attachment retains parent shadow without double charging");
+            owner.reset();CHECK(!weight_lifetime.expired(),"bound context retains immutable weight owner");
+            auto pending=run.read_context;run.read_context.reset();
+            uint32_t rows[k::PLE_N_HEADS]={};CHECK(pending->issue(rows),"retained context starts real IO");
+            CHECK(budget.snapshot().reserved.host_bytes==c::private_ple_host_headroom,
+                  "retained pending context keeps reservation after session drops reference");
+            pending.reset();
+            CHECK(weight_lifetime.expired()&&budget.snapshot().reserved.host_bytes==0&&budget.snapshot().reserved.io_slots==0&&budget.snapshot().reserved.shadows==0,
+                  "last context drains and releases both immutable owner and budget");
+        }
+#endif
+        auto a=std::make_unique<k::PleReadContext>(table),b=std::make_unique<k::PleReadContext>(table);
+        uint32_t rows_a[k::PLE_N_HEADS],rows_b[k::PLE_N_HEADS];
+        float out_a[k::NG_N_EMBD],out_b[k::NG_N_EMBD],legacy[k::NG_N_EMBD];
+        for(int h=0;h<k::PLE_N_HEADS;++h){rows_a[h]=uint32_t(32+h);rows_b[h]=uint32_t(64+h);}
+        CHECK(a->issue(rows_a)&&b->issue(rows_b),"two independent context reads admitted");
+        CHECK(!a->issue(rows_b),"uncollected context cannot overwrite its pending rows");
+        table->gather(rows_a,legacy);
+        CHECK(b->collect(out_b,error)&&a->collect(out_a,error),"reverse-order independent collection: %s",error.c_str());
+        CHECK(std::memcmp(out_a,legacy,sizeof out_a)==0,"owned read agrees with legacy gather while both contexts are pending");
+        uint8_t raw[k::PLE_ROW_BYTES_MAX];float expected[k::PLE_HEAD_DIM];
+        for(int h=0;h<k::PLE_N_HEADS;++h){
+            expected_row(rows_b[h],format.row_bytes,raw);format.dequant(raw,1.0f,expected);
+            CHECK(std::memcmp(out_b+size_t(h)*k::PLE_HEAD_DIM,expected,sizeof expected)==0,"second context retains its own row %d",h);
+        }
+        CHECK(!a->collect(out_a,error),"duplicate collect rejected");
+        CHECK(a->issue(rows_a),"context can issue after collection");
+        table->close();out_a[0]=-777;
+        CHECK(!a->collect(out_a,error)&&out_a[0]==-777,"close invalidates pending read without publishing output");
+        CHECK(table->open(path,error,options),"reopen shared table: %s",error.c_str());
+        CHECK(!a->issue(rows_a)&&!b->issue(rows_b),"old contexts cannot issue into reopened backing");
+        auto fresh=std::make_unique<k::PleReadContext>(table);
+        if(mode==k::PleIo::Direct)table->set_injected_delay_us(2000);
+        CHECK(fresh->issue(rows_b),"fresh generation context starts a read");
+        table.reset();CHECK(!lifetime.expired(),"contexts retain shared table lifetime");
+        a.reset();b.reset();CHECK(!lifetime.expired(),"last pending context retains backing");
+        fresh.reset();CHECK(lifetime.expired(),"pending destruction drains before releasing final table owner");
+    }
+    std::printf("per-window PLE contexts: direct/mmap, threaded/synchronous: checked\n");
+}
+
+void failure_round_trip(const std::string& dir) {
+    const auto path=dir+"/ple_failed_reader.bin";
+    for(bool threaded:{false,true}) {
+        CHECK(make_table(path,256,ng::ROW_BYTES),"write failure fixture");
+        ng::PleReader reader;std::string error;
+        CHECK(reader.open(path,HEADER,256,4,0,error,threaded),"open failure fixture");
+        // Real short read, no synthetic completion or mocked reader.
+        std::filesystem::resize_file(path,0);
+        uint32_t row=64;uint8_t output[ng::ROW_BYTES]={};
+        const auto ticket=reader.issue(&row,1,output);
+        CHECK(!reader.collect(ticket,error),"truncated file reports IO failure");
+        error.clear();
+        CHECK(!reader.collect(ticket,error)&&error=="PleReader: unknown ticket","failed drained ticket consumed exactly once");
+        std::memset(output,0x5a,sizeof output);bool refused=false;
+        try{(void)reader.issue(&row,1,output);}catch(const std::runtime_error&){refused=true;}
+        CHECK(refused,"failed reader rejects submission before queue mutation");
+        for(auto byte:output)CHECK(byte==0x5a,"failed submission leaves output unchanged");
+        reader.close();refused=false;
+        try{(void)reader.issue(&row,1,output);}catch(const std::runtime_error&){refused=true;}
+        CHECK(refused,"closed reader rejects submission");
+        CHECK(make_table(path,256,ng::ROW_BYTES),"restore failed backing file");
+        CHECK(reader.open(path,HEADER,256,4,0,error,threaded),"reopen drained reader");
+        const auto fresh=reader.issue(&row,1,output);
+        CHECK(reader.collect(fresh,error),"reopened reader succeeds");
+    }
+    std::puts("PLE failed-ticket retirement and reader recovery: checked");
+}
+
 int selftest(const std::string& dir, uint32_t rb) {
     const uint32_t N = 500000;                          // 45 MB: large enough for thousands of distinct pages
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
@@ -402,10 +524,15 @@ int selftest(const std::string& dir, uint32_t rb) {
         rd.set_injected_delay_us(3000);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
+        const auto reads_before = rd.snapshot().reads;
         const double t0 = now_us();
         check_rows(rd, rows, N, rb, "delayed");
-        CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
-        CHECK(rd.stats().late_injected > 0, "no read was held back");
+        const double elapsed = now_us() - t0;
+        CHECK(elapsed >= 3000, "injected delay not observed (%.0f us)", elapsed);
+        CHECK(rd.snapshot().reads > reads_before, "delayed ticket performed no reads");
+        // late_injected counts only completions that arrive before the delay
+        // deadline. Real I/O may already take >=3ms, requiring no extra hold;
+        // the delivery floor and unchanged row bytes are still mandatory.
     }
     // keep-alive: while rows are asked for, a page goes out after `period` without a read; it stops once the
     // window after the last issue has passed, starts again with the next issue (even one the row cache serves),
@@ -556,6 +683,14 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) {
+        uint32_t ticket_boundary=UINT32_MAX;
+        CHECK(ng::detail::take_ticket_id(ticket_boundary)==UINT32_MAX&&ticket_boundary==0,"final ticket ID is issued once");
+        bool exhausted=false;
+        try {(void)ng::detail::take_ticket_id(ticket_boundary);}catch(const std::overflow_error&){exhausted=true;}
+        CHECK(exhausted&&ticket_boundary==0,"exhaustion cannot recycle a live or completed ticket ID");
+        failure_round_trip(dir);
+        context_round_trip(dir);
+        if (g_fail != 0) return 1;
         // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (#296, OrcaRouter's Q5_0 PLE rows) through the
         // same generic row_bytes path -- see the comment on selftest().
         all_formats_round_trip(dir);               // every format of k::ple_formats(), both readers, vs its dequantizer

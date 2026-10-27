@@ -1,5 +1,6 @@
 // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/expert_retirement.hpp"
 
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -123,7 +124,9 @@ void PeerExperts::close() {
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-                       std::string& err) {
+                       std::string& err, ExpertTierOpenObserver* observer) {
+    ExpertTierOpenTransaction observation(observer);
+    if(!observation.valid(ranked.size())) {err="peer open observer storage/callbacks invalid";return false;}
     close();
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
@@ -196,13 +199,18 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     std::vector<std::pair<int32_t, int32_t>> pick;
     std::vector<int64_t> sizes;
     uint64_t used = 0;
-    for (const auto& pr : ranked) {
+    bool observation_full=false;
+    for (size_t rank=0;rank<ranked.size();++rank) {
+        const auto& pr=ranked[rank];
+        auto* decision=observation.append(rank,pr.first,pr.second);
+        if(observer&&!decision){err="peer open observation overflow";close();return false;}
         if (primary.slot_of(pr.first, pr.second) >= 0) continue;
         const uint64_t b = lay.blob_bytes(pr.first);
         const uint64_t b256 = lay.native ? (b + 255) / 256 * 256 : lay.max_blob;
-        if (used + b256 > budget) break;
-        if (max_slots > 0 && (int64_t) pick.size() >= max_slots) break;
+        if (used + b256 > budget) {observation_full=true;if(decision)decision->outcome=ExpertTierOpenOutcome::skipped_full;break;}
+        if (max_slots > 0 && (int64_t) pick.size() >= max_slots) {observation_full=true;if(decision)decision->outcome=ExpertTierOpenOutcome::skipped_full;break;}
         used += b256;
+        if(decision)decision->outcome=ExpertTierOpenOutcome::pending_copy;
         pick.push_back(pr);
         sizes.push_back((int64_t) b);
     }
@@ -216,16 +224,22 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     // mapped reads: advise the next kAhead pairs so their reads overlap
     constexpr size_t kAhead = 256;
     const bool advise = src.advise_pairs(pick.data(), (int64_t) std::min(kAhead, pick.size()));
+    size_t observation_cursor=0;
     for (size_t i = 0; i < pick.size(); ++i) {
         const auto& pr = pick[i];
         if (advise && i + kAhead < pick.size()) (void) src.advise_pairs(&pick[i + kAhead], 1);
+        auto* decision=observation.selected(observation_cursor);
+        if(observer&&!decision){err="peer open selected observation missing";close();return false;}
+        const bool previously_resident=observer&&cache_.slot_of(pr.first,pr.second)>=0;
+        uint64_t submitted_bytes=0;
         const int32_t slot = cache_.admit(pr.first, pr.second);
         const uint8_t* b = src.blob(pr.first, pr.second);
-        if (slot < 0 || b == nullptr || !cache_.fill_slot(slot, b, refill_, err, (int64_t) lay.blob_bytes(pr.first))) {
+        if (slot < 0 || b == nullptr || !cache_.fill_slot(slot, b, refill_, err, (int64_t) lay.blob_bytes(pr.first),observer?&submitted_bytes:nullptr)) {
             err = "peer experts: fill failed: " + err;
             close();
             return false;
         }
+        if(decision){decision->slot=slot;decision->bytes=submitted_bytes;decision->outcome=previously_resident?ExpertTierOpenOutcome::already_resident:ExpertTierOpenOutcome::copied;}
         src.note_async_read(b, refill_);   // #1237
         res_[(size_t) (pr.first * n_expert + pr.second)] = slot;
     }
@@ -237,6 +251,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         close();
         return false;
     }
+    if(!observation.publish(device,n_layers,n_expert,uint64_t(cache_.slots()),observation_full,uint64_t(cache_.slot_guard()),cache_.per_layer_admission())){err="peer open observation refused";close();return false;}
     resident_ = (int64_t) pick.size();
     return true;
 }
@@ -377,9 +392,16 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
 }
 
-void PeerExperts::apply_pending(bool wait) {
+void PeerExperts::apply_pending(bool wait) { apply_pending(wait,false); }
+
+void PeerExperts::apply_pending(bool wait,bool checked_completion) {
     if (pending_.empty()) return;
-    {
+    if(checked_completion) {
+        ExpertResourceDevice on(true,device_);
+        const auto result=wait?cudaEventSynchronize(refill_ev_):cudaEventQuery(refill_ev_);
+        if(!wait && result==cudaErrorNotReady)return;
+        retirement_check(true,result,"peer expert adaptation completion");
+    } else {
         On on(device_);
         if (wait) cudaEventSynchronize(refill_ev_);
         else if (cudaEventQuery(refill_ev_) != cudaSuccess) return;

@@ -4,6 +4,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/diagnostic_readers.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #if defined(_WIN32)
@@ -267,16 +268,16 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
 }  // namespace
 
 namespace {
-std::atomic<const Verifier*> g_diag_verifier{nullptr};
+constexpr int kLiveMax = 16;
+DiagnosticReaders<Verifier, kLiveMax> g_verifier_readers;
 void diag_active_verifier(std::FILE* f) {
-    if (const Verifier* v = g_diag_verifier.load()) v->diag(f);
+    if (auto v = g_verifier_readers.acquire_latest()) v->diag(f);
 }
 // #267: every live verifier (a layer split has one per stage), for the release before the engine ends
-constexpr int kLiveMax = 16;
-std::atomic<Verifier*> g_live[kLiveMax];
+
 void release_live_verifiers(std::FILE* f) {
-    for (auto& slot : g_live)
-        if (Verifier* v = slot.load()) {
+    for (int index = 0; index < kLiveMax; ++index)
+        if (auto v = g_verifier_readers.acquire((size_t) index)) {
             const Clock::time_point t0 = Clock::now();
             const bool done = v->release_gpu_waits(5000);
             if (f != nullptr)
@@ -411,15 +412,22 @@ void Verifier::diag(std::FILE* f) const {
     trace_dump(f);   // #649: STRATA_VERIFY_TRACE=1 only
 }
 
+bool Verifier::set_strict_retirement(bool enabled, std::string& error) {
+    if (retirement_init_started_) { error = "strict retirement must be configured before init"; return false; }
+    if (enabled) { error = "strict retirement is unsupported by SYCL"; return false; }
+    strict_retirement_ = enabled;
+    return true;
+}
+
+// SYCL has no validated runtime policy producer yet.
+RouteTailPolicyObservation Verifier::route_tail_policy() const noexcept {
+    return observe_tail_skip_policy();
+}
+
 Verifier::~Verifier() try {
     // SYCL port: at process exit the Level Zero context can already be gone (serve mode's end), and a destructor
     // that throws aborts the process (exit 139); the waits and frees below are best-effort then.
-    const Verifier* self = this;
-    g_diag_verifier.compare_exchange_strong(self, nullptr);
-    for (auto& slot : g_live) {
-        Verifier* me = this;
-        slot.compare_exchange_strong(me, nullptr);
-    }
+    g_verifier_readers.retire(this);   // drain readers before any device/member cleanup
     if (cs_) cs_->wait();
     if (sh_cs_) sh_cs_->wait();
     for (auto& e : exec_)
@@ -459,12 +467,9 @@ Verifier::~Verifier() try {
 bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
                     SessionState &ss, const VerifyHits &hits,
                     const NativeHead *head, int max_t, std::string &err) try {
-    g_diag_verifier.store(this);
+    retirement_init_started_ = true;
+    (void) g_verifier_readers.publish(this);   // fixed capacity, best effort as before
     diag_verify_fn().store(&diag_active_verifier);
-    for (auto& slot : g_live) {
-        Verifier* none = nullptr;
-        if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
-    }
     release_gpu_fn().store(&release_live_verifiers);
     device_ = dpct::get_current_device_id(); // a layer split's stage on another
                                              // GPU: its streams, graphs and

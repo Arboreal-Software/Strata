@@ -27,6 +27,8 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from types import SimpleNamespace
 import contextlib
 import collections
 import base64
@@ -949,6 +951,17 @@ def parse_stage_in_flight_sample(line: str) -> dict | None:
     return {"elapsed_us": elapsed_us, "in_flight_us": in_flight_us}
 
 
+@dataclass(frozen=True)
+class _EngineEpoch:
+    """Identity and queue/table references never change after publication."""
+    proc: object
+    gen: int
+    lines: object
+    slots: object
+    ctl: object
+    slot_cv: object
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -981,14 +994,71 @@ class StrataEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
+    _SLOT_FIELDS = ("slot_order", "slot_group", "slot_groups", "slot_gs", "slot_q", "slot_busy",
+                    "slot_claims", "slot_releasing", "_orphan_seen", "slot_held", "slot_used", "slot_live")
+
+    def _state_lock(self):
+        # Also supports the small __new__ fixtures used by protocol unit tests.
+        return self.__dict__.setdefault("_epoch_lock", threading.RLock())
+
+    def _capture_epoch(self, born=None):
+        with self._state_lock():
+            proc, gen = getattr(self, "proc", None), getattr(self, "gen", 0)
+            if born is not None and gen != born:
+                raise EngineDied("the engine changed after this request was admitted")
+            epoch = self.__dict__.get("_epoch")
+            if epoch is None or epoch.proc is not proc or epoch.gen != gen:
+                if proc is not None and getattr(self, "_stdin_closing", False):
+                    raise EngineDied("the engine has not published a ready process epoch")
+                # Real starts publish explicitly after READY. This path supports
+                # lazy/test engines that install their own process and queues.
+                slots = SimpleNamespace(**{k: getattr(self, k, None) for k in self._SLOT_FIELDS})
+                epoch = _EngineEpoch(proc, gen, getattr(self, "lines", None), slots,
+                                     getattr(self, "ctl", None), getattr(self, "slot_cv", None))
+                self._epoch = epoch
+            return epoch
+
+    def _epoch_current(self, epoch):
+        return (getattr(self, "proc", None) is epoch.proc and
+                getattr(self, "gen", 0) == epoch.gen and self.__dict__.get("_epoch") is epoch)
+
+    def _check_epoch(self, epoch):
+        with self._state_lock():
+            if not self._epoch_current(epoch):
+                raise EngineDied("the engine changed after this request was admitted")
+
+    @contextlib.contextmanager
+    def _epoch_state(self, epoch):
+        # Only short local status updates: never hold this over callbacks, pipe
+        # I/O, queue waits, process waits, or host-thread joins.
+        with self._state_lock():
+            self._check_epoch(epoch)
+            yield
+
+    def _epoch_update(self, epoch, **values):
+        with self._epoch_state(epoch):
+            for key, value in values.items():
+                setattr(self, key, value)
+
+    def _parse_done_epoch(self, line, epoch):
+        with self._epoch_state(epoch):
+            self._parse_done(line)
+
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
+        if "wlock" not in self.__dict__:
+            self.wlock = threading.Lock()  # one writer lock for this object, including every restart
+        self._state_lock()
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
-        self.proc, self.pump, self.log = None, None, None
+        with self.wlock, self._state_lock():
+            self.proc = None
+            self._stdin_closing = True
+            self._stdin_failed = False
+        self.pump, self.log = None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
@@ -1041,9 +1111,11 @@ class StrataEngine:
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
         try:
-            self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+            proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
                               **pin)
+            with self.wlock, self._state_lock():
+                self.proc = proc
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
             if log:
@@ -1084,7 +1156,8 @@ class StrataEngine:
                     pass
             try:                                        # its pipes and our handle on its log (the log stays)
                 self.proc.wait(timeout=5)
-                self.proc.stdin.close()
+                with self.wlock:
+                    self.proc.stdin.close()
                 self.proc.stdout.close()
                 if log:
                     self.log.close()
@@ -1128,9 +1201,9 @@ class StrataEngine:
             self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
-        self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
-        self.lines: queue.Queue = queue.Queue()
+        lines = queue.Queue()
+        slots = SimpleNamespace()
         # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
@@ -1145,27 +1218,27 @@ class StrataEngine:
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
         # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
-        self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
-        self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
-        self.slot_groups = groups
+        slots.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
+        slots.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
+        slots.slot_groups = groups
         # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
         # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
         # conversation cache - see pick_slot
         groups_run = int(self.info.get("batch_groups") or groups)
-        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
-        self.slot_q = [queue.Queue() for _ in range(self.batch)]
-        self.slot_busy = [False] * self.batch
+        slots.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+        slots.slot_q = [queue.Queue() for _ in range(self.batch)]
+        slots.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
         # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
-        self.slot_claims: set[int] = set()
-        self.slot_releasing: set[int] = set()
-        self._orphan_seen: dict[int, float] = {}
+        slots.slot_claims: set[int] = set()
+        slots.slot_releasing: set[int] = set()
+        slots._orphan_seen: dict[int, float] = {}
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
-        self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
-        self.slot_used = [0.0] * self.batch
-        self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+        slots.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        slots.slot_used = [0.0] * self.batch
+        slots.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
         # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
@@ -1177,25 +1250,33 @@ class StrataEngine:
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
-        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
-        self.wlock = threading.Lock()                   # stdin writes from several request threads
-        self.pump = threading.Thread(target=self._pump, daemon=True)
+        with self.wlock, self._state_lock():
+            self.gen = self.__dict__.get("gen", 0) + 1
+            self.lines = lines
+            for name in self._SLOT_FIELDS:
+                setattr(self, name, getattr(slots, name))
+            self._epoch = _EngineEpoch(self.proc, self.gen, lines, slots, self.ctl, self.slot_cv)
+            self._stdin_closing = False
+            self.ended = False                          # READY: publication and writer generation agree
+        self.pump = threading.Thread(target=self._pump, args=(self._epoch,), daemon=True)
         self.pump.start()
 
-    def _pump(self):
-        proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
-        slot_q = self.slot_q
+    def _pump(self, epoch=None):
+        epoch = epoch or self._capture_epoch()
+        proc, lines = epoch.proc, epoch.lines             # this process's: a restart replaces both (#344)
+        slot_q = epoch.slots.slot_q
         line = None
         for line in proc.stdout:
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
                 # process stays alive and prints DONE afterwards.
-                if self.proc is proc:
-                    self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
-                    self.ended = True
+                with self._state_lock():
+                    if self._epoch_current(epoch):
+                        self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
+                        self.ended = True
                 try:
                     proc.terminate()
                 except OSError:
@@ -1203,13 +1284,17 @@ class StrataEngine:
                 break                           # publish EOF, never the trailing DONE
             if line.startswith("BSTAT"):
                 sample = parse_batch_window_sample(line)
-                if sample is not None and self.proc is proc:
-                    self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
+                if sample is not None:
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue                        # control telemetry never enters a request's token stream
             if line.startswith("PSTAT"):
                 sample = parse_stage_in_flight_sample(line)
-                if sample is not None and self.proc is proc:
-                    self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
+                if sample is not None:
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
@@ -1218,10 +1303,11 @@ class StrataEngine:
                 except (IndexError, ValueError):
                     pass
             lines.put(line)
-        if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
-            self.ended = True                           # its output closed: it is gone, even before the OS says so
-            if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
-                self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
+        with self._state_lock():
+            if self._epoch_current(epoch):                           # a killed engine's pump must not mark its successor dead
+                self.ended = True                           # its output closed: it is gone, even before the OS says so
+                if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
+                    self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
         for q in slot_q:
             q.put(None)
@@ -1361,14 +1447,16 @@ class StrataEngine:
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
-        self.proc.stdin.flush()
+        epoch = self._capture_epoch()
+        born, lines = epoch.gen, epoch.lines
+        self._send("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}"), born=born)
         deadline = time.time() + timeout
         while True:
             try:
-                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                line = lines.get(timeout=max(0.1, deadline - time.time()))
             except queue.Empty:
                 raise EngineDied("the engine did not answer the VRAM command") from None
+            self._check_epoch(epoch)
             if line is None:
                 raise EngineDied("the engine ended")
             line = line.strip()
@@ -1379,8 +1467,9 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     out[k] = int(v) if v.lstrip("-").isdigit() else v
-                self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
-                self.info["vram"] = out
+                with self._epoch_state(epoch):
+                    self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
+                    self.info["vram"] = out
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
@@ -1465,37 +1554,64 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
-    def _send(self, text: str):
+    @staticmethod
+    def _write_locked(proc, text: str, close_stdin: bool = False):
+        """Caller holds the persistent writer lock; keep each command/flush indivisible."""
+        proc.stdin.write(text + "\n")
+        proc.stdin.flush()
+        if close_stdin:
+            proc.stdin.close()
+
+    def _send(self, text: str, *, born: int | None = None):
         btrace("send>", text[:60])
+        proc = self.proc                                # capture before waiting; never retarget a queued write
+        generation = getattr(self, "gen", 0) if born is None else born
         try:
             with self.wlock:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+                if (proc is None or self.proc is not proc or getattr(self, "gen", 0) != generation or
+                        getattr(self, "_stdin_closing", False)):
+                    raise EngineDied("the engine process changed before the command was sent")
+                try:
+                    self._write_locked(proc, text)
+                except (OSError, AttributeError, ValueError):
+                    self._stdin_closing = True
+                    self._stdin_failed = True
+                    self.ended = True
+                    raise
+        except (OSError, AttributeError, ValueError):
+            # A partially written command is not safe to retry on either process.
+            code = proc.poll() if proc is not None else None
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {code})") from None
 
-    def _control(self, cancel, on_token, stop_when=None, on_quiet=None):
+    def _control(self, cancel, on_token, stop_when=None, on_quiet=None, *, born=None, epoch=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE).  `on_quiet()` runs whenever the engine has been
         quiet for half a second: between two PP lines of a read whose chunks take longer than that."""
+        epoch = epoch or self._capture_epoch(born)
+        born, lines = epoch.gen, epoch.lines
+        self._check_epoch(epoch)
         stopped = False
         beat = time.monotonic()
         while True:
+            self._check_epoch(epoch)
             try:
                 # A client can leave before the first PP/token.  Poll its Event as often as _take_control does;
                 # the ten-second HTTP heartbeat is independent of how promptly STOP reaches the engine.
-                line = self.lines.get(timeout=0.5)
+                line = lines.get(timeout=0.5)
             except queue.Empty:
+                self._check_epoch(epoch)
                 if cancel.is_set() and not stopped:
-                    self._send("STOP")
+                    self._send("STOP", born=born)
                     stopped = True
                 if on_quiet is not None:
                     on_quiet()
                 if time.monotonic() - beat >= 10.0:
                     beat = time.monotonic()
+                    self._check_epoch(epoch)
                     yield None
                 continue
+            self._check_epoch(epoch)
             beat = time.monotonic()
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -1504,38 +1620,50 @@ class StrataEngine:
             if line.startswith("T "):
                 on_token(int(line[2:]))
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
-                    self._send("STOP")
+                    self._send("STOP", born=born)
                     stopped = True
+                self._check_epoch(epoch)
                 yield False                              # a token is pending (not a heartbeat)
             elif line.startswith("PP "):
                 f = line.split()
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                    self.progress = (int(f[1]), int(f[2]))
-                    self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
-                    self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                    with self._epoch_state(epoch):
+                        self.progress = (int(f[1]), int(f[2]))
+                    with self._epoch_state(epoch):
+                        self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
+                    with self._epoch_state(epoch):
+                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                 if not stopped and cancel.is_set():
                     # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
                     # silence, which a stream of PP lines never allows): the engine read the whole prompt first
-                    self._send("STOP")
+                    self._send("STOP", born=born)
                     stopped = True
+                self._check_epoch(epoch)
                 yield None
             elif line.startswith("DONE"):
-                self._parse_done(line)
-                self._last_done = line
+                self._parse_done_epoch(line, epoch)
+                with self._epoch_state(epoch):
+                    self._last_done = line
             elif line.startswith("BADM "):
                 f = line.split()
-                self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
+                with self._epoch_state(epoch):
+                    self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
                 return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
                 f = line.split()
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
-                    self._yielded = (int(f[1]), int(f[2]))
+                    with self._epoch_state(epoch):
+                        self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
-                self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
+                with self._epoch_state(epoch):
+                    self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
                 raise ValueError(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
-                self._ctl_result = ("done", None)
+                with self._epoch_state(epoch):
+                    self._ctl_result = ("done", None)
                 return
+
+
 
     def _done_finish(self) -> str | None:
         """The finish field of the DONE line the control lines read last (None: none since it was cleared)."""
@@ -1549,17 +1677,21 @@ class StrataEngine:
         drain - its end line was read already (by the request's own EngineDied), and waiting for another one held
         a request that had failed for the whole 300 s (#1012), or read the lines of the engine that replaced it."""
         end = time.monotonic() + timeout
+        epoch = self._capture_epoch(born)
+        lines = epoch.lines
         while time.monotonic() < end:
             if born is not None and (self.gen != born or not self.alive()):
                 return None
             try:
-                line = self.lines.get(timeout=max(0.1, min(1.0, end - time.monotonic())))
+                line = lines.get(timeout=max(0.1, min(1.0, end - time.monotonic())))
             except queue.Empty:
                 continue
+            if not self._epoch_current(epoch):
+                return None
             if line is None:
                 return None
             if line.startswith("DONE"):
-                self._parse_done(line)
+                self._parse_done_epoch(line, epoch)
             if line.startswith(until) or line.startswith("ERR"):
                 return line
         return None
@@ -1570,18 +1702,22 @@ class StrataEngine:
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
 
-    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
+    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0, *, epoch=None):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
         in the same window).  Read it here, so the request's figures are the slot leg's (the background wait would eat it,
         and the request kept the admission's single token).  None when it does not come in `wait_s`: then the background
         wait takes over."""
-        if slot >= len(self.slot_q):
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
+        if slot >= len(slots.slot_q):
             return None
         end = time.monotonic() + wait_s
         while time.monotonic() < end:
             try:
-                line = self.slot_q[slot].get(timeout=max(0.05, end - time.monotonic()))
+                line = slots.slot_q[slot].get(timeout=max(0.05, end - time.monotonic()))
             except queue.Empty:
+                return None
+            if not self._epoch_current(epoch):
                 return None
             if line is None:
                 return None
@@ -1589,18 +1725,22 @@ class StrataEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, *, born: int | None = None, epoch=None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
-        if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
+        if born is not None and epoch.gen != born:
+            return
+        if slot >= len(slots.slot_q):                    # the engine restarted with fewer slots: this one is gone
             return
         try:
-            self._send(f"BSTOP {slot}")
+            self._send(f"BSTOP {slot}", born=epoch.gen)
         except EngineDied:
-            pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing = self.slot_releasing
+            return
+        q, busy, held = slots.slot_q[slot], slots.slot_busy, slots.slot_held   # this process's: restart() replaces them
+        releasing = slots.slot_releasing
         releasing.add(slot)
 
         def wait():
@@ -1624,55 +1764,59 @@ class StrataEngine:
                         tail = []
                     break
             held[slot] = tail[:-1] if stream and tail else []
-            with self.slot_cv:
+            with epoch.slot_cv:
                 busy[slot] = False
                 releasing.discard(slot)
-                self.slot_cv.notify_all()
+                epoch.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
 
-    def _park_slot(self, slot: int) -> None:
+    def _park_slot(self, slot: int, *, epoch=None) -> None:
         """#1994: the engine refused a BGEN for `slot`.  Keep it busy here for SLOT_PARK_S (no request owns it), then
         give it back: the engine's view has caught up, or the next refusal parks it again."""
-        with self.slot_cv:
-            self.slot_claims.discard(slot)
-            self.slot_busy[slot] = True
-        busy = self.slot_busy
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
+        with epoch.slot_cv:
+            slots.slot_claims.discard(slot)
+            slots.slot_busy[slot] = True
+        busy = slots.slot_busy
 
         def free():
-            with self.slot_cv:
-                if slot not in self.slot_claims and slot not in self.slot_releasing:
+            with epoch.slot_cv:
+                if slot not in slots.slot_claims and slot not in slots.slot_releasing:
                     busy[slot] = False
-                self.slot_cv.notify_all()
+                epoch.slot_cv.notify_all()
         t = threading.Timer(self.SLOT_PARK_S, free)
         t.daemon = True
         t.start()
 
     ORPHAN_SLOT_S = 3.0   # #1603: a busy flag nobody owns this long is a leak and is given back
 
-    def _reap_orphan_slots(self) -> list[int]:
+    def _reap_orphan_slots(self, *, epoch=None) -> list[int]:
         """#1603: free the slots whose busy flag has no owner (no request holds or reserves them and no BDONE wait is
         running for them).  The caller holds slot_cv.  A flag that leaked kept every later request waiting for a slot
         that nothing would free - with nothing running, nothing queued and nothing for the frozen-engine check to see.
         A slot is only given back after it has looked ownerless for ORPHAN_SLOT_S, so a flag set a moment before its
         owner registers is never taken."""
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
         now = time.monotonic()
         freed = []
-        for b, busy in enumerate(self.slot_busy):
-            if busy and b not in self.slot_claims and b not in self.slot_releasing:
-                first = self._orphan_seen.setdefault(b, now)
+        for b, busy in enumerate(slots.slot_busy):
+            if busy and b not in slots.slot_claims and b not in slots.slot_releasing:
+                first = slots._orphan_seen.setdefault(b, now)
                 if now - first >= self.ORPHAN_SLOT_S:
-                    self.slot_busy[b] = False
-                    self._orphan_seen.pop(b, None)
+                    slots.slot_busy[b] = False
+                    slots._orphan_seen.pop(b, None)
                     freed.append(b)
             else:
-                self._orphan_seen.pop(b, None)
+                slots._orphan_seen.pop(b, None)
         if freed:
             print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request using them "
                   "(issue #1603); freed, the waiting request goes on", flush=True)
-            self.slot_cv.notify_all()
+            epoch.slot_cv.notify_all()
         return freed
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
@@ -1681,8 +1825,9 @@ class StrataEngine:
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
         `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
+        ctl, slot_cv = self.ctl, self.slot_cv
         entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
-        with self.slot_cv:
+        with slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
         beat = time.monotonic()
@@ -1696,44 +1841,44 @@ class StrataEngine:
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
                     # restart is under way it keeps waiting and goes on with the new engine.
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
-                with self.slot_cv:
+                with slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
                     if turn and new and ADMIT_SHORT_FIRST > 0:
                         turn = self._admit_next() is entry
                 left = deadline - time.monotonic() if deadline is not None else 0.5
-                if turn and left > 0 and self.ctl.acquire(timeout=min(0.5, left)):
+                if turn and left > 0 and ctl.acquire(timeout=min(0.5, left)):
                     if new and ADMIT_SHORT_FIRST > 0:
-                        with self.slot_cv:              # a shorter one came while this one waited in acquire()
+                        with slot_cv:              # a shorter one came while this one waited in acquire()
                             first = self._admit_next() is entry
                         if not first:
-                            self.ctl.release()
-                            with self.slot_cv:
-                                self.slot_cv.notify_all()
+                            ctl.release()
+                            with slot_cv:
+                                slot_cv.notify_all()
                             continue
                     if self.alive():
                         if deadline is not None and time.monotonic() >= deadline:
-                            self.ctl.release()
+                            ctl.release()
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                         break
-                    self.ctl.release()                  # it died (or is being restarted) while this one was getting
+                    ctl.release()                  # it died (or is being restarted) while this one was getting
                     turn = False                        # the lines: not the engine this request was meant for
                 if not turn:
-                    with self.slot_cv:
-                        self.slot_cv.wait(timeout=min(0.5, max(0, left)))
+                    with slot_cv:
+                        slot_cv.wait(timeout=min(0.5, max(0, left)))
                 if cancel.is_set():
                     return False
                 if time.monotonic() - beat >= 10.0:     # a heartbeat every 10 s, as the engine's own wait
                     beat = time.monotonic()
                     yield None
         finally:
-            with self.slot_cv:
+            with slot_cv:
                 self.waiting = max(0, self.waiting - 1)
                 if entry in self.wait_lens:
                     self.wait_lens.remove(entry)
-        with self.slot_cv:
+        with slot_cv:
             self.ctl_epoch += 1
-            self.slot_cv.notify_all()
-        return True
+            slot_cv.notify_all()
+        return ctl
 
     def _admit_next(self):
         """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
@@ -1787,11 +1932,24 @@ class StrataEngine:
         ok = yield from self._take_control(cancel, len(prompt), new=True)
         if not ok:
             return
-        holding, born = True, self.gen                  # (the engine it now has the control lines of)
+        held_ctl = self.ctl if ok is True else ok
+        epoch = self._capture_epoch()
+        slots = epoch.slots
+        holding, born = True, epoch.gen                  # (the engine it now has the control lines of)
         btrace("ctl acquired")
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
+        sent = False
+        def acquired_control():
+            nonlocal holding, born, epoch, slots, held_ctl
+            holding = True
+            held_ctl = self.ctl if ok is True else ok
+            if sent and self.gen != born:
+                raise EngineDied("the engine changed after this request was admitted")
+            epoch = self._capture_epoch(born if sent else None)
+            slots = epoch.slots
+            born = epoch.gen
         yields, solo_again, refused = 0, 0, 0
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
@@ -1800,61 +1958,70 @@ class StrataEngine:
                     ok = yield from self._take_control(cancel, len(prompt))
                     if not ok:
                         return
-                    holding, born = True, self.gen                  # (the engine it now has the control lines of)
-                with self.slot_cv:
-                    alone = not any(self.slot_busy) and self.waiting == 0
+                    acquired_control()
+                self._check_epoch(epoch)
+                with epoch.slot_cv:
+                    alone = not any(slots.slot_busy) and self.waiting == 0
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
-                    self._last_done = None                  # (#879: this request's DONE decides below)
+                    with self._epoch_state(epoch):
+                        self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}", born=born)
+                    sent = True
                     if deadline is not None:
                         cancel._strata_queue_deadline = None
                     started = getattr(cancel, "_strata_queue_started", None)
                     if started is not None:
                         started()
                     phase = "solo"
-                    self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
-                    self._ctl_erred = False
+                    with self._epoch_state(epoch):
+                        self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                    with self._epoch_state(epoch):
+                        self._ctl_erred = False
                     def others():
-                        with self.slot_cv:
+                        with epoch.slot_cv:
                             return self.waiting > 0
 
                     def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
                         nonlocal reserved
+                        self._check_epoch(epoch)
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
-                            with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                            with epoch.slot_cv:          # the slot the part read will wait in
+                                reserved = self.pick_slot(prompt, epoch=epoch)
                                 if reserved is not None:
-                                    self.slot_busy[reserved] = True
-                                    self.slot_claims.add(reserved)
+                                    slots.slot_busy[reserved] = True
+                                    slots.slot_claims.add(reserved)
                             if reserved is not None:
-                                self._send(f"BYIELD {reserved}")
-                    for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way):
+                                self._send(f"BYIELD {reserved}", born=born)
+                    for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way, born=born, epoch=epoch):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
+                            self._check_epoch(epoch)
                             yield t
                         if x is None:                       # a heartbeat (False: a token, flushed above)
                             give_way()
+                            self._check_epoch(epoch)
                             yield None
                     phase = "none"                          # its DONE is read
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
+                        self._check_epoch(epoch)
                         yield t
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
-                        with self.slot_cv:
-                            self.slot_busy[reserved] = False
-                            self.slot_claims.discard(reserved)
-                            self.slot_cv.notify_all()
+                        with epoch.slot_cv:
+                            slots.slot_busy[reserved] = False
+                            slots.slot_claims.discard(reserved)
+                            epoch.slot_cv.notify_all()
                         reserved = None
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
@@ -1877,11 +2044,11 @@ class StrataEngine:
                             deadline = getattr(cancel, "_strata_queue_deadline", None)
                             if deadline is not None and time.monotonic() >= deadline:
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                            with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                            with epoch.slot_cv:
+                                slot = self.pick_slot(prompt, epoch=epoch)
                                 if slot is not None:
-                                    self.slot_busy[slot] = True
-                                    self.slot_claims.add(slot)
+                                    slots.slot_busy[slot] = True
+                                    slots.slot_claims.add(slot)
                                     if admit_wait:
                                         admit_wait = False
                                         self.admitting = max(0, self.admitting - 1)
@@ -1890,44 +2057,45 @@ class StrataEngine:
                                     admit_wait, admit_since = True, time.monotonic()   # control lines then)
                                     self.admitting += 1
                             if holding:
-                                self.ctl.release()
+                                held_ctl.release()
                                 holding = False
-                            with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                            with epoch.slot_cv:
+                                if self.pick_slot(prompt, epoch=epoch) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
                                         if not admit_said:
                                             admit_said = True
-                                            busy = [b for b, v in enumerate(self.slot_busy) if v]
+                                            busy = [b for b, v in enumerate(slots.slot_busy) if v]
                                             print(f"[strata] parallel: a request has waited {time.monotonic() - admit_since:.0f} s "
-                                                  f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
-                                                  f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
-                                    self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                                  f"for a free slot (busy: {busy}, in use: {sorted(slots.slot_claims)}, "
+                                                  f"ending: {sorted(slots.slot_releasing)}) (issue #1603)", flush=True)
+                                    self._reap_orphan_slots(epoch=epoch)
+                                if self.pick_slot(prompt, epoch=epoch) is None:
                                     wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
-                                    self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
+                                    epoch.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
                             if cancel.is_set():
                                 return
                             if not holding:
                                 ok = yield from self._take_control(cancel, len(prompt))
                                 if not ok:
                                     return
-                                holding, born = True, self.gen
+                                acquired_control()
                     if self._yielded is not None:           # it gave way: the others waiting then go first
-                        self.slot_held[slot] = list(prompt[:self._yielded[1]])
-                        self._yielded = None
+                        slots.slot_held[slot] = list(prompt[:self._yielded[1]])
+                        with self._epoch_state(epoch):
+                            self._yielded = None
                         yields += 1
-                        self.ctl.release()
+                        held_ctl.release()
                         holding = False
-                        with self.slot_cv:
-                            epoch = self.ctl_epoch
-                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
+                        with epoch.slot_cv:
+                            turn_epoch = self.ctl_epoch
+                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=turn_epoch)
                         if not ok:
                             return
-                        holding, born = True, self.gen                  # (the engine it now has the control lines of)
-                    while not self.slot_q[slot].empty():
-                        self.slot_q[slot].get_nowait()
+                        acquired_control()
+                    while not slots.slot_q[slot].empty():
+                        slots.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
@@ -1935,25 +2103,30 @@ class StrataEngine:
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    self.slot_live[slot] = live
-                    self._last_done = None                  # (#879: this admission's DONE decides below)
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    slots.slot_live[slot] = live
+                    with self._epoch_state(epoch):
+                        self._last_done = None                  # (#879: this admission's DONE decides below)
+                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}", born=born)
+                    sent = True
                     if deadline is not None:
                         cancel._strata_queue_deadline = None
                     started = getattr(cancel, "_strata_queue_started", None)
                     if started is not None:
                         started()
-                    self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    slots.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
-                    self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
-                    self._ctl_erred = False
+                    with self._epoch_state(epoch):
+                        self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                    with self._epoch_state(epoch):
+                        self._ctl_erred = False
                     asked = False
 
                     def ask():        # as give_way above, for the slot this admission reads into
                         nonlocal asked
+                        self._check_epoch(epoch)
                         if (not asked and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
-                            self._send(f"BYIELD {slot}")
+                            self._send(f"BYIELD {slot}", born=born)
                             asked = True
 
                     def note_progress():
@@ -1961,14 +2134,16 @@ class StrataEngine:
                         if self.progress and live["state"] == "reading":
                             live["prompt_read"] = self.progress[0]
                     try:
-                        for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress())):
+                        for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()), born=born, epoch=epoch):
                             while pending:
                                 t = pending.pop(0)
                                 out.append(t)
+                                self._check_epoch(epoch)
                                 yield t
                             if x is None:
                                 ask()
                                 note_progress()
+                                self._check_epoch(epoch)
                                 yield None
                     except ValueError as e:
                         # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
@@ -1982,11 +2157,12 @@ class StrataEngine:
                         if refused > self.BGEN_REFUSALS_MAX:
                             raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
                                       retry_after=5) from e
-                        self.slot_live[slot] = None
-                        self.slot_held[slot] = []
+                        slots.slot_live[slot] = None
+                        slots.slot_held[slot] = []
                         phase = "none"
-                        self._ctl_erred = False
-                        self._park_slot(slot)
+                        with self._epoch_state(epoch):
+                            self._ctl_erred = False
+                        self._park_slot(slot, epoch=epoch)
                         slot = None
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
@@ -1994,13 +2170,14 @@ class StrataEngine:
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
+                        self._check_epoch(epoch)
                         yield t
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
-                self.ctl.release()
+                held_ctl.release()
                 holding = False
                 if not cont:
                     return
@@ -2008,14 +2185,17 @@ class StrataEngine:
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
+                    self._check_epoch(epoch)
                     try:
-                        line = self.slot_q[slot].get(timeout=10.0)
+                        line = slots.slot_q[slot].get(timeout=10.0)
                     except queue.Empty:
                         if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}")
+                            self._send(f"BSTOP {slot}", born=born)
                             stop_sent = True
+                        self._check_epoch(epoch)
                         yield None
                         continue
+                    self._check_epoch(epoch)
                     if line is None:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -2025,34 +2205,36 @@ class StrataEngine:
                         live["generated"] = len(out)
                         if cancel.is_set():
                             if not stop_sent:
-                                self._send(f"BSTOP {slot}")
+                                self._send(f"BSTOP {slot}", born=born)
                                 stop_sent = True
                             continue
+                        self._check_epoch(epoch)
                         yield t
                         if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
-                            self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                            self._send(f"BSTOP {slot}", born=born)         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
-                        self._apply_bdone(f)
+                        with self._epoch_state(epoch):
+                            self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
-                        self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        slots.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
-                            self.slot_held[slot] = []
+                            slots.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
                             carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
-                            self.slot_live[slot] = None
-                            self.slot_used[slot] = time.time()
-                            with self.slot_cv:
-                                self.slot_busy[slot] = False
-                                self.slot_claims.discard(slot)
-                                self.slot_cv.notify_all()
+                            slots.slot_live[slot] = None
+                            slots.slot_used[slot] = time.time()
+                            with epoch.slot_cv:
+                                slots.slot_busy[slot] = False
+                                slots.slot_claims.discard(slot)
+                                epoch.slot_cv.notify_all()
                             slot, gen0 = None, None
                             if reused0 is None:
                                 reused0 = (self.last or {}).get("reused")
@@ -2070,7 +2252,7 @@ class StrataEngine:
                 if phase in ("solo", "admit") and self._ctl_erred:
                     phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
                 if phase == "solo":
-                    self._send("STOP")
+                    self._send("STOP", born=born)
                     self._drain_control("DONE", born=born)
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
@@ -2080,57 +2262,65 @@ class StrataEngine:
                 pass
             bdone_in = False
             if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
-                bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
+                bd = self._bdone_after_eos(slot, epoch=epoch)            # (#1869) the slot's figures, not the admission's
                 if bd is not None:
-                    self._apply_bdone(bd.split())
-                    bdone_in = True
-            if reused0 is not None and isinstance(self.last, dict):
-                self.last = {**self.last, "reused": reused0}
-            if carry and isinstance(self.last, dict):
-                self.last = add_carry(carry, self.last)
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self._apply_bdone(bd.split())
+                            bdone_in = True
+            with self._state_lock():
+                if self._epoch_current(epoch):
+                    if reused0 is not None and isinstance(self.last, dict):
+                        self.last = {**self.last, "reused": reused0}
+                    if carry and isinstance(self.last, dict):
+                        self.last = add_carry(carry, self.last)
             if holding:
-                self.ctl.release()
+                held_ctl.release()
             if admit_wait:
-                with self.slot_cv:
+                with epoch.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
             if reserved is not None:
-                with self.slot_cv:
-                    self.slot_busy[reserved] = False
-                    self.slot_claims.discard(reserved)
-                    self.slot_cv.notify_all()
+                with epoch.slot_cv:
+                    slots.slot_busy[reserved] = False
+                    slots.slot_claims.discard(reserved)
+                    epoch.slot_cv.notify_all()
             if slot is not None:
-                self.slot_live[slot] = None
-                self.slot_used[slot] = time.time()
+                slots.slot_live[slot] = None
+                slots.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
-                    with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+                    slots.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+                    with epoch.slot_cv:
+                        slots.slot_busy[slot] = False
+                        slots.slot_claims.discard(slot)
+                        epoch.slot_cv.notify_all()
                 elif phase == "slot":
-                    self.slot_held[slot] = []
+                    slots.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    self._release_slot_when_done(slot, stream, born=born, epoch=epoch)    # freed at its BDONE
+                    slots.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
-                    with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+                    with epoch.slot_cv:
+                        slots.slot_busy[slot] = False
+                        slots.slot_claims.discard(slot)
+                        epoch.slot_cv.notify_all()
+
+
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], *, epoch=None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
         conversations other slots hold stay for their next turns.  None: every slot is busy."""
-        free = [b for b in self.slot_order if not self.slot_busy[b]]
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
+        free = [b for b in slots.slot_order if not slots.slot_busy[b]]
         if not free:
             return None
-        gs = getattr(self, "slot_gs", 0)
+        gs = getattr(slots, "slot_gs", 0)
         if gs > 1:
             # pipelined groups of several slots: the engine keeps no idle slot below a busy one as a conversation cache
             # (its pad row writes the slot), so nothing is worth keeping free for a next turn.  A group's window spans
@@ -2139,8 +2329,8 @@ class StrataEngine:
             # (reported on #793: least-recently-used picks left leading holes, [_ B], that cost a whole row each)
             def fills_hole(b):
                 g0 = b - b % gs
-                return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
-            return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
+                return any(slots.slot_busy[x] for x in range(b + 1, g0 + gs))
+            return min(free, key=lambda b: (not fills_hole(b), slots.slot_order.index(b)))
         def held_prefix(b):
             # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded)
             # when this prompt continues it, else its turn checkpoint - the engine takes one at the last <|im_start|> of
@@ -2148,7 +2338,7 @@ class StrataEngine:
             # assistant header), so a prompt that agrees with the held tokens up to there is that chat's next turn
             # too (#2518: it was only found by the engine's own source search, after pick_slot had sent it to another
             # slot and the request in that slot had overwritten the chat whose cache the next one needed)
-            h = self.slot_held[b]
+            h = slots.slot_held[b]
             if not h:
                 return 0
             if len(h) < len(prompt) and prompt[:len(h)] == h:
@@ -2157,24 +2347,27 @@ class StrataEngine:
             return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
-        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
+        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if slots.slot_groups > 1 else 1):
             return best
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
         busy_in = {}
         for b in range(self.batch):
-            if self.slot_busy[b]:
-                busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
-        return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
-                                        bool(self.slot_held[b]), self.slot_used[b]))
+            if slots.slot_busy[b]:
+                busy_in[slots.slot_group[b]] = busy_in.get(slots.slot_group[b], 0) + 1
+        return min(free, key=lambda b: (busy_in.get(slots.slot_group[b], 0) if slots.slot_groups > 1 else 0,
+                                        bool(slots.slot_held[b]), slots.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
+        if not self.batch:
+            return []
+        slots = self._capture_epoch().slots
         now, view = time.time(), []
-        for b in range(self.batch):
-            r = self.slot_live[b]
+        for b in range(len(slots.slot_q)):
+            r = slots.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
+                view.append({"slot": b, "state": "idle", "held_tokens": len(slots.slot_held[b])})
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
@@ -2198,11 +2391,10 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
-        try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-            self.proc.stdin.flush()
-        except OSError:                                  # the pipe is gone: the engine died (not the client)
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        epoch = self._capture_epoch()
+        born = epoch.gen
+        lines = epoch.lines                             # drain only this process's replies on cancellation
+        self._send(f"{head} {','.join(str(int(t)) for t in ids)}", born=born)
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
         # chunk at the slowest prompt reading on top of silence_s; a PP line resets it to its own chunk's time.
@@ -2214,21 +2406,23 @@ class StrataEngine:
         stall_state: dict = {}
         try:
             while True:
+                self._check_epoch(epoch)
                 wait = 10.0
                 if allow > 0:
                     wait = min(wait, allow - (time.monotonic() - heard))
                     if wait <= 0:
                         done = True                       # no STOP and no drain: nothing is listening
                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
-                                           "the request")
+                                           "the request", epoch=epoch)
                 try:
-                    line = self.lines.get(timeout=min(wait, 0.5))
+                    line = lines.get(timeout=min(wait, 0.5))
                 except queue.Empty:
+                    self._check_epoch(epoch)
                     if cancel.is_set():
                         return
                     if stall_s > 0:
                         try:
-                            self._stall_check(heard, stall_state, stall_s)
+                            self._stall_check(heard, stall_state, stall_s, epoch=epoch)
                         except EngineSilent:
                             done = True                   # as above: nothing is listening
                             raise
@@ -2236,8 +2430,10 @@ class StrataEngine:
                         continue                          # enforce the expired deadline before another heartbeat
                     if time.monotonic() - beat >= 10.0:
                         beat = time.monotonic()
+                        self._check_epoch(epoch)
                         yield None                        # polling cancellation does not add HTTP heartbeats
                     continue
+                self._check_epoch(epoch)
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -2249,27 +2445,33 @@ class StrataEngine:
                     allow = silence
                     if cancel.is_set():
                         return
+                    self._check_epoch(epoch)
                     yield int(line[2:])
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
-                        self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
-                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                        with self._epoch_state(epoch):
+                            self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        with self._epoch_state(epoch):
+                            self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
+                        with self._epoch_state(epoch):
+                            self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
                         if silence > 0 and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
                             allow = max(silence, PP_SLACK * chunk / rate)
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
+                    self._check_epoch(epoch)
                     yield None
                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
                     try:
-                        read_to = self.reused = int(line.split()[1])
+                        with self._epoch_state(epoch):
+                            read_to = self.reused = int(line.split()[1])
                     except (IndexError, ValueError):
                         pass
                 elif line.startswith("DONE"):
-                    self._parse_done(line)
+                    self._parse_done_epoch(line, epoch)
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -2278,33 +2480,36 @@ class StrataEngine:
                     done = True
                     raise ValueError(line[4:].strip())
         finally:
-            if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
+            if not done and self._epoch_current(epoch):  # never stop/drain a replacement process
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
-                    except OSError:
+                        self._send("STOP", born=born)
+                    except EngineDied:
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
                 # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
                 heard = time.monotonic()
-                while True:
+                while self._epoch_current(epoch):
                     left = allow - (time.monotonic() - heard) if allow > 0 else None
                     try:
                         if left is not None and left <= 0:
                             raise queue.Empty
-                        line = self.lines.get(timeout=left)
+                        line = lines.get(timeout=left)
                     except queue.Empty:
                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
-                                           f"within {allow:.0f} s") from None
+                                           f"within {allow:.0f} s", epoch=epoch) from None
+                    if not self._epoch_current(epoch):
+                        break
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
-                        self._parse_done(line)
+                        self._parse_done_epoch(line, epoch)
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
+
+
 
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
@@ -2317,7 +2522,7 @@ class StrataEngine:
         except Exception:  # noqa: BLE001 - psutil missing, the process gone, no permission: no reading
             return None
 
-    def _stall_check(self, heard: float, state: dict, stall_s: float) -> None:
+    def _stall_check(self, heard: float, state: dict, stall_s: float, *, epoch=None) -> None:
         """#1317: called while the engine is silent.  Takes a baseline soon after the last line, and at stall_s of silence
         compares: no CPU and no I/O in all that time -> the engine is ended (EngineSilent); work going on -> one warning."""
         age = time.monotonic() - heard
@@ -2333,7 +2538,7 @@ class StrataEngine:
             gpu_working = False
         if now is not None and not gpu_working and engine_frozen(state["base"], now):
             raise self._silent(f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time (frozen; "
-                               "STRATA_ENGINE_STALL_S sets this, 0 = off)")
+                               "STRATA_ENGINE_STALL_S sets this, 0 = off)", epoch=epoch)
         if now is not None:   # working: look again after another window from here, and say so once
             state["base"], state["next"] = now, age + stall_s
             if not state.get("warned"):
@@ -2343,17 +2548,19 @@ class StrataEngine:
         else:
             state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
 
-    def _silent(self, what: str) -> EngineSilent:
-        """#481: end an engine that lost step with the server (its main thread waits for a command the server never
-        sends), so the next request starts it again: killed now, its GPU and RAM go back with the process."""
-        self.silent_note = ("The engine and the server lost step (issue #481; a very slow PC can raise "
-                            "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, please add "
-                            "the end of the engine log to github.com/Niko1221/Strata/issues/481.")
-        self.ended = True                               # not alive from now: the next request restarts it
-        proc = self.proc
+    def _silent(self, what: str, *, epoch=None) -> EngineSilent:
+        """End only the child whose request timed out, never its replacement."""
+        epoch = epoch or self._capture_epoch()
+        with self._state_lock():
+            if not self._epoch_current(epoch):
+                return EngineSilent(f"{what}; the original engine was replaced")
+            self.silent_note = ("The engine and the server lost step (issue #481; a very slow PC can raise "
+                                "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, please add "
+                                "the end of the engine log to github.com/Niko1221/Strata/issues/481.")
+            self.ended = True
         try:
-            proc.kill()
-            proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
+            epoch.proc.kill()
+            epoch.proc.wait(timeout=20)
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
         return EngineSilent(f"{what}; the server ended the engine")
@@ -2372,20 +2579,20 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
-        try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
-        except OSError:
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        epoch = self._capture_epoch()
+        self._send(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}", born=epoch.gen)
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
         want = "SAVED" if action == "save" else "RESTORED"
 
         def out_of_step(line: str) -> EngineDied:
-            self.ended = True                               # not alive from now: the next request restarts it
+            with self._state_lock():
+                if not self._epoch_current(epoch):
+                    return EngineDied("the engine changed during the session exchange")
+                self.ended = True
             try:
-                self.proc.kill()
-                self.proc.wait(timeout=20)
+                epoch.proc.kill()
+                epoch.proc.wait(timeout=20)
             except (OSError, AttributeError, subprocess.TimeoutExpired):
                 pass
             return EngineDied(f"the engine answered a session {action} with {line.strip()[:200]!r}; "
@@ -2399,15 +2606,17 @@ class StrataEngine:
         last_done = -1
         allow = 0.0                                         # the announced blocking step's allowance, seconds
         while True:
+            self._check_epoch(epoch)
             limit = max(silence, allow)
             left = limit - (time.monotonic() - heard) if silence > 0 else None
             try:
                 if left is not None and left <= 0:
                     raise queue.Empty
-                line = self.lines.get(timeout=left)
+                line = epoch.lines.get(timeout=left)
             except queue.Empty:
                 raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
-                                   + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
+                                   + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else ""), epoch=epoch) from None
+            self._check_epoch(epoch)
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
             f = line.split()
@@ -2458,46 +2667,104 @@ class StrataEngine:
             raise out_of_step(line)
 
     def close(self):
-        """End the engine process: STOP + QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
-        EngineStuck when it still runs after all three."""
-        if self.proc is None:
-            return
+        """Bounded shutdown of the captured child, even if its writer is blocked."""
+        deadline = time.monotonic() + ENGINE_QUIT_WAIT_S + ENGINE_TERM_WAIT_S + ENGINE_KILL_WAIT_S
+        def remaining(cap):
+            return max(0.0, min(cap, deadline - time.monotonic()))
+
+        # Capture before waiting for another closer: a queued old close must
+        # never select a child published while it was waiting.
+        with self._state_lock():
+            proc, pump, log = self.proc, self.pump, self.log
+            if proc is None:
+                return
+            write_failed = getattr(self, "_stdin_failed", False)
+        closer = self.__dict__.setdefault("_close_lock", threading.Lock())
+        if not closer.acquire(timeout=remaining(ENGINE_QUIT_WAIT_S)):
+            raise EngineStuck("another engine shutdown is still in progress")
         try:
-            if self.proc.poll() is None:
+            with self._state_lock():
+                if self.proc is proc:
+                    self._stdin_closing = True
+            written = threading.Event()
+            errors = []
+
+            def shutdown_write():
                 try:
-                    # STOP first: a request still running ends at its next step instead of being waited for (the
-                    # engine reads stdin on its own thread; QUIT behind a long answer would sit in its queue)
-                    self.proc.stdin.write("STOP\nQUIT\n")
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    self.proc.terminate()
-                    self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+                    with self.wlock:
+                        # This worker never retargets a successor or appends bytes
+                        # after a failed earlier write acquired the lock first.
+                        with self._state_lock():
+                            valid = self.proc is proc and not getattr(self, "_stdin_failed", False)
+                        if valid and proc.poll() is None:
+                            self._write_locked(proc, "STOP\nQUIT", close_stdin=True)
+                except (OSError, AttributeError, ValueError) as error:
+                    errors.append(error)
+                finally:
+                    written.set()
+
+            writer = None
+            if proc.poll() is None:
+                graceful_deadline = min(deadline, time.monotonic() + ENGINE_QUIT_WAIT_S)
+                if not write_failed:
+                    writer = threading.Thread(target=shutdown_write, daemon=True)
+                    writer.start()
+                graceful = (not write_failed and written.wait(max(0, graceful_deadline - time.monotonic()))
+                            and not errors)
+                try:
+                    if not graceful:
+                        proc.terminate()
+                        proc.wait(timeout=remaining(ENGINE_TERM_WAIT_S))
+                    else:
+                        proc.wait(timeout=max(0, graceful_deadline - time.monotonic()))
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=remaining(ENGINE_TERM_WAIT_S))
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=remaining(ENGINE_KILL_WAIT_S))
+                        except subprocess.TimeoutExpired:
+                            raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
+                    except OSError:
+                        pass
+            # Killing the child normally breaks a blocked pipe write. Never
+            # publish another child while a writer still owns the old pipe.
+            if writer is not None:
+                writer.join(timeout=remaining(ENGINE_TERM_WAIT_S))
+                if writer.is_alive():
+                    raise EngineStuck("the old engine pipe writer has not stopped; restart is fenced")
+            # A descendant may retain stdout after the child exits. Closing a
+            # buffered reader while its pump blocks in read can wait forever on
+            # Python's reader lock. Keep the captured process/epoch retired only
+            # after that reader has drained; a later close can retry safely.
+            if pump is not None and pump.ident is not None:
+                pump.join(timeout=remaining(2))
+                if pump.is_alive():
+                    raise EngineStuck("the old engine output reader has not stopped; restart is fenced")
+            if not self.wlock.acquire(timeout=remaining(ENGINE_TERM_WAIT_S)):
+                raise EngineStuck("the old engine pipe writer has not stopped; restart is fenced")
             try:
-                self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
-            except subprocess.TimeoutExpired:
-                raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
-        except OSError:
-            pass
-        finally:
-            if self.proc.poll() is not None:
-                if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
-                    self.pump.join(timeout=2)
+                if proc.poll() is None:
+                    raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits")
                 try:
-                    self.proc.stdin.close()             # buffered data may flush again after the engine has exited
-                except OSError:
+                    proc.stdin.close()
+                except (OSError, ValueError):
                     pass
-                self.proc.stdout.close()
-                if self.log not in (None, subprocess.DEVNULL):
-                    self.log.close()
-                self.proc = None
-                self.ended = True
-                self.progress, self.last = None, {}
-                self.progress_ms, self.reused = 0, 0
+                with self._state_lock():
+                    if self.proc is proc:
+                        self.proc = None
+                        self.ended = True
+                        self.progress, self.last = None, {}
+                        self.progress_ms, self.reused = 0, 0
+            finally:
+                self.wlock.release()
+            proc.stdout.close()
+            if log not in (None, subprocess.DEVNULL):
+                log.close()
+        finally:
+            closer.release()
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)

@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "strata/core/strict_retirement.hpp"
 
 #include <cstddef>
 #include <cstdio>
@@ -32,6 +33,7 @@ public:
     PinnedRing(const PinnedRing&) = delete;
     PinnedRing& operator=(const PinnedRing&) = delete;
     ~PinnedRing() { release(); }
+    void set_strict_retirement(bool enabled) { strict_retirement_ = enabled; }
 
     // dst (device) <- bytes from src (host, any kind of memory); src is free to change when this returns
     cudaError_t h2d(void* dst, const void* src, size_t bytes, cudaStream_t s) {
@@ -55,10 +57,10 @@ public:
         next_ = (next_ + 1) % kSlots;
         if (sl.pending) {                  // the copy that last read this slot is done before it is refilled
             sl.pending = false;
-            if (cudaEventSynchronize(sl.ev) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+            if (retirement_result(strict_retirement_, cudaEventSynchronize(sl.ev), "pinned ring prior upload") != cudaSuccess) { cudaGetLastError(); return nullptr; }
         }
         if (sl.cap < bytes) {
-            if (sl.p) { cudaFreeHost(sl.p); sl.p = nullptr; sl.cap = 0; }   // idle: its last copy was waited for above
+            if (sl.p) { retirement_check(strict_retirement_, cudaFreeHost(sl.p), "pinned ring replacement"); sl.p = nullptr; sl.cap = 0; }   // idle: its last copy was waited for above
             const size_t cap = bytes < kMinCap ? kMinCap : bytes;
             if (cudaHostAlloc(&sl.p, cap, cudaHostAllocPortable) != cudaSuccess) {
                 cudaGetLastError();
@@ -127,10 +129,10 @@ public:
             if (sl.cap >= bytes && sl.ev != nullptr) continue;
             if (sl.pending) {
                 sl.pending = false;
-                if (cudaEventSynchronize(sl.ev) != cudaSuccess) { cudaGetLastError(); return false; }
+                if (retirement_result(strict_retirement_, cudaEventSynchronize(sl.ev), "pinned ring prior upload") != cudaSuccess) { cudaGetLastError(); return false; }
             }
             if (sl.cap < bytes) {
-                if (sl.p) { cudaFreeHost(sl.p); sl.p = nullptr; sl.cap = 0; }
+                if (sl.p) { retirement_check(strict_retirement_, cudaFreeHost(sl.p), "pinned ring replacement"); sl.p = nullptr; sl.cap = 0; }
                 const size_t cap = bytes < kMinCap ? kMinCap : bytes;
                 if (cudaHostAlloc(&sl.p, cap, cudaHostAllocPortable) != cudaSuccess) {
                     cudaGetLastError();
@@ -148,7 +150,20 @@ public:
         return true;
     }
 
+    // Caller seals producers; failure is terminal before a slot can be reused.
+    void retire_strict() {
+        StrictRetirementDevice device(dev_ >= 0, dev_);
+        for (Slot& sl : slots_) {
+            if (sl.pending && sl.ev) retirement_check(true, cudaEventSynchronize(sl.ev), "pinned ring drain");
+            if (sl.ev) retirement_check(true, cudaEventDestroy(sl.ev), "pinned ring event");
+            if (sl.p) retirement_check(true, cudaFreeHost(sl.p), "pinned ring memory");
+            sl = Slot{};
+        }
+        acquired_ = nullptr; dev_ = -1; next_ = 0;
+    }
+
     void release() {
+        if (strict_retirement_) { retire_strict(); return; }
         for (Slot& sl : slots_) {
             if (sl.pending && sl.ev) cudaEventSynchronize(sl.ev);
             if (sl.ev) cudaEventDestroy(sl.ev);
@@ -162,6 +177,7 @@ public:
     }
 
 private:
+    bool strict_retirement_ = false;
     static constexpr size_t kMinCap = 64 * 1024;
     struct Slot {
         void* p = nullptr;

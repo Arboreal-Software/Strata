@@ -1,3 +1,4 @@
+#include "strata/core/expert_retirement.hpp"
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
 
@@ -21,6 +22,10 @@
 #include <cstdlib>
 #include <utility>
 #include <cstring>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace strata::core {
 
@@ -72,21 +77,49 @@ size_t device_free_bytes() {
 }
 
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
-                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
+                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err,
+                         ExpertProfileCapture* capture) {
+    if(capture) {
+        capture->complete_=false;
+        if(capture->attempt_generation_==UINT64_MAX) {err.clear();return false;}
+        ++capture->attempt_generation_;
+    }
+#if defined(_WIN32)
+    if(capture) {err="profile capture requires POSIX descriptor identity";return false;}
+#endif
+    std::FILE* owned_file=nullptr;
+    struct FileGuard {std::FILE*& f;~FileGuard(){if(f)std::fclose(f);}} guard{owned_file};
+    try {
+    if(capture && path!=capture->inventory_.claims.expected_profile_path) {
+        err="profile capture path differs from admitted authority";return false;
+    }
+    std::vector<std::pair<int32_t,int32_t>> staged;
+    auto& result=capture?staged:ranked;
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) {
         err = "read_expert_profile: cannot open " + path;
         return false;
     }
+    owned_file=f;
+    auto close_file=[&]() {owned_file=nullptr;return std::fclose(f);};
+#if !defined(_WIN32)
+    auto identity_matches=[&]() {
+        struct stat st{};
+        const auto& c=capture->inventory_.claims;
+        return ::fstat(::fileno(f),&st)==0 && S_ISREG(st.st_mode) && st.st_size>=0 &&
+            uint64_t(st.st_dev)==c.device && uint64_t(st.st_ino)==c.inode && uint64_t(st.st_size)==c.bytes;
+    };
+    if(capture && !identity_matches()) {err="profile descriptor differs from admitted authority";return false;}
+#endif
     char magic[4] = {0, 0, 0, 0};
     uint32_t hdr[5] = {0, 0, 0, 0, 0};
     if (std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 5, f) != 5) {
-        std::fclose(f);
+        close_file();
         err = "read_expert_profile: " + path + " is too short to hold a header";
         return false;
     }
     if (std::memcmp(magic, "STRP", 4) != 0) {
-        std::fclose(f);
+        close_file();
         err = "read_expert_profile: " + path + " does not start with STRP";
         return false;
     }
@@ -94,7 +127,7 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
     // the version comes first: the fields after it are only known to be these in a version 1 file, so a later
     // format is refused by its number rather than read as if it were this one
     if (version != 1) {
-        std::fclose(f);
+        close_file();
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "read_expert_profile: %s is a version %u profile but this engine reads version 1 - it was "
@@ -104,7 +137,7 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         return false;
     }
     if ((int64_t) nl != n_layers || (int64_t) ne != n_expert) {
-        std::fclose(f);
+        close_file();
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "read_expert_profile: %s is %ux%u but this model is %lldx%lld - it is a profile for a "
@@ -113,18 +146,21 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         return false;
     }
     if (n_ranked > want) {
-        std::fclose(f);
+        close_file();
         err = "read_expert_profile: the header claims more ranked pairs than slots";
         return false;
     }
-    ranked.assign(n_ranked, {0, 0});
+    if(capture && n_ranked>capture->inventory_.limits.max_pairs) {
+        err="profile pair count exceeds admitted receipt bound";return false;
+    }
+    result.assign(n_ranked, {0, 0});
     std::vector<uint16_t> raw((size_t) n_ranked * 2);
     if (n_ranked > 0 && std::fread(raw.data(), 2, (size_t) n_ranked * 2, f) != (size_t) n_ranked * 2) {
-        std::fclose(f);
+        close_file();
         err = "read_expert_profile: the ranked list is truncated";
         return false;
     }
-    std::fclose(f);
+    if(!capture) close_file();
     for (uint32_t i = 0; i < n_ranked; ++i) {
         const int32_t l = (int32_t) raw[(size_t) i * 2], e = (int32_t) raw[(size_t) i * 2 + 1];
         if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
@@ -134,10 +170,26 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
             err = buf;
             return false;
         }
-        ranked[(size_t) i] = {l, e};
+        result[(size_t) i] = {l, e};
+    }
+    if(capture) {
+        auto& inv=capture->inventory_;
+        inv.ranked.assign(staged.begin(),staged.end());
+#if !defined(_WIN32)
+        if(!identity_matches()) {err="profile descriptor changed during read";return false;}
+#endif
+        if(close_file()!=0) {err="profile close failed";return false;}
+        // Only nonthrowing operations follow checked close. No partially parsed
+        // ranking or receipt becomes observable on any prior failure.
+        for(size_t i=0;i<5;++i)inv.header[i]=hdr[i];
+        inv.device=inv.claims.device;inv.inode=inv.claims.inode;inv.bytes=inv.claims.bytes;
+        inv.consumed_bytes=24+uint64_t(n_ranked)*4;
+        ranked.swap(staged);
+        capture->complete_=true;
     }
     slots = (int64_t) want;
     return true;
+    } catch(const std::bad_alloc&) {if(!capture)throw;err.clear();return false;}
 }
 
 std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, int64_t n_expert,
@@ -211,6 +263,17 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
     return true;
 }
 
+bool ExpertCache::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if (retirement_open_started_) { error = "strict retirement must be configured before open"; return false; }
+#if defined(STRATA_GPU_METAL)
+    if (enabled) { error = "strict expert retirement is unsupported by Metal"; return false; }
+#endif
+    if (enabled && !valid_retirement_topology(devices, error)) return false;
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
+    return true;
+}
+
 ExpertCache::~ExpertCache() { close(); }
 
 // ---- #533: the segmented arena (--vram-elastic).  The driver API's virtual memory functions, looked up through the
@@ -271,12 +334,12 @@ CUmemAllocationProp device_prop(int dev) {
 }
 
 // one segment: a physical allocation mapped at `va`, readable and writable by this device
-bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned long long& handle) {
+bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned long long& handle, bool strict = false) {
     const CUmemAllocationProp prop = device_prop(dev);
     CUmemGenericAllocationHandle h = 0;
     if (v.create(&h, bytes, &prop, 0) != CUDA_SUCCESS) return false;
     if (v.map(va, bytes, 0, h, 0) != CUDA_SUCCESS) {
-        v.release(h);
+        if (v.release(h) != CUDA_SUCCESS && strict) retirement_failed("expert segment rollback release");
         return false;
     }
     CUmemAccessDesc access{};
@@ -284,8 +347,8 @@ bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned l
     access.location.id = dev;
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     if (v.set_access(va, bytes, &access, 1) != CUDA_SUCCESS) {
-        v.unmap(va, bytes);
-        v.release(h);
+        if (v.unmap(va, bytes) != CUDA_SUCCESS && strict) retirement_failed("expert segment rollback unmap");
+        if (v.release(h) != CUDA_SUCCESS && strict) retirement_failed("expert segment rollback release");
         return false;
     }
     handle = (unsigned long long) h;
@@ -295,6 +358,7 @@ bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned l
 #endif
 
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
 #if defined(STRATA_EC_NO_VMM)
     (void) want;
     err = "ExpertCache: --vram-elastic (a segmented expert cache) is CUDA-only for now";
@@ -332,7 +396,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
     }
     for (size_t i = 0; i < segs_.size(); ++i) {
         if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
-                         segs_[i])) {
+                         segs_[i], strict_retirement_)) {
             char buf[200];
             std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc failed: segment %zu of %zu (%.2f GiB) of the "
                           "segmented cache could not be allocated", i + 1, segs_.size(),
@@ -350,14 +414,14 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 void ExpertCache::release_segmented() {
 #if !defined(STRATA_EC_NO_VMM)
     const Vmm& v = vmm();
-    if (base_ != nullptr) cudaDeviceSynchronize();
+    if (base_ != nullptr) retirement_check(strict_retirement_, cudaDeviceSynchronize(), "expert segmented drain");
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
     for (size_t i = 0; i < segs_.size(); ++i)
         if (segs_[i] != 0) {
-            v.unmap(va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i]);
-            v.release((CUmemGenericAllocationHandle) segs_[i]);
+            if (v.unmap(va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i]) != CUDA_SUCCESS && strict_retirement_) retirement_failed("expert segment unmap");
+            if (v.release((CUmemGenericAllocationHandle) segs_[i]) != CUDA_SUCCESS && strict_retirement_) retirement_failed("expert segment release");
         }
-    if (base_ != nullptr && reserved_ > 0) v.address_free(va, (size_t) reserved_);
+    if (base_ != nullptr && reserved_ > 0 && v.address_free(va, (size_t) reserved_) != CUDA_SUCCESS && strict_retirement_) retirement_failed("expert address range release");
 #endif
     segs_.clear();
     seg_size_.clear();
@@ -382,6 +446,7 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
 }
 
 bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
     if (segs_.empty()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
@@ -394,7 +459,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
     while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
     if (keep >= mapped_segs_) return true;
-    if (cudaDeviceSynchronize() != cudaSuccess) {
+    if (retirement_result(strict_retirement_, cudaDeviceSynchronize(), "expert shrink drain") != cudaSuccess) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -403,6 +468,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         const CUdeviceptr p = va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_);
         if (v.unmap(p, (size_t) seg_size_[(size_t) i]) != CUDA_SUCCESS ||
             v.release((CUmemGenericAllocationHandle) segs_[(size_t) i]) != CUDA_SUCCESS) {
+            if (strict_retirement_) retirement_failed("expert shrink segment retirement");
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
             return false;
@@ -416,6 +482,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
 }
 
 bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
     if (segs_.empty()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
@@ -426,13 +493,13 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 #else
     const Vmm& v = vmm();
     int dev = 0;
-    cudaGetDevice(&dev);
+    retirement_check(strict_retirement_, cudaGetDevice(&dev), "expert growth device");
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
     int64_t at = mapped_bytes();
     while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
         const size_t i = (size_t) mapped_segs_;
         if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
-                         segs_[i])) {
+                         segs_[i], strict_retirement_)) {
             (void) cudaGetLastError();
             err = "the driver has no VRAM for another expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
@@ -455,7 +522,7 @@ bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
         err = std::string("ExpertCache: HIP blocking staging allocation: ") + cudaGetErrorString(status);
         return false;
     }
-    if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
+    if (blocking_staging_) retirement_check(strict_retirement_, cudaFreeHost(blocking_staging_), "expert blocking staging");
     blocking_staging_ = static_cast<uint8_t*>(next);
     blocking_staging_bytes_ = bytes;
     return true;
@@ -471,6 +538,8 @@ void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
     close();
+    retirement_open_started_ = true;
+    retirement_capture_device(strict_retirement_, retirement_consumers_, retirement_device_);
     if (n_slots <= 0) {
         err = "ExpertCache: n_slots must be positive";
         return false;
@@ -509,6 +578,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     } else if (g_cache_vmm && vmm_available()) {
         // the elastic K/V: every chunk mapped now; the K/V may later take some of them (and give them back)
         auto r = std::make_unique<VmmRange>();
+        r->set_strict_retirement(strict_retirement_, retirement_device_);
         if (!r->reserve(want) || !r->map_range(0, r->chunks(), [] { return (VmmChunk) 0; })) {
             char buf[256];
             std::snprintf(buf, sizeof buf, "ExpertCache: mapping %.2f GiB of VRAM failed: out of memory",
@@ -562,6 +632,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
 bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
                              std::string& err) {
+    retirement_open_started_ = true;
     if (slot_bytes.empty()) { err = "ExpertCache: no slots"; return false; }
     int64_t mx = 0;
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
@@ -596,20 +667,21 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 }
 
 void ExpertCache::close() {
+    ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
 #if defined(STRATA_USE_HIP)
-    if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
+    if (blocking_staging_) retirement_check(strict_retirement_, cudaFreeHost(blocking_staging_), "expert blocking staging");
     blocking_staging_ = nullptr;
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
     guard_ = 0;
-    if (!segs_.empty()) {
+    if (!segs_.empty() || (strict_retirement_ && reserved_ > 0)) {
         release_segmented();
     } else if (vmm_) {
         vmm_.reset();   // unmaps and frees every chunk it still holds
         base_ = nullptr;
     } else if (base_ != nullptr) {
-        cudaFree(base_);
+        retirement_check(strict_retirement_, cudaFree(base_), "expert cache allocation");
         base_ = nullptr;
     }
     residency_.clear();
@@ -673,6 +745,11 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
+    return fill_slot(slot,host_blob,stream,err,bytes,nullptr);
+}
+
+bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err,
+                            int64_t bytes, uint64_t* submitted_bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -690,11 +767,17 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
         return false;
     }
+    if(submitted_bytes)*submitted_bytes=uint64_t(n);
     ++fills_;
     return true;
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+    return fill_slot_blocking(slot,host_blob,err,bytes,nullptr);
+}
+
+bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err,
+                                     int64_t bytes, uint64_t* completed_bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -721,6 +804,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
     }
+    if(completed_bytes)*completed_bytes=uint64_t(n);
     ++fills_;
     return true;
 }

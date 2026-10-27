@@ -238,6 +238,18 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+    copy_calls = sync_calls = fail_copy = fail_sync = 0;
+    SavedConversation private_capture;
+    check(conversation_snapshot_save_private(private_capture,view,ss,g,error),
+          "transaction-owned native capture succeeds without draft state");
+    check(private_capture.kv.size()==size_t(g.n_qsa_layers()) && private_capture.live.ids==view.ids,
+          "private capture includes owned layers and forwarded history");
+    copy_calls = sync_calls = 0; fail_copy = 1;
+    SavedConversation retained_partial;
+    check(!conversation_snapshot_save_private(retained_partial,view,ss,g,error),
+          "transaction-owned capture reports injected copy failure");
+    check(retained_partial.live.ids==view.ids && !retained_partial.live.gdn.empty(),
+          "failed private capture leaves transfer destinations owned by caller");
 #endif
 }
 }

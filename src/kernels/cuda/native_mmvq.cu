@@ -2027,7 +2027,7 @@ __global__ void native_q8_0_packed_kernel(const int8_t* __restrict__ qs, const h
     }
 }
 
-struct Q8Packed { const int8_t* qs; const half* d; int n_in, n_out; };
+struct Q8Packed { const int8_t* qs; const half* d; int n_in, n_out; bool release_failed = false; };
 std::unordered_map<const void*, Q8Packed>& q8_packed_registry() {
     static std::unordered_map<const void*, Q8Packed> registry;
     return registry;
@@ -2052,6 +2052,8 @@ bool q8_packed_shape(int n_in, int n_out) {   // the shapes native_q8_0_packed_k
 
 bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& registry = q8_packed_registry();
+    if (const auto it = registry.find(weights); it != registry.end() && it->second.release_failed)
+        throw std::runtime_error("Q8 packed allocation has uncertain lifetime");
 #if !defined(__HIPCC__)
     if (q8_sm60_on() && !registry.empty()) {
         const auto found = registry.find(weights);
@@ -2185,7 +2187,7 @@ __global__ void native_q6_k_packed_kernel(const int* __restrict__ ql, const int*
 bool g_q6_bypass = false;   // the load-time self-test times the GGUF-layout kernels with the copy registered
 
 // the packed planes of one Q6_K matrix (owned: allocated by native_q6_k_pack, freed by native_q6_k_unpack)
-struct Q6Packed { void* base; const int* ql; const int* qh; const int8_t* sc; const half* d; int n_in, n_out; };
+struct Q6Packed { void* base; const int* ql; const int* qh; const int8_t* sc; const half* d; int n_in, n_out; bool release_failed = false; };
 std::unordered_map<const void*, Q6Packed>& q6_packed_registry() {
     static std::unordered_map<const void*, Q6Packed> registry;
     return registry;
@@ -2204,6 +2206,8 @@ void q6_packed_launch(const Q6Packed& w, const Q81Block* x, float* y, cudaStream
 
 bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& registry = q6_packed_registry();
+    if (const auto it = registry.find(weights); it != registry.end() && it->second.release_failed)
+        throw std::runtime_error("Q6 packed allocation has uncertain lifetime");
     if (registry.empty() || g_q6_bypass || (ncols > 1 && !g_multi_exact)) return false;
     const auto found = registry.find(weights);
     if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out) return false;
@@ -2243,8 +2247,9 @@ bool native_q8_0_packed_eligible(int n_in, int n_out) {
 }
 
 namespace {
-std::unordered_map<const void*, void*>& q8_sm60_owned() {   // packed copies made here (the head), freed by release
-    static std::unordered_map<const void*, void*> owned;
+struct Q8HeadOwned { void* allocation = nullptr; std::size_t bytes = 0; bool release_failed = false; };
+std::unordered_map<const void*, Q8HeadOwned>& q8_sm60_owned() {   // packed copies made here (the head), freed by release
+    static std::unordered_map<const void*, Q8HeadOwned> owned;
     return owned;
 }
 } // namespace
@@ -2255,41 +2260,60 @@ bool native_q8_0_sm60_pack(const void* weights, int n_in, int n_out, const char*
     return false;
 #else
     if (!q8_sm60_on() || !weights || !native_q8_0_packed_eligible(n_in, n_out)) return false;
+    if (const auto it = q8_sm60_owned().find(weights); it != q8_sm60_owned().end() && it->second.release_failed)
+        throw std::runtime_error("Q8 head packing has retained failed resources");
     if (q8_packed_registry().count(weights)) return true;
     const std::size_t count = std::size_t(n_in / 32) * std::size_t(n_out);
     const std::size_t bytes = count * 34;
+    // Create both ownership records before allocating; a registry allocation
+    // exception cannot strand a CUDA allocation outside the retained model.
+    auto [owned_at, inserted] = q8_sm60_owned().try_emplace(weights);
+    try { q8_packed_registry().try_emplace(weights); }
+    catch (...) { if (inserted) q8_sm60_owned().erase(owned_at); throw; }
     void* packed = nullptr;
     if (cudaMalloc(&packed, bytes) != cudaSuccess) {
+        q8_packed_registry().erase(weights); q8_sm60_owned().erase(weights);
         cudaGetLastError();
         std::fprintf(stderr, "strata q8 sm60: no VRAM for the packed %s (%.0f MiB); it keeps the GGUF layout\n", what,
                      double(bytes) / 1048576.0);
         return false;
     }
+    owned_at->second = Q8HeadOwned{packed, bytes, false};
     auto* qs = static_cast<int8_t*>(packed);
     auto* d = reinterpret_cast<half*>(qs + std::size_t(n_in) * n_out);
     q8sm60::pack_kernel<<<unsigned((count + 255) / 256), 256>>>(static_cast<const Q80Block*>(weights), qs, d, count);
     if (cudaDeviceSynchronize() != cudaSuccess) {
         cudaGetLastError();
-        cudaFree(packed);
-        std::fprintf(stderr, "strata q8 sm60: packing the %s failed; it keeps the GGUF layout\n", what);
-        return false;
+        owned_at->second.release_failed = true;
+        q8_packed_registry().at(weights).release_failed = true;
+        throw std::runtime_error("Q8 head packing drain failed; retain model");
     }
     q8_packed_registry()[weights] = Q8Packed{qs, d, n_in, n_out};
-    q8_sm60_owned()[weights] = packed;
+    // The owned allocation was recorded before launching the pack kernel.
     std::fprintf(stderr, "strata q8 sm60: packed %s (%d x %d, %.0f MiB more VRAM)\n", what, n_out, n_in,
                  double(bytes) / 1048576.0);
     return true;
 #endif
 }
 
-void native_q8_0_sm60_release(const void* weights) {
+namespace {
+bool q8_head_release_checked(const void* weights) {
     auto& owned = q8_sm60_owned();
     const auto it = owned.find(weights);
-    if (it == owned.end()) return;
+    if (it == owned.end()) return true;
+    if (it->second.release_failed) return false;
+    if (cudaFree(it->second.allocation) != cudaSuccess) {
+        it->second.release_failed = true;
+        if (const auto active = q8_packed_registry().find(weights); active != q8_packed_registry().end())
+            active->second.release_failed = true;
+        return false;
+    }
     q8_packed_registry().erase(weights);
-    cudaFree(it->second);
     owned.erase(it);
+    return true;
 }
+}
+void native_q8_0_sm60_release(const void* weights) { (void) q8_head_release_checked(weights); }
 
 void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out) {
     const auto* blocks = static_cast<const Q80Block*>(gguf_blocks);
@@ -2303,6 +2327,10 @@ void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_o
 }
 
 void native_q8_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out) {
+    if (const auto it = q8_sm60_owned().find(gguf_weights); it != q8_sm60_owned().end() && it->second.release_failed)
+        throw std::runtime_error("Q8 packed key has retained failed allocation");
+    if (const auto it = q8_packed_registry().find(gguf_weights); it != q8_packed_registry().end() && it->second.release_failed)
+        throw std::runtime_error("Q8 packed key has uncertain lifetime");
     validate_pointer(gguf_weights);
     validate_pointer(packed);
     if (!native_q8_0_packed_eligible(n_in, n_out)) throw std::invalid_argument("Q8_0 packed: ineligible shape");
@@ -2311,7 +2339,11 @@ void native_q8_0_packed_register(const void* gguf_weights, const void* packed, i
         Q8Packed{qs, reinterpret_cast<const half*>(qs + std::size_t(n_in) * n_out), n_in, n_out};
 }
 
-void native_q8_0_packed_unregister(const void* gguf_weights) { q8_packed_registry().erase(gguf_weights); }
+void native_q8_0_packed_unregister(const void* gguf_weights) {
+    auto& registry = q8_packed_registry();
+    const auto it = registry.find(gguf_weights);
+    if (it != registry.end() && !it->second.release_failed) registry.erase(it);
+}
 
 bool native_q6_k_packed_enabled() {
     static const bool enabled = [] {
@@ -2323,7 +2355,10 @@ bool native_q6_k_packed_enabled() {
 
 bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what) {
     if (!weights || n_in <= 0 || n_in % 256 || n_in / 256 < WARPS * WARP / 32 || n_out < 2048) return false;
-    if (q6_packed_registry().count(weights)) return true;
+    if (const auto it = q6_packed_registry().find(weights); it != q6_packed_registry().end()) {
+        if (it->second.release_failed) throw std::runtime_error("Q6 head packing has retained failed resources");
+        return true;
+    }
     const std::size_t nb = std::size_t(n_in / 256) * std::size_t(n_out);
     const std::size_t bytes = nb * sizeof(Q6KBlock);
     std::vector<Q6KBlock> host(nb);
@@ -2340,16 +2375,25 @@ bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what
         std::memcpy(packed.data() + o_sc + b * 16, host[b].scales, 16);
         std::memcpy(packed.data() + o_d + b * 2, &host[b].d, 2);
     }
+    auto [record, inserted] = q6_packed_registry().try_emplace(weights);
     void* dev = nullptr;
-    if (cudaMalloc(&dev, total) != cudaSuccess) { cudaGetLastError(); return false; }
-    if (cudaMemcpy(dev, packed.data(), total, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(dev); cudaGetLastError(); return false;
-    }
+    if (cudaMalloc(&dev, total) != cudaSuccess) { q6_packed_registry().erase(record); cudaGetLastError(); return false; }
     auto* base = static_cast<uint8_t*>(dev);
-    q6_packed_registry()[weights] = Q6Packed{dev, reinterpret_cast<const int*>(base),
-                                             reinterpret_cast<const int*>(base + o_qh),
-                                             reinterpret_cast<const int8_t*>(base + o_sc),
-                                             reinterpret_cast<const half*>(base + o_d), n_in, n_out};
+    record->second = Q6Packed{dev, reinterpret_cast<const int*>(base),
+                            reinterpret_cast<const int*>(base + o_qh),
+                            reinterpret_cast<const int8_t*>(base + o_sc),
+                            reinterpret_cast<const half*>(base + o_d), n_in, n_out};
+    if (cudaMemcpy(dev, packed.data(), total, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            record->second.release_failed = true;
+            throw std::runtime_error("Q6 head packing drain failed; retain model");
+        }
+        if (cudaFree(dev) != cudaSuccess) {
+            record->second.release_failed = true;
+            throw std::runtime_error("Q6 head packing cleanup failed; retain model");
+        }
+        q6_packed_registry().erase(record); cudaGetLastError(); return false;
+    }
     std::fprintf(stderr, "strata: STRATA_Q6_PACKED=1 packed the %s (%d x %d, +%.1f MiB)\n", what, n_out, n_in,
                  total / 1048576.0);
     // STRATA_Q6P_SELFTEST=1: bitwise check against the GGUF-layout kernels (1..4 columns) and paired timings
@@ -2427,17 +2471,41 @@ bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what
         cudaEventDestroy(e0); cudaEventDestroy(e1);
         cudaFree(dx); cudaFree(ya); cudaFree(yb);
         cudaStreamDestroy(s);
-        if (!same) { native_q6_k_unpack(weights); return false; }
+        if (!same) {
+            if (!native_head_packed_release_checked(weights)) throw std::runtime_error("Q6 head selftest cleanup failed; retain model");
+            return false;
+        }
     }
     return true;
 }
 
-void native_q6_k_unpack(const void* weights) {
+namespace {
+bool q6_head_release_checked(const void* weights) {
     auto& registry = q6_packed_registry();
     const auto found = registry.find(weights);
-    if (found == registry.end()) return;
-    cudaFree(found->second.base);
+    if (found == registry.end()) return true;
+    if (found->second.release_failed) return false;
+    if (cudaFree(found->second.base) != cudaSuccess) { found->second.release_failed = true; return false; }
     registry.erase(found);
+    return true;
+}
+}
+void native_q6_k_unpack(const void* weights) { (void) q6_head_release_checked(weights); }
+
+std::size_t native_head_packed_allocation_bytes(const void* weights) {
+    std::size_t bytes = 0;
+    if (const auto it = q8_sm60_owned().find(weights); it != q8_sm60_owned().end()) bytes += it->second.bytes;
+    if (const auto it = q6_packed_registry().find(weights); it != q6_packed_registry().end()) {
+        const auto nb = std::size_t(it->second.n_in / 256) * std::size_t(it->second.n_out);
+        const auto qh = (nb * 128 + 255) & ~std::size_t(255);
+        const auto sc = (qh + nb * 64 + 255) & ~std::size_t(255);
+        const auto d = (sc + nb * 16 + 255) & ~std::size_t(255);
+        bytes += d + nb * 2;
+    }
+    return bytes;
+}
+bool native_head_packed_release_checked(const void* weights) {
+    return q6_head_release_checked(weights) && q8_head_release_checked(weights);
 }
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }

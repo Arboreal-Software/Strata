@@ -59,8 +59,12 @@ struct VerifyHits {
 
 class Verifier {
 public:
+    // SYCL policy producer unsupported; never proof of disabled tail routing.
+    RouteTailPolicyObservation route_tail_policy() const noexcept;
     Verifier() = default;
     ~Verifier();
+    /// CUDA ownership mode: configure before init; cleanup uncertainty terminates the worker.
+    bool set_strict_retirement(bool enabled, std::string& error);
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
@@ -262,6 +266,8 @@ public:
     std::string profile_report();
 
 private:
+    bool strict_retirement_ = false;
+    bool retirement_init_started_ = false;
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)

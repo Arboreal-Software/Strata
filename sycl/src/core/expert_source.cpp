@@ -63,6 +63,14 @@
 #endif
 
 namespace strata::core {
+// Unsupported producer, deliberately no environment or inferred runtime state.
+// Do not use this unresolved record to enable SYCL managed numerical identity.
+RouteTailPolicyObservation observe_tail_skip_policy() noexcept {
+    RouteTailPolicyObservation r;
+    r.applicability = PolicyApplicability::unknown;
+    return r;
+}
+
 
 namespace detail {
 
@@ -415,10 +423,19 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 
 // ================================ THE FILE-BACKED SOURCE ================================
 
+bool FileExpertSource::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if (retirement_open_started_) { error = "strict retirement must be configured before open"; return false; }
+    if (enabled) { error = "strict expert retirement is unsupported by SYCL"; return false; }
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
+    return true;
+}
+
 FileExpertSource::~FileExpertSource() { close(); }
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
+    retirement_open_started_ = true;
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
     const auto& layout = strata::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
@@ -2419,6 +2436,12 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;   // a previous layer already failed; do not make it worse
+    if (d.host_execution_observer != nullptr) {
+        d.failed = true;
+        d.fail = "SYCL expert host execution observation is unsupported";
+        d.fail_layer = d.layers;
+        return;
+    }
 
     using namespace strata::kernels::cpu;
     // Clause 3: the blob's internal offsets are compile-time constants, so a mismatched geometry does not
@@ -2548,6 +2571,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
+    if (d.host_execution_observer != nullptr) {
+        d.failed = true;
+        d.fail = "SYCL expert host execution observation is unsupported";
+        d.fail_layer = d.layers;
+        return;
+    }
     if (n_tok < 1 || n_tok > MAXT) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
@@ -3306,12 +3335,21 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     return st;
 }
 
+bool ArenaExpertSource::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if (retirement_open_started_) { error = "strict retirement must be configured before open"; return false; }
+    if (enabled) { error = "strict expert retirement is unsupported by SYCL"; return false; }
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
+    return true;
+}
+
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err, uint64_t max_pinned_bytes,
                              const std::string& shared_arena_file) {
     close();
+    retirement_open_started_ = true;
     const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();

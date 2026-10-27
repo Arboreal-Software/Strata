@@ -159,7 +159,7 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) sycl::free(state_arena_, dpct::get_in_order_queue());
     if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
     if (head_logits_) sycl::free(head_logits_, dpct::get_in_order_queue());
-    if (owns_draft_head_ && dhead_) {
+    if (owns_draft_head_ && dhead_ && !dhead_release_failed_) {
       strata::kernels::native_q6_k_unpack(dhead_);
       sycl::free(dhead_, dpct::get_in_order_queue());
     }
@@ -712,6 +712,9 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
 bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
                       const float *window_R, std::string &err,
                       const MtpDrafter *shared) try {
+    if (dhead_release_failed_ || (shared && shared->dhead_release_failed_)) {
+        err = "mtp: planar head ownership quarantined; restart required"; return false;
+    }
     const OnDevice on_device(device_);
     wt_ = &wt;
     head_ = head;
@@ -782,9 +785,12 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
                 strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,
                                                   "MTP draft head");
             if (!planar_gathered && dhead_type_ == 14 && !q4_head_ && !strata::kernels::native_q6_k_packed_enabled() &&
-                strata::kernels::native_q6_k_planar_enabled())   // STRATA_Q6_PLANAR
+                strata::kernels::native_q6_k_planar_enabled()) {   // STRATA_Q6_PLANAR
+                dhead_release_failed_ = true;
                 dhead_ = (uint8_t*) strata::kernels::native_q6_k_planar_adopt(dhead_, (int) (row_bytes / 210) * 256,
                                                                               (int) n_dvocab_, "MTP draft head");
+                dhead_release_failed_ = false;
+            }
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;

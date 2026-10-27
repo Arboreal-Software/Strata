@@ -15,13 +15,20 @@
 #endif
 #include <fstream>
 #include <sstream>
+#include <filesystem>
+#include <stdexcept>
+#include <type_traits>
+#include <charconv>
+#include <climits>
 
 namespace strata::kernels::cpu {
 namespace {
 ExpertLayout g_layout;
+std::atomic<uint64_t> layout_generation{0};
 }
 
 const ExpertLayout& expert_layout() { return g_layout; }
+uint64_t expert_layout_generation() noexcept {return layout_generation.load(std::memory_order_acquire);}
 
 int cpu_isa_cap() {
     // STRATA_FORCE_ISA (tests, the experimental older-CPU builds): the engine's own dispatch acts as if this CPU
@@ -385,17 +392,52 @@ void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, f
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
 
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,strata::core::ExpertLayoutCapture* capture) {
+    if(capture)capture->complete_=false;
+    try {
+    auto* receipt=capture?capture->inventory_.get():nullptr;
+    if(capture&&!receipt){err="unconfigured expert inventory";return false;}
+    auto present=[](const std::string& path){std::error_code ec;const auto st=std::filesystem::status(path,ec);if(ec&&ec!=std::errc::no_such_file_or_directory)throw std::runtime_error("expert metadata stat failed");if(st.type()==std::filesystem::file_type::not_found)return false;if(!std::filesystem::is_regular_file(st))throw std::runtime_error("expert metadata is not regular");return true;};
+    if(receipt){
+        receipt->layers.clear();receipt->signs.clear();receipt->hadamard_roles.clear();receipt->canonical={};
+        if(pack_dir!=receipt->claims.expected_pack_path||n_layers<=0||n_expert<=0||uint64_t(n_layers)>receipt->limits.max_layers){err="expert inventory path/geometry refusal";return false;}
+        if(present(pack_dir+"/native_experts.txt")!=receipt->claims.native_layout_present||present(pack_dir+"/hadamard.txt")!=receipt->claims.hadamard_present){err="expert metadata membership differs from admitted claims";return false;}
+        if(!receipt->claims.native_layout_present&&receipt->claims.hadamard_present){err="Hadamard metadata without native layout";return false;}
+        receipt->requested_layers=n_layers;receipt->requested_experts=n_expert;
+    }
+    HadamardSpec pending_hadamard;
+    auto commit=[&](ExpertLayout& layout){
+        if(receipt){
+            receipt->native=layout.native;receipt->layout_version=layout.version;receipt->effective_experts=layout.n_expert;
+            receipt->total_bytes=layout.total;receipt->max_blob_bytes=layout.max_blob;
+            receipt->hadamard_block=pending_hadamard.block;receipt->hadamard_roles=pending_hadamard.roles;
+            for(const auto& [width,values]:pending_hadamard.signs){strata::core::ExpertSignRecord r;r.width=uint64_t(width);r.values.reserve(values.size());for(float v:values)r.values.push_back(int8_t(v));receipt->signs.push_back(std::move(r));}
+            for(auto& record:receipt->layers)if(layout.native){record.format=layout.fmt[size_t(record.layer)];record.format.gu_signs=record.format.d_signs=nullptr;}
+            // All fallible metadata work precedes the two nonthrowing moves.
+            static_assert(std::is_nothrow_move_assignable_v<ExpertLayout> && std::is_nothrow_move_assignable_v<HadamardSpec>);
+            hadamard_set(std::move(pending_hadamard));layout_generation.fetch_add(1,std::memory_order_acq_rel);g_layout=std::move(layout);
+            receipt->layout_generation=expert_layout_generation();receipt->hadamard_generation=hadamard_generation();capture->complete_=true;
+        }else{layout_generation.fetch_add(1,std::memory_order_acq_rel);g_layout=layout;}
+    };
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
     std::ifstream in(pack_dir + "/native_experts.txt");
     if (!in) {
+        if(receipt&&!receipt->claims.native_layout_present&&present(pack_dir+"/native_experts.txt")){err="native metadata appeared or could not be read";return false;}
+        if(receipt&&receipt->claims.native_layout_present){err="declared native layout cannot be opened";return false;}
+        if(receipt&&(uint64_t(n_expert)>UINT64_MAX/uint64_t(BLOB)||uint64_t(n_layers)>UINT64_MAX/(uint64_t(n_expert)*uint64_t(BLOB)))){err="canonical expert layout overflow";return false;}
         L.total = (uint64_t) n_layers * (uint64_t) n_expert * (uint64_t) BLOB;
-        hadamard_set({});
-        g_layout = L;
+        if(receipt){
+            receipt->canonical={uint64_t(H),uint64_t(FF),uint64_t(QK),2,2,-1,
+                {O_GU_CODES,O_D_CODES,O_GU_SCALES,O_D_SCALES},
+                {O_D_CODES-O_GU_CODES,O_GU_SCALES-O_D_CODES,O_D_SCALES-O_GU_SCALES,BLOB-O_D_SCALES}};
+            for(int64_t layer=0;layer<n_layers;++layer){strata::core::ExpertLayerLoadRecord r;r.source_order=r.layer=uint64_t(layer);r.packed_offset=uint64_t(layer)*uint64_t(n_expert)*uint64_t(BLOB);r.blob_bytes=BLOB;receipt->layers.push_back(std::move(r));}}
+        else hadamard_set({});
+        commit(L);
         return true;
     }
+    if(receipt&&!receipt->claims.native_layout_present){err="undeclared native metadata opened";return false;}
 #if !defined(STRATA_NATIVE_EXPERTS)
     err = "this pack has native (IQ) experts but the engine was built without STRATA_NATIVE_EXPERTS";
     return false;
@@ -406,14 +448,23 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
     std::string line;
-    while (std::getline(in, line)) {
+    uint64_t metadata_bytes=0;
+    auto next_line=[&](){
+        if(!receipt)return bool(std::getline(in,line));
+        line.clear();char c;
+        while(in.get(c)){if(++metadata_bytes>receipt->limits.max_metadata_bytes)throw std::length_error("expert metadata byte bound");if(c=='\n')return true;if(line.size()>=receipt->limits.max_line_bytes)throw std::length_error("expert metadata line bound");line.push_back(c);}
+        if(in.bad())throw std::runtime_error("expert metadata read failed");
+        return !line.empty();
+    };
+    while (next_line()) {
         if (line.empty() || line[0] == '#') {
             if (!line.empty() && line[0] == '#') {
                 // "# strata native experts vN: ...".  A version this engine does not know may mean columns it
                 // would misread, so it is refused rather than parsed as far as the known columns go.
                 static const char tag[] = "# strata native experts v";
                 if (line.compare(0, sizeof tag - 1, tag) == 0) {
-                    L.version = std::atoi(line.c_str() + sizeof tag - 1);
+                    if(receipt){const char* first=line.data()+sizeof tag-1;auto parsed=std::from_chars(first,line.data()+line.size(),L.version);if(parsed.ec!=std::errc{}||L.version<1){err="native layout version parse refused";return false;}}
+                else L.version = std::atoi(line.c_str() + sizeof tag - 1);
                     if (L.version > kExpertLayoutVersion) {
                         err = "native_experts.txt is v" + std::to_string(L.version) + "; this engine reads up to v" +
                               std::to_string(kExpertLayoutVersion) + " (the pack was written by a newer tools/"
@@ -425,7 +476,10 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // fewer experts than the canonical geometry the caller passes, which is a compile-time
                 // default, so the header wins.
                 const size_t at = line.find("(n_expert ");
-                if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                if (at != std::string::npos) {
+                    if(receipt){const char* first=line.data()+at+10;auto parsed=std::from_chars(first,line.data()+line.size(),L.n_expert);if(parsed.ec!=std::errc{}||L.n_expert<=0){err="native expert count parse refused";return false;}}
+                    else L.n_expert = std::atoll(line.c_str() + at + 10);
+                }
             }
             continue;
         }
@@ -436,6 +490,8 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             err = "native_experts.txt: a malformed line: " + line;
             return false;
         }
+        if(receipt&&(gt<0||gt>INT_MAX||dt<0||dt>INT_MAX||L.offset[size_t(l)]!=~0ull||receipt->layers.size()>=receipt->limits.max_layers)){err="duplicate/bounded expert layout row refusal";return false;}
+        bool parsed_offsets=false;
         NativeFmt f;
         if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
         if (f.bytes != blob) {
@@ -443,13 +499,15 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                   " B but its formats make " + std::to_string(f.bytes);
             return false;
         }
-        if (ss >> go >> uo >> dox) {   // v2 lines: the GGUF offsets
+        if (ss >> go >> uo >> dox) {
+            parsed_offsets=true;   // v2 lines: the GGUF offsets
             if (L.gguf_off.empty()) L.gguf_off.assign((size_t) (3 * n_layers), 0);
             L.gguf_off[(size_t) (3 * l)] = go;
             L.gguf_off[(size_t) (3 * l + 1)] = uo;
             L.gguf_off[(size_t) (3 * l + 2)] = dox;
             std::string file;             // v3: the shard that holds this layer (a file name beside --native)
             if (ss >> file) {
+                if(receipt&&file.size()>3*receipt->limits.max_string_bytes+2){err="expert shard string bound";return false;}
                 if (L.gguf_file.empty()) L.gguf_file.assign((size_t) (3 * n_layers), std::string());
                 // One name covers all three roles.  When a shard boundary falls inside a layer the packer writes
                 // "gate,up,down" instead (v4), an empty field meaning the --native shard.  A GGUF file name has no
@@ -472,20 +530,26 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                           "gate,up,down, not: " + line;
                     return false;
                 }
-                for (size_t r = 0; r < 3; ++r) L.gguf_file[(size_t) (3 * l) + r] = parts[r];
+                for (size_t r = 0; r < 3; ++r) {
+                    if(receipt&&parts[r].size()>receipt->limits.max_string_bytes){err="expert shard name bound";return false;}
+                    L.gguf_file[(size_t) (3 * l) + r] = parts[r];
+                }
             }
         }
         L.fmt[(size_t) l] = f;
         L.offset[(size_t) l] = off;
         L.bytes[(size_t) l] = blob;
         if (blob > L.max_blob) L.max_blob = blob;
+        if(receipt){strata::core::ExpertLayerLoadRecord record;record.source_order=receipt->layers.size();record.layer=uint64_t(l);record.packed_offset=off;record.blob_bytes=blob;record.format=f;record.format.gu_signs=record.format.d_signs=nullptr;record.has_gguf_offsets=parsed_offsets;record.gguf_offsets={go,uo,dox};if(!L.gguf_file.empty())for(size_t r=0;r<3;++r)record.shard_names[r]=L.gguf_file[size_t(3*l)+r];receipt->layers.push_back(std::move(record));}
     }
+    if(receipt&&L.n_expert<=0){err="expert count override refused";return false;}
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
         if (L.offset[(size_t) l] != at) {
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
+        if(receipt&&(L.bytes[size_t(l)]>UINT64_MAX/uint64_t(L.n_expert)||L.bytes[size_t(l)]*uint64_t(L.n_expert)>UINT64_MAX-at)){err="native expert extent overflow";return false;}
         at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
     L.total = at;
@@ -494,6 +558,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     {
         std::ifstream probe(pack_dir + "/hadamard.txt");
         const bool have = (bool) probe;
+        if(receipt&&have!=receipt->claims.hadamard_present){err="declared Hadamard metadata cannot be opened or changed";return false;}
         if (L.version >= 5 && !have) {
             err = "native_experts.txt v5 declares Hadamard-folded experts, but " + pack_dir + "/hadamard.txt is missing";
             return false;
@@ -505,9 +570,12 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         }
         for (int64_t l = 0; l < n_layers; ++l) L.fmt[(size_t) l].layer = (int) l;
         HadamardSpec h;
-        if (have && !hadamard_parse(pack_dir + "/hadamard.txt", n_layers, h, err)) return false;
-        hadamard_set(std::move(h));
-        const HadamardSpec& hs = hadamard_spec();
+        HadamardParseLimits bounds;
+        if(receipt)bounds={receipt->limits.max_layers,receipt->limits.max_line_bytes,receipt->limits.max_metadata_bytes,receipt->limits.max_sign_vectors,receipt->limits.max_sign_elements};
+        if (have && !hadamard_parse(pack_dir + "/hadamard.txt", n_layers, h, err,receipt?&bounds:nullptr)) return false;
+        if(!receipt)hadamard_set(std::move(h));
+        const HadamardSpec& hs = receipt?h:hadamard_spec();
+        auto signs=[&](int width)->const float*{auto it=hs.signs.find(width);return it==hs.signs.end()?nullptr:it->second.data();};
         for (int64_t l = 0; hs.any() && l < n_layers; ++l) {
             NativeFmt& f = L.fmt[(size_t) l];
             f.had_block = hs.block;
@@ -523,18 +591,40 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 err = "hadamard.txt: layer " + std::to_string(l) + " folds a Q2_0 expert, which this engine cannot rotate";
                 return false;
             }
-            f.gu_signs = f.had_gu ? hadamard_signs((int) f.n_embd) : nullptr;
-            f.d_signs = f.had_d ? hadamard_signs((int) f.n_ff) : nullptr;
+            f.gu_signs = f.had_gu ? signs((int) f.n_embd) : nullptr;
+            f.d_signs = f.had_d ? signs((int) f.n_ff) : nullptr;
             // explicit signs are per width: a width without a vector would silently mean identity signs
             if (!hs.signs.empty() && ((f.had_gu && !f.gu_signs) || (f.had_d && !f.d_signs))) {
                 err = "hadamard.txt: no sign vector for layer " + std::to_string(l) + "'s expert width";
                 return false;
             }
         }
+    if(receipt)pending_hadamard=std::move(h);
     }
-    g_layout = L;
+    commit(L);
     return true;
 #endif
+    }catch(const std::exception&){if(!capture)throw;err.clear();return false;}
 }
 
 }  // namespace strata::kernels::cpu
+
+namespace strata::core {
+bool ExpertLayoutCapture::create(const ExpertInventoryLimits& limits,std::shared_ptr<const ReservationLease> lease,
+    std::shared_ptr<const VerifiedDriverBindings> bindings,const ExpertMetadataClaims& claims,
+    std::unique_ptr<ExpertLayoutCapture>& out,std::string& error){
+    uint64_t required=0;if(!expert_inventory_host_bound(limits,required,error))return false;
+    if(!lease||lease->purpose()!=ReservationPurpose::foreground||lease->resources().host_bytes<required||!bindings||
+       claims.expected_pack_path.empty()||claims.expected_pack_path.size()>limits.max_string_bytes){error="expert capture requires admitted metadata and retained input claims";return false;}
+    try{auto capture=std::make_unique<ExpertLayoutCapture>();auto inv=std::make_unique<ExpertLayoutInventory>();
+        inv->metadata_reservation=std::move(lease);inv->retained_input_bindings=std::move(bindings);inv->limits=limits;inv->claims=claims;
+        inv->layers.reserve(size_t(limits.max_layers));inv->signs.reserve(size_t(limits.max_sign_vectors));inv->hadamard_roles.reserve(size_t(limits.max_layers));
+        capture->inventory_=std::move(inv);out=std::move(capture);return true;
+    }catch(const std::bad_alloc&){error.clear();return false;}
+}
+const ExpertLayoutInventory* ExpertLayoutCapture::completed_inventory()const noexcept{
+    if(!complete_||!inventory_||inventory_->layout_generation!=strata::kernels::cpu::expert_layout_generation()||
+       inventory_->hadamard_generation!=strata::kernels::cpu::hadamard_generation())return nullptr;
+    return inventory_.get();
+}
+}

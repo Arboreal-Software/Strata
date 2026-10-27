@@ -43,6 +43,7 @@ struct ForesightSwap {
         unsigned long long dptr = 0;         ///< the slot's device address
         const uint8_t* src = nullptr;        ///< the host blob being copied in
         uint64_t bytes = 0;
+        int event_device = -1;              ///< strict cleanup: exact creating device, including partial init
         void* ev = nullptr;                  ///< cudaEvent_t on the layer's card
     };
 
@@ -69,6 +70,9 @@ struct ForesightSwap {
     static constexpr int32_t kDropped = -2;  ///< Slot::expert: dropped by `hold`, reusable under the same depth rule
 
     /// Allocates the slots on each card and starts the filler.  `card_of_layer[l]` indexes `devices` (CUDA ids).
+    /// Configure before init. Before destruction, detach and join all external readers;
+    /// atomic callback-pointer clearing alone is not a reader drain. Strict uncertainty terminates the worker.
+    bool set_strict_retirement(bool enabled, const std::vector<int>& consumer_devices, std::string& error);
     bool init(int slots_per_layer, int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
               const std::vector<int>& devices, std::string& err);
     ~ForesightSwap();
@@ -91,6 +95,11 @@ struct ForesightSwap {
     std::string report() const;
 
 private:
+    bool strict_retirement_ = false;
+    bool retirement_init_started_ = false;
+    int retirement_device_ = -1;
+    uint64_t allocated_slots_ = 0;
+    std::vector<int> retirement_consumers_;
     void request_locked(ExpertSource* src, int64_t layer, int32_t expert, bool predicted);
     std::mutex smu_;                         ///< slot, where, card_* and the counters: the pool thread and the look-ahead thread
     std::mutex mu_;
@@ -102,6 +111,7 @@ private:
 };
 
 ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
-                                       const std::vector<int>& devices);
+                                       const std::vector<int>& devices, bool strict_retirement = false,
+                                       const std::vector<int>& consumer_devices = {});
 
 }  // namespace strata::core
