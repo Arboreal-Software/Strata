@@ -10,6 +10,7 @@
 #include <set>
 #include <vector>
 #include <stdexcept>
+#include <unistd.h>
 using namespace strata::core;
 static int allocations=0,copies=0,fail_alloc=0,fail_copy=0;
 static bool fail_register=false;
@@ -36,7 +37,18 @@ void fused_gr_quantize_q8_0(const uint16_t*,uint8_t*,int64_t,void*){throw std::r
 }
 template<class T>static void put(std::vector<uint8_t>& b,T v){auto n=b.size();b.resize(n+sizeof v);std::memcpy(b.data()+n,&v,sizeof v);}
 static void str(std::vector<uint8_t>& b,const std::string& s){put<uint64_t>(b,s.size());b.insert(b.end(),s.begin(),s.end());}
-static std::string fixture(){
+struct FixtureDirectory {
+    char directory[64] = "/tmp/strata-native-load-XXXXXX";
+    FixtureDirectory(){if(!::mkdtemp(directory))throw std::runtime_error("create private fixture directory");}
+    FixtureDirectory(const FixtureDirectory&)=delete;
+    FixtureDirectory& operator=(const FixtureDirectory&)=delete;
+    ~FixtureDirectory(){
+        // Only remove this guard's known file; never recursively follow entries.
+        char file[96];std::snprintf(file,sizeof file,"%s/model.gguf",directory);
+        std::remove(file);::rmdir(directory);
+    }
+};
+static std::string fixture(const FixtureDirectory& directory){
     std::vector<uint8_t> b;put<uint32_t>(b,0x46554747);put<uint32_t>(b,3);put<uint64_t>(b,2);put<uint64_t>(b,7);
     str(b,"general.architecture");put<uint32_t>(b,8);str(b,"qwen4exp");
     const auto& g=kCompiledGeometry;
@@ -44,10 +56,22 @@ static std::string fixture(){
     uint64_t offset=0;
     for(const auto* name:{"blk.0.attn_q.weight","blk.0.hc_attn_down.weight"}){str(b,name);put<uint32_t>(b,2);put<uint64_t>(b,32);put<uint64_t>(b,32);put<uint32_t>(b,8);put<uint64_t>(b,offset);offset+=1088;}
     b.resize((b.size()+31)/32*32+offset,0);
-    const std::string path="/tmp/strata_native_load_fixture.gguf";std::ofstream(path,std::ios::binary).write(reinterpret_cast<const char*>(b.data()),b.size());return path;
+    const std::string path=std::string(directory.directory)+"/model.gguf";
+    std::ofstream out(path,std::ios::binary|std::ios::trunc);
+    if(!out)throw std::runtime_error("open fixture file");
+    out.write(reinterpret_cast<const char*>(b.data()),std::streamsize(b.size()));
+    if(!out)throw std::runtime_error("write fixture file");
+    out.close();if(!out)throw std::runtime_error("close fixture file");
+    return path;
 }
-int main(){
-    setenv("STRATA_HC_Q8","1",1);const auto path=fixture();
+int main() try {
+    setenv("STRATA_HC_Q8","1",1);FixtureDirectory directory;const auto path=fixture(directory);
+    // Simultaneously live fixtures cannot overwrite or remove one another.
+    {FixtureDirectory other;const auto second=fixture(other);
+        check(path!=second,"overlapping fixture paths are distinct");
+        std::ifstream first(path,std::ios::binary),next(second,std::ios::binary);
+        check(first.good()&&next.good(),"both overlapping fixtures remain readable");}
+    check(std::ifstream(path,std::ios::binary).good(),"other fixture cleanup preserves original");
     for(int scenario=std::getenv("STRATA_NATIVE_TEST_FAULTS_ONLY")?1:0;scenario<9;++scenario){
         allocations=copies=0;fail_alloc=scenario>=1&&scenario<=4?scenario:0;
         fail_copy=scenario>=5&&scenario<=7?scenario-4:0;fail_register=scenario==8;
@@ -63,5 +87,7 @@ int main(){
         }
         check(live.empty()&&registered.empty(),"failure/success teardown retains then releases every allocation and registration");
     }
-    std::remove(path.c_str());std::puts("native_dense_load_test passed");
+    std::puts("native_dense_load_test passed");
+} catch(const std::exception& error){
+    std::fprintf(stderr,"FAIL: fixture setup: %s\n",error.what());return 1;
 }
