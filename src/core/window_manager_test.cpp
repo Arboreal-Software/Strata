@@ -1,3 +1,4 @@
+#include "window_session_elastic_test_mocks.hpp"
 #include "strata/core/window_restore.hpp"
 #include "strata/core/window_allocator.hpp"
 #include "strata/core/window_selection.hpp"
@@ -93,6 +94,7 @@ static WindowLaneToken lane(WindowManager& m,size_t i=0){WindowLaneToken out;che
 static ManagedWindowToken token(WindowManager& m,const ManagedWindowToken& old){ManagedWindowSnapshot out;check(m.entry_snapshot(old.registration,out)==S::ok,"entry snapshot");return out.token;}
 static void finish(ManagedWindowWork& work,const ManagedWindowToken& t){auto lease=work.lease();auto cut=t.selection.cut;++cut.id;check(lease.finish(lease.operation(),t.selection.key,{cut,cut},true,true),"common cut finish");}
 int main(){
+    strata::core::window_test::check_fixed_kv_elastic_mock_contract();
     alarm(45);
     WindowBudget budget(WindowResources{{1000000,1000000},256<<20,10000,0,0,100},WindowResources{{0,0},0,0,0,0,0});
     {

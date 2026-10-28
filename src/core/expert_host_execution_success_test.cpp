@@ -1,3 +1,4 @@
+#include "window_session_elastic_test_mocks.hpp"
 // Prepared genuine source+selection success fixture. No execution authorized.
 // Real immutable bundle/source/layout/allocator/initial/selection factories;
 // CUDA allocation and session shape/reset are CPU seams, not GPU qualification.
@@ -125,6 +126,7 @@ struct RetainedRuntime final:NativeRuntimeAttachment,ExpertHostRuntimeBinding {
  }
 };
 int main(){
+    strata::core::window_test::check_fixed_kv_elastic_mock_contract();
  Fixture f(false);std::string error;
  WindowBudget session_budget({{100000,100000},32<<20,10000,0,0,2},{{0,0},0,0,0,0,0});
  auto runtime=std::make_shared<RetainedRuntime>();runtime->inputs=f.bindings;runtime->layout=f.layout;
