@@ -2,7 +2,7 @@
 // CUDA virtual memory (the elastic K/V, --kv-grow): an address range reserved once, whose physical memory is mapped and
 // unmapped in chunks of the device's granularity (2 MiB).  The K/V pools grow with the context by taking chunks the
 // expert cache gives up, and neither moves: every captured graph and stored pointer stays valid.  The driver calls
-// are reached through the runtime's entry-point query, so nothing links the driver library.  Not under HIP.
+// CUDA driver entry points are resolved at runtime; HIP uses its native VMM API.
 
 #include <cstdint>
 #include <vector>
@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include "strata/core/window_budget.hpp"
+#include "strata/core/native_retirement.hpp"
 
 namespace strata::core {
 
@@ -27,6 +28,12 @@ void vmm_chunk_retire(VmmChunk h, bool strict);
 
 // Managed calls require one serialized owner reactor and checked quiescence.
 // They do not infer that a GPU consumer has stopped from a host token.
+struct VmmChunkOutcome;
+struct VmmRetirementResult {
+    enum Code { complete, refused, unknown };
+    Code code=refused;
+    size_t retired=0; // confirmed physical releases in this invocation
+};
 class DetachedVmmChunk {
 public:
     DetachedVmmChunk() = default;
@@ -41,6 +48,9 @@ public:
     // must be empty; failed/unknown device release is fail-stop, never retried.
     static bool allocate(WindowBudget&, int device, DetachedVmmChunk&, std::string&);
     bool retire() noexcept;
+    // Host-only one-shot seal; empty slots are legitimate no-effect participants.
+    bool prepare_retirement(const NativeRetirementContext&) noexcept;
+    VmmRetirementResult commit_retirement(const NativeRetirementContext&,VmmChunkOutcome&) noexcept;
 private:
     friend class VmmRange;
     friend class PreparedVmmAllocationBatch;
@@ -49,6 +59,8 @@ private:
     uint64_t incarnation_ = 0;
     int device_ = -1;
     bool fresh_ = true;
+    uint64_t retirement_generation_=0;
+    bool retirement_failed_=false,retirement_complete_=false;
     std::shared_ptr<const ReservationLease> lease_;
 };
 struct VmmBatchDevicePlan {
@@ -106,7 +118,12 @@ public:
     bool map_managed(int64_t lo, int64_t hi, std::span<DetachedVmmChunk>,
                      std::span<VmmChunkOutcome>) noexcept;
     bool detach_managed(int64_t index, DetachedVmmChunk&, VmmChunkOutcome&) noexcept;
-    bool managed_healthy() const noexcept { return managed_ && base_ != 0 && !managed_unknown_; }
+    bool managed_healthy() const noexcept { return managed_ && base_ != 0 && !managed_unknown_ && !retirement_generation_; }
+    // Preallocate caller outcomes (one per range slot) before device work.
+    // Known partial activation/mapping is accepted; unknown ownership is sealed
+    // but refused. Commit never waits, allocates, or retries an uncertain free.
+    bool prepare_retirement(const NativeRetirementContext&) noexcept;
+    VmmRetirementResult commit_retirement(const NativeRetirementContext&,std::span<VmmChunkOutcome>) noexcept;
     ~VmmRange() { release(); }
     void set_strict_retirement(bool enabled, int device) { if (managed_) return; strict_retirement_ = enabled; retirement_device_ = device; }
     VmmRange(const VmmRange&) = delete;
@@ -116,9 +133,9 @@ public:
     bool reserve(uint64_t bytes);
     /// Unmaps and frees every chunk, then the addresses.
     void release();
-    uint8_t* base() const { return (uint8_t*) (uintptr_t) base_; }
+    uint8_t* base() const { return retirement_generation_?nullptr:(uint8_t*) (uintptr_t) base_; }
     int64_t chunks() const { return (int64_t) h_.size(); }
-    bool mapped(int64_t i) const { return i >= 0 && i < chunks() && h_[(std::size_t) i] != 0; }
+    bool mapped(int64_t i) const { return !retirement_generation_ && i >= 0 && i < chunks() && h_[(std::size_t) i] != 0; }
     int64_t mapped_count() const;
     /// Maps chunks [lo, hi) that are not mapped yet, each to `take()` or, when that returns 0, to a new chunk.
     /// Readable and writable when it returns; false: out of memory (what was mapped stays mapped).
@@ -134,6 +151,8 @@ private:
     };
     std::shared_ptr<const ReservationLease> metadata_;
     std::vector<ManagedSlot> managed_slots_;
+    uint64_t retirement_generation_=0;
+    bool retirement_failed_=false,retirement_complete_=false;
     bool managed_ = false, managed_unknown_ = false;
     bool managed_internal_ = false;
     bool managed_prepared_ = false, managed_activation_attempted_ = false;

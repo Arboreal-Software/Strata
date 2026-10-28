@@ -947,6 +947,50 @@ bool FileExpertSource::set_strict_retirement(bool enabled, const std::vector<int
     return true;
 }
 
+namespace {
+struct FileBackgroundStopFrame {
+    const void* owner;
+    FileBackgroundStopFrame* previous;
+    static thread_local FileBackgroundStopFrame* current;
+    explicit FileBackgroundStopFrame(const void* p) noexcept:owner(p),previous(current){current=this;}
+    ~FileBackgroundStopFrame(){current=previous;}
+    static bool active(const void* p) noexcept {
+        for(auto* f=current;f;f=f->previous)if(f->owner==p)return true;
+        return false;
+    }
+};
+thread_local FileBackgroundStopFrame* FileBackgroundStopFrame::current=nullptr;
+} // namespace
+
+bool FileExpertSource::stop_background_after_callers_joined() noexcept {
+    background_sealed_.store(true,std::memory_order_release);
+    if(FileBackgroundStopFrame::active(this))return false;
+    FileBackgroundStopFrame frame(this);
+    try {
+        std::unique_lock<std::mutex> close(background_close_mu_,std::try_to_lock);
+        if(!close.owns_lock()||background_close_failed_.load(std::memory_order_acquire))return false;
+        if(background_joined_)return true;
+        const auto self=std::this_thread::get_id();
+        for(const auto& t:async_th_)if(t.joinable()&&t.get_id()==self)return false;
+        for(const auto& t:io_workers_)if(t.joinable()&&t.get_id()==self)return false;
+        if(ram_thread_.joinable()&&ram_thread_.get_id()==self)return false;
+        // Finish already-issued prefetches before stopping helper IO workers.
+        // Do not call prefetch_end/ram_stop/io_stop: they also release storage.
+        for(auto& t:async_th_)if(t.joinable())t.join();
+        {std::lock_guard<std::mutex> lock(ram_mu_);ram_quit_=true;}
+        ram_cv_.notify_all();
+        if(ram_thread_.joinable())ram_thread_.join();
+        {std::lock_guard<std::mutex> lock(io_mu_);io_quit_=true;}
+        io_cv_.notify_all();
+        for(auto& t:io_workers_)if(t.joinable())t.join();
+        background_joined_=true;
+        return true;
+    } catch(...) {
+        background_close_failed_.store(true,std::memory_order_release);
+        return false;
+    }
+}
+
 FileExpertSource::~FileExpertSource() { close(); }
 
 #if defined(__linux__)
@@ -1092,6 +1136,7 @@ void FileExpertSource::io_window_tick() {
 // the queue's fill against the window budget (a busy drive takes only the surer guesses); the window's speculative bytes
 // stay within the budget; each job carries the layer clock by which it must have started (else the worker drops it).
 void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const float* conf, int64_t n, int ahead) {
+    if(background_sealed_.load(std::memory_order_acquire))return;
     if (!io_sched_ || !io_pf_ || !direct_.empty() || !io_ahead_ || !gate_open()) { warm(layer, experts, n); return; }
     if (n <= 0 || layer < 0 || layer >= n_layers_) return;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
@@ -1099,6 +1144,7 @@ void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const 
     bool any = false;
     {
         std::lock_guard<std::mutex> lk(io_mu_);
+        if(background_sealed_.load(std::memory_order_acquire))return;
         const uint64_t budget = io_budget_now();
         for (int64_t j = 0; j < n; ++j) {
             const int64_t e = experts[j];
@@ -1125,6 +1171,7 @@ void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const 
 }
 
 void FileExpertSource::set_io_prefetch(bool on, int threads) {
+    if(background_sealed_.load(std::memory_order_acquire))return;
     io_stop();
 #if defined(__linux__)
     if (!on) return;
@@ -1200,6 +1247,7 @@ void FileExpertSource::io_stop() {
 void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, bool ahead) {
     {
         std::lock_guard<std::mutex> lk(io_mu_);
+        if(background_sealed_.load(std::memory_order_acquire))return;
         if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
             io_q_.pop_front();
             io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -1362,6 +1410,7 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
 }
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+    if(background_sealed_.load(std::memory_order_acquire))return false;
     close();
     if(inventory_&&!inventory_->begin(pack_dir,gguf_,n_layers,n_expert,false,err))return false;
     inventory_closed_=false;
@@ -1550,10 +1599,23 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 
 void FileExpertSource::close() {
     if(inventory_)inventory_->invalidate();
-    prefetch_end();
-    ram_stop();
-    io_stop();
+    const bool terminal=background_sealed_.load(std::memory_order_acquire);
+    if(terminal) {
+        if(!stop_background_after_callers_joined())retirement_failed("expert background worker join");
+    } else {
+        prefetch_end();
+        ram_stop();
+        io_stop();
+    }
     ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
+    if(terminal) {
+        // Explicit terminal stop retained these borrowers until this checked
+        // drain (or the caller's drain in legacy unchecked mode) completed.
+        async_th_.clear();
+        async_todo_.clear();
+        ram_stop();
+        io_stop();
+    }
     inputs_.clear();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_registered_) retirement_check(strict_retirement_, cudaFreeHost(complement_arena_), "expert source cleanup/drain");
@@ -2178,6 +2240,7 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
 }
 
 void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
+    if(background_sealed_.load(std::memory_order_acquire))return;
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
     if (io_fill_ && io_pf_ && direct_.empty()) {   // hand the layer's uncached blobs to the workers and go on: the kernels
         for (int64_t i = 0; i < n; ++i) {          // that reach one before it lands wait on its pages, the rest compute
@@ -2276,6 +2339,7 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
 // 149-cold STRATA_COLD_OVERLAP=1: the claimed blobs are read on background threads (the decode thread computes the
 // ready experts meanwhile); the same reads as fill_many, on as many threads, each blob published as it lands.
 int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, int64_t n, uint8_t* pending) {
+    if(background_sealed_.load(std::memory_order_acquire))return 0;
     for (int64_t i = 0; i < n; ++i) pending[i] = 0;
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return 0;
     if (io_fill_ && io_pf_ && direct_.empty()) {   // the page-fill mode: nothing is staged here, the kernels wait on pages
@@ -2374,6 +2438,7 @@ bool FileExpertSource::zc_roles(int64_t layer, int64_t expert, const uint8_t** p
 }
 
 void FileExpertSource::prefetch_end() {
+    if(background_sealed_.load(std::memory_order_acquire))return;
     if (async_th_.empty()) return;
     for (std::thread& t : async_th_) t.join();
     async_th_.clear();
@@ -2386,6 +2451,7 @@ void FileExpertSource::prefetch_end() {
 }
 
 void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) {
+    if(background_sealed_.load(std::memory_order_acquire))return;
     if (direct_.empty() || pairs == nullptr || n <= 0) return;   // unbuffered only: the mapped fill stays as it was
     std::vector<Fill> todo;
     {
@@ -2560,6 +2626,7 @@ bool FileExpertSource::open_prompt_direct(std::string& why) {
 }
 
 bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
+    if(background_sealed_.load(std::memory_order_acquire))return false;
 #if defined(_WIN32) || defined(__linux__)
     if (base_ == nullptr || paths_.empty() || !direct_.empty()) {
         why = !direct_.empty() ? "already unbuffered" : "no expert files open";
@@ -2579,6 +2646,7 @@ bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
 }
 
 bool FileExpertSource::recheck_unbuffered(std::string& why) {
+    if(background_sealed_.load(std::memory_order_acquire))return false;
 #if defined(_WIN32) || defined(__linux__)
     if (const char* env = std::getenv("STRATA_UNBUFFERED_LOAD"); env != nullptr && env[0] != '\0') {
         why = std::string("STRATA_UNBUFFERED_LOAD=") + env;
@@ -2667,6 +2735,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
 }
 
 bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
+    if(background_sealed_.load(std::memory_order_acquire))return false;
 #if defined(_WIN32)
     if (const char* v = std::getenv("STRATA_STARTUP_UNBUFFERED"); v != nullptr && v[0] != '\0' && std::atoi(v) == 0) {
         why = "STRATA_STARTUP_UNBUFFERED=0";
@@ -2723,6 +2792,7 @@ bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
 }
 
 bool FileExpertSource::end_startup_unbuffered(std::string& why) {
+    if(background_sealed_.load(std::memory_order_acquire))return false;
     ExpertRetirementScope retirement(strict_retirement_, retirement_device_, retirement_consumers_);
     if (!startup_ub_) return true;
     startup_ub_ = false;
@@ -2751,6 +2821,7 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
 }
 
 bool FileExpertSource::map_view(std::string& why) {
+    if(background_sealed_.load(std::memory_order_acquire))return false;
 #if defined(_WIN32)
     // open's mapping of experts.bin, again
     const std::string& path = paths_.front();
@@ -3045,6 +3116,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 }
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
+    if(background_sealed_.load(std::memory_order_acquire))return;
     if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
     {
@@ -3091,19 +3163,51 @@ static inline int la_pc64(uint64_t x) {   // (portable: no compiler builtin)
     return n;
 }
 
-RouterLookahead::~RouterLookahead() {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        quit_ = true;
+namespace {
+// Detect same-thread lifecycle/source callback reentry BEFORE touching a
+// nonrecursive mutex. try_lock on an already-owned std::mutex is not a fence.
+struct WorkerLifecycleScope {
+    const void* owner;
+    WorkerLifecycleScope* previous;
+    static thread_local WorkerLifecycleScope* current;
+    explicit WorkerLifecycleScope(const void* value) noexcept
+        : owner(value), previous(current) { current=this; }
+    ~WorkerLifecycleScope() { current=previous; }
+    static bool active(const void* value) noexcept {
+        for(auto* frame=current;frame;frame=frame->previous)
+            if(frame->owner==value)return true;
+        return false;
     }
-    cv_.notify_all();
-    if (thread_.joinable()) thread_.join();
+};
+thread_local WorkerLifecycleScope* WorkerLifecycleScope::current=nullptr;
+} // namespace
+
+bool RouterLookahead::close_for_retirement() noexcept {
+    retirement_started_.store(true,std::memory_order_release);
+    if(WorkerLifecycleScope::active(this))return false;
+    WorkerLifecycleScope lifecycle_frame(this);
+    try {
+        std::unique_lock<std::mutex> close(retirement_mu_,std::try_to_lock);
+        if(!close.owns_lock()||retirement_failed_)return false;
+        if(retirement_done_)return true;
+        if(thread_.joinable()&&thread_.get_id()==std::this_thread::get_id())return false;
+        { std::lock_guard<std::mutex> lock(mu_); quit_=true; }
+        cv_.notify_all();
+        try { if(thread_.joinable())thread_.join(); }
+        catch(...) {retirement_failed_=true;return false;}
+        retirement_done_=true;
+        return true;
+    } catch(...) {return false;}
+}
+RouterLookahead::~RouterLookahead() {
+    if(!close_for_retirement())retirement_failed("lookahead worker join");
 }
 
 void RouterLookahead::set_foresight(ForesightSwap* fs) {
     for (;;) {
         {
             std::lock_guard<std::mutex> lk(mu_);
+            if(retirement_started_.load(std::memory_order_acquire))return;
             if (fs != nullptr || !busy_) { fs_ = fs; return; }
         }
         // detaching: a prediction in progress finishes first (the swap space is about to go away)
@@ -3113,10 +3217,15 @@ void RouterLookahead::set_foresight(ForesightSwap* fs) {
 
 bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k,
                             ExpertSource* src, std::string& err, bool allow_cold_source) {
+    if(WorkerLifecycleScope::active(this)){err="worker lifecycle reentry";return false;}
+    WorkerLifecycleScope lifecycle_frame(this);
+    std::unique_lock<std::mutex> lifecycle(retirement_mu_,std::try_to_lock);
+    if(!lifecycle.owns_lock()||retirement_started_.load(std::memory_order_acquire)||thread_.joinable()) {err="lookahead is started or retired";return false;}
     if (src == nullptr || (!allow_cold_source && !src->warms())) { err = "RouterLookahead: the expert source does not warm"; return false; }
     if (n_embd % 8 != 0) { err = "RouterLookahead: n_embd is not a multiple of 8"; return false; }
     for (const auto& r : routers)
         if (r.size() != (size_t) (n_embd * n_expert)) { err = "RouterLookahead: a router of another shape"; return false; }
+    if(retirement_started_.load(std::memory_order_acquire)) {err="lookahead is retired";return false;}
     routers_ = std::move(routers);
     n_embd_ = n_embd;
     n_expert_ = n_expert;
@@ -3135,6 +3244,7 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if(retirement_started_.load(std::memory_order_acquire))return;
         if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
         n_tok_ = std::min<int64_t>(n_tok, 8);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
@@ -3147,6 +3257,8 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
 }
 
 void RouterLookahead::enable_stats(int64_t n_layers) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if(retirement_started_.load(std::memory_order_acquire))return;
     words_ = (n_expert_ + 63) / 64;
     pmask_.reset(new std::atomic<uint64_t>[(size_t) (n_layers * 3 * words_)]);
     pstamp_.reset(new std::atomic<uint64_t>[(size_t) n_layers]);
@@ -3159,6 +3271,8 @@ void RouterLookahead::enable_stats(int64_t n_layers) {
 
 // the dispatch thread: score the prediction made for `layer` against the experts it routes outside the GPU cache
 void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if(retirement_started_.load(std::memory_order_acquire))return;
     if (!stats_on_ || layer < 1 || layer >= (int64_t) routers_.size()) return;
     ++st_layers_;
     if (pstamp_[(size_t) layer].load(std::memory_order_acquire) != gen_.load(std::memory_order_relaxed) + 1) {
@@ -4461,11 +4575,13 @@ bool FileExpertSource::install_resident(int64_t layer, int64_t in, int64_t out, 
 // ---- 149-prefetch: staged promotions.  The read of `in` runs on this source's own thread (one at a time: the drive's
 // queue stays the decode's first); the install is the decode thread's (ram_install, at a window boundary).
 bool FileExpertSource::ram_stage(int64_t layer, int64_t in, int64_t out) {
+    if(background_sealed_.load(std::memory_order_acquire))return false;
     if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || layer >= n_layers_ || in < 0 || out < 0 ||
         in >= n_expert_ || out >= n_expert_ || in == out)
         return false;
     {
         std::lock_guard<std::mutex> lk(ram_mu_);
+        if(background_sealed_.load(std::memory_order_acquire))return false;
         static const size_t cap = [] {
             const char* v = std::getenv("STRATA_RAM_ADAPT_QUEUE");
             return v != nullptr ? (size_t) std::max(1, std::atoi(v)) : (size_t) 64;
@@ -4525,6 +4641,7 @@ void FileExpertSource::ram_worker() {
 }
 
 int64_t FileExpertSource::ram_install(const int32_t* host_res, int64_t n_expert) {
+    if(background_sealed_.load(std::memory_order_acquire))return 0;
     std::vector<std::unique_ptr<RamJob>> done;
     {
         std::lock_guard<std::mutex> lk(ram_mu_);
@@ -6320,7 +6437,37 @@ const uint8_t* ArenaExpertSource::blob_at(int64_t layer, int64_t expert) const {
 // ---- Foresight swap space (see include/strata/core/foresight_swap.hpp) ------------------------------------------
 namespace strata::core {
 
+thread_local ForesightSwap::ActiveRequest* ForesightSwap::active_request_ = nullptr;
+
+bool ForesightSwap::close_for_retirement() noexcept {
+    retirement_started_.store(true,std::memory_order_release);
+    if(WorkerLifecycleScope::active(this))return false;
+    WorkerLifecycleScope lifecycle_frame(this);
+    for(auto* frame=active_request_;frame;frame=frame->previous)
+        if(frame->owner==this)return false; // source callback still owns smu_
+    try {
+        std::unique_lock<std::mutex> close(retirement_mu_,std::try_to_lock);
+        if(!close.owns_lock()||retirement_failed_)return false;
+        if(retirement_done_)return true;
+        if(filler_.joinable()&&filler_.get_id()==std::this_thread::get_id())return false;
+        {
+            std::lock_guard<std::mutex> slots_lock(smu_);
+            std::lock_guard<std::mutex> worker_lock(mu_);
+            stop_=true;
+        }
+        cv_.notify_all();
+        try {if(filler_.joinable())filler_.join();}
+        catch(...) {retirement_failed_=true;return false;}
+        retirement_done_=true;
+        return true;
+    } catch(...) {return false;}
+}
+
 bool ForesightSwap::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if(WorkerLifecycleScope::active(this)){error="worker lifecycle reentry";return false;}
+    WorkerLifecycleScope lifecycle_frame(this);
+    std::unique_lock<std::mutex> lifecycle(retirement_mu_,std::try_to_lock);
+    if(!lifecycle.owns_lock()||retirement_started_.load(std::memory_order_acquire)){error="foresight is retired";return false;}
     if (retirement_init_started_) { error = "strict foresight retirement must be configured before init"; return false; }
 #if defined(STRATA_GPU_METAL)
     if (enabled) { error = "strict foresight retirement is unsupported by Metal"; return false; }
@@ -6333,6 +6480,10 @@ bool ForesightSwap::set_strict_retirement(bool enabled, const std::vector<int>& 
 
 bool ForesightSwap::init(int slots_per_layer, int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
                          const std::vector<int>& devices, std::string& err) {
+    if(WorkerLifecycleScope::active(this)){err="worker lifecycle reentry";return false;}
+    WorkerLifecycleScope lifecycle_frame(this);
+    std::unique_lock<std::mutex> lifecycle(retirement_mu_,std::try_to_lock);
+    if(!lifecycle.owns_lock()||retirement_started_.load(std::memory_order_acquire)){err="foresight is retired";return false;}
     if (strict_retirement_ && retirement_init_started_) { err = "strict foresight reinitialization requires a new owner"; return false; }
     retirement_init_started_ = true;
     if (strict_retirement_) {
@@ -6426,12 +6577,7 @@ bool ForesightSwap::init(int slots_per_layer, int64_t layers, int64_t experts, c
 }
 
 ForesightSwap::~ForesightSwap() {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        stop_ = true;
-    }
-    cv_.notify_all();
-    if (filler_.joinable()) filler_.join();
+    if(!close_for_retirement())retirement_failed("foresight filler join");
     if (strict_retirement_) {
         if (retirement_device_ < 0) return; // never initialized, or rejected before allocation
         ExpertRetirementScope retirement(true, retirement_device_, retirement_consumers_);
@@ -6501,6 +6647,7 @@ void ForesightSwap::fill_loop() {
 
 bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr) {
     std::lock_guard<std::mutex> smu_lk(smu_);
+    if(retirement_started_.load(std::memory_order_acquire))return false;
     const int s = where[(size_t) (layer * n_expert + expert)];
     if (s < 0) return false;
     Slot& sl = slot[(size_t) (layer * slots + s)];
@@ -6541,6 +6688,7 @@ bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr)
 void ForesightSwap::hold(int64_t layer, int32_t expert) {
     if (layer < 0 || layer >= n_layers || expert < 0 || expert >= n_expert) return;
     std::lock_guard<std::mutex> smu_lk(smu_);
+    if(retirement_started_.load(std::memory_order_acquire))return;
     const size_t key = (size_t) (layer * n_expert + expert);
     const int s = where[key];
     where[key] = kHeld;
@@ -6554,6 +6702,7 @@ void ForesightSwap::hold(int64_t layer, int32_t expert) {
 void ForesightSwap::unhold(int64_t layer, int32_t expert) {
     if (layer < 0 || layer >= n_layers || expert < 0 || expert >= n_expert) return;
     std::lock_guard<std::mutex> smu_lk(smu_);
+    if(retirement_started_.load(std::memory_order_acquire))return;
     int16_t& w = where[(size_t) (layer * n_expert + expert)];
     if (w == kHeld) w = -1;
 }
@@ -6570,6 +6719,11 @@ void ForesightSwap::predict(ExpertSource* src, int64_t layer, int32_t expert) {
 }
 
 void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t expert, bool predicted_copy) {
+    if(retirement_started_.load(std::memory_order_acquire))return;
+    WorkerLifecycleScope lifecycle_frame(this);
+    ActiveRequest frame{this,active_request_};
+    struct Restore { ActiveRequest*& head; ActiveRequest* previous; ~Restore(){head=previous;} } restore{active_request_,active_request_};
+    active_request_=&frame;
     if (failed.load(std::memory_order_relaxed)) return;
     const size_t key = (size_t) (layer * n_expert + expert);
     if (where[key] != -1) return;                       // already on its way, or held by an exchange (#2134)
@@ -6584,8 +6738,9 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
     if (card_round[(size_t) c] != now) { card_round[(size_t) c] = now; card_used[(size_t) c] = 0; }
     if (card_used[(size_t) c] >= budget) { ++over_budget; return; }
     if (src == nullptr || !src->pinned(layer, expert)) return;   // async copies need the pinned arena
+    if(retirement_started_.load(std::memory_order_acquire))return;
     const uint8_t* b = src->blob(layer, expert);
-    if (b == nullptr) return;
+    if (b == nullptr || retirement_started_.load(std::memory_order_acquire)) return;
     int best = -1;
     uint64_t best_ref = ~0ull;
     for (int s = 0; s < slots; ++s) {   // an empty slot, else the one used longest ago that no window can still read

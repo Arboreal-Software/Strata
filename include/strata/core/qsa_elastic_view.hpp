@@ -4,6 +4,7 @@
 #include <string>
 namespace strata::core {
 struct QsaState;
+class NativeRetirementContext;
 enum class QsaElasticFormat : uint8_t { f16, int8, q4, hybrid };
 // Explicit immutable sizing/binding contract; no global mode/index or budget ABI.
 struct QsaElasticPlan {
@@ -33,6 +34,10 @@ public:
     // Host-prepared owner; initialize only after the entire gang is admitted.
     virtual bool initialize_checked(std::string&)=0;
     virtual bool claim_state(QsaState*) noexcept=0;
+    // Terminal owner-reactor protocol. Defaults refuse for old/custom providers;
+    // they do not invent closure or complete a managed allocator retirement.
+    virtual bool prepare_retirement(const NativeRetirementContext&) noexcept { return false; }
+    virtual bool commit_retirement(const NativeRetirementContext&) noexcept { return false; }
     virtual bool retire_checked() noexcept=0;
 };
 }

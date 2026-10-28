@@ -5,6 +5,13 @@
 #include "strata/core/session.hpp"
 #include <cstdlib>
 
+namespace strata::kernels {
+// Fixed-KV fixtures never construct a PLE reader. Keep terminal IO unsupported;
+// real PLE closure has its own actual-reader tests, not a fake success here.
+#ifndef STRATA_WINDOW_TEST_ACTUAL_PLE_CONTEXT
+bool PleReadContext::close_for_retirement() noexcept { return false; }
+#endif
+}
 namespace strata::core {
 bool qsa_elastic_plan_matches(const ModelGeometry&, const QsaElasticPlan&) {
     return false;
