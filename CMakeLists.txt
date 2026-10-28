@@ -726,7 +726,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_library(strata_window_state STATIC ${_strata_window_codec_sources}
       src/core/window_model_owner.cpp src/core/window_buffer.cpp src/core/window_ple_weights.cpp src/core/window_ple.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_capture.cpp src/core/window_restore.cpp src/core/window_selection.cpp src/core/window_lease.cpp src/core/window_budget.cpp
       src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp src/core/window_disk.cpp src/core/window_manager.cpp src/core/window_admission.cpp src/core/vmm_managed.cpp src/core/owned_qsa_elastic.cpp
-      src/core/window_edit.cpp src/core/window_token_ledger.cpp src/core/window_profile.cpp src/core/window_loader_profile.cpp src/core/expert_policy_inventory.cpp src/core/expert_policy_runtime.cpp src/core/expert_host_execution.cpp src/core/verified_artifact.cpp src/core/verified_inputs.cpp src/core/verified_input_manifest.cpp src/core/thread_priority.cpp src/core/thread_dependencies.cpp)
+      src/core/window_edit.cpp src/core/window_token_ledger.cpp src/core/window_profile.cpp src/core/window_loader_profile.cpp src/core/expert_runtime_profile.cpp src/core/expert_policy_inventory.cpp src/core/expert_policy_runtime.cpp src/core/expert_host_execution.cpp src/core/verified_artifact.cpp src/core/verified_inputs.cpp src/core/verified_input_manifest.cpp src/core/thread_priority.cpp src/core/thread_dependencies.cpp)
     target_include_directories(strata_window_state PUBLIC include)
     target_link_libraries(strata_window_state PUBLIC strata_engine)
     if(STRATA_WINDOW_NVCOMP)
@@ -747,6 +747,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(window_model_link_test PRIVATE strata_window_state)
       add_test(NAME window_model_link_test COMMAND window_model_link_test)
       if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Synthetic source/bundle collector fixture: CUDA declarations/mocks,
+        # explicit host-only closure; no engine archive or HIP qualification.
+        if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+          add_subdirectory(tests/core/expert_runtime_profile)
+        endif()
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         add_custom_target(check_submitted_work_drain_extract
           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/submitted_work_drain/check_extract.py
