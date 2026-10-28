@@ -346,56 +346,125 @@ int main(){
           "record charge released after final retained metadata");
     watched_record_budget=nullptr;
  }
- int ambiguous=0,refused=0;
- for(int fault=0;fault<150;++fault){
-    World w;auto actor_result=w.priorities.register_activity(w.thread,"allocation-test-actor",1,0);
-    check(bool(actor_result),"allocation actor");
-    ActivityKey decision_actor{w.thread,"allocation-test-actor",actor_result.snapshot.activity.front().incarnation};
-    check(bool(w.priorities.set_activity(decision_actor,1,20,10,0)),"decision source activity");auto c=w.candidate(w.op,w.ta);WindowAdmissionHandle h;
-    allocation_countdown=fault;auto result=w.admission.admit(0,{&c,1},false,h);allocation_countdown=-1;
-    if(result.status==A::acknowledgement_pending){
-       ++ambiguous;check(!h.work()&&bool(h.recovery_lease()),"ambiguous ack retains exact work without execution");
-       check(w.admission.refresh(0).status==A::acknowledgement_pending,"pending ack blocks next admission cut");
-       auto op=h.recovery_lease().operation();
-       auto orphan=w.priorities.create_thread("idle-no-operation",3,0);
-       check(bool(orphan),"orphan registry thread");
-       auto orphan_actor=w.priorities.register_activity(orphan.snapshot.key,"idle-user",1,0);
-       check(bool(orphan_actor),"orphan actor");
-       ActivityKey orphan_key{orphan.snapshot.key,"idle-user",orphan_actor.snapshot.activity.front().incarnation};
-       check(bool(w.priorities.set_activity(orphan_key,1,30,1,0)),"orphan temporary priority");
-       check(bool(w.priorities.set_base(orphan.snapshot.key,1,-7,0)),"edited orphan base independent of boost");
-       allocation_countdown=0;auto timer=w.admission.refresh(1);allocation_countdown=-1;
-       check(timer.status==A::acknowledgement_pending&&timer.next_expiry_ms==10,
-             "pending acknowledgement advances registry timer without allocation or input");
-       check(w.priorities.next_activity_expiry_ms()==10,
-             "registry itself expired orphan before any snapshot can advance its time");
-       check(w.priorities.snapshot(orphan.snapshot.key,0).error==PriorityError::invalid_time,
-             "timer already advanced registry monotonic clock");
-       auto expired=w.priorities.snapshot(orphan.snapshot.key,1);
-       check(expired.snapshot.local_effective==-7&&!expired.snapshot.activity.front().active,
-             "orphan expiry preserves base while unrelated work retained");
-       check(!h.work()&&h.recovery_lease().operation()==op&&w.admission.release(h)==A::unresolved,
-             "timer is not execution or release proof");
-       check(w.admission.refresh(0).status==A::invalid,"pending state does not hide backwards time");
-       if(ambiguous%2==0){
-          allocation_countdown=0;auto decision_expiry=w.admission.refresh(10);allocation_countdown=-1;
-          check(decision_expiry.status==A::acknowledgement_pending&&!decision_expiry.next_expiry_ms,
-                "decision activity expiry clears timer even with pending work");
-          check(bool(w.priorities.set_base(w.thread,1,4,10)),"base edit after decision expiry");
-          check(w.admission.recover_acknowledgement(h)==A::acknowledgement_blocked,"changed revision cannot reinterpret pending admission");
-          check(!h.work()&&w.admission.release(h)==A::unresolved,"blocked acknowledgement retains work");
-          check(w.admission.refresh(11).status==A::acknowledgement_pending&&
-                !w.priorities.next_activity_expiry_ms(),"blocked acknowledgement still maintains timer");
-          check(w.manager.request_cancel(w.ta)==S::ok,"cancel blocked admitted work");
-          auto lease=h.recovery_lease();check(lease.finish(op,w.ta.selection.key,{},true,true),"drain blocked admission");
-          check(w.admission.release(h)==A::released,"release blocked admission only after exact drain");
-       }else{
-          check(w.admission.recover_acknowledgement(h)==A::ready,"unrelated expiry permits original revision/cut recovery at current time");
-          check(h.work()->lease().operation()==op,"recovery never readmits");w.drain(h);
+ // Every recovery/refusal branch has its own bounded fault search and count.
+ // Inherited cases must observe the first registry ack committed and the second
+ // still unapplied; merely reaching acknowledgement_pending is insufficient.
+ enum class AckCase { direct_recover,direct_expiry,direct_edit,partial_recover,
+                      target_expiry,target_edit,source_expiry,source_edit,count };
+ constexpr size_t case_count=static_cast<size_t>(AckCase::count);
+ int reached[case_count]={},partial_count=0,recovered_count=0,blocked_count=0,refused_count=0;
+ for(size_t scenario=0;scenario<case_count;++scenario){
+   const auto mode=static_cast<AckCase>(scenario);
+   const bool inherited=scenario>=static_cast<size_t>(AckCase::partial_recover);
+   const bool target_expires=mode==AckCase::direct_expiry||mode==AckCase::target_expiry;
+   const bool source_expires=mode==AckCase::source_expiry;
+   const bool target_edits=mode==AckCase::direct_edit||mode==AckCase::target_edit;
+   const bool source_edits=mode==AckCase::source_edit;
+   const bool recover=mode==AckCase::direct_recover||mode==AckCase::partial_recover;
+   for(int fault=0;fault<256&&!reached[scenario];++fault){
+     World w;
+     auto add_actor=[&](const ThreadKey& thread,const char* name,int boost,uint64_t ttl){
+       auto registered=w.priorities.register_activity(thread,name,1,0);
+       check(bool(registered),"decision actor registration");
+       ActivityKey actor{thread,name,registered.snapshot.activity.front().incarnation};
+       check(bool(w.priorities.set_activity(actor,1,boost,ttl,0)),"decision actor activity");
+     };
+     add_actor(w.thread,"target-actor-with-allocating-id",5,target_expires?10:100);
+     if(inherited){
+       add_actor(w.other,"source-actor-with-allocating-id",20,source_expires?10:100);
+       check(bool(w.priorities.set_base(w.other,1,40,0)),"source higher base");
+       check(bool(w.dependencies.update_dependencies({{w.op2,w.op,true}},w.dependencies.snapshot().revision)),
+             "actual waiting consumer raises prerequisite priority");
+     }
+     auto c=w.candidate(w.op,w.ta);WindowAdmissionHandle h;
+     allocation_countdown=fault;auto result=w.admission.admit(0,{&c,1},false,h);allocation_countdown=-1;
+     if(result.status!=A::acknowledgement_pending){
+       if(result.status==A::ready)w.drain(h);
+       else {++refused_count;check(!h.work(),"pre-admission failure has no executable receipt");}
+       continue;
+     }
+     check(!h.work()&&bool(h.recovery_lease()),"pending ack retains exact non-executable work");
+     const auto target_before=w.priorities.snapshot(w.thread,0).snapshot;
+     const auto source_before=w.priorities.snapshot(inherited?w.other:w.thread,0).snapshot;
+     const bool partial=inherited&&target_before.applied_revision==target_before.accepted_revision&&
+         target_before.applied_cut==h.cut()&&source_before.applied_revision<source_before.accepted_revision;
+     if(inherited&&!partial){
+       check(w.admission.recover_acknowledgement(h)==A::ready,"nonpartial fault recovers before search continues");
+       w.drain(h);continue;
+     }
+     ++reached[scenario];if(partial)++partial_count;
+     const auto cut=h.cut();const auto op=h.recovery_lease().operation();const auto token=*h.token();
+     const auto target_receipt=h.priority()->thread;const auto source_receipt=*h.inherited_source();
+     if(inherited){
+       check(h.priority()->priority_source==w.op2&&source_receipt.key==w.other,
+             "record contains genuine inherited source identity");
+       check(target_receipt.applied_revision<target_before.applied_revision,
+             "partial registry ack is not prematurely published into receipt");
+     }
+     auto orphan=w.priorities.create_thread("idle-no-operation",3,0);check(bool(orphan),"orphan thread");
+     auto actor=w.priorities.register_activity(orphan.snapshot.key,"idle-user",1,0);check(bool(actor),"orphan actor");
+     ActivityKey orphan_key{orphan.snapshot.key,"idle-user",actor.snapshot.activity.front().incarnation};
+     check(bool(w.priorities.set_activity(orphan_key,1,30,1,0)),"orphan boost");
+     check(bool(w.priorities.set_base(orphan.snapshot.key,1,-7,0)),"orphan independent base edit");
+     const uint64_t expected_deadline=target_expires||source_expires?10:100;
+     allocation_countdown=0;auto timer=w.admission.refresh(1);allocation_countdown=-1;
+     check(timer.status==A::acknowledgement_pending&&timer.next_expiry_ms==expected_deadline,
+           "pending ack timer maintenance is allocation-free");
+     check(w.priorities.next_activity_expiry_ms()==expected_deadline,
+           "registry itself expired orphan before any snapshot can advance its time");
+     check(w.priorities.snapshot(orphan.snapshot.key,0).error==PriorityError::invalid_time,
+           "registry clock already advanced");
+     auto expired=w.priorities.snapshot(orphan.snapshot.key,1).snapshot;
+     check(expired.local_effective==-7&&!expired.activity.front().active,"orphan expiry restores edited base");
+     check(w.admission.refresh(0).status==A::invalid,"pending does not hide backwards time");
+     if(target_expires||source_expires){
+       allocation_countdown=0;auto expiry=w.admission.refresh(10);allocation_countdown=-1;
+       check(expiry.status==A::acknowledgement_pending,"expiry-only remains pending until reconciliation");
+       // No base mutation in expiry-only cases: a base edit must not mask stale expiry ack.
+     }else if(target_edits||source_edits){
+       const auto& changed=source_edits?w.other:w.thread;
+       const uint64_t base_version=source_edits?2:1;
+       check(bool(w.priorities.set_base(changed,base_version,7,1)),"edit-only changes one decision source");
+       check(w.priorities.next_activity_expiry_ms()==100,"edit-only occurs before either activity expires");
+     }
+     const auto status=w.admission.recover_acknowledgement(h);
+     check(h.cut()==cut&&h.recovery_lease().operation()==op&&*h.token()==token,
+           "reconciliation preserves original cut operation and complete token");
+     check(h.priority()->thread.accepted_revision==target_receipt.accepted_revision&&
+           h.inherited_source()->accepted_revision==source_receipt.accepted_revision,
+           "reconciliation never substitutes new accepted decision revisions");
+     if(recover){
+       ++recovered_count;check(status==A::ready&&h.work(),"unrelated expiry recovers original exact unit");
+       check(h.priority()->thread.applied_cut==cut&&h.inherited_source()->applied_cut==cut,
+             "successful retry publishes original applied cut");w.drain(h);
+     }else{
+       ++blocked_count;check(status==A::acknowledgement_blocked&&!h.work(),"changed decision source blocks execution");
+       check(h.priority()->thread.applied_revision==target_receipt.applied_revision&&
+             h.priority()->thread.applied_cut==target_receipt.applied_cut&&
+             h.inherited_source()->applied_revision==source_receipt.applied_revision&&
+             h.inherited_source()->applied_cut==source_receipt.applied_cut,
+             "blocked receipt retains unapplied publication fields");
+       const uint64_t now=target_expires||source_expires?10:1;
+       if(partial){
+         auto first=w.priorities.snapshot(w.thread,now).snapshot;
+         auto second=w.priorities.snapshot(w.other,now).snapshot;
+         check(first.applied_revision==target_before.applied_revision&&first.applied_cut==target_before.applied_cut,
+               "first committed registry ack survives blocked second ack without rollback");
+         check(second.applied_revision==source_before.applied_revision&&second.applied_cut==source_before.applied_cut,
+               "failed inherited ack never advances source applied state");
        }
-    }else if(result.status==A::ready)w.drain(h);
-    else {++refused;check(!h.work(),"allocation refusal leaves output empty");}
+       check(w.admission.release(h)==A::unresolved,"blocked lease cannot release before drain");
+       check(w.admission.refresh(now+1).status==A::acknowledgement_pending,"blocked state still permits timer maintenance");
+       check(w.manager.request_cancel(w.ta)==S::ok,"cancel exact blocked window");
+       auto lease=h.recovery_lease();check(lease.finish(op,w.ta.selection.key,{},true,true),"actual retained lease drains cancellation");
+       check(w.admission.release(h)==A::released,"release only after exact cancellation drain");
+     }
+   }
+   if(reached[scenario]!=1)std::fprintf(stderr,"unreached acknowledgement scenario %zu\n",scenario);
+   check(reached[scenario]==1,"each named acknowledgement scenario must reach its intended fault phase");
  }
- check(ambiguous>0&&refused>0,"allocation sweep reaches preadmission and postadmission ambiguity");
- std::printf("window admission passed: allocation refusals %d, retained acknowledgements %d\n",refused,ambiguous);
+ check(recovered_count==2&&blocked_count==6&&partial_count==5&&refused_count>0,
+       "independent recovery blocked partial and preadmission counts all reached");
+ std::printf("window admission passed: recoveries %d, blocked %d, partial inherited %d, allocation refusals %d\n",
+             recovered_count,blocked_count,partial_count,refused_count);
 }
