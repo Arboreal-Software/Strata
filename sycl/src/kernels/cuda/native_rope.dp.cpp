@@ -240,6 +240,11 @@ bool native_norm_rope_usable(int head_dim, int n_rot) {
     return on && (head_dim == 128 || head_dim == 256) && n_rot == 64;
 }
 
+NativeRopePolicyObservation native_rope_policy_observation(int head_dim, int n_rot) {
+    return {true, head_dim, n_rot, native_rope_enabled(), rope_table_enabled(),
+            native_norm_rope_usable(head_dim, n_rot)};
+}
+
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {
     if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||
