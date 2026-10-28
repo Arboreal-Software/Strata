@@ -789,7 +789,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_link_libraries(pipeline_admission_race_test PRIVATE Threads::Threads)
         add_test(NAME pipeline_admission_race_test COMMAND pipeline_admission_race_test)
         set_tests_properties(pipeline_admission_race_test PROPERTIES TIMEOUT 30)
-        # Expected-old variant needs a harness requiring exact exit1 + diagnostic and
+        # Expected-old variant needs a harness requiring exact assertion exit86 + diagnostic and
         # rejecting sanitizer/crash output; do not use WILL_FAIL alone as reproduction.
         # Actual worker methods with CPU service mocks; no real IO/device proof.
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
