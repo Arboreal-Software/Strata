@@ -15,6 +15,8 @@ def pieces():
  methods=result['methods.inc'];a=methods.index('void RouterLookahead::submit(')
  assert methods[a:].count('cv_.notify_all();')==1
  result['methods-notify-one.inc']=methods[:a]+methods[a:].replace('cv_.notify_all();','cv_.notify_one();')
+ assert methods[a:].count('submitted_drain_ || ')==1
+ result['methods-no-submit-seal.inc']=methods[:a]+methods[a:].replace('submitted_drain_ || ','',1)
  return result
 if __name__=='__main__':
  for name,text in pieces().items():
