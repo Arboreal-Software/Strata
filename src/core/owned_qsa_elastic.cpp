@@ -11,6 +11,9 @@ struct OwnedQsaElasticPool::Storage {
     VmmRange range;
     std::vector<DetachedVmmChunk> chunks;
     std::vector<VmmChunkOutcome> outcomes;
+    std::vector<VmmChunkOutcome> retirement_outcomes;
+    uint64_t retirement_generation=0;
+    bool sealed=false,retirement_prepared=false,commit_attempted=false;
     QsaState* bound=nullptr;
     int64_t committed=0;
     bool attempted=false,ready=false,retired=false;
@@ -19,11 +22,15 @@ struct OwnedQsaElasticPool::Storage {
 bool OwnedQsaElasticPool::host_bound(const QsaElasticPlan& p,uint64_t& owner,uint64_t& range)noexcept{
     if(!p.granularity||!p.virtual_bytes||p.virtual_bytes%p.granularity||!p.initial_chunks||p.initial_chunks>(1ull<<24))return false;
     const uint64_t slots=p.virtual_bytes/p.granularity;
+    if(slots>std::vector<VmmChunkOutcome>().max_size())return false;
     uint64_t r=0;if(!VmmRange::managed_host_bound(slots,r))return false;
     uint64_t n=65536+sizeof(Storage)+sizeof(OwnedQsaElasticPool);
     const uint64_t per=sizeof(DetachedVmmChunk)+sizeof(VmmChunkOutcome)+32;
     if(p.initial_chunks>(UINT64_MAX-n)/per)return false;n+=p.initial_chunks*per;
-    // managed_host_bound includes both handle and managed-slot arrays.
+    if(slots>(UINT64_MAX-n)/sizeof(VmmChunkOutcome))return false;
+    n+=slots*sizeof(VmmChunkOutcome);
+    // managed_host_bound includes both handle and managed-slot arrays;
+    // owner envelope additionally retains one range disposition per virtual chunk.
     if(n>SIZE_MAX)return false;owner=n;range=r;return true;
 }
 bool OwnedQsaElasticPool::prepare(const ModelGeometry& g,const QsaElasticPlan& plan,
@@ -39,20 +46,21 @@ bool OwnedQsaElasticPool::prepare(const ModelGeometry& g,const QsaElasticPlan& p
         auto p=std::shared_ptr<OwnedQsaElasticPool>(new OwnedQsaElasticPool);p->storage_=std::make_unique<Storage>();
         auto& s=*p->storage_;s.plan=plan;s.owner_metadata=std::move(owner);
         s.chunks.resize(size_t(plan.initial_chunks));s.outcomes.resize(size_t(plan.initial_chunks));
+        s.retirement_outcomes.resize(size_t(plan.virtual_bytes/plan.granularity));
         if(!s.range.prepare_managed_metadata(plan.virtual_bytes/plan.granularity,plan.granularity,
             std::move(range),plan.device,error))return false;
         s.batch=std::move(batch);out=std::move(p);return true;
     }catch(const std::bad_alloc&){error.clear();return false;}
 }
 const QsaElasticPlan& OwnedQsaElasticPool::plan()const noexcept{return storage_->plan;}
-uint8_t* OwnedQsaElasticPool::base()const noexcept{return storage_->range.base();}
+uint8_t* OwnedQsaElasticPool::base()const noexcept{return storage_->sealed?nullptr:storage_->range.base();}
 int64_t OwnedQsaElasticPool::committed_slots()const noexcept{return healthy()?storage_->committed:0;}
-bool OwnedQsaElasticPool::healthy()const noexcept{return storage_->ready&&!storage_->retired&&storage_->range.managed_healthy();}
+bool OwnedQsaElasticPool::healthy()const noexcept{return storage_->ready&&!storage_->sealed&&!storage_->retired&&storage_->range.managed_healthy();}
 bool OwnedQsaElasticPool::claim_state(QsaState* s)noexcept{
     if(!s||!healthy()||storage_->bound)return false;storage_->bound=s;return true;
 }
 bool OwnedQsaElasticPool::initialize_checked(std::string& error){
-    auto& s=*storage_;if(s.attempted||s.retired){error="owned elastic initialization is one-shot";return false;}s.attempted=true;
+    auto& s=*storage_;if(s.attempted||s.retired||s.sealed){error="owned elastic initialization is one-shot";return false;}s.attempted=true;
     WindowDeviceScope device(s.plan.device);
     bool effects_attempted=false;
     auto refuse=[&](const char* why){
@@ -95,8 +103,38 @@ bool OwnedQsaElasticPool::initialize_checked(std::string& error){
     if(!device.finish()){error="owned elastic initial device restoration failed";return false;}
     s.committed=int64_t(live);s.ready=true;return true;
 }
+bool OwnedQsaElasticPool::prepare_retirement(const NativeRetirementContext& context)noexcept{
+    auto& s=*storage_;
+    if(s.sealed||s.retired||!context.prepared()||!context.covers(s.plan.device)||!context.generation())return false;
+    // Fence first, including preparation refusal. A partially sealed owner must
+    // never fall back to the legacy destructor's nested device drains.
+    s.sealed=true;s.ready=false;s.retirement_generation=context.generation();
+    bool complete=s.range.prepare_retirement(context);
+    for(auto& chunk:s.chunks)if(!chunk.prepare_retirement(context))complete=false;
+    s.retirement_prepared=complete;
+    return complete;
+}
+bool OwnedQsaElasticPool::commit_retirement(const NativeRetirementContext& context)noexcept{
+    auto& s=*storage_;
+    if(!s.sealed||!s.retirement_prepared||s.commit_attempted||s.retired||
+       context.generation()!=s.retirement_generation||!context.drained()||!context.covers(s.plan.device))return false;
+    s.commit_attempted=true;
+    // Selecting/restoring the device is checked, but never performs another wait.
+    WindowDeviceScope device(s.plan.device);
+    if(!device.ok()){(void)device.finish();return false;}
+    const auto range=s.range.commit_retirement(context,s.retirement_outcomes);
+    if(range.code!=VmmRetirementResult::complete){(void)device.finish();return false;}
+    for(size_t i=0;i<s.chunks.size();++i){
+        const auto chunk=s.chunks[i].commit_retirement(context,s.outcomes[i]);
+        if(chunk.code!=VmmRetirementResult::complete){(void)device.finish();return false;}
+    }
+    if(!device.finish())return false;
+    // All physical owners are now terminal. Attachment/parent quota is held by
+    // the batch until this point even when every consumed output slot was empty.
+    s.batch.reset();s.bound=nullptr;s.committed=0;s.retired=true;return true;
+}
 bool OwnedQsaElasticPool::retire_checked()noexcept{
-    auto& s=*storage_;if(s.retired)return true;if(s.attempted&&!s.ready)return false;
+    auto& s=*storage_;if(s.retired)return true;if(s.sealed)return false;if(s.attempted&&!s.ready)return false;
     if(!s.attempted){s.retired=true;return true;}
     s.ready=false;
     WindowDeviceScope device(s.plan.device);

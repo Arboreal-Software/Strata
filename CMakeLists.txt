@@ -724,7 +724,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   if(STRATA_BUILD_WINDOW_STATE)
     add_library(strata_window_state STATIC ${_strata_window_codec_sources}
-      src/core/window_model_owner.cpp src/core/window_buffer.cpp src/core/window_ple_weights.cpp src/core/window_ple.cpp src/core/window_allocator.cpp src/core/window_capture.cpp src/core/window_restore.cpp src/core/window_selection.cpp src/core/window_lease.cpp src/core/window_budget.cpp
+      src/core/window_model_owner.cpp src/core/window_buffer.cpp src/core/window_ple_weights.cpp src/core/window_ple.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_capture.cpp src/core/window_restore.cpp src/core/window_selection.cpp src/core/window_lease.cpp src/core/window_budget.cpp
       src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp src/core/window_disk.cpp src/core/window_manager.cpp src/core/window_admission.cpp src/core/vmm_managed.cpp src/core/owned_qsa_elastic.cpp
       src/core/window_edit.cpp src/core/window_token_ledger.cpp src/core/window_profile.cpp src/core/window_loader_profile.cpp src/core/expert_policy_inventory.cpp src/core/expert_policy_runtime.cpp src/core/expert_host_execution.cpp src/core/verified_artifact.cpp src/core/verified_inputs.cpp src/core/verified_input_manifest.cpp src/core/thread_priority.cpp src/core/thread_dependencies.cpp)
     target_include_directories(strata_window_state PUBLIC include)
@@ -761,9 +761,34 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         set_tests_properties(verified_input_manifest_test PROPERTIES TIMEOUT 120)
       endif()
       if(STRATA_ENABLE_CUDA AND UNIX)
+        # Real retirement primitives with injected runtime/driver calls only.
+        add_executable(native_retirement_test src/core/native_retirement_test.cpp src/core/native_retirement.cpp)
+        target_include_directories(native_retirement_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(native_retirement_test PRIVATE Threads::Threads)
+        target_compile_options(native_retirement_test PRIVATE -UNDEBUG)
+        add_test(NAME native_retirement_test COMMAND native_retirement_test)
+        add_executable(vmm_retirement_test src/core/vmm_retirement_test.cpp src/core/vmm_retirement_test_driver.cpp
+          src/core/vmm.cpp src/core/vmm_managed.cpp src/core/native_retirement.cpp src/core/window_budget.cpp)
+        target_include_directories(vmm_retirement_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(vmm_retirement_test PRIVATE Threads::Threads)
+        target_compile_options(vmm_retirement_test PRIVATE -UNDEBUG)
+        add_test(NAME vmm_retirement_test COMMAND vmm_retirement_test)
+        foreach(mode inactive drain-get address)
+          add_test(NAME vmm_retirement_${mode}_test COMMAND vmm_retirement_test ${mode})
+        endforeach()
+        foreach(mode drain unmap release)
+          foreach(at 1 2)
+            add_test(NAME vmm_retirement_${mode}_${at}_test COMMAND vmm_retirement_test ${mode} ${at})
+          endforeach()
+        endforeach()
+        foreach(at 1 2 3)
+          add_test(NAME vmm_retirement_drain_set_${at}_test COMMAND vmm_retirement_test drain-set ${at})
+        endforeach()
+        add_test(NAME vmm_retirement_abandon_test COMMAND vmm_retirement_test abandon)
+        set_tests_properties(vmm_retirement_abandon_test PROPERTIES WILL_FAIL TRUE TIMEOUT 30)
         # Actual manager/selection code with CPU CUDA mocks; POSIX test fixtures, no GPU or test seams.
         add_executable(window_manager_test src/core/window_manager_test.cpp
-          src/core/window_manager.cpp src/core/window_allocator.cpp
+          src/core/window_manager.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp
           src/core/window_restore.cpp src/core/window_selection.cpp
           src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
           src/core/window_lease.cpp src/core/window_budget.cpp)
@@ -773,7 +798,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         set_tests_properties(window_manager_test PROPERTIES TIMEOUT 120)
         add_executable(window_admission_test src/core/window_admission_test.cpp
           src/core/window_admission.cpp src/core/thread_priority.cpp src/core/thread_dependencies.cpp
-          src/core/window_manager.cpp src/core/window_allocator.cpp src/core/window_restore.cpp
+          src/core/window_manager.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_restore.cpp
           src/core/window_selection.cpp src/core/window_native.cpp src/core/window_state.cpp
           src/core/window_hash.cpp src/core/window_lease.cpp src/core/window_budget.cpp)
         target_include_directories(window_admission_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
@@ -781,7 +806,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_test(NAME window_admission_test COMMAND window_admission_test)
         set_tests_properties(window_admission_test PROPERTIES TIMEOUT 120)
         add_executable(window_initial_test src/core/window_initial_test.cpp
-          src/core/window_allocator.cpp src/core/window_restore.cpp src/core/window_selection.cpp
+          src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_restore.cpp src/core/window_selection.cpp
           src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
           src/core/window_lease.cpp src/core/window_budget.cpp)
         target_include_directories(window_initial_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
@@ -789,7 +814,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_test(NAME window_initial_test COMMAND window_initial_test)
         set_tests_properties(window_initial_test PROPERTIES TIMEOUT 120)
         add_executable(window_token_ledger_test src/core/window_token_ledger_test.cpp
-          src/core/window_token_ledger.cpp src/core/window_manager.cpp src/core/window_allocator.cpp
+          src/core/window_token_ledger.cpp src/core/window_manager.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp
           src/core/window_restore.cpp src/core/window_selection.cpp src/core/window_capture.cpp
           src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
           src/core/window_lease.cpp src/core/window_budget.cpp)
@@ -800,7 +825,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         # Fixed-KV allocator ownership/failure fixtures; CUDA calls are CPU mocks.
         # Keep the real session/layer/VMM implementations out of this closure.
         add_executable(window_allocator_test src/core/window_allocator_test.cpp
-          src/core/window_allocator.cpp src/core/window_restore.cpp src/core/window_selection.cpp
+          src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_restore.cpp src/core/window_selection.cpp
           src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
           src/core/window_lease.cpp src/core/window_budget.cpp)
         target_include_directories(window_allocator_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
@@ -809,8 +834,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_test(NAME window_allocator_transfer_test COMMAND window_allocator_test --transfer)
         add_test(NAME window_allocator_lock_scope_test COMMAND window_allocator_test --lock-scope)
         add_test(NAME window_allocator_retirement_drain_test COMMAND window_allocator_test --retirement-drain)
+        add_test(NAME window_allocator_terminal_retirement_test COMMAND window_allocator_test --terminal-retirement)
         set_tests_properties(window_allocator_test window_allocator_transfer_test
-          window_allocator_lock_scope_test window_allocator_retirement_drain_test PROPERTIES TIMEOUT 120)
+          window_allocator_lock_scope_test window_allocator_retirement_drain_test window_allocator_terminal_retirement_test PROPERTIES TIMEOUT 120)
       endif()
     endif()
   endif()

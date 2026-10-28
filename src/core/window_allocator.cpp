@@ -30,6 +30,7 @@ struct Storage {
     std::shared_ptr<const ReservationLease> reservation;
     std::vector<Stage> stages;
     bool uncertain = false;
+    bool terminal = false, retired = false, poisoned = false;
     Storage* next = nullptr;
 };
 Storage* quarantined = nullptr;
@@ -99,8 +100,9 @@ bool release(Storage& storage) {
 }
 void destroy(Storage* storage) noexcept {
     std::lock_guard operation(operation_mutex);
-    bool uncertain;
-    { std::lock_guard lock(allocator_mutex);uncertain=storage->uncertain; }
+    bool uncertain,retired;
+    { std::lock_guard lock(allocator_mutex);uncertain=storage->uncertain;retired=storage->retired; }
+    if(retired){delete storage;return;}
     bool safe=false;
     try { safe=!uncertain&&release(*storage); } catch(...) {}
     if(safe) {delete storage;return;}
@@ -109,6 +111,87 @@ void destroy(Storage* storage) noexcept {
     allocator_failed=true;
     storage->next=quarantined;quarantined=storage;++quarantine_count;
 }
+}
+bool NativeRetirementAttempt::prepare(const NativeSessionAllocation& allocation,
+    std::span<const int> additional,std::string& error) noexcept {
+    try {
+        if(storage_||attempted_||!allocation.storage_){error="retirement attempt or allocation unavailable";return false;}
+        auto storage=std::static_pointer_cast<Storage>(allocation.storage_);
+        std::array<int,64> devices{};size_t count=0;
+        const auto add_device=[&](int device){
+            if(device<0)return false;
+            for(size_t i=0;i<count;++i)if(devices[i]==device)return true;
+            if(count==devices.size())return false;
+            devices[count++]=device;return true;
+        };
+        for(const auto& stage:storage->stages)if(!add_device(stage.device)){error="retirement consumer set exceeds bound";return false;}
+        for(int device:additional)if(!add_device(device)){error="invalid additional retirement consumer";return false;}
+        {
+            std::lock_guard lock(allocator_mutex);
+            if(storage->terminal||storage->uncertain||allocator_failed){error="retirement requires an unsealed known allocation";return false;}
+            if(!context_.prepare(storage,std::span<const int>(devices.data(),count))){error="retirement context refused";return false;}
+            storage->terminal=true;storage->uncertain=true;
+            storage_=storage; // Retain whole gang before any pool can be sealed.
+        }
+        for(auto& stage:storage->stages)for(auto& pool:stage.elastic_pools)
+            if(!pool->prepare_retirement(context_)){
+                error="elastic retirement preparation refused; whole gang retained";return false;
+            }
+        prepared_=true;return true;
+    } catch(...) {return false;}
+}
+bool NativeRetirementAttempt::drain_and_commit(std::string& error) noexcept {
+    if(!prepared_||attempted_||!storage_)return false;
+    attempted_=true;
+    auto storage=std::static_pointer_cast<Storage>(storage_);
+    bool complete=false;
+    struct FailedRetirement {
+        bool& complete;
+        ~FailedRetirement(){if(!complete){std::lock_guard lock(allocator_mutex);allocator_failed=true;}}
+    } failed{complete};
+    try {
+        // Explicit checked terminal IO closure, outside both allocator mutexes.
+        // A shared_ptr reset alone can silently quarantine an exceptional join.
+        // Other submitters must be joined by the enclosing runtime reactor.
+        for(auto& stage:storage->stages)if(stage.session&&stage.session->ple.read_context){
+            if(!stage.session->ple.read_context->close_for_retirement()){
+                error="PLE retirement join uncertain; whole gang retained";return false;
+            }
+            stage.session->ple.read_context.reset();
+        }
+        if(!context_.drain_after_producers_closed()){
+            error="retirement consumer drain failed; whole gang retained";return false;
+        }
+        // Only legacy registration/free serialization remains here; no producer
+        // joins or explicit GPU synchronization may be added to this phase.
+        std::lock_guard operation(operation_mutex);
+        for(auto& stage:storage->stages){
+            {std::lock_guard lock(allocator_mutex);
+                if(storage->poisoned||allocator_failed){error="retirement invalidated by allocator poison";return false;}}
+            WindowDeviceScope device(stage.device);
+            if(!device.ok()){error="retirement commit device selection failed";return false;}
+            for(auto& pool:stage.elastic_pools)if(!pool->commit_retirement(context_)){
+                error="elastic retirement commit failed; residual gang retained";return false;
+            }
+            if(stage.session){
+                auto& session=*stage.session;
+                for(int64_t j=0;session.qsa_states&&j<session.qsa_alloc;++j)
+                    if(!qsa_state_release_host(session.qsa_states[session.qsa_ord0+j],error))return false;
+                session_release(session);
+                for(void** pointer:{&stage.ple_native_key,&stage.ple_scratch,&stage.ple_embedding,&stage.arena})if(*pointer){
+                    if(cudaFree(*pointer)!=cudaSuccess){error="retirement device free uncertain; no retry";return false;}
+                    *pointer=nullptr;
+                }
+                delete[] session.qsa_states;session.qsa_states=nullptr;
+            }
+            if(!device.finish()){error="retirement device restoration failed";return false;}
+        }
+        {std::lock_guard lock(allocator_mutex);
+            if(storage->poisoned||allocator_failed){error="retirement invalidated after partial cleanup";return false;}
+            storage->retired=true;storage->uncertain=false;}
+        complete=true;
+        return true;
+    } catch(...) {return false;}
 }
 uint64_t native_session_quarantine_count() {
     std::lock_guard lock(allocator_mutex);return quarantine_count;
@@ -223,19 +306,19 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t c
         }
         // Build all potentially allocating public handles before issuing CUDA
         // work, so publication allocation cannot strand completed allocations.
-        NativeSessionAllocation candidate;candidate.reservation_=reserved.lease;
+        NativeSessionAllocation candidate;candidate.reservation_=reserved.lease;candidate.storage_=storage;
         const std::weak_ptr<Storage> weak=storage;
         candidate.healthy_=[weak] {
             const auto owner=weak.lock(); // must be destroyed after the state lock
             std::lock_guard lock(allocator_mutex);
-            if(!owner||owner->uncertain||allocator_failed)return false;
+            if(!owner||owner->terminal||owner->uncertain||allocator_failed)return false;
             for(const auto& stage:owner->stages)for(const auto& pool:stage.elastic_pools)if(!pool->healthy())return false;
             return true;
         };
         candidate.poison_=[weak] {
             const auto owner=weak.lock();
             std::lock_guard lock(allocator_mutex);
-            if(owner){owner->uncertain=true;allocator_failed=true;}
+            if(owner){owner->uncertain=true;owner->poisoned=true;allocator_failed=true;}
         };
         candidate.stages_.reserve(requests.size());
         for(size_t i=0;i<storage->stages.size();++i)

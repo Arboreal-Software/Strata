@@ -30,6 +30,12 @@ public:
     bool healthy()const noexcept override;
     bool initialize_checked(std::string&) override;
     bool claim_state(QsaState*) noexcept override;
+    // Host-only seal retains bound state identity and every admitted owner.
+    // False after seal is terminal: caller retains the context/owner, no retry.
+    bool prepare_retirement(const NativeRetirementContext&) noexcept override;
+    // Requires exact checked gang context; no device synchronization here.
+    // False may follow successful frees: residual owners stay retained, no rollback.
+    bool commit_retirement(const NativeRetirementContext&) noexcept override;
     bool retire_checked() noexcept override;
 private:
     OwnedQsaElasticPool()=default;

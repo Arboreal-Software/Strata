@@ -251,6 +251,12 @@ public:
     ~PleReadContext();
     PleReadContext(const PleReadContext&) = delete;
     PleReadContext& operator=(const PleReadContext&) = delete;
+    // Terminal: seals aliases before joining a pending read, without decoding or
+    // publishing output. True certifies this context's IO is retired; false is
+    // sticky and requires retaining its complete owner graph. An ambiguous
+    // reader error is not completion proof. Caller keeps this object alive for
+    // the call; concurrent destruction is not supported. No GPU drain implied.
+    bool close_for_retirement() noexcept;
     bool issue(const uint32_t* rows16);
     bool collect(float* out2560, std::string& error);
     bool pending() const;
