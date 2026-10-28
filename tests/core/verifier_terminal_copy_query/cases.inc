@@ -5,6 +5,16 @@ static void retained(const Verifier& v){
 }
 int main(int argc,char**argv){
  check(argc==2,"one scenario required");const std::string mode=argv[1];Verifier v;std::string error;
+ if(mode=="--release-query-error"){
+  main_status=cudaErrorUnknown;
+  check(!v.release_gpu_waits(10),"main query error cannot certify drain");
+  check(v.released_.load()&&releases==1&&fences==1&&drained_traces==0,"host release effects retained on query failure");
+  for(auto f:v.flags)check(f==UINT32_MAX,"every mapped wait flag released");
+  check(main_queries==1&&copy_queries==0,"stop on main query uncertainty");
+  main_status=cudaSuccess;copy_status=cudaErrorUnknown;
+  check(!v.release_gpu_waits(10)&&drained_traces==0,"copy query error cannot certify drain");
+  check(main_queries==2&&copy_queries==1,"both query branches tested");return 0;
+ }
  if(mode=="--pending"){
   copy_status=cudaErrorNotReady;check(!v.done(error)&&error.empty(),"copy pending remains pending");
   check(!v.terminal_copy_query_failed_.load()&&v.copy_used_&&v.fl_active_&&v.windows==0,"pending is not terminal");
