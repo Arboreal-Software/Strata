@@ -415,6 +415,9 @@ private:
     // batch_launch / batch_poll (with external serving, batch_serve runs on another thread: running and the served
     // layer count are atomics, set by batch_launch before running)
     std::atomic<bool> b_running_{false};
+    // Host poll/launch owner only. Copy-query uncertainty is terminal for this
+    // verifier; no reset/retry may turn it into completion. Reconstruct the owner.
+    bool batch_copy_failed_ = false;
     std::atomic<int64_t> b_k_{0};
     int64_t b_steps_ = 0;
     std::atomic<bool> ext_serve_{false};
