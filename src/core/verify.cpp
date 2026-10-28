@@ -3142,6 +3142,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         nl.handed = true;
         ++windows;
         const bool ok = next_->run(T, tokens, pos0, pool, next_user_, out, err);
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        // Host service and the downstream stage are done: join this stage's
+        // launcher before certifying completion. A pending status() is not a
+        // successful launch, and destructor cleanup must not release waits on
+        // a successful chained window.
+        const cudaError_t launch_result = launch_o ? launch_o->finish() : cudaSuccess;
+        if (launch_result != cudaSuccess) {
+            err = std::string("verify: launch: ") + cudaGetErrorString(launch_result);
+            return false;
+        }
+#endif
         const OnDevice back(device_);
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (!finish_serial_copies(err)) return false;

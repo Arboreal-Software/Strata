@@ -1,0 +1,5 @@
+{
+  "src/core/verify.cpp": "7cc179fafc6d72ef96336c1f2f31dc19d53c6339644b5deb141cde24447a47e1",
+  "include/strata/core/host_graph_launch.hpp": "1474ae8535d46984f73ad90d199c7e3acc97779ade8d688025383614bfc621a5",
+  "tests/core/chain_async_launch/before.inc": "4bcd0462fe27f4ec2f3ea3c58c4d0b00a0381f361b63839d369907a412f97dd6"
+}
