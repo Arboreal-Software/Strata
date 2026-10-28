@@ -523,6 +523,15 @@ private:
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
     bool copy_used_ = false;
+    // Terminal copy-stream observation failure, not proof that GPU waits were
+    // released. Never reset on init/relaunch; reconstruct this verifier instead.
+    std::atomic<bool> terminal_copy_query_failed_{false};
+    bool refuse_copy_query_failure(std::string& err) const {
+        if (!terminal_copy_query_failed_.load(std::memory_order_acquire)) return false;
+        err = "verify: previous terminal copy-stream query failure; reconstruct verifier";
+        return true;
+    }
+
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
