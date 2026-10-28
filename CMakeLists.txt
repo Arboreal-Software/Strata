@@ -786,6 +786,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         endforeach()
         add_test(NAME vmm_retirement_abandon_test COMMAND vmm_retirement_test abandon)
         set_tests_properties(vmm_retirement_abandon_test PROPERTIES WILL_FAIL TRUE TIMEOUT 30)
+        # Actual owned pool/VMM/context/budget with injected CPU CUDA driver calls.
+        # The geometry predicate is a fixed fixture seam; no GPU libraries link.
+        add_executable(owned_qsa_elastic_retirement_test
+          src/core/owned_qsa_elastic_retirement_test.cpp
+          src/core/owned_qsa_elastic_retirement_test_driver.cpp
+          src/core/owned_qsa_elastic.cpp src/core/vmm.cpp src/core/vmm_managed.cpp
+          src/core/native_retirement.cpp src/core/window_budget.cpp)
+        target_include_directories(owned_qsa_elastic_retirement_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(owned_qsa_elastic_retirement_test PRIVATE Threads::Threads)
+        target_compile_options(owned_qsa_elastic_retirement_test PRIVATE -UNDEBUG)
+        add_test(NAME owned_qsa_elastic_retirement_test COMMAND owned_qsa_elastic_retirement_test)
+        set_tests_properties(owned_qsa_elastic_retirement_test PROPERTIES TIMEOUT 30)
         # Actual manager/selection code with CPU CUDA mocks; POSIX test fixtures, no GPU or test seams.
         add_executable(window_manager_test src/core/window_manager_test.cpp
           src/core/window_manager.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp
