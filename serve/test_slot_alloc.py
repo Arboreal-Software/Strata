@@ -17,6 +17,8 @@ def engine(batch, groups, pipelined=True):
     e = object.__new__(StrataEngine)          # pick_slot reads only the slot tables
     gs = batch // groups
     e.batch = batch
+    e.slot_groups = groups
+    e.slot_group = [b // gs for b in range(batch)]
     e.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
     e.slot_busy = [False] * batch
     e.slot_held = [[] for _ in range(batch)]
@@ -72,10 +74,10 @@ class OneGroup(unittest.TestCase):
         e.slot_held[2] = [1, 2]
         self.assertEqual(e.pick_slot([1, 2, 3]), 2)        # its conversation's next turn
         e.slot_held[2] = [9]
-        e.slot_held = [[5], [], [9], [6]]
+        e.slot_held[:] = [[5], [], [9], [6]]
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)        # an empty slot before evicting a held one
         e.slot_held[1] = [8]
-        e.slot_used = [5.0, 3.0, 9.0, 1.0]
+        e.slot_used[:] = [5.0, 3.0, 9.0, 1.0]
         self.assertEqual(e.pick_slot([1, 2, 3]), 3)        # else the least recently used
 
 

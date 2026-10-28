@@ -19,6 +19,31 @@ def configure(engine, busy, groups):
 
 
 class EpochSlotCountTests(unittest.TestCase):
+    def test_pipeline_hole_keeps_captured_tables(self):
+        for successor_count in (2, 8):
+            with self.subTest(successor_count=successor_count):
+                e = batch_engine()
+                configure(e, [False, False, False, True], [0, 0, 1, 1])
+                e.slot_gs = 2
+                e.slot_order = [0, 2, 1, 3]
+                old = e._capture_epoch()
+                replace(e)
+                configure(e, [False] * successor_count, [0] * successor_count)
+                successor = e._capture_epoch()
+                with old.slot_cv:
+                    self.assertEqual(e.pick_slot([7], epoch=old), 2)
+                self.assertEqual(successor.slots.slot_busy, [False] * successor_count)
+                self.assertEqual(old.slots.slot_busy, [False, False, False, True])
+
+    def test_all_captured_slots_busy_despite_free_successor(self):
+        e = batch_engine()
+        configure(e, [True, True], [0, 1])
+        old = e._capture_epoch()
+        replace(e)
+        configure(e, [False] * 4, [0] * 4)
+        with old.slot_cv:
+            self.assertIsNone(e.pick_slot([7], epoch=old))
+
     def test_growing_successor_does_not_index_old_slots(self):
         e = batch_engine()
         configure(e, [False, False], [0, 1])
