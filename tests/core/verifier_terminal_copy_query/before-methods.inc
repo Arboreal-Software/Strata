@@ -168,3 +168,34 @@ std::string Verifier::route_stats_report() {
     std::memset(rs_win_, 0, sizeof rs_win_);
     return out;
 }
+bool Verifier::release_gpu_waits(int timeout_ms) {
+    released_.store(true);
+    trace_ev("RELEASE", -1, -1, timeout_ms);
+    // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
+    // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
+    // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_})   // + an overlapped split's hand-off wait
+        if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    for (cudaStream_t s : {cs_, copy_}) {
+        if (s == nullptr) continue;
+        for (;;) {
+            const cudaError_t status = cudaStreamQuery(s);
+            if (status == cudaSuccess) break;
+            if (status != cudaErrorNotReady) {
+                trace_ev("RELEASE-QUERY-FAILED", -1, -1, (int64_t) status);
+                return false;
+            }
+            if (ms_since(t0) > timeout_ms) {
+                trace_ev("RELEASE-NOT-DRAINED", -1, -1, (int64_t) ms_since(t0));
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    trace_ev("RELEASE-DRAINED", -1, -1, (int64_t) ms_since(t0));   // aux: ms the GPU took to finish once released
+    return true;
+}

@@ -15,6 +15,7 @@ header=(ROOT/'include/strata/core/verify.hpp').read_text()
 actual=''.join(extract(verify,'bool Verifier::'+n+'(') for n in ('done','pl_finish','prestage','run_slots','commit_slots'))
 actual+=extract(drain,'bool Verifier::wait_commit(')+extract(drain,'Verifier::SnapshotDrain Verifier::poll_snapshot_drain(')
 actual+=extract(verify,'std::string Verifier::route_stats_report(')
+actual+=extract(verify,'bool Verifier::release_gpu_waits(')
 assert actual==(HERE/'fixed-methods.inc').read_text(), 'stale complete methods'
 a=header.index('    std::atomic<bool> terminal_copy_query_failed_')
 b=header.index('    bool capture_commit(',a)
