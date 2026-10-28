@@ -111,14 +111,14 @@ struct RouteResidentCfg {
     // picks the block by the host thread's current device.  nullptr (the allocation failed): the kernel runs without counters.
     std::mutex mu;
     std::map<int, unsigned long long*> blocks;
-    unsigned long long* stats_on(int dev) {
+    unsigned long long* stats_on(int dev, bool checked = false) {
         if (margin <= 0.0f || dev < 0) return nullptr;
         std::lock_guard<std::mutex> lk(mu);
         const auto it = blocks.find(dev);
         if (it != blocks.end()) return it->second;
         unsigned long long* p = nullptr;
         {
-            const OnDevice on(dev);
+            const OnDevice on(dev, checked);
             if (cudaMalloc((void**) &p, 8 * sizeof(unsigned long long)) != cudaSuccess ||
                 cudaMemset(p, 0, 8 * sizeof(unsigned long long)) != cudaSuccess) {
                 (void) cudaGetLastError();
@@ -519,7 +519,13 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
-    const OnDevice on_device(device_);
+    // An unused strict verifier may still participate in no-work cleanup.
+    // Never treat a partially initialized/stream-owning object as this case.
+    if (strict_retirement_ && !retirement_init_started_ && device_ < 0 && !cs_ && !copy_) {
+        trace_ev("RELEASE-DRAINED", -1, -1, 0);
+        return true;
+    }
+    const OnDevice on_device(device_, strict_retirement_);
     const Clock::time_point t0 = Clock::now();
     for (cudaStream_t s : {cs_, copy_}) {
         if (s == nullptr) continue;
@@ -694,7 +700,7 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     if (refuse_copy_query_failure(err)) return false;
     if (next_ && !next_->set_logit_bias(bias, err)) return false;
     if (le_ < g_->n_layers) return true;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
         err = "logit_bias vocabulary size mismatch"; return false;
     }
@@ -718,7 +724,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     diag_verify_fn().store(&diag_active_verifier);
     release_gpu_fn().store(&release_live_verifiers);
     retirement_check(strict_retirement_, cudaGetDevice(&device_), "Verifier init device");   // a layer split's stage on another GPU: its streams, graphs and buffers live there
-    rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
+    rr_stats_ = route_resident_cfg().stats_on(device_, strict_retirement_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
     wt_ = &wt;
@@ -2857,7 +2863,7 @@ bool Verifier::chain_overlap() const {
 
 bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     prelaunched_ = 0;
     cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[T] : exec_[T];   // #871: the variant the previous stage refreshed
     if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
@@ -2906,8 +2912,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     (void) user;
     return strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err);
 #endif
+    // A new prelaunch thread uses the child's own policy. Refuse a mixed
+    // chain before capture/launch rather than silently downgrading its scopes.
+    if (strict_retirement_ && next_ != nullptr && !next_->strict_retirement_)
+        retirement_failed("Verifier unchecked child device scope");
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -2923,7 +2933,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (!capture(T, err) || !capture_commit(err)) return false;
     const bool chain = chain_overlap();
     if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
-        const OnDevice on_next(next_->device_);
+        const OnDevice on_next(next_->device_, strict_retirement_ || next_->strict_retirement_);
         next_->refresh_ar();                     // #871: the variant its prelaunch and its run() will both use
         if (!next_->capture(T, err) || !next_->capture_commit(err)) return false;
     }
@@ -3153,7 +3163,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             return false;
         }
 #endif
-        const OnDevice back(device_);
+        const OnDevice back(device_, strict_retirement_);
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (!finish_serial_copies(err)) return false;
         if (!ok) return false;
@@ -3352,7 +3362,7 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
                                std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
 #if defined(STRATA_GPU_METAL)
     // the head logits are the Metal window's (window_copy_logits, row by row)
     if (n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
@@ -3427,7 +3437,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
 #if defined(STRATA_GPU_METAL)
     return strata::metal_engine::window_commit(metal_, n_keep, err);
 #endif
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (!commit_failure_.empty()) { err = commit_failure_; return false; }
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -3487,7 +3497,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
 
 bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
     if (slots.empty()) {
         err = "verify: init_slots needs at least one session";
@@ -3817,7 +3827,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                              void* user, int32_t* out, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const ModelGeometry& g = *g_;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
@@ -3928,7 +3938,7 @@ bool Verifier::commit_slots(std::string& err) {
 
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
@@ -3988,7 +3998,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return false; }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
@@ -4075,7 +4085,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (now - last_ring() <= std::chrono::milliseconds(2) || now - ext_checked_ < std::chrono::milliseconds(1))
                 return 0;
             ext_checked_ = now;   // (at most one query a millisecond: pump calls this in a loop)
-            const OnDevice on_device(device_);
+            const OnDevice on_device(device_, strict_retirement_);
             const cudaError_t q = cudaStreamQuery(cs_);
             if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (k + 1)) {
                 err = "verify batch: layer " + std::to_string(lb_ + k) + " never rang (" +
@@ -4092,7 +4102,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             return 0;
         }
     }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const int S = last_t_;
     // the layers that have rung so far (batch_serve); with one still to ring: did the graph finish without it, or
     // has it waited too long?
@@ -4227,7 +4237,7 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
 
 bool Verifier::capture_all(std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -4283,7 +4293,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
 
 bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
@@ -4335,7 +4345,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         const double now = now_ms();
         if (now - fl_flush_ms_ <= 2.0 && now - fl_since_ms_ <= 20000.0) return 0;
     }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const int T = fl_T_;
@@ -4419,7 +4429,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
 bool Verifier::done(std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     if (!fl_active_ || fl_k_ < fl_total_) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const cudaError_t q = cudaEventQuery(ev_done_);
     if (q == cudaErrorNotReady) {
         const double now = now_ms();
@@ -4448,7 +4458,7 @@ bool Verifier::done(std::string& err) {
 bool Verifier::pl_finish(int32_t* out, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const ModelGeometry& g = *g_;
     fl_active_ = false;
     if (fl_prof_) accumulate_profile(prof_pin_);
@@ -4475,7 +4485,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
 
 bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();

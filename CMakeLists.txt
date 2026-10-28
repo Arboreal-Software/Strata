@@ -795,6 +795,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_subdirectory(tests/core/verifier_terminal_copy_query)
         add_subdirectory(tests/core/verifier_serial_copy)
         add_subdirectory(tests/core/chain_async_launch)
+        add_subdirectory(tests/core/checked_device)
         # Actual worker methods with CPU service mocks; no real IO/device proof.
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         find_package(Threads REQUIRED)

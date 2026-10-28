@@ -1,0 +1,1 @@
+{"tests":["checked_device_source_freshness","checked_device_eleven_modes"],"modes":["get","select","restore","nested-restore","parent-restore","worker","invalid","partial-no-device","no-work","success","legacy"],"targets":["checked_device_fixture"],"backend_qualification":false,"full_verifier_run_compiled":false,"release_query_repair_included":false}
