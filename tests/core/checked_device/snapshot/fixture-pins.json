@@ -1,0 +1,7 @@
+{
+  "fixture/check_source.py": "46897ee2539c552930086dd17ccfac3d47bae8bc0b22f32495d481849aaeed83",
+  "fixture/cuda_runtime.h": "65eb5bb407831981fbb52cbb61996ef057be08b71eb18a648b17f59ad9bb8c0c",
+  "fixture/release.inc": "6c0c11ee9744a78db731d961a0686c820df5095cc073d5308cdfd82e2ec62663",
+  "fixture/supervise.py": "0bfe131baa5fffc166113871526c09078a87a632e894478ee5f3e3661853190a",
+  "fixture/test.cpp": "ecd15e720c7771d01d9bb83df60b9e74ced2b6d0aea3308fa5d5f557280bc9a0"
+}
