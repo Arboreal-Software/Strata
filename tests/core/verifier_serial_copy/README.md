@@ -4,7 +4,8 @@ Prepared source fixtures, not executed. The production change is based on PR25
 390356e09b3bff0e9d433c1aa3f280f7b1a88283. Both unchecked serial copy-stream
 synchronizations are covered: the overlapped stage-chain return and the ordinary
 serial return. `fixed.inc` contains the exact new helper and exact completion
-blocks from `Verifier::run`; `before.inc` preserves both original blocks. The
+blocks from `Verifier::run`; `before.inc` preserves both original blocks from that base; its reviewed SHA-256
+is included in `source-pins.json` so changes to the old control require review. The
 wrappers retain the existing entry refusal and omit already-completed GPU/kernel
 work. This does not test the full verifier, remote controller, CUDA or HIP runtime.
 
