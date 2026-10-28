@@ -26,6 +26,7 @@ are CPU fakes; no device or model is involved. Allocation injection affects real
 C++ string allocation with global operator new, not a fake returned error string.
 
 After a fresh CPU grant, configure this directory as a standalone CMake project,
-build both targets, then run all three CTests. No shared/root CMake was changed.
+build both targets, then run all three CTests. The fixture is also registered
+through the root CMake test configuration.
 Successful-path arithmetic and kernels were not modified; backend builds and
 numerical qualification have not been performed for this change.
