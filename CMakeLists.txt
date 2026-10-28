@@ -791,6 +791,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         set_tests_properties(pipeline_admission_race_test PROPERTIES TIMEOUT 30)
         # Expected-old variant needs a harness requiring exact exit1 + diagnostic and
         # rejecting sanitizer/crash output; do not use WILL_FAIL alone as reproduction.
+        add_subdirectory(tests/core/verifier_copy_query)
         # Actual worker methods with CPU service mocks; no real IO/device proof.
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         find_package(Threads REQUIRED)

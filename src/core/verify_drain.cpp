@@ -20,6 +20,7 @@ bool Verifier::wait_commit(std::string& err) {
 }
 
 Verifier::SnapshotDrain Verifier::poll_snapshot_drain(std::string& err) {
+    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return SnapshotDrain::unhealthy; }
 #if defined(STRATA_GPU_METAL)
     err = "verify: snapshot drain is not implemented for Metal";
     return SnapshotDrain::unsupported;
