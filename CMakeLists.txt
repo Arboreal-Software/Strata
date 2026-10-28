@@ -775,6 +775,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_link_libraries(serial_adapt_join_test PRIVATE Threads::Threads)
         add_test(NAME serial_adapt_join_test COMMAND serial_adapt_join_test)
         set_tests_properties(serial_adapt_join_test PROPERTIES TIMEOUT 30)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_custom_target(check_pipeline_admission_race_extract
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/pipeline_admission_race/check_extract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/program/generate.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/pipeline_admission_race
+          VERBATIM)
+        add_executable(pipeline_admission_race_test tests/core/pipeline_admission_race/test.cpp)
+        add_dependencies(pipeline_admission_race_test check_pipeline_admission_race_extract)
+        target_include_directories(pipeline_admission_race_test PRIVATE include/strata/core)
+        target_compile_features(pipeline_admission_race_test PRIVATE cxx_std_20)
+        target_compile_options(pipeline_admission_race_test PRIVATE -UNDEBUG)
+        target_link_libraries(pipeline_admission_race_test PRIVATE Threads::Threads)
+        add_test(NAME pipeline_admission_race_test COMMAND pipeline_admission_race_test)
+        set_tests_properties(pipeline_admission_race_test PROPERTIES TIMEOUT 30)
+        # Expected-old variant needs a harness requiring exact exit1 + diagnostic and
+        # rejecting sanitizer/crash output; do not use WILL_FAIL alone as reproduction.
         # Actual worker methods with CPU service mocks; no real IO/device proof.
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         find_package(Threads REQUIRED)
