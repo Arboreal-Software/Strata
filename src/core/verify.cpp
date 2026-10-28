@@ -466,7 +466,7 @@ void release_live_verifiers(std::FILE* f) {
             if (f != nullptr)
                 std::fprintf(f, "strata: released the verify window's GPU waits (#267): the GPU %s\n",
                              done ? ("finished in " + std::to_string((long long) ms_since(t0)) + " ms").c_str()
-                                  : "did not finish within 5 s");
+                                  : "drain not confirmed (query failed or timed out)");
         }
     if (f != nullptr) std::fflush(f);
 }
@@ -486,7 +486,7 @@ int64_t trace_now_ns() {
 }
 std::string released_note(bool drained) {
     return drained ? "; its GPU waits were released and the GPU finished (#267)"
-                   : "; its GPU waits were released but the GPU did not finish within 5 s (#267)";
+                   : "; its GPU waits were released but drain was not confirmed (query failed or timed out) (#267)";
 }
 // #267 test hook: STRATA_TEST_VERIFY_STALL=N withholds the last layer's flag in the N-th window (1-based), so the
 // GPU spins on a flag nobody raises - the bounded window wait and the release are then what ends it.  Unset: never.
