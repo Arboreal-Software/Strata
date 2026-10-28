@@ -36,6 +36,11 @@ int main(int argc,char**argv){
  check(v.poll_snapshot_drain(error)==Verifier::SnapshotDrain::unhealthy,"snapshot cannot certify failed copy");
  check(v.check_entry_guards(error),"every actual entry first guard refuses");
  retained(v);
+ // Complete production report method: forbid allocation and preserve both
+ // device and host statistics after the terminal latch.
+ deny_new=true;const auto report=v.route_stats_report();deny_new=false;
+ check(report.empty()&&route_copies==0&&route_resets==0&&v.rs_win_[1]==3,
+       "route report refuses before allocation copy and device/host reset");
  check(event_queries==before_events&&copy_queries==before_copies&&device_calls==before_devices&&effects==0,
        "terminal entries perform no query callback staging or device effect");
  // Retry diagnostics may also throw, but must not resume/query the failed work.
