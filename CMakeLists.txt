@@ -747,6 +747,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(window_model_link_test PRIVATE strata_window_state)
       add_test(NAME window_model_link_test COMMAND window_model_link_test)
       if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_custom_target(check_submitted_work_drain_extract
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/submitted_work_drain/check_extract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/program/generate.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/submitted_work_drain/controller.inc
+          VERBATIM)
+        add_executable(submitted_work_drain_test tests/core/submitted_work_drain/test.cpp)
+        add_dependencies(submitted_work_drain_test check_submitted_work_drain_extract)
+        target_include_directories(submitted_work_drain_test PRIVATE include/strata/core)
+        target_compile_features(submitted_work_drain_test PRIVATE cxx_std_20)
+        target_compile_options(submitted_work_drain_test PRIVATE -UNDEBUG)
+        target_link_libraries(submitted_work_drain_test PRIVATE Threads::Threads)
+        add_test(NAME submitted_work_drain_test COMMAND submitted_work_drain_test)
+        set_tests_properties(submitted_work_drain_test PROPERTIES TIMEOUT 30)
         # Actual worker methods with CPU service mocks; no real IO/device proof.
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         find_package(Threads REQUIRED)
