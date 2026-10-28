@@ -523,7 +523,13 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     const Clock::time_point t0 = Clock::now();
     for (cudaStream_t s : {cs_, copy_}) {
         if (s == nullptr) continue;
-        while (cudaStreamQuery(s) == cudaErrorNotReady) {
+        for (;;) {
+            const cudaError_t status = cudaStreamQuery(s);
+            if (status == cudaSuccess) break;
+            if (status != cudaErrorNotReady) {
+                trace_ev("RELEASE-QUERY-FAILED", -1, -1, (int64_t) status);
+                return false;
+            }
             if (ms_since(t0) > timeout_ms) {
                 trace_ev("RELEASE-NOT-DRAINED", -1, -1, (int64_t) ms_since(t0));
                 return false;
