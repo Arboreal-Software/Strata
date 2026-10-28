@@ -31,3 +31,9 @@ No fixture forks descendants. CTest30-second limits and the candidate's outer
 container deadline provide additional bounds; a blocked actual join cannot leave
 a child process after the inner supervisor completes. This bounds failure rather
 than pretending the production std::thread::join itself accepts a timeout.
+
+PR40 fixture compatibility: the fixed chain extraction now passes the actual
+strict-retirement boolean to the mock device scope. The mock accepts the optional
+boolean; this fixture still tests launch/copy ordering, not checked device
+semantics. Full-source pins for chain and serial-copy freshness follow PR40.
+Historical expected-red extracts are unchanged. Follow-up not yet executed.
