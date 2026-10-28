@@ -1,6 +1,8 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/core/geometry.hpp"
+#include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdint>
@@ -14,7 +16,7 @@
 #include <unistd.h>
 using namespace strata::core;
 static int allocations=0,copies=0,fail_alloc=0,fail_copy=0;
-static bool fail_register=false;
+static bool fail_register=false,register_fault_hit=false;
 static std::map<void*,size_t> live;
 static std::set<const void*> registered;
 static void check(bool ok,const char* why){if(!ok){std::fprintf(stderr,"FAIL: %s\n",why);std::exit(1);}}
@@ -42,9 +44,10 @@ size_t native_q8_1_bytes(int a,int b){return size_t(a)*b/32*36;}
 bool native_q8_0_packed_enabled(){return true;}
 bool native_q8_0_packed_eligible(int,int){return true;}
 void native_q8_0_pack_host(const void* src,void* dst,int a,int b){std::memcpy(dst,src,size_t(a)*b/32*34);}
-void native_q8_0_packed_register(const void* a,const void*,int,int){registered.insert(a);if(fail_register)throw std::bad_alloc();}
+void native_q8_0_packed_register(const void* a,const void*,int,int){registered.insert(a);if(fail_register){register_fault_hit=true;throw std::bad_alloc();}}
 void native_q8_0_packed_unregister(const void* a){registered.erase(a);}
 void fused_gr_quantize_q8_0(const uint16_t*,uint8_t*,int64_t,void*){throw std::runtime_error("unexpected quantize branch");}
+void fused_gr_dequant_q8_0(const uint8_t*,uint16_t*,int64_t,void*){throw std::runtime_error("unexpected dequantize branch");}
 }
 template<class T>static void put(std::vector<uint8_t>& b,T v){auto n=b.size();b.resize(n+sizeof v);std::memcpy(b.data()+n,&v,sizeof v);}
 static void str(std::vector<uint8_t>& b,const std::string& s){put<uint64_t>(b,s.size());b.insert(b.end(),s.begin(),s.end());}
@@ -92,12 +95,17 @@ int main(int argc,char** argv) try {
     }
     for(int scenario=std::getenv("STRATA_NATIVE_TEST_FAULTS_ONLY")?1:0;scenario<9;++scenario){
         allocations=copies=0;fail_alloc=scenario>=1&&scenario<=4?scenario:0;
-        fail_copy=scenario>=5&&scenario<=7?scenario-4:0;fail_register=scenario==8;
+        fail_copy=scenario>=5&&scenario<=7?scenario-4:0;fail_register=scenario==8;register_fault_hit=false;
         WeightTable table;float canonical=0;auto& refs=const_cast<std::map<std::string,WeightRef>&>(table.all());
         WeightRef q;q.ne0=q.ne1=32;q.elements=1024;q.code_bits=8;q.data=&canonical;refs["blk.0.attn_q.weight"]=q;
         q.code_bits=0;q.kind=WeightKind::Bf16InF32;q.bytes=2048;refs["blk.0.hc_attn_down.weight"]=q;
         {
             NativeDense dense;check(dense.ready_for_adoption(),"untouched canonical-only native owner is admissible");std::string error;const bool loaded=dense.load({path},table,error);
+            // Check reachability before duplicate-load refusal can obscure which
+            // failure the first load actually encountered.
+            if(fail_alloc)check(allocations==fail_alloc,"requested allocation fault was reached");
+            if(fail_copy)check(copies==fail_copy,"requested copy fault was reached");
+            if(scenario==8)check(register_fault_hit,"requested registration fault was reached");
             if(scenario==0){check(loaded,error.c_str());check(dense.ready_for_adoption(),"complete native load admissible");
                 const auto count=allocations;check(!dense.load({path},table,error)&&allocations==count&&dense.ready_for_adoption(),"duplicate load refuses without invalidating live model");check(allocations==4&&copies==3,"fixture exercised primary packed HC and scratch allocations");check(dense.allocated_bytes()==3300,"allocation estimate includes all four allocations");check(dense.owns_weight_span(refs.at("blk.0.attn_q.weight").native_data,1088),"complete load publishes owned native span");}
             else {check(!loaded,"injected loader failure propagated");check(!dense.ready_for_adoption(),"failed loader cannot be adopted");
