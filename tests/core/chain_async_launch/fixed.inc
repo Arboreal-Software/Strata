@@ -16,7 +16,7 @@
             return false;
         }
 #endif
-        const OnDevice back(device_);
+        const OnDevice back(device_, strict_retirement_);
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (!finish_serial_copies(err)) return false;
         if (!ok) return false;

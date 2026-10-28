@@ -23,7 +23,7 @@ int cudaStreamSynchronize(int){
  ++primary_syncs;std::unique_lock lock(mu);cv.wait(lock,[]{return launched;});return 0;
 }
 const char* cudaGetErrorString(int){return "mock launch failure";}
-struct OnDevice{explicit OnDevice(int){}};
+struct OnDevice{explicit OnDevice(int,bool=false){}};
 struct Next {
  bool run(int,const int32_t*,int64_t,void*,void*,int32_t*,std::string&){
   if(throw_downstream)throw std::runtime_error("downstream exception");
@@ -32,7 +32,7 @@ struct Next {
 };
 struct JoinedNext {bool handed=false;bool join(std::string&){return true;}};
 struct Fixture {
- Next* next_;JoinedNext nl;bool chain=true,commit_pending_=true,prof_on_=false;int windows=0;
+ Next* next_;bool strict_retirement_=false;JoinedNext nl;bool chain=true,commit_pending_=true,prof_on_=false;int windows=0;
  int T=1,device_=0,cs_=1,G=1;int32_t* tokens=nullptr;int32_t* out=nullptr;
  int64_t pos0=0;void* pool=nullptr;void* next_user_=nullptr;int* h_plan_err_=nullptr;
  bool finish_serial_copies(std::string& error){++copy_syncs;if(copy_error){error="copy failure";return false;}return true;}
