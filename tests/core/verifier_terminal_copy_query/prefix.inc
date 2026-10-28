@@ -15,6 +15,10 @@ using cudaError_t=int;using cudaStream_t=void*;
 constexpr int cudaSuccess=0,cudaErrorNotReady=1,cudaErrorUnknown=999;
 static void* main_stream=reinterpret_cast<void*>(1);static void* copy_stream=reinterpret_cast<void*>(2);
 static int event_status=0,copy_status=0,event_queries=0,copy_queries=0,device_calls=0,effects=0;
+static int route_copies=0,route_resets=0;
+constexpr int cudaMemcpyDeviceToHost=2;
+static int cudaMemcpy(void*,const void*,size_t,int){++route_copies;return cudaSuccess;}
+static int cudaMemset(void*,int,size_t){++route_resets;return cudaSuccess;}
 static int profiles=0,samples=0,beats=0,nonfinite=0,releases=0;
 static int cudaStreamQuery(void*s){if(s==copy_stream){++copy_queries;return copy_status;}++effects;return cudaSuccess;}
 static int cudaEventQuery(void*){++event_queries;return event_status;}
@@ -50,6 +54,8 @@ struct Verifier {
  int32_t picked=7;int32_t*h_out_=&picked,*m_out_=&picked;const int32_t*hist_d_=nullptr;
  float*head_logits_=nullptr;unsigned long long*prof_pin_=nullptr;
  std::vector<uint32_t>pl_ple_rows_{0};std::vector<int>slots_{0};int last_rows_[8]{};
+ bool rs_on_=true;unsigned long long route_device[72]{};void*rs_dev_=route_device;int64_t rs_win_[9]{0,3};
+ std::string route_stats_report();
  bool release_gpu_waits(int){++releases;released_=true;return false;}
  void accumulate_profile(const unsigned long long*){++profiles;}
  void trace_ev(const char*,int64_t,int64_t,int64_t){}
