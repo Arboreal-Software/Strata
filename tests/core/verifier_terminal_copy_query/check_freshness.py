@@ -34,3 +34,9 @@ assert ''.join(parts)==(HERE/'entry-guards.inc').read_text(), 'stale first-guard
 for mode in ('before','fixed'):
     assert (HERE/(mode+'.cpp')).read_text()=='#include "prefix.inc"\n#include "'+mode+'-methods.inc"\n#include "cases.inc"\n'
 print('complete methods, latch and actual first-guard adapters current')
+
+header_text=(root if "root" in globals() else ROOT)/"include/strata/core/verify.hpp"
+hook_header=header_text.read_text()
+a=hook_header.index("    void latch_copy_query_failure()")
+b=hook_header.index("\n    bool strict_retirement_",a)
+assert (Path(__file__).resolve().parent/"completion-latch.inc").read_text()==hook_header[a:b]+"\n", "stale completion latch hook"

@@ -26,6 +26,8 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/verifier_completion_gate.hpp"
+#include "strata/core/strict_retirement.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -194,7 +196,16 @@ public:
     }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
-    void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    void set_next(Verifier* next, void* next_user) {
+        if(completion_gate_) retirement_failed("sealed verifier completion topology");
+        next_ = next; next_user_ = next_user;
+    }
+    // Host-only, strictly BEFORE init/registry publication for every stage.
+    // Configure strict policy and set_next first. Caller retains all
+    // actual chain owners and admitted metadata. Output must be empty. No CUDA.
+    static bool prepare_serial_completion_gate(Verifier& root,
+        std::shared_ptr<const ReservationLease> metadata,
+        std::shared_ptr<VerifierCompletionGate>& output,std::string& error);
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -385,6 +396,15 @@ public:
     std::string route_stats_report();
 
 private:
+    std::shared_ptr<VerifierCompletionGate> completion_gate_;
+    std::size_t completion_stage_=0;
+    void mark_completion_unhealthy()noexcept {
+        if(completion_gate_)completion_gate_->fail_stage(completion_stage_);
+    }
+    void latch_copy_query_failure()noexcept {
+        mark_completion_unhealthy();
+        terminal_copy_query_failed_.store(true,std::memory_order_release);
+    }
     bool strict_retirement_ = false;
     bool retirement_init_started_ = false;
     RemoteExpertOpt* remote_opt_ = nullptr;

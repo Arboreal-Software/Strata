@@ -1,3 +1,4 @@
+#include "strata/core/window_budget.hpp"
 #include "strata/core/strict_retirement.hpp"
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
@@ -510,6 +511,7 @@ const int64_t g_test_drop = [] {
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
+    mark_completion_unhealthy(); // linearize request BEFORE flags/drain
     released_.store(true);
     trace_ev("RELEASE", -1, -1, timeout_ms);
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
@@ -606,7 +608,40 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 
+bool Verifier::prepare_serial_completion_gate(Verifier& root,
+    std::shared_ptr<const ReservationLease> metadata,
+    std::shared_ptr<VerifierCompletionGate>& output,std::string& error) {
+    // Bind before init can publish a stage to the watchdog registry. Caller
+    // excludes topology mutation; allocation failure leaves stages untouched.
+    if(output||!metadata||metadata.use_count()!=1||
+       metadata->purpose()!=ReservationPurpose::foreground)return false;
+    const auto& charge=metadata->resources();
+    if(charge.host_bytes<VerifierCompletionGate::metadata_bytes()||charge.pinned_bytes||
+       charge.disk_bytes||charge.io_slots||charge.shadows)return false;
+    for(uint64_t bytes:charge.device_bytes)if(bytes)return false;
+    std::array<Verifier*,VerifierCompletionGate::max_stages> stages{};
+    std::size_t count=0;
+    for(Verifier* p=&root;p;p=p->next_) {
+        if(count==stages.size()||p->retirement_init_started_||!p->strict_retirement_||p->completion_gate_||
+           p->released_.load(std::memory_order_acquire)||
+           p->terminal_copy_query_failed_.load(std::memory_order_acquire))return false;
+        for(std::size_t i=0;i<count;++i)if(stages[i]==p)return false;
+        stages[count++]=p;
+    }
+    try {
+        auto gate=std::shared_ptr<VerifierCompletionGate>(new VerifierCompletionGate);
+        gate->metadata_=std::move(metadata);
+        gate->count_=count;
+        for(std::size_t i=0;i<count;++i)gate->identities_[i]=stages[i];
+        for(std::size_t i=0;i<count;++i) {
+            stages[i]->completion_stage_=i;stages[i]->completion_gate_=gate;
+        }
+        output=std::move(gate);error.clear();return true;
+    }catch(const std::bad_alloc&){return false;}
+}
+
 bool Verifier::set_strict_retirement(bool enabled, std::string& error) {
+    if(completion_gate_) { error="verifier completion policy is sealed";return false; }
     if (retirement_init_started_) { error = "strict retirement must be configured before init"; return false; }
 #if defined(STRATA_GPU_METAL)
     if (enabled) { error = "strict retirement is unsupported by Metal"; return false; }
@@ -620,6 +655,7 @@ RouteTailPolicyObservation Verifier::route_tail_policy() const noexcept {
 }
 
 Verifier::~Verifier() {
+    mark_completion_unhealthy(); // no future publication while this stage retires
     g_verifier_readers.retire(this);   // before Metal/device/member cleanup, outside the registry lock
     StrictRetirementDevice retirement(strict_retirement_ && device_ >= 0, device_);
 #if defined(STRATA_GPU_METAL)
@@ -2890,7 +2926,7 @@ bool Verifier::finish_serial_copies(std::string& err) {
     if (status != cudaSuccess) {
         // Preserve outstanding-work flags even if diagnostic allocation throws.
         // Cleanup remains callable; a successful later sync cannot heal this state.
-        terminal_copy_query_failed_.store(true, std::memory_order_release);
+        latch_copy_query_failure();
         err = std::string("verify: serial copy-stream synchronization failed: ") + cudaGetErrorString(status);
         return false;
     }
@@ -4436,7 +4472,7 @@ bool Verifier::done(std::string& err) {
         if (copy_status != cudaSuccess) {
             // Latch BEFORE diagnostic allocation. Keep all outstanding-work
             // flags/counters intact; neither a retry nor pl_finish may certify it.
-            terminal_copy_query_failed_.store(true, std::memory_order_release);
+            latch_copy_query_failure();
             err = std::string("verify: copy-stream query failed: ") + cudaGetErrorString(copy_status);
             return false;
         }

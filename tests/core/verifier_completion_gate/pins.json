@@ -1,0 +1,7 @@
+{
+  "include/strata/core/verifier_completion_gate.hpp": "27cdfbe0d2b7148c5450955b2b068edd3f847d797a078f11c3539c0038d25310",
+  "include/strata/core/verify.hpp": "dc323a013815e49983a7fd8fd78674fad10cc3e6878dabcc2cc39e5622066abc",
+  "src/core/verify.cpp": "9a36d0721a413737c4eec3324187911420c599a024d281bc6446340f04444a27",
+  "include/strata/core/window_budget.hpp": "2ff480175a6ae178d56287a00fd72958919359d733a69073cbf9524b51e8b702",
+  "src/core/window_budget.cpp": "77a4686d037f9f0d212280dc284cb3ddc3af6f09f697518c3f05aed2787d6c83"
+}
