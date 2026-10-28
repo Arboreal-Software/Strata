@@ -305,6 +305,10 @@ class RouterLookahead {
 public:
     RouterLookahead() = default;
     ~RouterLookahead();
+    // Terminal stop/join only: preserves source/FS targets and all buffers for
+    // the caller's subsequent GPU drain. False requires retaining this owner.
+    // Concurrent/reentrant/self close refuses; no join under worker mutex.
+    bool close_for_retirement() noexcept;
     RouterLookahead(const RouterLookahead&) = delete;
     RouterLookahead& operator=(const RouterLookahead&) = delete;
     /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits, n_expert rows of n_embd.
@@ -319,13 +323,13 @@ public:
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
     /// STRATA_IO_PREFETCH_DEPTH: how many layers ahead of `layer` are predicted and warmed (default 1, the next layer).
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
-    void set_depth(int d) { depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
+    void set_depth(int d) { std::lock_guard<std::mutex> lock(mu_); if(!retirement_started_.load()) depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
     int depth() const { return depth_; }
     /// STRATA_LOOKAHEAD_STATS=1 (measurement only): remember each prediction (top k, k+4 and k+10 per token) and let the
     /// dispatch score it against the experts the next layer really routes outside the GPU cache.
     void enable_stats(int64_t n_layers);
     bool stats_on() const { return stats_on_; }
-    void stats_window_start() { gen_.fetch_add(1, std::memory_order_relaxed); }
+    void stats_window_start() { std::lock_guard<std::mutex> lock(mu_); if(!retirement_started_.load()) gen_.fetch_add(1, std::memory_order_relaxed); }
     void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0);
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
@@ -333,6 +337,9 @@ public:
 
 private:
     void run();
+    std::mutex retirement_mu_;
+    std::atomic<bool> retirement_started_{false};
+    bool retirement_done_ = false, retirement_failed_ = false; // retirement_mu_
     std::vector<std::vector<uint16_t>> routers_;
     int64_t n_embd_ = 0, n_expert_ = 0;
     int k_ = 10;
@@ -808,6 +815,11 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    // Caller has completed and joined every foreground/dispatch/lookahead
+    // caller. Terminally seals background scheduling and joins workers only;
+    // retains job buffers, descriptors, maps and pinned storage for GPU drain.
+    // False requires retaining this complete owner; no raw-alias admission proof.
+    bool stop_background_after_callers_joined() noexcept;
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -1240,6 +1252,10 @@ private:
     void io_worker();
     void io_enqueue(int64_t layer, int64_t expert, bool ahead = false);   ///< ahead: a prediction (warm), not a layer's demand
     static constexpr int32_t kIoAhead = 1 << 30;      ///< io_q_: the expert field's flag for a prediction
+    std::mutex background_close_mu_;
+    std::atomic<bool> background_sealed_{false};
+    std::atomic<bool> background_close_failed_{false};
+    bool background_joined_ = false; // background_close_mu_
     void io_stop();
     const uint8_t* io_blob(int64_t layer, int64_t expert);
     const uint8_t* base_ = nullptr;

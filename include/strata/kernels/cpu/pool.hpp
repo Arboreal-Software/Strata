@@ -203,6 +203,11 @@ public:
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
+    /// Stop/join only; retains buffers and borrowed dispatch/source pointers. The controller must
+    /// first finish outstanding doorbell/pipeline work and join every host dispatch caller.
+    /// Active dispatch returns false WITHOUT sealing or stopping workers. CAS success is not
+    /// proof of global producer closure. No self-delete/concurrent destruction is permitted.
+    bool stop_after_dispatch_callers_joined() noexcept;
     ExpertPool(const ExpertPool&) = delete;
     ExpertPool& operator=(const ExpertPool&) = delete;
 
@@ -284,6 +289,19 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    enum class DispatchState { idle, active, sealed, joined, failed };
+    std::atomic<DispatchState> dispatch_state_{DispatchState::idle};
+    // Failure is sticky: unwinding a published batch does not prove its borrowers completed.
+    struct DispatchGuard {
+        ExpertPool& pool;
+        bool complete = false;
+        explicit DispatchGuard(ExpertPool& p);
+        ~DispatchGuard();
+    };
+    void run_impl(ExpertJob* jobs, int n);
+    void run_split_impl(ExpertJob* jobs, int n);
+    void run_split_multi_impl(ExpertJobMulti* jobs, int n);
+    void run_split_multi_native_impl(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     int phase_tasks(int64_t rows) const;
     int tasks_ = 0;
     void worker(int id);
