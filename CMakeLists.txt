@@ -847,6 +847,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_test(NAME window_allocator_lock_scope_test COMMAND window_allocator_test --lock-scope)
         add_test(NAME window_allocator_retirement_drain_test COMMAND window_allocator_test --retirement-drain)
         add_test(NAME window_allocator_terminal_retirement_test COMMAND window_allocator_test --terminal-retirement)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_custom_target(check_ple_context_extract
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/check_ple_context_extract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ngram.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/core/window_allocator_ple_context_test.inc
+          VERBATIM)
+        add_executable(window_allocator_ple_retirement_test src/core/window_allocator_ple_retirement_test.cpp
+          src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_restore.cpp
+          src/core/window_selection.cpp src/core/window_native.cpp src/core/window_state.cpp
+          src/core/window_hash.cpp src/core/window_lease.cpp src/core/window_budget.cpp)
+        add_dependencies(window_allocator_ple_retirement_test check_ple_context_extract)
+        target_include_directories(window_allocator_ple_retirement_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(window_allocator_ple_retirement_test PRIVATE Threads::Threads)
+        target_compile_options(window_allocator_ple_retirement_test PRIVATE -UNDEBUG)
+        add_test(NAME window_allocator_ple_retirement_test COMMAND window_allocator_ple_retirement_test)
+        set_tests_properties(window_allocator_ple_retirement_test PROPERTIES TIMEOUT 30)
         set_tests_properties(window_allocator_test window_allocator_transfer_test
           window_allocator_lock_scope_test window_allocator_retirement_drain_test window_allocator_terminal_retirement_test PROPERTIES TIMEOUT 120)
       endif()
