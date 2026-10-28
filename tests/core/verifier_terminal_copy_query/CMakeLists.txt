@@ -15,7 +15,7 @@ set_tests_properties(verifier_terminal_copy_freshness_test PROPERTIES FIXTURES_S
 add_test(NAME verifier_terminal_copy_expected_red_test
   COMMAND "${Python3_EXECUTABLE}" "${terminal_dir}/expect_red.py" $<TARGET_FILE:verifier_terminal_copy_before>)
 set_tests_properties(verifier_terminal_copy_expected_red_test PROPERTIES FIXTURES_REQUIRED terminal_copy_current TIMEOUT 30)
-foreach(mode IN ITEMS copy-error allocation pending success release-query-error)
+foreach(mode IN ITEMS copy-error allocation pending success release-query-error release-sticky)
   add_test(NAME verifier_terminal_copy_${mode}_test COMMAND verifier_terminal_copy_fixed --${mode})
   set_tests_properties(verifier_terminal_copy_${mode}_test PROPERTIES FIXTURES_REQUIRED terminal_copy_current TIMEOUT 30)
 endforeach()

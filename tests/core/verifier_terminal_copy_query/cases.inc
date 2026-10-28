@@ -15,6 +15,22 @@ int main(int argc,char**argv){
   check(!v.release_gpu_waits(10)&&drained_traces==0,"copy query error cannot certify drain");
   check(main_queries==2&&copy_queries==1,"both query branches tested");return 0;
  }
+ if(mode=="--release-sticky"){
+  copy_status=cudaErrorUnknown;check(!v.done(error),"inject terminal copy error before release");
+  check(v.terminal_copy_query_failed_.load(),"copy latch established");
+  copy_status=cudaSuccess;
+  check(v.release_gpu_waits(10),"actual release method remains available after latch");
+  check(v.released_.load()&&releases==1&&fences==1&&drained_traces==1,"actual host release and successful drain trace");
+  for(auto f:v.flags)check(f==UINT32_MAX,"all actual mapped wait flags raised");
+  check(v.terminal_copy_query_failed_.load()&&v.fl_active_&&v.copy_used_&&v.windows==0,
+        "release neither clears latch nor publishes work completion");
+  const int cq=copy_queries,eq=event_queries,mq=main_queries,dc=device_calls;
+  int32_t out=-99;
+  check(!v.done(error)&&!v.pl_finish(&out,error)&&out==-99,"completion and finish remain refused after release");
+  check(v.poll_snapshot_drain(error)==Verifier::SnapshotDrain::unhealthy,"snapshot remains unhealthy after release");
+  check(copy_queries==cq&&event_queries==eq&&main_queries==mq&&device_calls==dc&&profiles==0&&beats==0&&samples==0,
+        "postrelease refusal has no query or publication effects");return 0;
+ }
  if(mode=="--pending"){
   copy_status=cudaErrorNotReady;check(!v.done(error)&&error.empty(),"copy pending remains pending");
   check(!v.terminal_copy_query_failed_.load()&&v.copy_used_&&v.fl_active_&&v.windows==0,"pending is not terminal");
