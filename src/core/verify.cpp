@@ -3945,6 +3945,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
 }
 
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
+    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return false; }
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
@@ -4017,6 +4018,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
 }
 
 int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return -1; }
     if (!b_running_) return 1;
     // set_external_serve: another thread serves the doorbells (batch_serve) and this one only checks for a window that
     // will not finish, as below: its graph ended (or failed) with a layer still to ring, or no layer rang for 20 s.
@@ -4074,6 +4076,13 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
     const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
     if (qc == cudaErrorNotReady) return 0;
+    if (qc != cudaSuccess) {
+        // Keep the unresolved batch busy and latch BEFORE diagnostic allocation.
+        // A later successful query cannot certify this failed window or reuse it.
+        batch_copy_failed_ = true;
+        err = std::string("verify batch copy stream: ") + cudaGetErrorString(qc);
+        return -1;
+    }
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }

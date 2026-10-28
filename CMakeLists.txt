@@ -775,6 +775,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_link_libraries(serial_adapt_join_test PRIVATE Threads::Threads)
         add_test(NAME serial_adapt_join_test COMMAND serial_adapt_join_test)
         set_tests_properties(serial_adapt_join_test PROPERTIES TIMEOUT 30)
+        add_subdirectory(tests/core/verifier_copy_query)
         # Actual worker methods with CPU service mocks; no real IO/device proof.
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         find_package(Threads REQUIRED)
