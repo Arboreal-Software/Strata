@@ -1383,6 +1383,12 @@ struct DriverExpertOpenObservation {
 struct DriverWindowRuntime final : strata::core::NativeRuntimeAttachment,
                                    strata::core::ExpertHostRuntimeBinding {
     ~DriverWindowRuntime();
+    // Execution-scope controllers must first finish doorbell/pipeline work and
+    // join all external dispatch/foreground callers while their captures live.
+    // This joins only the runtime-owned background producers; it is not proof
+    // that arbitrary external raw aliases or controller threads have stopped.
+    bool close_background_after_callers_joined() noexcept;
+    std::atomic<unsigned> background_retirement{0}; // open/closing/closed/failed
     // The selected runtime must own the exact dispatch receiver and its source
     // and pool. Matching independent source receipts alone cannot establish this
     // join. Caller serializes consumer replacement and selected-work callbacks.
@@ -1651,7 +1657,33 @@ bool DriverWindowRuntime::allocate_scratch(strata::core::WindowBudget& budget,
     if(mapped)*mapped=scratch.back().device_data();
     return true;
 }
+bool DriverWindowRuntime::close_background_after_callers_joined() noexcept {
+    unsigned expected=0;
+    if(!background_retirement.compare_exchange_strong(expected,1,std::memory_order_acq_rel))
+        return expected==2;
+    bool closed=false;
+    try {
+        // No new predictions may reach the swap source or dispatch pool once
+        // their workers are stopped. Keep every buffer and callback target alive.
+        closed=(!lookahead||lookahead->close_for_retirement())&&
+               (!foresight||foresight->close_for_retirement())&&
+               (!pool||pool->stop_after_dispatch_callers_joined())&&
+               (!source||source->stop_background_after_callers_joined());
+        if(closed)for(const auto& stage:sessions.stages()){
+            if(stage.session&&stage.session->ple.read_context&&
+               !stage.session->ple.read_context->close_for_retirement()){
+                closed=false;break;
+            }
+        }
+    } catch(...) {closed=false;}
+    background_retirement.store(closed?2u:3u,std::memory_order_release);
+    return closed;
+}
 DriverWindowRuntime::~DriverWindowRuntime() {
+    if(!close_background_after_callers_joined()){
+        std::fputs("strata: runtime producer closure uncertain; worker restart required\n",stderr);
+        std::_Exit(1);
+    }
     // Caller has closed and joined producers. Keep external streams alive while
     // downstream consumer destructors retire their graphs and borrowed bindings.
     gpu_handles.drain_after_producers_closed();

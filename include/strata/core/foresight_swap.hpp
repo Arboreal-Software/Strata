@@ -76,6 +76,10 @@ struct ForesightSwap {
     bool init(int slots_per_layer, int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
               const std::vector<int>& devices, std::string& err);
     ~ForesightSwap();
+    // Terminal stop/join only; retains allocations, events, streams and borrowed
+    // source addresses until caller drains all GPU consumers. False is not a
+    // completion certificate. Public configuration fields remain caller-owned.
+    bool close_for_retirement() noexcept;
 
     /// The pool, for a routed expert that is not in the cache: true and its device address when a landed slot holds it.
     bool take(int64_t layer, int32_t expert, unsigned long long& ptr);
@@ -95,6 +99,11 @@ struct ForesightSwap {
     std::string report() const;
 
 private:
+    struct ActiveRequest { ForesightSwap* owner; ActiveRequest* previous; };
+    static thread_local ActiveRequest* active_request_;
+    std::mutex retirement_mu_;
+    std::atomic<bool> retirement_started_{false};
+    bool retirement_done_ = false, retirement_failed_ = false; // retirement_mu_
     bool strict_retirement_ = false;
     bool retirement_init_started_ = false;
     int retirement_device_ = -1;
