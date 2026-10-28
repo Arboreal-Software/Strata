@@ -12,6 +12,7 @@ struct VerifiedDriverOverrides {
     std::map<std::string,std::vector<std::string>> paths;
 };
 class ParsedVerifiedInputs;
+class ExpectedRunningExecutable;
 class VerifiedDriverBindings {
 public:
     VerifiedDriverBindings()=default;
@@ -61,6 +62,10 @@ public:
     const VerifiedInputManifest& manifest() const{return manifest_;}
     const VerifiedInputLimits& limits() const{return limits_;}
     const StateDigest& digest() const{return digest_;}
+    // Only schema3 MAIN_IMAGE mints this private expectation. Legacy schema or
+    // metadata admission/allocation refusal returns null; no borrowed fake claim.
+    bool requires_running_executable_observation() const noexcept {return main_image_present_;}
+    std::shared_ptr<const ExpectedRunningExecutable> expected_running_executable(WindowBudget) const noexcept;
     // Call BEFORE bundle preparation. No original-path fallback or unlisted
     // caller override. Failure leaves bundle/output binding untouched.
     VerifiedArtifactResult validate_overrides(const VerifiedDriverOverrides&) const;
@@ -72,6 +77,9 @@ public:
 private:
     friend class ExpertProfileCapture;
     ParsedVerifiedInputs()=default;
+    bool main_image_present_=false;
+    uint64_t main_image_bytes_=0;
+    StateDigest main_image_digest_{};
     VerifiedInputManifest manifest_;
     VerifiedInputLimits limits_;
     StateDigest digest_{};
