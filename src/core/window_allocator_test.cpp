@@ -95,18 +95,24 @@ int main(int argc,char** argv){
             WindowBudget budget(capacity,zero);NativeSessionAllocation out;
             check(bool(allocate_native_sessions(g,16,1,requests,budget,out)),"failed drain fixture");
             auto* a=out.stages()[0].session;auto* b=out.stages()[1].session;
+            std::weak_ptr<const void> public_owner=out.stages()[0].owner;
             std::weak_ptr<const ReservationLease> lease=out.reservation();
             const auto held=budget.snapshot().reserved;const auto old_frees=frees,old_host_frees=host_frees;
             current_device=7;drained_devices.clear();check_retirement_order=true;
             if(scenario<2)fail_drain_device=scenario;
             else fail_set_target=scenario==4?7:scenario-2;
             out={};
+            // Quarantine keeps raw Storage, not its expired shared control block.
+            check(public_owner.expired(),"last shared owner expires after quarantine deleter");
             check(!lease.expired()&&a->qsa_states[a->qsa_ord0].host_step&&b->qsa_states[b->qsa_ord0].host_step,
                   "failed drain/select/restore retains actual session owner and pinned targets");
             check(frees==old_frees&&host_frees==old_host_frees&&budget.snapshot().reserved==held&&native_session_quarantine_count()==1,
                   "no borrowed free or quota release before full gang drain and restoration");
             if(scenario!=4)check(current_device==7,"failed drain/select restores original device");
             const auto calls=device_calls;out={};check(device_calls==calls,"uncertain retired owner is not retried");
+            check(allocate_native_sessions(g,16,1,requests,budget,out).status==NativeAllocationStatus::unhealthy&&
+                  out.stages().empty()&&device_calls==calls&&budget.snapshot().reserved==held,
+                  "quarantined allocator refuses republish without device work or quota loss");
         });
         {
             auto small=capacity;small.device_bytes[1]=1;WindowBudget budget(small,zero);NativeSessionAllocation out;
@@ -115,6 +121,28 @@ int main(int argc,char** argv){
                   "host-only gang admission refuses");
             check(device_calls==before&&out.stages().empty()&&budget.snapshot().reserved==zero,
                   "host-only unwind performs no device work");
+        }
+        {
+            WindowBudget budget(capacity,zero);NativeSessionAllocation out;
+            check(bool(allocate_native_sessions(g,16,1,requests,budget,out)),"containment prior output");
+            const auto* prior=out.stages()[0].session;
+            const auto charge=budget.snapshot().reserved;
+            for(int variant=0;variant<3;++variant){
+                auto elastic=requests;bool called=false;
+                if(variant!=1)elastic[0].elastic_plans.emplace_back();
+                if(variant!=0)elastic[0].prepare_elastic=[&](const auto&,auto&,const auto&,auto&,auto&){called=true;return false;};
+                std::vector<std::unique_ptr<SessionState>> fresh;
+                fresh.push_back(std::make_unique<SessionState>());fresh.push_back(std::make_unique<SessionState>());
+                const auto* a=fresh[0].get();const auto* b=fresh[1].get();const auto calls=device_calls;
+                const auto result=allocate_native_sessions(g,16,1,elastic,fresh,budget,out);
+                check(result.status==NativeAllocationStatus::invalid&&
+                      result.detail=="elastic native retirement requires a two-phase owner contract"&&!called,
+                      "elastic plans and factories refuse before callback or device work");
+                check(fresh[0].get()==a&&fresh[1].get()==b&&out.stages()[0].session==prior&&
+                      device_calls==calls&&budget.snapshot().reserved==charge,
+                      "containment preserves both incoming sessions, existing output and quota");
+            }
+            out={};check(budget.snapshot().reserved==zero,"flat allocation remains releasable after refusal");
         }
         std::puts("window_allocator retirement drain tests passed");return 0;
     }

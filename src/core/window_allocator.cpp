@@ -140,6 +140,13 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t c
         for(size_t j=0;j<i;++j)if(fresh[i].get()==fresh[j].get())
             return {NativeAllocationStatus::invalid,"duplicate native session owner"};
     }
+    // Temporary containment: pool/VMM retirement still drains while releasing.
+    // Until every pool supports a non-destructive preparation phase followed by
+    // no-drain release, a later failure could follow earlier borrowed frees.
+    // Keep the implementation below for that follow-up; do not activate it yet.
+    for(const auto& request:requests)
+        if(!request.elastic_plans.empty()||request.prepare_elastic)
+            return {NativeAllocationStatus::invalid,"elastic native retirement requires a two-phase owner contract"};
     bool attempted=false;
     try {
         auto storage=std::shared_ptr<Storage>(new Storage,destroy);
