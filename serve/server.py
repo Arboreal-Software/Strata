@@ -962,6 +962,18 @@ class _EngineEpoch:
     slot_cv: object
 
 
+@dataclass
+class _BatchControl:
+    """Own exactly the acquired lock until handoff or final cleanup."""
+    lock: object = None
+    error: BaseException | None = None
+
+    def release(self):
+        lock, self.lock = self.lock, None
+        if lock is not None:
+            lock.release()
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1911,6 +1923,25 @@ class StrataEngine:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+        """Guard the acquired control lock through setup, streaming and cleanup."""
+        control = _BatchControl()
+        try:
+            yield from self._generate_batched(ids, max_new, sampling, cancel, embeddings, control)
+        except BaseException as error:
+            # Cleanup (including tracing) must not replace a body exception or
+            # GeneratorExit. Even an unexpected release error is secondary.
+            primary = control.error if control.error is not None else error
+            try:
+                control.release()
+            except BaseException as release_error:
+                raise primary from release_error
+            if primary is not error:
+                raise primary from error
+            raise
+        else:
+            control.release()
+
+    def _generate_batched(self, ids, max_new, sampling, cancel, embeddings, control):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
         its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
@@ -1932,33 +1963,26 @@ class StrataEngine:
         ok = yield from self._take_control(cancel, len(prompt), new=True)
         if not ok:
             return
-        held_ctl = self.ctl if ok is True else ok
-        # Acquisition succeeded, but epoch capture and setup can still fail
-        # before the request's normal cleanup is initialized. Release the exact
-        # acquired lock even if a successor has replaced self.ctl meanwhile.
-        try:
-            epoch = self._capture_epoch()
+        control.lock = self.ctl if ok is True else ok
+        epoch = self._capture_epoch()
+        slots = epoch.slots
+        holding, born = True, epoch.gen                  # (the engine it now has the control lines of)
+        btrace("ctl acquired")
+        slot, gen0, reserved = None, None, None
+        phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
+        stop_sent = False
+        sent = False
+        def acquired_control():
+            nonlocal holding, born, epoch, slots
+            control.lock = self.ctl if ok is True else ok
+            holding = True
+            if sent and self.gen != born:
+                raise EngineDied("the engine changed after this request was admitted")
+            epoch = self._capture_epoch(born if sent else None)
             slots = epoch.slots
-            holding, born = True, epoch.gen                  # (the engine it now has the control lines of)
-            btrace("ctl acquired")
-            slot, gen0, reserved = None, None, None
-            phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
-            stop_sent = False
-            sent = False
-            def acquired_control():
-                nonlocal holding, born, epoch, slots, held_ctl
-                holding = True
-                held_ctl = self.ctl if ok is True else ok
-                if sent and self.gen != born:
-                    raise EngineDied("the engine changed after this request was admitted")
-                epoch = self._capture_epoch(born if sent else None)
-                slots = epoch.slots
-                born = epoch.gen
-            yields, solo_again, refused = 0, 0, 0
-            admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
-        except BaseException:
-            held_ctl.release()
-            raise
+            born = epoch.gen
+        yields, solo_again, refused = 0, 0, 0
+        admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -2064,7 +2088,7 @@ class StrataEngine:
                                     admit_wait, admit_since = True, time.monotonic()   # control lines then)
                                     self.admitting += 1
                             if holding:
-                                held_ctl.release()
+                                control.release()
                                 holding = False
                             with epoch.slot_cv:
                                 if self.pick_slot(prompt, epoch=epoch) is None:
@@ -2093,7 +2117,7 @@ class StrataEngine:
                         with self._epoch_state(epoch):
                             self._yielded = None
                         yields += 1
-                        held_ctl.release()
+                        control.release()
                         holding = False
                         with epoch.slot_cv:
                             turn_epoch = self.ctl_epoch
@@ -2184,7 +2208,7 @@ class StrataEngine:
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
-                held_ctl.release()
+                control.release()
                 holding = False
                 if not cont:
                     return
@@ -2250,9 +2274,16 @@ class StrataEngine:
                             btrace("back to the solo path")
                             break
                         return
+        except BaseException as error:
+            control.error = error
+            raise
         finally:
             # a consumer that left early (or an error): keep the engine and this server in step
-            btrace("finally phase", phase, "slot", slot, "holding", holding)
+            trace_error = None
+            try:
+                btrace("finally phase", phase, "slot", slot, "holding", holding)
+            except BaseException as error:
+                trace_error = error  # Diagnostics must not skip protocol cleanup.
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
                     phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
@@ -2282,7 +2313,7 @@ class StrataEngine:
                     if carry and isinstance(self.last, dict):
                         self.last = add_carry(carry, self.last)
             if holding:
-                held_ctl.release()
+                control.release()
             if admit_wait:
                 with epoch.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
@@ -2311,7 +2342,8 @@ class StrataEngine:
                         slots.slot_busy[slot] = False
                         slots.slot_claims.discard(slot)
                         epoch.slot_cv.notify_all()
-
+            if trace_error is not None:
+                raise trace_error
 
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
