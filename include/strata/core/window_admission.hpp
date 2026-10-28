@@ -56,9 +56,15 @@ public:
     WindowAdmission& operator=(const WindowAdmission&)=delete;
     WindowAdmission(WindowAdmission&&)=delete;
     WindowAdmission& operator=(WindowAdmission&&)=delete;
+    // Always maintain registry expiry and its allocation-free timer hint, even
+    // while acknowledgement recovery blocks new admission. Graph refresh may
+    // still allocate/fail; expiry/time effects are independent and not rolled back.
     AdmissionDecision refresh(uint64_t now_ms);
     AdmissionDecision admit(uint64_t now_ms, std::span<const AdmissionCandidate>,
                             bool other_nonmaintenance_demand, WindowAdmissionHandle&);
+    // Call refresh with current reactor time first. Recovery keeps the original
+    // accepted revisions/cut; changed decision sources block rather than reinterpret
+    // admitted work. Blocked/uncertain owners require cancellation and proven drain.
     AdmissionStatus recover_acknowledgement(const WindowAdmissionHandle&);
     AdmissionStatus release(const WindowAdmissionHandle&);
     bool outstanding(size_t slot, WindowAdmissionHandle&) const;

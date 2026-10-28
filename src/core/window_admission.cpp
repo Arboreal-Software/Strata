@@ -61,10 +61,14 @@ bool WindowAdmission::pending() const {
 }
 AdmissionDecision WindowAdmission::refresh(uint64_t now){
     AdmissionDecision answer;answer.next_expiry_ms=next_expiry_;
-    if(pending()){answer.status=A::acknowledgement_pending;return answer;}
     if(now<now_){answer.status=A::invalid;return answer;}
     try {
         if(!priorities_.advance_time(now)){answer.status=A::invalid;return answer;}
+        // Timer maintenance is independent of permission to admit another unit.
+        // No allocation here: unresolved work must not freeze unrelated actors' expiry.
+        now_=now;next_expiry_=priorities_.next_activity_expiry_ms();
+        answer.next_expiry_ms=next_expiry_;
+        if(pending()){answer.status=A::acknowledgement_pending;return answer;}
         auto refreshed=dependencies_.refresh_priorities(now);
         if(!refreshed){answer.status=refreshed.error==DependencyError::allocation_failed?A::allocation_failed:A::stale;return answer;}
         auto graph=dependencies_.snapshot();
@@ -85,10 +89,13 @@ AdmissionDecision WindowAdmission::refresh(uint64_t now){
 AdmissionStatus WindowAdmission::acknowledge(const std::shared_ptr<WindowAdmissionRecord>& r){
     if(r->status!=A::acknowledgement_pending)return r->status;
     try {
-        auto ack=priorities_.acknowledge(r->priority.thread.key,r->priority.thread.accepted_revision,r->cut,r->now);
+        // Retain the original decision revisions/cut, but validate at the reactor's
+        // maintained time. Unrelated expiry need not block recovery; expiry/edit
+        // of either decision source refuses the exact-revision acknowledgement.
+        auto ack=priorities_.acknowledge(r->priority.thread.key,r->priority.thread.accepted_revision,r->cut,now_);
         if(!ack){r->status=A::acknowledgement_blocked;return r->status;}
         if(r->source.key!=r->priority.thread.key){
-            ack=priorities_.acknowledge(r->source.key,r->source.accepted_revision,r->cut,r->now);
+            ack=priorities_.acknowledge(r->source.key,r->source.accepted_revision,r->cut,now_);
             if(!ack){r->status=A::acknowledgement_blocked;return r->status;}
         }
         // These scalar observations are published only after all acknowledgements.
