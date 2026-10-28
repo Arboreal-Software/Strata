@@ -19,7 +19,9 @@ line, separately for terminal-first and chain-first execution; crashes, timeouts
 other assertions and sanitizer output cannot qualify. Fixed scenarios cover hard
 copy errors, sticky retry without device calls, persistent allocation failure in
 the diagnostic, retained pending/copy flags, successful copy, unused copy, and a
-non-success pending status. CUDA synchronization and handoff/resident-plan helpers
+non-success pending status. The chain matrix combines downstream success/failure,
+primary success/error, and copy success/error; it checks call counts, independent
+flag transitions, sticky copy failure, and diagnostic ordering. CUDA synchronization and handoff/resident-plan helpers
 are CPU fakes; no device or model is involved. Allocation injection affects real
 C++ string allocation with global operator new, not a fake returned error string.
 
