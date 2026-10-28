@@ -57,6 +57,17 @@ bool add(uint64_t& total,uint64_t amount) {
     total+=amount;return true;
 }
 bool release(Storage& storage) {
+    // Host producers must already be closed by the caller. Drain the complete
+    // gang before releasing any pinned staging or cross-stage borrowed target;
+    // a later stage can still be using an earlier stage's storage.
+    for(const auto& stage:storage.stages) {
+        if(!stage.session)continue;
+        if(!stage.arena&&!stage.session->qsa_states&&!stage.ple_embedding&&!stage.ple_scratch&&!stage.ple_native_key)continue;
+        WindowDeviceScope device(stage.device);
+        const bool drained=device.ok()&&cudaDeviceSynchronize()==cudaSuccess;
+        const bool restored=device.finish(); // attempt even when drain failed
+        if(!drained||!restored)return false;
+    }
     for(auto& stage:storage.stages) {
         if(!stage.session)continue; // host preparation refused before ownership transfer
         if(!stage.arena&&!stage.session->qsa_states&&!stage.ple_embedding&&!stage.ple_scratch&&!stage.ple_native_key)continue;
@@ -129,6 +140,13 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t c
         for(size_t j=0;j<i;++j)if(fresh[i].get()==fresh[j].get())
             return {NativeAllocationStatus::invalid,"duplicate native session owner"};
     }
+    // Temporary containment: pool/VMM retirement still drains while releasing.
+    // Until every pool supports a non-destructive preparation phase followed by
+    // no-drain release, a later failure could follow earlier borrowed frees.
+    // Keep the implementation below for that follow-up; do not activate it yet.
+    for(const auto& request:requests)
+        if(!request.elastic_plans.empty()||request.prepare_elastic)
+            return {NativeAllocationStatus::invalid,"elastic native retirement requires a two-phase owner contract"};
     bool attempted=false;
     try {
         auto storage=std::shared_ptr<Storage>(new Storage,destroy);
