@@ -797,6 +797,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_link_libraries(window_token_ledger_test PRIVATE Threads::Threads)
         add_test(NAME window_token_ledger_test COMMAND window_token_ledger_test)
         set_tests_properties(window_token_ledger_test PROPERTIES TIMEOUT 120)
+        # Fixed-KV allocator ownership/failure fixtures; CUDA calls are CPU mocks.
+        # Keep the real session/layer/VMM implementations out of this closure.
+        add_executable(window_allocator_test src/core/window_allocator_test.cpp
+          src/core/window_allocator.cpp src/core/window_restore.cpp src/core/window_selection.cpp
+          src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
+          src/core/window_lease.cpp src/core/window_budget.cpp)
+        target_include_directories(window_allocator_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(window_allocator_test PRIVATE Threads::Threads)
+        add_test(NAME window_allocator_test COMMAND window_allocator_test)
+        add_test(NAME window_allocator_transfer_test COMMAND window_allocator_test --transfer)
+        add_test(NAME window_allocator_lock_scope_test COMMAND window_allocator_test --lock-scope)
+        set_tests_properties(window_allocator_test window_allocator_transfer_test
+          window_allocator_lock_scope_test PROPERTIES TIMEOUT 120)
       endif()
     endif()
   endif()

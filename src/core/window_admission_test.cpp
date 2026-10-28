@@ -1,3 +1,4 @@
+#include "window_session_elastic_test_mocks.hpp"
 #include "strata/core/window_restore.hpp"
 #include "strata/core/window_allocator.hpp"
 #include "strata/core/window_selection.hpp"
@@ -148,6 +149,7 @@ struct World {
     void drain(WindowAdmissionHandle& h){auto* work=h.work();check(work,"ready work");finish(*work,work->token());check(admission.release(h)==A::released,"release exact complete lease");}
 };
 int main(){
+    strata::core::window_test::check_fixed_kv_elastic_mock_contract();
  alarm(60);
  check(!WindowWork{}.resolved(),"empty work unresolved");
  {
