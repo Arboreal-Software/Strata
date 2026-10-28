@@ -1,3 +1,4 @@
+#include "window_session_elastic_test_mocks.hpp"
 #include "strata/core/window_restore.hpp"
 #include "strata/core/window_allocator.hpp"
 #include "strata/core/window_selection.hpp"
@@ -148,6 +149,7 @@ static void park_import(Harness& h) {
     check(h.manager.unbind(lane(h.manager),empty)==S::ok,"import source unbound");
 }
 int main(){
+    strata::core::window_test::check_fixed_kv_elastic_mock_contract();
     alarm(60);
     WindowBudget budget(WindowResources{{1000000,1000000},256<<20,10000,0,0,100},WindowResources{{0,0},0,0,0,0,0});
     {
