@@ -11,6 +11,11 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <limits>
+#include <new>
+#include "strata/core/window_budget.hpp"
+using strata::core::ReservationLease;
+using strata::core::ReservationPurpose;
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -28,10 +33,11 @@ void bf16_rows_dot_multi_avx1(const uint16_t*,int,int,const float*,int,float*){s
 }
 struct ExpertSource {
  std::function<void()> before_read;
+ std::function<void(int64_t,const int64_t*,int64_t)> on_warm;
  std::atomic<int> warms_count{0};
  bool warms(){return true;} bool wants_scores(){return false;}
  bool read_ahead_open(){if(before_read)before_read();return true;}
- void warm(int64_t,const int64_t*,int64_t){++warms_count;}
+ void warm(int64_t l,const int64_t* e,int64_t n){if(on_warm)on_warm(l,e,n);++warms_count;}
  void warm_scored(int64_t,const int64_t*,const float*,int64_t,int){std::abort();}
 };
 struct ForesightSwap {void predict(ExpertSource*,int64_t,int32_t){}};
@@ -105,7 +111,7 @@ int main(){int cases=0;float x[8]{};int32_t res[4]={-1,-1,-1,-1};
  {R r;ExpertSource s;std::atomic<bool> refused=false;s.before_read=[&]{R::SubmittedDrain own;refused=r.drain_submitted(own)==D::refused;};start(r,s);r.submit(0,x,1,res);R::SubmittedDrain held;
   check(r.drain_submitted(held,Clock::now()+std::chrono::seconds(5))==D::drained,"worker finishes self-refusal");check(refused,"worker callback cannot drain itself");++cases;}
  { // Execute real worker catch on this test thread; production uncaught exception remains fatal.
-  R r;ExpertSource s;s.before_read=[] {throw std::runtime_error("source failure");};r.src_=&s;r.routers_.assign(2,std::vector<uint16_t>(16));r.x_.assign(8,0);r.n_embd_=8;r.n_expert_=2;r.k_=1;r.submit(0,x,1,res);
+  R r;ExpertSource s;s.before_read=[] {throw std::runtime_error("source failure");};r.src_=&s;r.routers_.assign(2,std::vector<uint16_t>(16));r.x_.assign(8,0);r.residency_snapshot_.assign(4,0);r.n_embd_=8;r.n_expert_=2;r.k_=1;r.submit(0,x,1,res);
   bool caught=false;std::thread failed([&]{try{r.run();}catch(const std::runtime_error&){caught=true;}});failed.join();check(caught&&r.worker_failed_,"actual worker exception is sticky");
   R::SubmittedDrain held;check(r.drain_submitted(held)==D::refused,"exception never becomes idle proof");++cases;}
  {R r;ExpertSource s;Barrier b;s.before_read=[&]{b.block();};start(r,s);r.submit(0,x,1,res);b.wait();
@@ -134,5 +140,5 @@ int main(){int cases=0;float x[8]{};int32_t res[4]={-1,-1,-1,-1};
   check(result==D::drained,"pending submission must wake worker while deadline waiter exists");
   check(s.warms_count==1,"pending prediction ran once");++cases;
  }
- check(cases==7,"all independent scenarios executed");std::puts("PASS lookahead submitted drain: 7 scenarios");
+ check(cases==7,"all independent scenarios executed");std::puts("PASS lookahead submitted drain: 7 scenarios");return 0;
 }

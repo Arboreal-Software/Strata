@@ -17,7 +17,7 @@ void RouterLookahead::run() try {
             busy_ = true;
             layer = layer_;
             nt = n_tok_;
-            host_res = host_res_;
+            host_res = has_residency_ ? residency_snapshot_.data() : nullptr;
             fs = fs_;
             sgen = sub_gen_;
         }
@@ -118,7 +118,7 @@ void RouterLookahead::run() try {
         {
             std::lock_guard<std::mutex> lk(mu_);
             busy_ = false;
-            host_res_ = nullptr;
+            has_residency_ = false;
         }
         cv_.notify_all();
     }
@@ -127,7 +127,7 @@ void RouterLookahead::run() try {
         std::lock_guard<std::mutex> lock(mu_);
         worker_failed_ = true;
         busy_ = pending_ = false;
-        host_res_ = nullptr;
+        has_residency_ = false;
     }
     cv_.notify_all();
     throw; // Preserve existing uncaught-worker fatal behavior; never signal success.

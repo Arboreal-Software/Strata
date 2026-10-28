@@ -19,3 +19,16 @@ target_link_options(lookahead_notify_one_control PRIVATE -fsanitize=address,unde
 target_link_libraries(lookahead_notify_one_control PRIVATE Threads::Threads)
 add_test(NAME lookahead_previous_notify_one_control COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/expect_notify_red.py $<TARGET_FILE:lookahead_notify_one_control>)
 set_tests_properties(lookahead_previous_notify_one_control PROPERTIES DEPENDS lookahead_drain_freshness TIMEOUT 20)
+
+target_include_directories(lookahead_drain_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../include)
+target_include_directories(lookahead_notify_one_control PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../include)
+# Follow-up snapshot test uses the real ledger. The two targets above deliberately
+# omit window_budget.cpp, checking that default linkage has no new dependency.
+add_executable(lookahead_snapshot_test ../lookahead_snapshot/test.cpp ../../../src/core/window_budget.cpp)
+target_include_directories(lookahead_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../include)
+target_compile_features(lookahead_snapshot_test PRIVATE cxx_std_20)
+target_compile_options(lookahead_snapshot_test PRIVATE -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer)
+target_link_options(lookahead_snapshot_test PRIVATE -fsanitize=address,undefined)
+target_link_libraries(lookahead_snapshot_test PRIVATE Threads::Threads)
+add_test(NAME lookahead_snapshot_cases COMMAND lookahead_snapshot_test)
+set_tests_properties(lookahead_snapshot_cases PROPERTIES DEPENDS lookahead_drain_freshness TIMEOUT 20)

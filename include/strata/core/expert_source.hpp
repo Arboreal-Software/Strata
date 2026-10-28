@@ -52,6 +52,7 @@ struct ExpertLayout;
 }
 
 namespace strata::core {
+class ReservationLease;
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
@@ -305,6 +306,15 @@ struct ForesightSwap;
 class RouterLookahead {
 public:
     RouterLookahead() = default;
+    // Exact additional logical residency-array payload; output unchanged on
+    // overflow/invalid dimensions. Zero layers is valid for legacy empty start.
+    static bool residency_snapshot_bytes(size_t layers, int64_t experts, uint64_t& out) noexcept;
+    // Owned startup only. Consumes a genuine exclusive dedicated foreground
+    // lease after validating exact host bytes and no other resource charges.
+    // Caller uses the actual runtime ledger, not an untrusted aliased lease.
+    // No WindowBudget operation is linked into the default source translation unit.
+    bool configure_residency_snapshot(size_t layers, int64_t experts,
+        std::shared_ptr<const ReservationLease>& lease) noexcept;
     ~RouterLookahead();
     // Terminal stop/join only: preserves source/FS targets and all buffers for
     // the caller's subsequent GPU drain. False requires retaining this owner.
@@ -347,6 +357,8 @@ public:
     void set_foresight(ForesightSwap* fs);
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
+    /// Caller supplies full startup geometry and serializes writes through this
+    /// synchronous copy. Only the private snapshot survives submit returning.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
     /// STRATA_IO_PREFETCH_DEPTH: how many layers ahead of `layer` are predicted and warmed (default 1, the next layer).
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
@@ -380,7 +392,12 @@ private:
     std::thread::id worker_id_{}; // mu_, avoids racing thread_ join
     bool worker_failed_ = false; // sticky, never a successful drain proof
     int64_t layer_ = -1, n_tok_ = 0;
-    const int32_t* host_res_ = nullptr;
+    // Charge declared before allocation: storage is destroyed before its lease.
+    std::shared_ptr<const ReservationLease> residency_lease_;
+    std::vector<int32_t> residency_snapshot_;
+    size_t admitted_layers_ = 0;
+    int64_t admitted_experts_ = 0;
+    bool has_residency_ = false;
     uint64_t sub_gen_ = 0;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;
