@@ -761,6 +761,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_link_libraries(submitted_work_drain_test PRIVATE Threads::Threads)
         add_test(NAME submitted_work_drain_test COMMAND submitted_work_drain_test)
         set_tests_properties(submitted_work_drain_test PROPERTIES TIMEOUT 30)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_custom_target(check_serial_adapt_join_extract
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serial_adapt_join/check_extract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/program/generate.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serial_adapt_join
+          VERBATIM)
+        add_executable(serial_adapt_join_test tests/core/serial_adapt_join/test.cpp)
+        add_dependencies(serial_adapt_join_test check_serial_adapt_join_extract)
+        target_include_directories(serial_adapt_join_test PRIVATE include/strata/core)
+        target_compile_features(serial_adapt_join_test PRIVATE cxx_std_20)
+        target_compile_options(serial_adapt_join_test PRIVATE -UNDEBUG)
+        target_link_libraries(serial_adapt_join_test PRIVATE Threads::Threads)
+        add_test(NAME serial_adapt_join_test COMMAND serial_adapt_join_test)
+        set_tests_properties(serial_adapt_join_test PROPERTIES TIMEOUT 30)
         # Actual worker methods with CPU service mocks; no real IO/device proof.
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         find_package(Threads REQUIRED)
