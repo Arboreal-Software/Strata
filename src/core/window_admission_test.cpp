@@ -348,21 +348,49 @@ int main(){
  }
  int ambiguous=0,refused=0;
  for(int fault=0;fault<150;++fault){
-    World w;check(bool(w.priorities.register_activity(w.thread,"allocation-test-actor",1,0)),"allocation actor");auto c=w.candidate(w.op,w.ta);WindowAdmissionHandle h;
+    World w;auto actor_result=w.priorities.register_activity(w.thread,"allocation-test-actor",1,0);
+    check(bool(actor_result),"allocation actor");
+    ActivityKey decision_actor{w.thread,"allocation-test-actor",actor_result.snapshot.activity.front().incarnation};
+    check(bool(w.priorities.set_activity(decision_actor,1,20,10,0)),"decision source activity");auto c=w.candidate(w.op,w.ta);WindowAdmissionHandle h;
     allocation_countdown=fault;auto result=w.admission.admit(0,{&c,1},false,h);allocation_countdown=-1;
     if(result.status==A::acknowledgement_pending){
        ++ambiguous;check(!h.work()&&bool(h.recovery_lease()),"ambiguous ack retains exact work without execution");
        check(w.admission.refresh(0).status==A::acknowledgement_pending,"pending ack blocks next admission cut");
        auto op=h.recovery_lease().operation();
+       auto orphan=w.priorities.create_thread("idle-no-operation",3,0);
+       check(bool(orphan),"orphan registry thread");
+       auto orphan_actor=w.priorities.register_activity(orphan.snapshot.key,"idle-user",1,0);
+       check(bool(orphan_actor),"orphan actor");
+       ActivityKey orphan_key{orphan.snapshot.key,"idle-user",orphan_actor.snapshot.activity.front().incarnation};
+       check(bool(w.priorities.set_activity(orphan_key,1,30,1,0)),"orphan temporary priority");
+       check(bool(w.priorities.set_base(orphan.snapshot.key,1,-7,0)),"edited orphan base independent of boost");
+       allocation_countdown=0;auto timer=w.admission.refresh(1);allocation_countdown=-1;
+       check(timer.status==A::acknowledgement_pending&&timer.next_expiry_ms==10,
+             "pending acknowledgement advances registry timer without allocation or input");
+       check(w.priorities.next_activity_expiry_ms()==10,
+             "registry itself expired orphan before any snapshot can advance its time");
+       check(w.priorities.snapshot(orphan.snapshot.key,0).error==PriorityError::invalid_time,
+             "timer already advanced registry monotonic clock");
+       auto expired=w.priorities.snapshot(orphan.snapshot.key,1);
+       check(expired.snapshot.local_effective==-7&&!expired.snapshot.activity.front().active,
+             "orphan expiry preserves base while unrelated work retained");
+       check(!h.work()&&h.recovery_lease().operation()==op&&w.admission.release(h)==A::unresolved,
+             "timer is not execution or release proof");
+       check(w.admission.refresh(0).status==A::invalid,"pending state does not hide backwards time");
        if(ambiguous%2==0){
-          check(bool(w.priorities.set_base(w.thread,1,4,0)),"external control violates pending-ack serialization");
+          allocation_countdown=0;auto decision_expiry=w.admission.refresh(10);allocation_countdown=-1;
+          check(decision_expiry.status==A::acknowledgement_pending&&!decision_expiry.next_expiry_ms,
+                "decision activity expiry clears timer even with pending work");
+          check(bool(w.priorities.set_base(w.thread,1,4,10)),"base edit after decision expiry");
           check(w.admission.recover_acknowledgement(h)==A::acknowledgement_blocked,"changed revision cannot reinterpret pending admission");
           check(!h.work()&&w.admission.release(h)==A::unresolved,"blocked acknowledgement retains work");
+          check(w.admission.refresh(11).status==A::acknowledgement_pending&&
+                !w.priorities.next_activity_expiry_ms(),"blocked acknowledgement still maintains timer");
           check(w.manager.request_cancel(w.ta)==S::ok,"cancel blocked admitted work");
           auto lease=h.recovery_lease();check(lease.finish(op,w.ta.selection.key,{},true,true),"drain blocked admission");
           check(w.admission.release(h)==A::released,"release blocked admission only after exact drain");
        }else{
-          check(w.admission.recover_acknowledgement(h)==A::ready,"recover idempotent acknowledgement");
+          check(w.admission.recover_acknowledgement(h)==A::ready,"unrelated expiry permits original revision/cut recovery at current time");
           check(h.work()->lease().operation()==op,"recovery never readmits");w.drain(h);
        }
     }else if(result.status==A::ready)w.drain(h);
