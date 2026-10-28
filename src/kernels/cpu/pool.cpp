@@ -741,8 +741,8 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
-    : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks, bool checked_retirement)
+    : checked_retirement_(checked_retirement), tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     pinned_ = pin;
     layout_ = logical_cpu_layout();   // now, before anything pins the caller (Linux reads the calling thread's allowed CPUs)
@@ -952,7 +952,14 @@ ExpertPool::~ExpertPool() {
         g_numa_plan = NumaSplitPlan{};
         g_numa_owner = nullptr;
     }
-    if (!stop_after_dispatch_callers_joined()) std::terminate();
+    if (checked_retirement_) {
+        if (!stop_after_dispatch_callers_joined()) std::terminate();
+    } else {
+        stop_.store(true, std::memory_order_release);
+        // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
+        publish();
+        for (auto& t : threads_) t.join();
+    }
 }
 
 ExpertPool::DispatchGuard::DispatchGuard(ExpertPool& p) : pool(p) {
@@ -968,6 +975,7 @@ ExpertPool::DispatchGuard::~DispatchGuard() {
 }
 
 bool ExpertPool::stop_after_dispatch_callers_joined() noexcept {
+    if (!checked_retirement_) return false;
     auto expected = DispatchState::idle;
     if (!dispatch_state_.compare_exchange_strong(expected, DispatchState::sealed,
             std::memory_order_acq_rel))
@@ -1497,21 +1505,25 @@ void name_this_thread(const char* base, int index) {
 
 namespace strata::kernels::cpu {
 void ExpertPool::run(ExpertJob* jobs, int n) {
+    if (!checked_retirement_) { run_impl(jobs, n); return; }
     DispatchGuard guard(*this);
     run_impl(jobs, n);
     guard.complete = true;
 }
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
+    if (!checked_retirement_) { run_split_impl(jobs, n); return; }
     DispatchGuard guard(*this);
     run_split_impl(jobs, n);
     guard.complete = true;
 }
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
+    if (!checked_retirement_) { run_split_multi_impl(jobs, n); return; }
     DispatchGuard guard(*this);
     run_split_multi_impl(jobs, n);
     guard.complete = true;
 }
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
+    if (!checked_retirement_) { run_split_multi_native_impl(f, jobs, n); return; }
     DispatchGuard guard(*this);
     run_split_multi_native_impl(f, jobs, n);
     guard.complete = true;

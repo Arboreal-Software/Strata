@@ -7353,7 +7353,13 @@ int main(int argc, char** argv) {
 #else
         nullptr
 #endif
-        ,o.pool_workers,true,!o.no_host_worker,o.pool_affinity,o.pool_tasks);
+        ,o.pool_workers,true,!o.no_host_worker,o.pool_affinity,o.pool_tasks,
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        bool(owned_runtime)
+#else
+        false
+#endif
+        );
     auto& pool=pool_storage.get();
     std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
                  o.pool_tasks ? o.pool_tasks : 3 * (pool.workers() + (pool.host_works() ? 1 : 0)),
