@@ -2396,6 +2396,7 @@ std::string Verifier::profile_by_t_report() {
 }
 
 std::string Verifier::route_stats_report() {
+    if (terminal_copy_query_failed_.load(std::memory_order_acquire)) return std::string();
     if (!rs_on_ || rs_dev_ == nullptr || g_ == nullptr) return std::string();
     const int64_t L = g_->n_layers;
     std::vector<unsigned long long> h((size_t) 9 * (size_t) L * 8);

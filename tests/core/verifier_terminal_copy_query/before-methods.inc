@@ -140,3 +140,31 @@ Verifier::SnapshotDrain Verifier::poll_snapshot_drain(std::string& err) {
     return SnapshotDrain::drained;
 #endif
 }
+std::string Verifier::route_stats_report() {
+    if (terminal_copy_query_failed_.load(std::memory_order_acquire)) return std::string();
+    if (!rs_on_ || rs_dev_ == nullptr || g_ == nullptr) return std::string();
+    const int64_t L = g_->n_layers;
+    std::vector<unsigned long long> h((size_t) 9 * (size_t) L * 8);
+    cudaMemcpy(h.data(), rs_dev_, h.size() * 8, cudaMemcpyDeviceToHost);
+    std::string out;
+    char b[160];
+    for (int T = 1; T <= 8; ++T) {
+        if (rs_win_[T] == 0) continue;
+        double row[8] = {};
+        for (int64_t l = 0; l < L; ++l)
+            for (int r = 0; r < 8; ++r) row[r] += (double) h[((size_t) T * (size_t) L + (size_t) l) * 8 + (size_t) r];
+        const double denom = (double) rs_win_[T] * (double) L;
+        double sum = 0;
+        for (int r = 0; r < T; ++r) sum += row[r] / denom;
+        std::snprintf(b, sizeof b, "T%d (n=%lld): distinct experts per layer %.2f; new per row:", T, (long long) rs_win_[T], sum);
+        out += b;
+        for (int r = 0; r < T; ++r) {
+            std::snprintf(b, sizeof b, " %.2f", row[r] / denom);
+            out += b;
+        }
+        out += "\n";
+    }
+    cudaMemset(rs_dev_, 0, h.size() * 8);
+    std::memset(rs_win_, 0, sizeof rs_win_);
+    return out;
+}
