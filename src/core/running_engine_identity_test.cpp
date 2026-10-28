@@ -37,12 +37,17 @@ static std::string replace(std::string text,const std::string& from,const std::s
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 namespace strata::core::running_engine_test {
 static std::string image;
 static int opened=0,closed=0,stats=0,open_attempts=0,pid_calls=0,stat_fail_at=0;
 static int64_t pid=123;
 static bool read_error=false,changed=false,not_regular=false,open_error=false,close_error=false,pid_change=false;
 static WindowBudget* close_budget=nullptr;
+static WindowResources close_expected_resources;
+static int close_expected_fd=-1,close_attempts=0,close_event_fd=-1,close_errno=EIO;
+struct CloseEvent {int fd,attempt,error;};
 static int interrupts=0;
 int open_self(){++open_attempts;stats=0;pid_calls=0;if(open_error){errno=EACCES;return -1;}++opened;return 900+opened;}
 int stat_fd(int,struct stat* s){++stats;if(stats==stat_fail_at){errno=EIO;return -1;}*s={};s->st_mode=not_regular?S_IFIFO:S_IFREG;s->st_dev=2;s->st_ino=3;s->st_size=image.size();if(changed&&stats==2)++s->st_ino;return 0;}
@@ -52,7 +57,17 @@ ssize_t read_at(int,void* p,size_t n,off_t off){
  if(off<0||uint64_t(off)>=image.size())return 0;
  n=std::min<size_t>({n,image.size()-size_t(off),17});std::memcpy(p,image.data()+off,n);return ssize_t(n);
 }
-int close_fd(int){++closed;if(close_error){if(!close_budget||close_budget->snapshot().reserved.host_bytes==0)std::_Exit(83);errno=EIO;return -1;}return 0;}
+int close_fd(int fd){
+ ++closed;
+ if(close_error){
+  const CloseEvent event{fd,++close_attempts,close_errno};
+  if(::write(close_event_fd,&event,sizeof(event))!=ssize_t(sizeof(event)))std::_Exit(86);
+  if(fd!=close_expected_fd||close_attempts!=1)std::_Exit(87);
+  if(!close_budget||!(close_budget->snapshot().reserved==close_expected_resources))std::_Exit(83);
+  errno=close_errno;return -1;
+ }
+ return 0;
+}
 int64_t process_id(){return pid_change&&++pid_calls>=2?pid+1:pid;}
 }
 static std::string native_elf(){
@@ -83,6 +98,7 @@ int main(){
  // Receipt retains metadata only; read block capacity is no longer charged.
  assert(b.snapshot().reserved.host_bytes==claim_host+4096+sizeof(RunningEngineReceipt));
  ++pid;assert(!out->observation());--pid;assert(out->observation());
+ const int retained_fd=900+opened;
  auto saved=out;
  auto failure=[&](const std::shared_ptr<const ExpectedRunningExecutable>& e,const RunningEngineLimits& lim,
                   WindowBudget q,const RunningEngineOptions& opts,const char* diagnostic){
@@ -116,21 +132,59 @@ int main(){
  auto tiny=budget(64);failure(expected,limits,tiny,{},"receipt quota");
  auto workspace_only=budget(4096+sizeof(RunningEngineReceipt)+1);before=open_attempts;
  failure(expected,limits,workspace_only,{},"workspace/IO quota");assert(open_attempts==before);
- // Real subprocess proves fail-stop status AND exact diagnostic, not merely
- // any child failure. No real executable FD is opened by these fake hooks.
- for(bool during_cleanup:{false,true}){
-  int pipes[2];assert(pipe(pipes)==0);const pid_t child=fork();assert(child>=0);
+ // Every failure scenario gets its own child and parent-observed close events.
+ // Compare the entire ledger, not a nonzero total masked by other live claims.
+ for(bool during_cleanup:{false,true})for(int injected_errno:{EIO,EINTR}){
+  const auto before_close=b.snapshot().reserved;
+  int pipes[2],events[2];assert(pipe(pipes)==0);assert(pipe(events)==0);
+  const pid_t child=fork();assert(child>=0);
   if(child==0){
-   ::close(pipes[0]);assert(dup2(pipes[1],STDERR_FILENO)>=0);::close(pipes[1]);
-   close_error=true;close_budget=&b;
-   if(during_cleanup){read_error=true;(void)collect_running_engine(expected,limits,b,out,error);std::_Exit(84);}
+   ::close(pipes[0]);::close(events[0]);
+   assert(dup2(pipes[1],STDERR_FILENO)>=0);::close(pipes[1]);
+   close_error=true;close_budget=&b;close_event_fd=events[1];close_errno=injected_errno;
+   close_attempts=0;close_expected_resources=before_close;
+   close_expected_fd=during_cleanup?900+opened+1:retained_fd;
+   const uint64_t metadata=4096+sizeof(RunningEngineReceipt);
+   if(during_cleanup){
+    // Existing receipt/claims remain unchanged; new receipt plus still-live
+    // read/hash workspace and its IO slot are charged at the failed FD close.
+    close_expected_resources.host_bytes+=metadata+limits.block_bytes+65536;
+    close_expected_resources.io_slots+=1;
+    read_error=true;(void)collect_running_engine(expected,limits,b,out,error);std::_Exit(84);
+   }
+   // Explicit operation delta: remove unrelated owners' baseline, then require
+   // this closing receipt's complete metadata charge still present.
+   assert(close_expected_resources.host_bytes>=metadata);
+   auto unrelated=before_close;unrelated.host_bytes-=metadata;
+   close_expected_resources=unrelated;close_expected_resources.host_bytes+=metadata;
    saved.reset();out.reset();std::_Exit(85);
   }
-  ::close(pipes[1]);std::string diagnostic;char buf[256];ssize_t n;
+  ::close(pipes[1]);::close(events[1]);
+  int status=0;pid_t reaped=0;
+  auto await_child=[&](int milliseconds){
+   const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds);
+   do {
+    reaped=waitpid(child,&status,WNOHANG);
+    if(reaped==child)return true;
+    if(reaped<0&&errno!=EINTR)return false;
+    usleep(1000);
+   }while(std::chrono::steady_clock::now()<deadline);
+   return false;
+  };
+  const bool timely=await_child(3000);
+  if(!timely){(void)kill(child,SIGKILL);(void)await_child(1000);}
+  // Never block reading a pipe while the child might still hold its writer.
+  if(reaped!=child){::close(pipes[0]);::close(events[0]);assert(false&&"close child not reaped within bound");}
+  std::string diagnostic;char buf[256];ssize_t n;
   while((n=::read(pipes[0],buf,sizeof(buf)))>0)diagnostic.append(buf,size_t(n));
-  ::close(pipes[0]);int status=0;assert(waitpid(child,&status,0)==child);
-  assert(WIFEXITED(status)&&WEXITSTATUS(status)==1);
+  ::close(pipes[0]);
+  CloseEvent event{};const auto event_bytes=::read(events[0],&event,sizeof(event));
+  char extra=0;const auto extra_bytes=::read(events[0],&extra,1);::close(events[0]);
+  assert(timely&&WIFEXITED(status)&&WEXITSTATUS(status)==1);
+  assert(event_bytes==ssize_t(sizeof(event))&&extra_bytes==0);
+  assert(event.fd==(during_cleanup?900+opened+1:retained_fd)&&event.attempt==1&&event.error==injected_errno);
   assert(diagnostic=="strata: running image descriptor close uncertain; worker restart required\n");
+  assert(b.snapshot().reserved==before_close);
  }
 
  saved.reset();out.reset();assert(opened==closed);expected.reset();wrong.reset();bad_elf.reset();assert(b.snapshot().reserved.host_bytes==0&&b.snapshot().reserved.io_slots==0);
