@@ -754,6 +754,11 @@ public:
     const ExpertSourceInventory* completed_inventory() const noexcept {
         return !inventory_closed_&&inventory_?inventory_->completed_inventory():nullptr;
     }
+    // Serialized with open/close/layout mutation, like completed_inventory().
+    // Retains the exact capture across replacement; not a concurrent read lock.
+    std::shared_ptr<const ExpertSourceCapture> completed_inventory_owner() const noexcept {
+        return completed_inventory()?inventory_:nullptr;
+    }
 
     /// Configure before open; callers seal producers before close. Mode/topology persist across reopen.
     bool set_strict_retirement(bool enabled, const std::vector<int>& consumer_devices, std::string& error);
@@ -1330,6 +1335,11 @@ public:
     // Borrow requires retained source and serialized close/layout mutation.
     const ExpertSourceInventory* completed_inventory() const noexcept {
         return !inventory_closed_&&inventory_?inventory_->completed_inventory():nullptr;
+    }
+    // Serialized with open/close/layout mutation, like completed_inventory().
+    // Retains the exact capture across replacement; not a concurrent read lock.
+    std::shared_ptr<const ExpertSourceCapture> completed_inventory_owner() const noexcept {
+        return completed_inventory()?inventory_:nullptr;
     }
 
     /// Configure before open; callers seal producers before close. Mode/topology persist across reopen.
