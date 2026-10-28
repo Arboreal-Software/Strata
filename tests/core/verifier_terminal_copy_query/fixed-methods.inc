@@ -18,7 +18,7 @@ bool Verifier::done(std::string& err) {
         if (copy_status != cudaSuccess) {
             // Latch BEFORE diagnostic allocation. Keep all outstanding-work
             // flags/counters intact; neither a retry nor pl_finish may certify it.
-            terminal_copy_query_failed_.store(true, std::memory_order_release);
+            latch_copy_query_failure();
             err = std::string("verify: copy-stream query failed: ") + cudaGetErrorString(copy_status);
             return false;
         }

@@ -15,6 +15,10 @@ int cudaStreamSynchronize(int stream) { if(stream==2) { ++copies; return status;
 const char* cudaGetErrorString(int code) { return code==77 ? "mock primary failure" : "mock copy failure"; }
 void progress_at(const char*,int64_t) {}
 struct Verifier {
+    // Explicit gate-mark seam; actual gate/factory ordering has its own fixture.
+    int completion_marks=0;
+    void mark_completion_unhealthy()noexcept{++completion_marks;}
+#include "completion-latch.inc"
     int copy_=2,cs_=1,T=1; bool copy_used_=true,commit_pending_=true,ok=true;
     int* h_plan_err_=nullptr;
     std::atomic<bool> terminal_copy_query_failed_{false};
@@ -38,7 +42,7 @@ int main(int argc,char**) {
         Verifier failed; status=9; copies=primary=0;
         check(!run(failed,e),"serial copy error must not report completion");
         check(failed.copy_used_ && failed.commit_pending_,"failed copy retains pending flags");
-        check(failed.terminal_copy_query_failed_.load(),"failure latched");
+        check(failed.terminal_copy_query_failed_.load() && failed.completion_marks==1,"failure latched after completion invalidation");
         int calls=copies+primary; status=0;
         check(!run(failed,e) && copies+primary==calls,"retry must refuse without device calls");
         Verifier oom; status=9; e.clear(); e.shrink_to_fit(); allocation_failure=true;

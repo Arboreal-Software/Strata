@@ -26,3 +26,9 @@ assert 'bool Verifier::wait_commit(std::string& err) {\n    if (refuse_copy_quer
 assert 'Verifier::SnapshotDrain Verifier::poll_snapshot_drain(std::string& err) {\n    if (refuse_copy_query_failure(err)) return SnapshotDrain::unhealthy;' in drain
 
 print("serial copy exact-source freshness PASS")
+
+header_text=(root if "root" in globals() else ROOT)/"include/strata/core/verify.hpp"
+hook_header=header_text.read_text()
+a=hook_header.index("    void latch_copy_query_failure()")
+b=hook_header.index("\n    bool strict_retirement_",a)
+assert (Path(__file__).resolve().parent/"completion-latch.inc").read_text()==hook_header[a:b]+"\n", "stale completion latch hook"

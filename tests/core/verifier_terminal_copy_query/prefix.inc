@@ -35,6 +35,10 @@ struct SamplerParams {bool greedy=true;float temperature=0;const float* logit_bi
 template<class...T>void sample_tokens(T...){++samples;}
 }
 struct Verifier {
+    // Explicit gate-mark seam; actual gate/factory ordering has its own fixture.
+    int completion_marks=0;
+    void mark_completion_unhealthy()noexcept{++completion_marks;}
+#include "completion-latch.inc"
 #include "latch.inc"
  bool fl_active_=true,copy_used_=true,fl_prof_=true,head_sampling_=false,commit_pending_=true;
  bool batch_copy_failed_=false,pl_prestaged_=false;

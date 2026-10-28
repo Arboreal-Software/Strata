@@ -6,7 +6,7 @@ bool Verifier::finish_serial_copies(std::string& err) {
     if (status != cudaSuccess) {
         // Preserve outstanding-work flags even if diagnostic allocation throws.
         // Cleanup remains callable; a successful later sync cannot heal this state.
-        terminal_copy_query_failed_.store(true, std::memory_order_release);
+        latch_copy_query_failure();
         err = std::string("verify: serial copy-stream synchronization failed: ") + cudaGetErrorString(status);
         return false;
     }

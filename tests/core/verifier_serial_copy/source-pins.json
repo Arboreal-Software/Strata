@@ -1,6 +1,6 @@
 {
-  "src/core/verify.cpp": "7cc179fafc6d72ef96336c1f2f31dc19d53c6339644b5deb141cde24447a47e1",
-  "include/strata/core/verify.hpp": "d15b40c9fbac050c9b02ee0cf0f2546d65faeee219585c6600233656f864f622",
+  "src/core/verify.cpp": "9a36d0721a413737c4eec3324187911420c599a024d281bc6446340f04444a27",
+  "include/strata/core/verify.hpp": "dc323a013815e49983a7fd8fd78674fad10cc3e6878dabcc2cc39e5622066abc",
   "src/core/verify_drain.cpp": "ff920094d551a0935b638f3909e71073f61ff27f89ce4918c4cd8403981ea127",
   "tests/core/verifier_serial_copy/before.inc": "0e25e5eacdc61da2c91e9216b63b8464a5df39fdcf7177aa792f955da11c6006"
 }
