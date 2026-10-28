@@ -34,6 +34,7 @@
 #include <cmath>
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
@@ -309,6 +310,32 @@ public:
     // the caller's subsequent GPU drain. False requires retaining this owner.
     // Concurrent/reentrant/self close refuses; no join under worker mutex.
     bool close_for_retirement() noexcept;
+    // Reversible writer boundary for the actual borrowed residency table/source.
+    // Caller retains this RouterLookahead through guard destruction, serializes
+    // guard access and freezes configuration. Never destroy the owner via a callback.
+    class SubmittedDrain {
+    public:
+        SubmittedDrain() = default;
+        ~SubmittedDrain() noexcept;
+        void reset() noexcept; // known writer completion/cancellation only
+        SubmittedDrain(const SubmittedDrain&) = delete;
+        SubmittedDrain& operator=(const SubmittedDrain&) = delete;
+        SubmittedDrain(SubmittedDrain&&) = delete;
+        SubmittedDrain& operator=(SubmittedDrain&&) = delete;
+    private:
+        friend class RouterLookahead;
+        RouterLookahead* owner_ = nullptr;
+    };
+    enum class DrainResult { drained, busy, refused };
+    // No deadline means a nonblocking poll. A supplied absolute steady-clock
+    // deadline bounds waiting; callers must not wait on work needing their reactor.
+    // Busy retains the seal in guard for retry; destruction releases it. While
+    // sealed submit drops speculative predictions (counts skipped), never queues.
+    // Only drained authorizes mutation, and only while the same guard is alive.
+    // This joins our submitted warm/predict callbacks, NOT downstream source or
+    // Foresight GPU completion; those owners retain their own ordering contracts.
+    DrainResult drain_submitted(SubmittedDrain& guard,
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
     RouterLookahead(const RouterLookahead&) = delete;
     RouterLookahead& operator=(const RouterLookahead&) = delete;
     /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits, n_expert rows of n_embd.
@@ -349,6 +376,9 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
+    SubmittedDrain* submitted_drain_ = nullptr; // mu_, nonmovable guard identity
+    std::thread::id worker_id_{}; // mu_, avoids racing thread_ join
+    bool worker_failed_ = false; // sticky, never a successful drain proof
     int64_t layer_ = -1, n_tok_ = 0;
     const int32_t* host_res_ = nullptr;
     uint64_t sub_gen_ = 0;

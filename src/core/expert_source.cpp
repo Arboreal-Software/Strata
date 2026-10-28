@@ -3182,8 +3182,44 @@ struct WorkerLifecycleScope {
 thread_local WorkerLifecycleScope* WorkerLifecycleScope::current=nullptr;
 } // namespace
 
+RouterLookahead::SubmittedDrain::~SubmittedDrain() noexcept { reset(); }
+void RouterLookahead::SubmittedDrain::reset() noexcept {
+    if (!owner_) return;
+    std::lock_guard<std::mutex> lock(owner_->mu_);
+    // Owner lifetime and exclusive guard access are caller prerequisites. Clearing
+    // the seal never clears terminal state; submit independently checks retirement.
+    if (owner_->submitted_drain_ == this) owner_->submitted_drain_ = nullptr;
+    owner_ = nullptr;
+}
+
+RouterLookahead::DrainResult RouterLookahead::drain_submitted(
+    SubmittedDrain& guard, std::optional<std::chrono::steady_clock::time_point> deadline) {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (worker_id_ == std::this_thread::get_id() ||
+        (guard.owner_ && guard.owner_ != this) ||
+        (submitted_drain_ && submitted_drain_ != &guard) ||
+        retirement_started_.load(std::memory_order_acquire) || quit_ || worker_failed_)
+        return DrainResult::refused;
+    // Publish seal before observing idle: independent submits cannot slip between
+    // observation and writer mutation. Existing pending work is allowed to finish.
+    submitted_drain_ = &guard;
+    guard.owner_ = this;
+    const auto settled = [&] {
+        return (!pending_ && !busy_) || quit_ || worker_failed_ ||
+               retirement_started_.load(std::memory_order_acquire);
+    };
+    if (deadline && !settled()) cv_.wait_until(lock, *deadline, settled);
+    if (retirement_started_.load(std::memory_order_acquire) || quit_ || worker_failed_)
+        return DrainResult::refused;
+    return !pending_ && !busy_ ? DrainResult::drained : DrainResult::busy;
+}
+
 bool RouterLookahead::close_for_retirement() noexcept {
-    retirement_started_.store(true,std::memory_order_release);
+    { // Serialize with the wait predicate so terminal wakeups cannot be lost.
+        std::lock_guard<std::mutex> lock(mu_);
+        retirement_started_.store(true,std::memory_order_release);
+    }
+    cv_.notify_all(); // wake bounded drain waiters even when retirement refuses
     if(WorkerLifecycleScope::active(this))return false;
     WorkerLifecycleScope lifecycle_frame(this);
     try {
@@ -3245,7 +3281,7 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     {
         std::lock_guard<std::mutex> lk(mu_);
         if(retirement_started_.load(std::memory_order_acquire))return;
-        if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
+        if (submitted_drain_ || worker_failed_ || busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
         n_tok_ = std::min<int64_t>(n_tok, 8);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
@@ -3253,7 +3289,9 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
         sub_gen_ = gen_.load(std::memory_order_relaxed);
         pending_ = true;
     }
-    cv_.notify_one();
+    // Worker and bounded drain waiters share this CV; waking only a drain
+    // waiter could strand pending work while the worker remains asleep.
+    cv_.notify_all();
 }
 
 void RouterLookahead::enable_stats(int64_t n_layers) {
@@ -3355,7 +3393,8 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
     }
 }
 
-void RouterLookahead::run() {
+void RouterLookahead::run() try {
+    { std::lock_guard<std::mutex> lock(mu_); worker_id_=std::this_thread::get_id(); }
     std::vector<float> logits((size_t) (8 * n_expert_));
     std::vector<int32_t> order((size_t) n_expert_);
     std::vector<int64_t> want;
@@ -3474,8 +3513,19 @@ void RouterLookahead::run() {
         {
             std::lock_guard<std::mutex> lk(mu_);
             busy_ = false;
+            host_res_ = nullptr;
         }
+        cv_.notify_all();
     }
+} catch (...) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        worker_failed_ = true;
+        busy_ = pending_ = false;
+        host_res_ = nullptr;
+    }
+    cv_.notify_all();
+    throw; // Preserve existing uncaught-worker fatal behavior; never signal success.
 }
 
 void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
