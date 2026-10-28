@@ -68,6 +68,19 @@ int main(){
  failed.dispatch_state_.store(ExpertPool::DispatchState::joined);
  ExpertPool empty(true);assert(empty.stop_after_dispatch_callers_joined());
  {
+  // Exercise the default refusal from idle, before deliberately poisoned-state
+  // cases: otherwise the checked CAS alone can mask a missing mode guard.
+  ExpertPool fresh;
+  assert(fresh.dispatch_state_.load()==ExpertPool::DispatchState::idle);
+  assert(!fresh.stop_after_dispatch_callers_joined());
+  assert(fresh.dispatch_state_.load()==ExpertPool::DispatchState::idle);
+  assert(!fresh.stop_.load()&&fresh.publishes==0);
+  fresh.run(nullptr,1);
+  assert(fresh.calls==1);
+  assert(fresh.dispatch_state_.load()==ExpertPool::DispatchState::idle);
+  assert(!fresh.stop_.load()&&fresh.publishes==0);
+ }
+ {
   ExpertPool legacy; // Default constructor path must remain untracked.
   legacy.dispatch_state_.store(ExpertPool::DispatchState::failed);
   assert(!legacy.stop_after_dispatch_callers_joined());
