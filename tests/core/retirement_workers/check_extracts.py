@@ -39,14 +39,22 @@ def main():
     same(read('file/actual-control-fields.inc'),header[a:b],'File control fields')
     pool=(args.source_root/'src/kernels/cpu/pool.cpp').read_text()
     # Full contiguous blocks include namespaces/comments and all guard/wrapper code.
-    for name in ['actual-methods.inc','actual-wrappers.inc']:
+    for name in ['actual-methods.inc','actual-wrappers.inc','actual-destructor.inc']:
         if read('pool/'+name).strip() not in pool:
             raise SystemExit('stale retirement pool extract: '+name)
     same(read('pool/test.cpp'),read('pool/harness-before.inc')+read('pool/harness-after.inc'),'pool composition')
     header=(args.source_root/'include/strata/kernels/cpu/pool.hpp').read_text()
-    a=header.index('    enum class DispatchState');b=header.index('    int phase_tasks(',a)
+    a=header.index('    const bool checked_retirement_;');b=header.index('    int phase_tasks(',a)
     same(read('pool/actual-control-fields.inc'),header[a:b],'pool control fields')
-    driver=extract((args.source_root/'src/program/generate.cpp').read_text(),'bool DriverWindowRuntime::close_background_after_callers_joined()')
+    if 'int tasks = 0, bool checked_retirement = false);' not in header:
+        raise SystemExit('stale pool default constructor contract')
+    if 'int tasks, bool checked_retirement)\n    : checked_retirement_(checked_retirement), tasks_(tasks)' not in pool:
+        raise SystemExit('stale pool construction mode initialization')
+    program=(args.source_root/'src/program/generate.cpp').read_text()
+    a=program.index('    DriverRuntimeObject<strata::kernels::cpu::ExpertPool> pool_storage(')
+    b=program.index('    auto& pool=pool_storage.get();',a)
+    same(read('pool/actual-owned-construction.inc'),program[a:b],'owned pool construction')
+    driver=extract(program,'bool DriverWindowRuntime::close_background_after_callers_joined()')
     same(read('driver/actual-method.inc'),driver+'\n','driver helper')
     same(read('driver/test.cpp'),read('driver/prefix.inc')+driver+'\n'+read('driver/cases.inc'),'driver composition')
 

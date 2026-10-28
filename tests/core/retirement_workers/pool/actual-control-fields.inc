@@ -1,3 +1,4 @@
+    const bool checked_retirement_; // Fixed before worker creation; default dispatch remains untracked.
     enum class DispatchState { idle, active, sealed, joined, failed };
     std::atomic<DispatchState> dispatch_state_{DispatchState::idle};
     // Failure is sticky: unwinding a published batch does not prove its borrowers completed.
