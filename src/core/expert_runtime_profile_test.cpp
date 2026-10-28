@@ -47,6 +47,9 @@ bool native_fmt(int gu,int down,int64_t,int64_t,NativeFmt& f,std::string& error)
 }
 }
 static void require(bool ok,const std::string& message){if(!ok){std::fprintf(stderr,"FAIL: %s\n",message.c_str());std::exit(1);}}
+static bool same_budget(const WindowBudgetSnapshot& a,const WindowBudgetSnapshot& b){
+ return a.capacity==b.capacity&&a.baseline==b.baseline&&a.reserved==b.reserved&&a.overcommitted==b.overcommitted;
+}
 static StateDigest digest(const std::string& text){WindowHasher h;h.update(text.data(),text.size());return h.digest();}
 static std::string gguf(){
  std::string b;auto n=[&](uint64_t x,int bytes){for(int i=0;i<bytes;++i)b+=char(x>>(8*i));};
@@ -112,6 +115,22 @@ int main(){
    auto refused=limits;refused.max_host_bytes=1;
    require(!collect_expert_runtime_profile(runtime,refused,f.metadata,profile,error),"prepaid envelope refusal");
    require(profile.spans()==previous&&f.metadata.snapshot().reserved.host_bytes==retained,"failure preserves output/charge");
+   // A1: unchanged VALID administrative limits, but a genuinely exhausted
+   // distinct ledger. The precise diagnostic proves reserve(), not envelope
+   // validation, refused the attempted replacement of an existing profile.
+   WindowBudget exhausted{{{0},1<<20,0,0,0,0},{{0}}};
+   auto occupied=exhausted.reserve({{0},1<<20,0,0,0,0},ReservationPurpose::foreground);
+   require(bool(occupied),"reserve entire independent metadata ledger");
+   const auto original_before=f.metadata.snapshot(),refused_before=exhausted.snapshot();
+   const auto inputs_before=f.input_budget.snapshot();
+   const auto* previous_artifacts=profile.artifacts();const auto* previous_layout=profile.layout();
+   require(!collect_expert_runtime_profile(runtime,limits,exhausted,profile,error),"actual metadata ledger refusal");
+   require(error=="expert profile metadata reservation refused","reservation branch, not administrative refusal");
+   require(profile.current()&&profile.spans()==previous&&profile.artifacts()==previous_artifacts&&
+           profile.layout()==previous_layout,"ledger refusal leaves existing profile identity unchanged");
+   require(same_budget(f.metadata.snapshot(),original_before)&&same_budget(exhausted.snapshot(),refused_before),
+           "ledger refusal preserves full original and attempted ledgers");
+   require(same_budget(f.input_budget.snapshot(),inputs_before),"ledger refusal preserves retained input charges");
    runtime->expose=false;require(!profile.current(),"missing actual source refuses");runtime->expose=true;
    auto genuine=runtime->inputs;
    runtime->inputs=std::shared_ptr<const VerifiedDriverBindings>(genuine.get(),[](const auto*){});
