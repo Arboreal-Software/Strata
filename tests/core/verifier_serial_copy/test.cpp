@@ -10,9 +10,9 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p,std::size_t) noexcept { std::free(p); }
 using cudaError_t=int;
 constexpr int cudaSuccess=0;
-static int status=0, copies=0, primary=0;
-int cudaStreamSynchronize(int stream) { if(stream==2) { ++copies; return status; } ++primary; return 0; }
-const char* cudaGetErrorString(int) { return "mock copy failure"; }
+static int status=0, primary_status=0, copies=0, primary=0;
+int cudaStreamSynchronize(int stream) { if(stream==2) { ++copies; return status; } ++primary; return primary_status; }
+const char* cudaGetErrorString(int code) { return code==77 ? "mock primary failure" : "mock copy failure"; }
 void progress_at(const char*,int64_t) {}
 struct Verifier {
     int copy_=2,cs_=1,T=1; bool copy_used_=true,commit_pending_=true,ok=true;
@@ -53,5 +53,31 @@ int main(int argc,char**) {
         Verifier pending; status=34;
         check(!run(pending,e) && pending.commit_pending_ && pending.copy_used_,"non-success pending status cannot certify sync");
     }
+    // The extracted chain block checks the copy before downstream/primary
+    // failures. A successful copy must not erase the earlier diagnostic; a copy
+    // failure takes precedence and remains sticky even when another error exists.
+    for(bool downstream_ok : {false,true})
+        for(int primary_error : {0,77})
+            for(int copy_error : {0,9}) {
+                Verifier chain; chain.ok=downstream_ok;
+                primary_status=primary_error; status=copy_error; copies=primary=0;
+                std::string error=downstream_ok ? "unchanged" : "downstream failure";
+                const bool success=chain.chain(error);
+                const bool expected=downstream_ok && !primary_error && !copy_error;
+                check(success==expected,"chain error matrix completion");
+                check(primary==1 && copies==1,"chain always checks both streams once");
+                check(chain.commit_pending_==!expected,"chain retains pending until complete");
+                check(chain.copy_used_==(copy_error!=0),"copy flag follows copy completion only");
+                check(chain.terminal_copy_query_failed_.load()==(copy_error!=0),"only copy error latches copy failure");
+                if(copy_error) {
+                    check(error.find("mock copy failure")!=std::string::npos,"copy diagnostic takes precedence");
+                    primary_status=status=0;
+                    check(!chain.chain(error) && primary==1 && copies==1,"combined error cannot heal or issue calls");
+                } else if(!downstream_ok) {
+                    check(error=="downstream failure","successful copy preserves downstream diagnostic");
+                } else if(primary_error) {
+                    check(error=="verify: mock primary failure","primary diagnostic preserved after copy success");
+                } else check(error=="unchanged","successful chain leaves diagnostic untouched");
+            }
     std::puts("PASS: terminal and chained serial copy completion cases");
 }
