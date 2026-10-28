@@ -3,9 +3,10 @@
 #include "strata/core/geometry.hpp"
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <cerrno>
 #include <map>
 #include <set>
 #include <vector>
@@ -24,6 +25,16 @@ extern "C" cudaError_t cudaGetDevice(int* p){*p=0;return cudaSuccess;}
 extern "C" cudaError_t cudaDeviceSynchronize(){return cudaSuccess;}
 extern "C" cudaError_t cudaGetLastError(){return cudaSuccess;}
 extern "C" const char* cudaGetErrorString(cudaError_t){return "injected";}
+// Public CPU target links no CUDA runtime. Unused canonical staging is refused;
+// event tokens model ordering calls only and do not represent device completion.
+extern "C" cudaError_t cudaSetDevice(int device){return device==0?cudaSuccess:cudaErrorInvalidDevice;}
+extern "C" cudaError_t cudaHostAlloc(void** p,size_t,unsigned){*p=nullptr;return cudaErrorNotSupported;}
+extern "C" cudaError_t cudaFreeHost(void* p){check(p==nullptr,"canonical staging unsupported by fixture");return cudaSuccess;}
+extern "C" cudaError_t cudaEventCreateWithFlags(cudaEvent_t* event,unsigned){
+    static uintptr_t next=1;*event=reinterpret_cast<cudaEvent_t>(next++);return cudaSuccess;
+}
+extern "C" cudaError_t cudaStreamWaitEvent(cudaStream_t,cudaEvent_t event,unsigned){return event?cudaSuccess:cudaErrorInvalidResourceHandle;}
+extern "C" cudaError_t cudaEventRecord(cudaEvent_t event,cudaStream_t){return event?cudaSuccess:cudaErrorInvalidResourceHandle;}
 namespace strata::kernels {
 bool native_mmvq_supported(int t) noexcept{return t==8;}
 size_t native_mmvq_weight_bytes(int,int a,int b){return size_t(a)*b/32*34;}
@@ -37,18 +48,28 @@ void fused_gr_quantize_q8_0(const uint16_t*,uint8_t*,int64_t,void*){throw std::r
 }
 template<class T>static void put(std::vector<uint8_t>& b,T v){auto n=b.size();b.resize(n+sizeof v);std::memcpy(b.data()+n,&v,sizeof v);}
 static void str(std::vector<uint8_t>& b,const std::string& s){put<uint64_t>(b,s.size());b.insert(b.end(),s.begin(),s.end());}
-struct FixtureDirectory {
-    char directory[64] = "/tmp/strata-native-load-XXXXXX";
-    FixtureDirectory(){if(!::mkdtemp(directory))throw std::runtime_error("create private fixture directory");}
-    FixtureDirectory(const FixtureDirectory&)=delete;
-    FixtureDirectory& operator=(const FixtureDirectory&)=delete;
-    ~FixtureDirectory(){
-        // Only remove this guard's known file; never recursively follow entries.
-        char file[96];std::snprintf(file,sizeof file,"%s/model.gguf",directory);
-        std::remove(file);::rmdir(directory);
+class TempGguf {
+    char path_[sizeof("/tmp/strata-native-load-XXXXXX")]="/tmp/strata-native-load-XXXXXX";
+    int fd_=-1;
+public:
+    TempGguf(){fd_=::mkstemp(path_);if(fd_<0)throw std::runtime_error("create exclusive fixture");}
+    TempGguf(const TempGguf&)=delete;
+    TempGguf& operator=(const TempGguf&)=delete;
+    ~TempGguf(){if(fd_>=0)(void)::close(fd_);(void)::unlink(path_);}
+    const char* path()const{return path_;}
+    void write_and_close(const std::vector<uint8_t>& bytes){
+        size_t at=0;
+        while(at<bytes.size()){
+            const auto n=::write(fd_,bytes.data()+at,bytes.size()-at);
+            if(n<0&&errno==EINTR)continue;
+            if(n<=0)throw std::runtime_error("write fixture");
+            at+=size_t(n);
+        }
+        const int fd=fd_;fd_=-1; // close may consume descriptor even on error: never retry
+        if(::close(fd)!=0)throw std::runtime_error("close fixture");
     }
 };
-static std::string fixture(const FixtureDirectory& directory){
+static void fixture(TempGguf& file){
     std::vector<uint8_t> b;put<uint32_t>(b,0x46554747);put<uint32_t>(b,3);put<uint64_t>(b,2);put<uint64_t>(b,7);
     str(b,"general.architecture");put<uint32_t>(b,8);str(b,"qwen4exp");
     const auto& g=kCompiledGeometry;
@@ -56,22 +77,19 @@ static std::string fixture(const FixtureDirectory& directory){
     uint64_t offset=0;
     for(const auto* name:{"blk.0.attn_q.weight","blk.0.hc_attn_down.weight"}){str(b,name);put<uint32_t>(b,2);put<uint64_t>(b,32);put<uint64_t>(b,32);put<uint32_t>(b,8);put<uint64_t>(b,offset);offset+=1088;}
     b.resize((b.size()+31)/32*32+offset,0);
-    const std::string path=std::string(directory.directory)+"/model.gguf";
-    std::ofstream out(path,std::ios::binary|std::ios::trunc);
-    if(!out)throw std::runtime_error("open fixture file");
-    out.write(reinterpret_cast<const char*>(b.data()),std::streamsize(b.size()));
-    if(!out)throw std::runtime_error("write fixture file");
-    out.close();if(!out)throw std::runtime_error("close fixture file");
-    return path;
+    file.write_and_close(b);
 }
-int main() try {
-    setenv("STRATA_HC_Q8","1",1);FixtureDirectory directory;const auto path=fixture(directory);
-    // Simultaneously live fixtures cannot overwrite or remove one another.
-    {FixtureDirectory other;const auto second=fixture(other);
-        check(path!=second,"overlapping fixture paths are distinct");
-        std::ifstream first(path,std::ios::binary),next(second,std::ios::binary);
-        check(first.good()&&next.good(),"both overlapping fixtures remain readable");}
-    check(std::ifstream(path,std::ios::binary).good(),"other fixture cleanup preserves original");
+int main(int argc,char** argv) try {
+    // Main assertions unwind fixture ownership; fatal CUDA mock invariants retain
+    // their existing process-failure behavior and cannot promise cleanup.
+    const auto check=[](bool ok,const char* why){if(!ok)throw std::runtime_error(why);};
+    setenv("STRATA_HC_Q8","1",1);TempGguf input;fixture(input);const std::string path=input.path();
+    if(argc==2&&(std::string(argv[1])=="--fixture-ready"||std::string(argv[1])=="--fixture-throw")){
+        check(std::puts(path.c_str())>=0&&std::fflush(stdout)==0,"publish fixture path");
+        char byte=0;ssize_t n;do{n=::read(STDIN_FILENO,&byte,1);}while(n<0&&errno==EINTR);
+        check(n==1,"fixture barrier");
+        if(std::string(argv[1])=="--fixture-throw")throw std::runtime_error("injected fixture unwind");
+    }
     for(int scenario=std::getenv("STRATA_NATIVE_TEST_FAULTS_ONLY")?1:0;scenario<9;++scenario){
         allocations=copies=0;fail_alloc=scenario>=1&&scenario<=4?scenario:0;
         fail_copy=scenario>=5&&scenario<=7?scenario-4:0;fail_register=scenario==8;
@@ -89,5 +107,5 @@ int main() try {
     }
     std::puts("native_dense_load_test passed");
 } catch(const std::exception& error){
-    std::fprintf(stderr,"FAIL: fixture setup: %s\n",error.what());return 1;
+    std::fprintf(stderr,"FAIL: %s\n",error.what());return 1;
 }
