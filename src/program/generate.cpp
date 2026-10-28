@@ -74,6 +74,7 @@
 #include "strata/core/expert_host_execution.hpp"
 #include "strata/core/expert_tier_open_observer.hpp"
 #include "strata/core/window_loader_profile.hpp"
+#include "strata/core/running_engine_identity.hpp"
 #include "strata/core/window_consumer_guard.hpp"
 #include "strata/core/submitted_work_drain.hpp"
 #include "strata/core/joined_thread_scope.hpp"
@@ -1297,10 +1298,11 @@ struct DriverVerifiedInputs {
     // also retained by the actual model gang; strings alone confer no lifetime.
     std::unique_ptr<strata::core::WindowBudget> budget;
     std::shared_ptr<const strata::core::ParsedVerifiedInputs> plan;
+    std::shared_ptr<const strata::core::RunningEngineReceipt> running_engine;
     std::shared_ptr<const strata::core::VerifiedInputBundle> bundle;
     std::shared_ptr<strata::core::VerifiedDriverBindings> bindings;
     bool finish() {
-        bindings.reset();plan.reset();
+        bindings.reset();running_engine.reset();plan.reset();
         if(!bundle)return true;
         if(bundle->retire_checked()!=strata::core::VerifiedInputRetirement::retired)return false;
         bundle.reset();budget.reset();return true;
@@ -3606,6 +3608,20 @@ int main(int argc, char** argv) {
             auto result=ParsedVerifiedInputs::read(o.verified_input_manifest,expected,bounds,
                 *verified_inputs.budget,verified_inputs.plan);
             if(!result)throw std::runtime_error(result.detail);
+            if(verified_inputs.plan->requires_running_executable_observation()) {
+                auto expected_engine=verified_inputs.plan->expected_running_executable(*verified_inputs.budget);
+                if(!expected_engine)throw std::runtime_error("running image expectation quota refused");
+                // Actual executing ELF only, before any model payload reads.
+                // The transient IO1/hash workspace releases on return; retained
+                // metadata cannot consume the following bundle loader's IO slot.
+                // This partial observation does not establish DSO/JIT identity
+                // or authorize managed window execution.
+                const RunningEngineLimits image_limits{2ull<<30,1ull<<20,1000000,30000};
+                std::string image_error;
+                if(!collect_running_engine(std::move(expected_engine),image_limits,*verified_inputs.budget,
+                    verified_inputs.running_engine,image_error))
+                    throw std::runtime_error("actual running image: "+image_error);
+            }
             VerifiedDriverOverrides overrides{o.verified_original_paths};
             if(o.no_ple) {
                 if(overrides.paths.count("ple"))throw std::runtime_error("conflicting explicit PLE options");
