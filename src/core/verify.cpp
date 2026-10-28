@@ -2882,6 +2882,22 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     return true;
 }
 
+bool Verifier::finish_serial_copies(std::string& err) {
+    if (refuse_copy_query_failure(err)) return false;
+    if (!copy_used_) return true;
+    // No host function of this window may raise flag B in the next one.
+    const cudaError_t status = cudaStreamSynchronize(copy_);
+    if (status != cudaSuccess) {
+        // Preserve outstanding-work flags even if diagnostic allocation throws.
+        // Cleanup remains callable; a successful later sync cannot heal this state.
+        terminal_copy_query_failed_.store(true, std::memory_order_release);
+        err = std::string("verify: serial copy-stream synchronization failed: ") + cudaGetErrorString(status);
+        return false;
+    }
+    copy_used_ = false;
+    return true;
+}
+
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
@@ -3128,10 +3144,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const bool ok = next_->run(T, tokens, pos0, pool, next_user_, out, err);
         const OnDevice back(device_);
         const cudaError_t se = cudaStreamSynchronize(cs_);
-        if (copy_used_) {
-            cudaStreamSynchronize(copy_);
-            copy_used_ = false;
-        }
+        if (!finish_serial_copies(err)) return false;
         if (!ok) return false;
         if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
         if (handoff_failed(err)) return false;   // a middle stage of three or more: its own hand-in
@@ -3167,12 +3180,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
         return false;
     }
-    commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
-    if (copy_used_) {
-        cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
-        copy_used_ = false;
-    }
+    if (!finish_serial_copies(err)) return false;
+    commit_pending_ = false;
     if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's

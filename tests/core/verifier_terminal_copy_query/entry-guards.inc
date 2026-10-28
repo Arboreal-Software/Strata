@@ -22,6 +22,10 @@
     if (refuse_copy_query_failure(err)) return false;
         ++effects; return true;
     }
+    bool entry_finish_serial_copies(std::string& err) {
+    if (refuse_copy_query_failure(err)) return false;
+        ++effects; return true;
+    }
     bool entry_run(std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
         ++effects; return true;
@@ -129,6 +133,7 @@
             && entry_capture(err) == false
             && entry_capture_commit(err) == false
             && entry_prelaunch(err) == false
+            && entry_finish_serial_copies(err) == false
             && entry_run(err) == false
             && entry_window_logprobs(err) == false
             && entry_commit(err) == false

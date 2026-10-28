@@ -31,6 +31,11 @@
   ],
   [
     "bool",
+    "finish_serial_copies",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
     "run",
     "    if (refuse_copy_query_failure(err)) return false;"
   ],
