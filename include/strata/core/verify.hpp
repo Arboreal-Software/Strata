@@ -533,6 +533,7 @@ private:
     }
 
     bool capture_commit(std::string& err);
+    bool finish_serial_copies(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)

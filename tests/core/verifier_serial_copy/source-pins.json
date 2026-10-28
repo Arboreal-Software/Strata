@@ -1,0 +1,5 @@
+{
+  "src/core/verify.cpp": "78c1b41d47e563e5b5adeeba67a360ff70d3eb34c3475346e1d691f3bc6abb63",
+  "include/strata/core/verify.hpp": "d15b40c9fbac050c9b02ee0cf0f2546d65faeee219585c6600233656f864f622",
+  "src/core/verify_drain.cpp": "ff920094d551a0935b638f3909e71073f61ff27f89ce4918c4cd8403981ea127"
+}
