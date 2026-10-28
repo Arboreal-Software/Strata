@@ -3,6 +3,7 @@
 
 namespace strata::core {
 bool Verifier::wait_commit(std::string& err) {
+    if (refuse_copy_query_failure(err)) return false;
 #if defined(STRATA_GPU_METAL)
     (void) err;
     return true;
@@ -20,6 +21,7 @@ bool Verifier::wait_commit(std::string& err) {
 }
 
 Verifier::SnapshotDrain Verifier::poll_snapshot_drain(std::string& err) {
+    if (refuse_copy_query_failure(err)) return SnapshotDrain::unhealthy;
     if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return SnapshotDrain::unhealthy; }
 #if defined(STRATA_GPU_METAL)
     err = "verify: snapshot drain is not implemented for Metal";

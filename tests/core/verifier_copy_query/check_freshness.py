@@ -45,3 +45,9 @@ for mode in ("before", "fixed"):
     if (HERE / (mode + ".cpp")).read_text() != expected:
         raise SystemExit("unexpected fixture wrapper: " + mode)
 print("verifier full-method and terminal-latch freshness passed")
+
+# The additive terminal-copy guard is shared with the independent pipeline fixture.
+a=header.index('    std::atomic<bool> terminal_copy_query_failed_')
+b=header.index('    bool capture_commit(',a)
+if header[a:b] != (HERE.parent/'verifier_terminal_copy_query/latch.inc').read_text():
+    raise SystemExit('stale shared terminal-copy guard')
