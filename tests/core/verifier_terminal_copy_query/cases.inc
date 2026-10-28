@@ -34,7 +34,19 @@ int main(int argc,char**argv){
  if(mode=="--pending"){
   copy_status=cudaErrorNotReady;check(!v.done(error)&&error.empty(),"copy pending remains pending");
   check(!v.terminal_copy_query_failed_.load()&&v.copy_used_&&v.fl_active_&&v.windows==0,"pending is not terminal");
-  check(event_queries==1&&copy_queries==1,"pending queries each stream once");return 0;
+  check(event_queries==1&&copy_queries==1,"pending queries each stream once");
+  copy_status=cudaSuccess;check(v.done(error)&&!v.copy_used_,"same pending object completes after copy succeeds");
+  int32_t out=-1;check(v.pl_finish(&out,error)&&out==7&&v.windows==1&&!v.fl_active_,"same object publishes once");
+  const int cq=copy_queries,eq=event_queries;out=-99;
+  check(!v.done(error)&&out==-99&&v.windows==1&&profiles==1&&beats==1&&nonfinite==1,
+        "finished object cannot announce another completion or duplicate publication");
+  check(copy_queries==cq&&event_queries==eq,"finished poll has no query");return 0;
+ }
+ if(mode=="--copy-unused"){
+  v.copy_used_=false;copy_status=cudaErrorUnknown;
+  check(v.done(error)&&copy_queries==0&&!v.terminal_copy_query_failed_.load(),"unused copy stream never queried");
+  int32_t out=-1;check(v.pl_finish(&out,error)&&out==7&&copy_queries==0&&v.windows==1,
+                      "unused copy path finishes without querying unrelated failed stream");return 0;
  }
  if(mode=="--success"){
   check(v.done(error)&&error.empty()&&!v.copy_used_,"successful copy completes");int32_t out=-1;
