@@ -3,6 +3,7 @@
 #include <atomic>
 #include <new>
 #include <utility>
+#include <cuda_runtime.h>
 
 namespace strata::core {
 namespace {
@@ -16,7 +17,7 @@ uint64_t mint_chunks(uint64_t count) noexcept {
 }
 }
 bool DetachedVmmChunk::allocate(WindowBudget& budget,int device,DetachedVmmChunk& out,std::string& error) {
-    if (!out.empty() || !allocation_domain(device)) { error="managed allocation domain/output mismatch"; return false; }
+    if (!out.empty() || out.retirement_generation_ || !allocation_domain(device)) { error="managed allocation domain/output mismatch"; return false; }
     // This first API explicitly requires budget slots indexed by physical device
     // ordinal. Remapped logical budgets must use a future validated mapping API.
     try {
@@ -76,7 +77,7 @@ bool PreparedVmmAllocationBatch::prepare(std::span<const VmmBatchDevicePlan> pla
 }
 VmmBatchResult PreparedVmmAllocationBatch::allocate_device(size_t index,std::span<DetachedVmmChunk> outputs) noexcept {
     if(index||consumed_||outputs.size()!=plan_.chunks)return {};
-    for(const auto& out:outputs)if(!out.empty())return {};
+    for(const auto& out:outputs)if(!out.empty()||out.retirement_generation_)return {};
     // All independent caller admissions must already be complete. Backend lazy
     // discovery can allocate here, but finishes before the FIRST physical create.
     // Catch only this pre-effect phase; never reinterpret a partial create prefix.

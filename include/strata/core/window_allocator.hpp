@@ -1,6 +1,7 @@
 #pragma once
 #include "strata/core/session.hpp"
 #include "strata/core/window_budget.hpp"
+#include "strata/core/native_retirement.hpp"
 #include <memory>
 #include <functional>
 #include <string>
@@ -29,6 +30,7 @@ struct OwnedNativeSession {
     std::shared_ptr<const void> owner;
 };
 struct NativeAllocationResult;
+class NativeRetirementAttempt;
 class NativeSessionAllocation {
 public:
     NativeSessionAllocation() = default;
@@ -37,6 +39,7 @@ public:
     bool healthy() const { return healthy_ && healthy_(); }
     void mark_unhealthy() const { if (poison_) poison_(); }
 private:
+    friend class NativeRetirementAttempt;
     friend NativeAllocationResult allocate_native_sessions(const ModelGeometry&,int64_t,int64_t,
         const std::vector<NativeSessionRequest>&,WindowBudget&,NativeSessionAllocation&);
     friend NativeAllocationResult allocate_native_sessions(const ModelGeometry&,int64_t,int64_t,
@@ -45,6 +48,25 @@ private:
     std::shared_ptr<const ReservationLease> reservation_;
     std::function<bool()> healthy_;
     std::function<void()> poison_;
+    std::shared_ptr<void> storage_;
+};
+// Owner-reactor-only terminal transaction. The caller must seal all admissions,
+// revoke external borrows and join producers before drain_and_commit. Preparation
+// makes every allocation alias unhealthy. Abandonment/failure retains the entire
+// gang through its quarantine deleter; it cannot restore execution or retry frees.
+// Keep this attempt outside the retained runtime/allocation to avoid owner cycles.
+class NativeRetirementAttempt {
+public:
+    NativeRetirementAttempt()=default;
+    NativeRetirementAttempt(const NativeRetirementAttempt&)=delete;
+    NativeRetirementAttempt& operator=(const NativeRetirementAttempt&)=delete;
+    bool prepare(const NativeSessionAllocation&,std::span<const int> additional_consumers,
+                 std::string& error) noexcept;
+    bool drain_and_commit(std::string& error) noexcept;
+private:
+    NativeRetirementContext context_;
+    std::shared_ptr<void> storage_;
+    bool prepared_=false,attempted_=false;
 };
 enum class NativeAllocationStatus { allocated, invalid, budget_refused, unhealthy };
 struct NativeAllocationResult {

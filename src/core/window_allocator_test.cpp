@@ -14,7 +14,7 @@
 using namespace strata::core;
 static int current_device=0,mallocs=0,frees=0,inits=0,fail_malloc=0,fail_init=0;
 static bool fail_free=false;
-static int device_calls=0,host_frees=0,fail_drain_device=-1,fail_set_target=-1;
+static int device_calls=0,host_frees=0,fail_drain_device=-1,fail_set_target=-1,sync_calls=0;
 static bool check_retirement_order=false;
 static std::set<int> drained_devices;
 static void check_gang_drained();
@@ -45,7 +45,7 @@ static void check_gang_drained(){
     if(check_retirement_order)check(drained_devices==std::set<int>{0,1},"all gang devices drain before any pinned/device free");
 }
 extern "C" cudaError_t cudaDeviceSynchronize(){
-    ++device_calls;if(during_drain)during_drain();
+    ++device_calls;++sync_calls;if(during_drain)during_drain();
     if(current_device==fail_drain_device)return cudaErrorUnknown;
     if(check_retirement_order)drained_devices.insert(current_device);
     return cudaSuccess;
@@ -78,6 +78,52 @@ int main(int argc,char** argv){
     ModelGeometry g;g.n_layers=8;g.qsa_interval=4;
     WindowResources capacity{{100000,100000},100000,10000,0,0,2},zero{{0,0},0,0,0,0,0};
     const std::vector<NativeSessionRequest> requests{{0,0,4,true},{1,4,8,false}};
+    if(argc>1&&std::string(argv[1])=="--terminal-retirement"){
+        {
+            WindowBudget budget(capacity,zero);NativeSessionAllocation out;
+            check(bool(allocate_native_sessions(g,16,1,requests,budget,out)),"terminal fixture");
+            auto alias=out;const auto held=budget.snapshot().reserved;const auto syncs=sync_calls;
+            std::string error;
+            {
+                NativeRetirementAttempt attempt;
+                check(attempt.prepare(out,{},error)&&!out.healthy()&&!alias.healthy(),"seal every alias");
+                NativeRetirementAttempt other;
+                check(!other.prepare(alias,{},error),"second terminal claim refuses");
+                current_device=7;drained_devices.clear();check_retirement_order=true;
+                check(attempt.drain_and_commit(error),error.c_str());
+                check(sync_calls==syncs+2&&current_device==7&&device_allocations.empty(),"one gang barrier and actual resource retirement");
+                check(!attempt.drain_and_commit(error),"successful commit cannot replay");
+                check(!alias.healthy()&&budget.snapshot().reserved==held,"terminal aliases retain metadata charge");
+                out={};alias={};
+            }
+            check_retirement_order=false;
+            check(sync_calls==syncs+2&&budget.snapshot().reserved==zero,"completed deleter neither redrains nor leaks quota");
+        }
+        for(int scenario=0;scenario<4;++scenario)isolated([&]{
+            WindowBudget budget(capacity,zero);NativeSessionAllocation out;
+            check(bool(allocate_native_sessions(g,16,1,requests,budget,out)),"failed terminal fixture");
+            const auto held=budget.snapshot().reserved;const auto freed=frees;const auto host=host_frees;
+            std::string error;
+            {
+                NativeRetirementAttempt attempt;check(attempt.prepare(out,{},error),"failure seal");
+                if(scenario==0){ /* abandoned before drain */ }
+                else {
+                    if(scenario==1)fail_drain_device=1;
+                    if(scenario==2)during_drain=[&]{out.mark_unhealthy();};
+                    if(scenario==3)fail_free=true;
+                    check(!attempt.drain_and_commit(error),"failure cannot certify retirement");
+                    const auto calls=device_calls;
+                    check(!attempt.drain_and_commit(error)&&device_calls==calls,"failure cannot retry effects");
+                }
+                out={};
+            }
+            during_drain={};
+            check(native_session_quarantine_count()==1&&budget.snapshot().reserved==held,"entire failed or abandoned gang retained");
+            if(scenario<3)check(frees==freed&&host_frees==host,"precommit failure releases no borrowed resource");
+            else check(frees==freed&&host_frees>host,"partial destruction is retained, not claimed rolled back");
+        });
+        std::puts("window_allocator terminal retirement tests passed");return 0;
+    }
     if(argc>1&&std::string(argv[1])=="--retirement-drain"){
         // Actual allocator Storage/owner/budget, mocked CUDA and session buffers.
         // Producer closure is caller-established; no callback submits new work.

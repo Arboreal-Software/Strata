@@ -1,4 +1,5 @@
 #include "strata/core/strict_retirement.hpp"
+#include "strata/core/window_device.hpp"
 #include "strata/core/vmm.hpp"
 #include <atomic>
 #include <limits>
@@ -80,6 +81,12 @@ static bool managed_domain(int device) noexcept {
 static bool managed_free(VmmChunk h) noexcept {
     return api().ok && api().release((CUmemGenericAllocationHandle)h) == CUDA_SUCCESS;
 }
+static bool retirement_unmap(uint64_t address,uint64_t bytes) noexcept {
+    return api().ok&&api().unmap(CUdeviceptr(address),size_t(bytes))==CUDA_SUCCESS;
+}
+static bool retirement_free_va(uint64_t address,uint64_t bytes) noexcept {
+    return api().ok&&api().free_va(CUdeviceptr(address),size_t(bytes))==CUDA_SUCCESS;
+}
 bool vmm_available() { return api().ok; }
 uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
 
@@ -105,7 +112,7 @@ void vmm_chunk_retire(VmmChunk h, bool strict) {
 }
 
 bool VmmRange::activate_managed() noexcept {
-    if(!managed_||!managed_prepared_||managed_activation_attempted_||base_||managed_unknown_)return false;
+    if(retirement_generation_||!managed_||!managed_prepared_||managed_activation_attempted_||base_||managed_unknown_)return false;
     if(!managed_domain(managed_device_)||api().gran!=managed_granularity_)return false;
     managed_activation_attempted_=true;
     const uint64_t bytes=uint64_t(h_.size())*managed_granularity_;
@@ -131,6 +138,7 @@ bool VmmRange::reserve(uint64_t bytes) {
 }
 
 void VmmRange::release() {
+    if(retirement_generation_){if(!retirement_complete_)retirement_failed("uncommitted sealed VMM range");return;}
     if (managed_unknown_) retirement_failed("unknown managed VMM destruction");
     if (base_ == 0) { if (managed_) release_managed_metadata(); return; }
     StrictRetirementDevice retirement(strict_retirement_, retirement_device_);
@@ -261,6 +269,12 @@ static bool managed_domain(int device) noexcept {
 static bool managed_free(VmmChunk h) noexcept {
     return api().ok && hipMemRelease((hipMemGenericAllocationHandle_t)(uintptr_t)h) == hipSuccess;
 }
+static bool retirement_unmap(uint64_t address,uint64_t bytes) noexcept {
+    return api().ok&&hipMemUnmap(reinterpret_cast<void*>(uintptr_t(address)),size_t(bytes))==hipSuccess;
+}
+static bool retirement_free_va(uint64_t address,uint64_t bytes) noexcept {
+    return api().ok&&hipMemAddressFree(reinterpret_cast<void*>(uintptr_t(address)),size_t(bytes))==hipSuccess;
+}
 bool vmm_available() { return api().ok; }
 uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
 
@@ -283,7 +297,7 @@ void vmm_chunk_retire(VmmChunk h, bool strict) {
 }
 
 bool VmmRange::activate_managed() noexcept {
-    if(!managed_||!managed_prepared_||managed_activation_attempted_||base_||managed_unknown_)return false;
+    if(retirement_generation_||!managed_||!managed_prepared_||managed_activation_attempted_||base_||managed_unknown_)return false;
     if(!managed_domain(managed_device_)||api().gran!=managed_granularity_)return false;
     managed_activation_attempted_=true;
     const uint64_t bytes=uint64_t(h_.size())*managed_granularity_;
@@ -309,6 +323,7 @@ bool VmmRange::reserve(uint64_t bytes) {
 }
 
 void VmmRange::release() {
+    if(retirement_generation_){if(!retirement_complete_)retirement_failed("uncommitted sealed VMM range");return;}
     if (managed_unknown_) retirement_failed("unknown managed VMM destruction");
     if (base_ == 0) { if (managed_) release_managed_metadata(); return; }
     StrictRetirementDevice retirement(strict_retirement_, retirement_device_);
@@ -378,6 +393,8 @@ VmmChunk VmmRange::unmap(int64_t i) {
 namespace strata::core {
 static bool managed_domain(int) noexcept { return false; }
 static bool managed_free(VmmChunk) noexcept { return false; }
+static bool retirement_unmap(uint64_t,uint64_t) noexcept {return false;}
+static bool retirement_free_va(uint64_t,uint64_t) noexcept {return false;}
 bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
 VmmChunk vmm_chunk_new() { return 0; }
@@ -385,7 +402,7 @@ void vmm_chunk_free(VmmChunk) {}
 void vmm_chunk_retire(VmmChunk h, bool strict) { if (strict && h) retirement_failed("unsupported VMM chunk retirement"); }
 bool VmmRange::activate_managed() noexcept { return false; }
 bool VmmRange::reserve(uint64_t) { return false; }
-void VmmRange::release() { if(managed_)release_managed_metadata(); }
+void VmmRange::release() { if(retirement_generation_){if(!retirement_complete_)retirement_failed("uncommitted sealed VMM range");return;}if(managed_)release_managed_metadata(); }
 int64_t VmmRange::mapped_count() const { return 0; }
 bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
 bool VmmRange::set_access(int64_t, int64_t) { return false; }
@@ -399,10 +416,16 @@ VmmChunk VmmRange::unmap(int64_t) { return 0; }
 namespace strata::core {
 DetachedVmmChunk::DetachedVmmChunk(DetachedVmmChunk&& x) noexcept
     : handle_(std::exchange(x.handle_,0)), incarnation_(x.incarnation_),
-      device_(x.device_), fresh_(x.fresh_), lease_(std::move(x.lease_)) {}
+      device_(x.device_), fresh_(x.fresh_), lease_(std::move(x.lease_)) {
+    if(x.retirement_generation_)retirement_failed("moving sealed physical chunk");
+}
 bool DetachedVmmChunk::allocation_domain(int device) noexcept { return managed_domain(device); }
-DetachedVmmChunk::~DetachedVmmChunk() { if (handle_) retire(); }
+DetachedVmmChunk::~DetachedVmmChunk() {
+    if(retirement_generation_&&!retirement_complete_)retirement_failed("uncommitted sealed physical chunk");
+    if(handle_)retire();
+}
 bool DetachedVmmChunk::retire() noexcept {
+    if(retirement_generation_)return retirement_complete_;
     if (!handle_) return true;
     // Explicit quiescence is the caller's obligation; destruction drains before
     // releasing an owned detached allocation, using existing worker policy.
@@ -454,17 +477,17 @@ bool VmmRange::prepare_managed(std::shared_ptr<const ReservationLease> lease,int
     try {
         std::vector<ManagedSlot> slots(h_.size());
         managed_slots_.swap(slots);metadata_=std::move(lease);
-        managed_device_=device;strict_retirement_=true;retirement_device_=device;managed_=true;
+        managed_device_=device;managed_granularity_=vmm_granularity();strict_retirement_=true;retirement_device_=device;managed_=true;
         return true;
     }catch(const std::bad_alloc&){error.clear();return false;}
 }
 bool VmmRange::map_managed(int64_t lo,int64_t hi,std::span<DetachedVmmChunk> input,
                           std::span<VmmChunkOutcome> output) noexcept {
-    if(!managed_ || !base_ || managed_unknown_ || !managed_domain(managed_device_) || lo<0 || hi<lo || hi>chunks())return false;
+    if(retirement_generation_ || !managed_ || !base_ || managed_unknown_ || !managed_domain(managed_device_) || lo<0 || hi<lo || hi>chunks())return false;
     size_t need=0;
     for(auto i=lo;i<hi;++i)need+=!mapped(i);
     if(input.size()!=need || output.size()<need)return false;
-    for(auto& c:input)if(!c.handle_ || !c.lease_ || c.device_!=managed_device_)return false;
+    for(auto& c:input)if(c.retirement_generation_ || !c.handle_ || !c.lease_ || c.device_!=managed_device_)return false;
     size_t k=0;
     for(auto i=lo;i<hi;++i)if(!mapped(i)) {
         output[k]={i,input[k].incarnation_,input[k].fresh_,VmmDisposition::not_attempted};++k;
@@ -491,7 +514,7 @@ bool VmmRange::map_managed(int64_t lo,int64_t hi,std::span<DetachedVmmChunk> inp
     return true;
 }
 bool VmmRange::detach_managed(int64_t i,DetachedVmmChunk& out,VmmChunkOutcome& receipt) noexcept {
-    if(!managed_ || !base_ || managed_unknown_ || !managed_domain(managed_device_) || !out.empty() || !mapped(i))return false;
+    if(retirement_generation_ || !managed_ || !base_ || managed_unknown_ || !managed_domain(managed_device_) || !out.empty() || out.retirement_generation_ || !mapped(i))return false;
     auto& slot=managed_slots_[(size_t)i];
     // unmap's strict backend policy fail-stops on uncertainty. It never clears
     // h_ before successful backend unmap.
@@ -501,5 +524,65 @@ bool VmmRange::detach_managed(int64_t i,DetachedVmmChunk& out,VmmChunkOutcome& r
     out.fresh_=false;out.lease_=std::move(slot.lease);
     receipt={i,out.incarnation_,false,VmmDisposition::detached};slot.incarnation=0;
     return true;
+}
+
+bool DetachedVmmChunk::prepare_retirement(const NativeRetirementContext& context) noexcept {
+    if(!context.prepared()||retirement_generation_||(handle_&&!context.covers(device_)))return false;
+    retirement_generation_=context.generation();
+    if(handle_&&!lease_){retirement_failed_=true;return false;}
+    return true;
+}
+VmmRetirementResult DetachedVmmChunk::commit_retirement(const NativeRetirementContext& context,VmmChunkOutcome& out) noexcept {
+    if(!retirement_generation_||context.generation()!=retirement_generation_||!context.drained())return {};
+    if(retirement_failed_)return {VmmRetirementResult::unknown,0};
+    if(retirement_complete_)return {VmmRetirementResult::complete,0};
+    if(!handle_){retirement_complete_=true;lease_.reset();out={-1,incarnation_,fresh_,VmmDisposition::retired};return {VmmRetirementResult::complete,0};}
+    if(!context.covers(device_))return {};
+    WindowDeviceScope device(device_);
+    auto unknown=[&]() noexcept {
+        retirement_failed_=true;out={-1,incarnation_,fresh_,VmmDisposition::unknown};
+        (void)device.finish();return VmmRetirementResult{VmmRetirementResult::unknown,0};
+    };
+    if(!device.ok()||!managed_domain(device_))return unknown();
+    if(!managed_free(handle_))return unknown();
+    handle_=0; // successful physical release is never retried
+    out={-1,incarnation_,fresh_,VmmDisposition::retired};
+    if(!device.finish()){retirement_failed_=true;return {VmmRetirementResult::unknown,1};}
+    retirement_complete_=true;lease_.reset();return {VmmRetirementResult::complete,1};
+}
+bool VmmRange::prepare_retirement(const NativeRetirementContext& context) noexcept {
+    if(!context.prepared()||retirement_generation_||!managed_||!context.covers(managed_device_))return false;
+    retirement_generation_=context.generation();
+    if(managed_unknown_||managed_slots_.size()!=h_.size()||!managed_granularity_){retirement_failed_=true;return false;}
+    return true;
+}
+VmmRetirementResult VmmRange::commit_retirement(const NativeRetirementContext& context,std::span<VmmChunkOutcome> out) noexcept {
+    if(!retirement_generation_||context.generation()!=retirement_generation_||!context.drained()||!context.covers(managed_device_))return {};
+    if(retirement_failed_)return {VmmRetirementResult::unknown,0};
+    if(retirement_complete_)return {VmmRetirementResult::complete,0};
+    if(out.size()!=h_.size())return {};
+    for(size_t i=0;i<h_.size();++i)out[i]={int64_t(i),managed_slots_[i].incarnation,managed_slots_[i].fresh,VmmDisposition::not_attempted};
+    if(!base_){
+        for(auto h:h_)if(h){retirement_failed_=true;return {VmmRetirementResult::unknown,0};}
+        release_managed_metadata();retirement_complete_=true;return {VmmRetirementResult::complete,0};
+    }
+    WindowDeviceScope device(managed_device_);
+    size_t retired=0;
+    auto unknown=[&]() noexcept {
+        retirement_failed_=true;managed_unknown_=true;(void)device.finish();
+        return VmmRetirementResult{VmmRetirementResult::unknown,retired};
+    };
+    if(!device.ok()||!managed_domain(managed_device_))return unknown();
+    for(size_t i=0;i<h_.size();++i)if(h_[i]){
+        if(!retirement_unmap(base_+uint64_t(i)*managed_granularity_,managed_granularity_)){
+            out[i].disposition=VmmDisposition::unknown;return unknown();
+        }
+        if(!managed_free(h_[i])){out[i].disposition=VmmDisposition::unknown;return unknown();}
+        h_[i]=0;managed_slots_[i].lease.reset();out[i].disposition=VmmDisposition::retired;++retired;
+    }
+    if(!retirement_free_va(base_,uint64_t(h_.size())*managed_granularity_))return unknown();
+    base_=0; // confirmed VA retirement cannot become an active ABA key
+    if(!device.finish()){retirement_failed_=true;managed_unknown_=true;return {VmmRetirementResult::unknown,retired};}
+    release_managed_metadata();retirement_complete_=true;return {VmmRetirementResult::complete,retired};
 }
 } // namespace strata::core
