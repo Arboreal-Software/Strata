@@ -176,7 +176,14 @@ class BatchControlTests(unittest.TestCase):
         e = engine()
         e.lines.put("DONE 0 2 1 1 length")
         e.lines.put("BADM 0 1")
-        e.slot_q[0].put("BT 0 7")
+        send = e._send
+        def admit(text, **kwargs):
+            send(text, **kwargs)
+            # Real admission discards queued output before sending BGEN.
+            # A reply can only arrive after that command reaches the child.
+            if text.startswith("BGEN "):
+                e.slot_q[0].put("BT 0 7")
+        e._send = admit
         e._release_slot_when_done = mock.Mock(side_effect=RuntimeError("slot cleanup"))
         gen = e.generate_batched([1, 2], 4, {}, threading.Event())
         self.assertEqual(next(gen), 7)
