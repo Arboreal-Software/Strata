@@ -28,6 +28,7 @@ struct SessionState {int ple_prev[2]{};};
 using Clock=std::chrono::steady_clock;
 using PoolMultiFn=void(*)();
 struct Verifier {
+#include "../verifier_terminal_copy_query/latch.inc"
  bool batch_copy_failed_=false;std::atomic<bool>b_running_{true},ext_serve_{false},released_{false};
  std::atomic<int64_t>b_k_{0};int64_t b_steps_=0;int lb_=0,le_=1,device_=0,last_t_=1,last_pos_b_=0;
  Clock::time_point ext_checked_=Clock::now();uint32_t seq=0;uint32_t*h_seq_=&seq;

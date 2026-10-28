@@ -1,4 +1,5 @@
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
+    if (refuse_copy_query_failure(err)) return false;
     if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return false; }
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
@@ -24,6 +25,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     return true;
 }
 int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+    if (refuse_copy_query_failure(err)) return -1;
     if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return -1; }
     if (!b_running_) return 1;
     // set_external_serve: another thread serves the doorbells (batch_serve) and this one only checks for a window that
@@ -101,6 +103,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     return 1;
 }
 Verifier::SnapshotDrain Verifier::poll_snapshot_drain(std::string& err) {
+    if (refuse_copy_query_failure(err)) return SnapshotDrain::unhealthy;
     if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return SnapshotDrain::unhealthy; }
 #if defined(STRATA_GPU_METAL)
     err = "verify: snapshot drain is not implemented for Metal";

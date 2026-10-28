@@ -1,0 +1,157 @@
+[
+  [
+    "bool",
+    "set_logit_bias",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "init",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "record_window",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "capture",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "capture_commit",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "prelaunch",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "run",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "window_logprobs",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "commit",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "init_slots",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "capture_batch",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "capture_commit_batch",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "evict_batch_graph",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "instantiate_evicting",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "stage_batch",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "run_slots",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "run_slot_rows",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "commit_slots",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "commit_slot_prefixes",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "sample_rows",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "batch_launch",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "int",
+    "batch_serve",
+    "    if (terminal_copy_query_failed_.load(std::memory_order_acquire)) return -1;"
+  ],
+  [
+    "int",
+    "batch_poll",
+    "    if (refuse_copy_query_failure(err)) return -1;"
+  ],
+  [
+    "bool",
+    "copy_logits",
+    "    if (terminal_copy_query_failed_.load(std::memory_order_acquire)) return false;"
+  ],
+  [
+    "bool",
+    "capture_all",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "prestage",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "pl_launch",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "int",
+    "service",
+    "    if (refuse_copy_query_failure(err)) return -1;"
+  ],
+  [
+    "bool",
+    "done",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "pl_finish",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ],
+  [
+    "bool",
+    "pl_commit_async",
+    "    if (refuse_copy_query_failure(err)) return false;"
+  ]
+]
