@@ -12,6 +12,8 @@ struct NativeSessionRequest {
     int64_t layer_begin = 0, layer_end = 0;
     bool ple_buffers = false;
     bool ple_native_key = false;
+    // Temporarily refused by native allocation pending two-phase elastic
+    // retirement; retained as the explicit preparation interface for that work.
     // Exact quote before parent admission; factory is trusted HOST ONLY. It may
     // reserve metadata and physical private_attachment leases under the supplied
     // genuine arena parent, but cannot discover/create/map any device resources.
@@ -65,6 +67,13 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry&, int64_t ma
 NativeAllocationResult allocate_native_sessions(const ModelGeometry&, int64_t max_cells, int64_t k,
     const std::vector<NativeSessionRequest>&, std::vector<std::unique_ptr<SessionState>>& fresh,
     WindowBudget&, NativeSessionAllocation& out);
+// The final reference is not a producer-closure or device-completion proof.
+// Release it off callback/device-worker threads: destruction can wait while
+// holding the allocator operation mutex; producers must not wait on that mutex.
+// Before dropping the last owner, callers must close/join every host producer
+// and prevent new graph/stream submissions. Retirement drains all owned stage
+// devices before freeing pinned or borrowed targets. Uses from additional
+// devices must be drained by the caller; this allocator does not discover them.
 // Failed initialization or failed release retains allocations AND accounting
 // until worker restart. This count is an operational fault signal, not a cache.
 uint64_t native_session_quarantine_count();
