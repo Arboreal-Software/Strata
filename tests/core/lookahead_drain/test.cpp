@@ -66,7 +66,9 @@ struct WakeCv {
 #define private public
 #include "class-test.inc"
 #undef private
-#if defined(LOOKAHEAD_OLD_NOTIFY_ONE)
+#if defined(LOOKAHEAD_NO_SUBMIT_SEAL)
+#include "methods-no-submit-seal.inc"
+#elif defined(LOOKAHEAD_OLD_NOTIFY_ONE)
 #include "methods-notify-one.inc"
 #else
 #include "methods.inc"
@@ -82,7 +84,7 @@ struct Barrier {
  void open(){std::lock_guard l(m);release=true;cv.notify_all();}
 };
 static void start(R& r,ExpertSource& s){std::string e;check(r.start(std::vector<std::vector<uint16_t>>(2,std::vector<uint16_t>(16)),8,2,1,&s,e),"start actual worker");}
-int main(){int cases=0;float x[8]{};int32_t res[4]={-1,-1,-1,-1};
+int main(){int cases=0,idle_seal_checks=0;float x[8]{};int32_t res[4]={-1,-1,-1,-1};
  { // Real worker blocked BEFORE dereferencing borrowed host_res.
   R r;ExpertSource s;Barrier b;s.before_read=[&]{b.block();};start(r,s);r.submit(0,x,1,res);b.wait();
   R::SubmittedDrain held,other;
@@ -92,6 +94,18 @@ int main(){int cases=0;float x[8]{};int32_t res[4]={-1,-1,-1,-1};
   auto skipped=r.skipped();for(int i=0;i<4;++i)r.submit(0,x,1,res);
   check(r.skipped()==skipped+4,"new units cannot replace pending sealed borrow");
   b.open();check(r.drain_submitted(held,Clock::now()+std::chrono::seconds(5))==D::drained,"retained seal makes bounded progress");
+  // Busy is now false. A retained seal must independently reject a new job.
+  const auto idle_skipped=r.skipped();const auto idle_warms=s.warms_count.load();
+  r.submit(0,x,1,res);
+  // Settle even an incorrectly accepted counterfactual job BEFORE changing the
+  // borrowed input or asserting. A timeout is cleanup failure, never expected red.
+  const bool settled=r.drain_submitted(held,Clock::now()+std::chrono::seconds(5))==D::drained;
+  const bool sealed=settled&&r.skipped()==idle_skipped+1&&s.warms_count==idle_warms;
+  if(!sealed){held.reset();const bool closed=r.close_for_retirement();
+   check(settled&&closed,"idle seal counterfactual cleanup completed");
+   check(false,"idle retained guard must reject submission");
+  }
+  ++idle_seal_checks;
   res[2]=1; // Legal ONLY after actual source callback and raw reads complete.
   check(s.warms_count==1,"first prediction completes once");
   held.reset();r.submit(0,x,1,res);
@@ -134,5 +148,5 @@ int main(){int cases=0;float x[8]{};int32_t res[4]={-1,-1,-1,-1};
   check(result==D::drained,"pending submission must wake worker while deadline waiter exists");
   check(s.warms_count==1,"pending prediction ran once");++cases;
  }
- check(cases==7,"all independent scenarios executed");std::puts("PASS lookahead submitted drain: 7 scenarios");
+ check(cases==7&&idle_seal_checks==1,"all independent scenarios and idle seal assertion executed");std::puts("PASS lookahead submitted drain: 7 scenarios");
 }

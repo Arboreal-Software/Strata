@@ -25,3 +25,15 @@ fixture catches actual run on its own thread solely to inspect sticky refusal.
 
 Configure this directory with CMake; no root CMake changes are included. Three
 CTest cases: freshness, seven-scenario fixed suite, precise previous-notify control.
+
+PR44 oracle follow-up: after the real worker drains, the SAME retained guard is
+held while another submit is attempted. Its skipped count must increase and warm
+count must remain unchanged. The test always drains any incorrectly accepted job
+before mutation of borrowed input. Failure closes/joins the worker before asserting.
+An independent control removes ONLY submitted_drain_ from the actual submit
+rejection condition and must hit the exact idle-seal assertion70; it cannot pass
+because the earlier busy condition happened to reject submissions. Timeout,
+cleanup failure, sanitizer output, other assertions or crash are not accepted.
+Freshness verifies this one-expression transformation as well as original source.
+The suite now has four CTests and separately counts the idle-seal assertion.
+Snapshot follow-up work is not included; production code is unchanged from PR44.
