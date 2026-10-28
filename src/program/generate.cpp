@@ -74,6 +74,7 @@
 #include "strata/core/expert_host_execution.hpp"
 #include "strata/core/expert_tier_open_observer.hpp"
 #include "strata/core/window_loader_profile.hpp"
+#include "strata/core/expert_runtime_profile.hpp"
 #include "strata/core/window_consumer_guard.hpp"
 #include "strata/core/submitted_work_drain.hpp"
 #include "strata/core/joined_thread_scope.hpp"
@@ -1383,7 +1384,8 @@ struct DriverExpertOpenObservation {
 };
 
 struct DriverWindowRuntime final : strata::core::NativeRuntimeAttachment,
-                                   strata::core::ExpertHostRuntimeBinding {
+                                   strata::core::ExpertHostRuntimeBinding,
+                                   strata::core::ExpertRuntimeProfileBinding {
     ~DriverWindowRuntime();
     // Execution-scope controllers must first finish doorbell/pipeline work and
     // join all external dispatch/foreground callers while their captures live.
@@ -1400,6 +1402,14 @@ struct DriverWindowRuntime final : strata::core::NativeRuntimeAttachment,
             ((source && candidate->src == source.get()) ||
              (arena_source && candidate->src == arena_source.get()));
     }
+    // Actual source membership and retained loader authority; collection and
+    // borrowed profile use require serialized source/layout mutation.
+    strata::core::ExpertProfileSourceView expert_profile_source() const noexcept override {
+        return {profile_source==source.get()?source.get():nullptr,
+                profile_source==arena_source.get()?arena_source.get():nullptr,profile_bindings};
+    }
+    const strata::core::ExpertSource* profile_source=nullptr;
+    std::shared_ptr<const strata::core::VerifiedDriverBindings> profile_bindings;
     std::shared_ptr<const strata::core::OwnedModelGang> model;
     // Actual loaded fragment; never a substitute for the complete runtime profile.
     strata::core::WindowLoaderProfile loader_profile;
@@ -2951,6 +2961,9 @@ int main(int argc, char** argv) {
     std::unique_ptr<strata::core::WindowBudget> model_budget;
     std::shared_ptr<const strata::core::OwnedModelGang> owned_model;
     std::shared_ptr<DriverWindowRuntime> owned_runtime;
+    // External owner: the profile retains owned_runtime, so storing it inside
+    // DriverWindowRuntime would create an ownership cycle. Always partial.
+    strata::core::ExpertRuntimeProfile expert_runtime_profile;
     auto allocate_scratch=[&](int device,uint64_t bytes,void** pointer,
         strata::core::WindowBufferMemory memory=strata::core::WindowBufferMemory::device,void** mapped=nullptr)->bool {
         return owned_runtime && model_budget &&
@@ -6869,6 +6882,7 @@ int main(int argc, char** argv) {
             if(!owned_runtime || !verified_inputs.budget || !verified_inputs.bindings) {
                 std::fprintf(stderr,"strata generate: loader profile lacks retained verified owners\n");return 1;
             }
+            owned_runtime->profile_bindings=verified_inputs.bindings;
             // Explicit rejection ceilings. Collector admission prices actual
             // bounded receipts before allocation, not every ceiling entry.
             const strata::core::LoaderProfileLimits limits{8,65544,65536,8,4096,512ull<<20};
@@ -8368,6 +8382,18 @@ int main(int argc, char** argv) {
     }
 
 #if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.verified_inputs_active) {
+        // Source open/fill has completed. This joins the actual retained source,
+        // not an independently supplied inventory. Policy/topology/engine joins
+        // remain incomplete; this does not enable managed window execution.
+        if(owned_runtime)owned_runtime->profile_source=srcp;
+        const strata::core::ExpertRuntimeProfileLimits limits{1024,65536,4096,512ull<<20};
+        if(!owned_runtime || !verified_inputs.budget ||
+           !strata::core::collect_expert_runtime_profile(owned_runtime,limits,
+               *verified_inputs.budget,expert_runtime_profile,err)) {
+            std::fprintf(stderr,"strata generate: actual expert source profile: %s\n",err.c_str());return 1;
+        }
+    }
     if(owned_runtime && owned_runtime->expert_policy) {
         // All configured tier loaders have completed at this serialized cut.
         // Require every declared tier, including helpers, to have its actual
