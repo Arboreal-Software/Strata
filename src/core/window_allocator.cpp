@@ -157,7 +157,9 @@ bool NativeRetirementAttempt::drain_and_commit(std::string& error) noexcept {
             if(!stage.session->ple.read_context->close_for_retirement()){
                 error="PLE retirement join uncertain; whole gang retained";return false;
             }
-            stage.session->ple.read_context.reset();
+            // Keep the sealed context's table, immutable weight owner and
+            // attachment quota through the gang barrier and any quarantine.
+            // IO completion does not authorize dropping GPU borrowers' owners.
         }
         if(!context_.drain_after_producers_closed()){
             error="retirement consumer drain failed; whole gang retained";return false;
