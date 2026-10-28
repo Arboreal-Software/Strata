@@ -28,3 +28,10 @@ repaired here; that is a separate change. These tests do not execute full
 Verifier graph/callback paths or establish CUDA, HIP, SYCL or Metal compatibility.
 No backend build or hardware test has been performed for this patch. The
 SYCL-specific OnDevice and verifier sources are unchanged.
+
+Release assertion policy: configure this public directory, not the historical
+snapshot, for standalone use: `cmake -S tests/core/checked_device -B build/checked-device -DCMAKE_BUILD_TYPE=Release`.
+The public target explicitly undefines NDEBUG and compiles a guard that refuses
+any configuration still defining it. This also applies when the repository adds
+the directory. Historical snapshot inputs remain unchanged. This follow-up has
+not yet been compiled or executed.
