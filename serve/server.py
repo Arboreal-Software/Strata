@@ -2391,7 +2391,7 @@ class StrataEngine:
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
         busy_in = {}
-        for b in range(self.batch):
+        for b in range(len(slots.slot_busy)):
             if slots.slot_busy[b]:
                 busy_in[slots.slot_group[b]] = busy_in.get(slots.slot_group[b], 0) + 1
         return min(free, key=lambda b: (busy_in.get(slots.slot_group[b], 0) if slots.slot_groups > 1 else 0,
