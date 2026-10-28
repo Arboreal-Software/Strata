@@ -761,6 +761,29 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         set_tests_properties(verified_input_manifest_test PROPERTIES TIMEOUT 120)
       endif()
       if(STRATA_ENABLE_CUDA AND UNIX)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+          # Real loader/WeightTable/platform code, CPU CUDA/kernel seams only.
+          # No cudart, frozen archives or section-GC dependency hiding.
+          add_executable(native_dense_load_test src/core/native_dense_load_test.cpp
+            src/core/native_dense.cpp src/core/weights.cpp src/platform/memory.cpp)
+          target_include_directories(native_dense_load_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+          target_link_libraries(native_dense_load_test PRIVATE Threads::Threads)
+          target_compile_options(native_dense_load_test PRIVATE -UNDEBUG)
+          add_test(NAME native_dense_load_test COMMAND native_dense_load_test)
+          add_test(NAME native_dense_load_faults_test COMMAND native_dense_load_test)
+          set_tests_properties(native_dense_load_faults_test PROPERTIES ENVIRONMENT "STRATA_NATIVE_TEST_FAULTS_ONLY=1")
+          set_tests_properties(native_dense_load_test native_dense_load_faults_test PROPERTIES TIMEOUT 60)
+          find_package(Python3 COMPONENTS Interpreter REQUIRED)
+          add_test(NAME native_dense_fixture_isolation_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/native_dense_fixture_isolation_test.py $<TARGET_FILE:native_dense_load_test>)
+          add_test(NAME native_dense_fixture_faults_isolation_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/native_dense_fixture_isolation_test.py $<TARGET_FILE:native_dense_load_test>)
+          set_tests_properties(native_dense_fixture_faults_isolation_test PROPERTIES ENVIRONMENT "STRATA_NATIVE_TEST_FAULTS_ONLY=1")
+          add_test(NAME native_dense_fixture_unwind_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/native_dense_fixture_isolation_test.py $<TARGET_FILE:native_dense_load_test> --throw)
+          set_tests_properties(native_dense_fixture_isolation_test native_dense_fixture_faults_isolation_test
+            native_dense_fixture_unwind_test PROPERTIES TIMEOUT 90)
+        endif()
         # Actual manager/selection code with CPU CUDA mocks; POSIX test fixtures, no GPU or test seams.
         add_executable(window_manager_test src/core/window_manager_test.cpp
           src/core/window_manager.cpp src/core/window_allocator.cpp
