@@ -6,6 +6,24 @@ namespace strata::kernels {
 void native_rope_set_enabled(bool enabled);
 bool native_rope_enabled();
 
+// Partial policy observation, not table identity or dispatch evidence. Call only
+// during serialized startup/adoption: native enable can change independently,
+// and this value does not fence mutations or capture a coherent concurrent epoch.
+// First observation may initialize the same lazy environment selectors used by
+// kernels. The caller must freeze configuration before either observation/use.
+struct NativeRopePolicyObservation {
+    bool supported = false;
+    int head_dim = 0;
+    int n_rot = 0;
+    bool native_enabled = false;
+    bool table_policy_enabled = false;
+    bool fused_norm_geometry_usable = false;
+};
+// Allocation-free; no device query, table access, synchronization or launch.
+// supported=false means this backend has no observation implementation.
+NativeRopePolicyObservation native_rope_policy_observation(int head_dim, int n_rot);
+
+
 // Pinned CUDA text-only IMRoPE: F32 rows, 64 rotated channels, equal text positions in all four
 // IMRoPE sections. Each device position must be nonnegative. The position buffer remains live
 // through graph replay. Supports head_dim 128/256 and exact x==out; partial overlap is rejected.

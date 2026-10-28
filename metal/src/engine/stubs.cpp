@@ -366,3 +366,6 @@ namespace strata::prefill { void swiglu_interleaved(const float * p0, uint16_t *
 namespace strata::prefill { void swiglu_pair(const float * p0, const float * p1, uint16_t * p2, int64_t p3, void * p4) { strata::metal_engine::missing("strata::prefill::swiglu_pair"); } }
 namespace strata::prefill { void to_bf16(const float * p0, uint16_t * p1, int64_t p2, void * p3, uint16_t * p4) { strata::metal_engine::missing("strata::prefill::to_bf16"); } }
 namespace strata::prefill { void to_f16(const float * p0, uint16_t * p1, int64_t p2, void * p3) { strata::metal_engine::missing("strata::prefill::to_f16"); } }
+
+// Partial native policy is explicitly unavailable on this backend.
+namespace strata::kernels { NativeRopePolicyObservation native_rope_policy_observation(int p0, int p1) { return {false, p0, p1, false, false, false}; } }
