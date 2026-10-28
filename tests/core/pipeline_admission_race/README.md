@@ -24,3 +24,33 @@ cannot report success for the injected assertion. The OLD_ADMISSION `race` mode
 remains a separate reproduction and now requires exit86 plus exactly the original
 admitted-race diagnostic; do not confuse it with expected fatal teardown exit1.
 No production guard or driver behavior changes in this fixture correction.
+
+
+Child supervision uses nonblocking diagnostic reads and `waitpid(WNOHANG)` with a
+three-second monotonic deadline. EOF does not establish child completion. Errors,
+oversized diagnostics or expiry kill the exact unreaped child and reap it before
+reporting failure; no parent-only alarm remains. The fixed64KiB capture buffer
+avoids string allocation while the child is active. A scope owner supplies the
+same cleanup on exceptional parent unwind. Kernel reap after SIGKILL must finish
+before reporting; this is not a guarantee against uninterruptible kernel IO.
+
+Two short negative controls deliberately hang with stderr open and with stderr
+closed. Each must time out, be killed by SIGKILL, be reaped, and produce ECHILD on
+an immediate second wait; the closed case must have observed EOF before cleanup.
+They run in the default fixture and separately with `--timeout-controls`. These
+controls prove local cleanup rather than relying on an external container timeout.
+
+The timeout repair and its new candidate are source-only and unrun pending a new
+CPU grant. Previous fixture results do not qualify this change. Production guard,
+driver extracts and exact assertion86/fatal-exit1 diagnostic oracles are unchanged.
+
+
+PID ownership is separate from captured exit status. Any `ECHILD` permanently
+disarms the child owner, preserves an unqualified failure, and prevents subsequent
+cleanup/destructor signals. Cleanup preflights `waitpid(WNOHANG)` before a kill.
+The single-threaded fixture refuses inherited SIGCHLD auto-reaping/custom handlers
+before forking, rather than assuming it has exclusive status ownership.
+A safe status-loss syscall seam first reaps the real child, then returns synthetic
+ECHILD; the control requires zero kill attempts, no qualified status, and ECHILD
+on a second wait. Its kill guard refuses any attempt to signal the already-reaped
+PID, so this negative control never probes a potentially recycled live PID.
