@@ -197,7 +197,7 @@ public:
     /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
     explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
-                        PoolAffinity affinity = PoolAffinity::All, int tasks = 0);
+                        PoolAffinity affinity = PoolAffinity::All, int tasks = 0, bool checked_retirement = false);
     /// Batched row phases: 0 keeps three tasks per participating thread; explicit counts are capped by rows.
     static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
@@ -205,6 +205,7 @@ public:
     ~ExpertPool();
     /// Stop/join only; retains buffers and borrowed dispatch/source pointers. The controller must
     /// first finish outstanding doorbell/pipeline work and join every host dispatch caller.
+    /// Requires checked_retirement=true at construction; an untracked pool refuses without effects.
     /// Active dispatch returns false WITHOUT sealing or stopping workers. CAS success is not
     /// proof of global producer closure. No self-delete/concurrent destruction is permitted.
     bool stop_after_dispatch_callers_joined() noexcept;
@@ -289,6 +290,7 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    const bool checked_retirement_; // Fixed before worker creation; default dispatch remains untracked.
     enum class DispatchState { idle, active, sealed, joined, failed };
     std::atomic<DispatchState> dispatch_state_{DispatchState::idle};
     // Failure is sticky: unwinding a published batch does not prove its borrowers completed.

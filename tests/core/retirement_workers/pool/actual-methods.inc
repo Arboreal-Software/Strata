@@ -11,6 +11,7 @@ ExpertPool::DispatchGuard::~DispatchGuard() {
 }
 
 bool ExpertPool::stop_after_dispatch_callers_joined() noexcept {
+    if (!checked_retirement_) return false;
     auto expected = DispatchState::idle;
     if (!dispatch_state_.compare_exchange_strong(expected, DispatchState::sealed,
             std::memory_order_acq_rel))

@@ -1,0 +1,14 @@
+{
+  "public": {
+    "SuffixRawResult SuffixRawTransaction::capture(": "4397e3fc9a274e06dfa2e80a8e88eff64731cd4e317459e002f618e4ba03c09a",
+    "SuffixRawResult SuffixRawTransaction::restore(": "7b82392a67e75525307fd948547edd0e4b433f989d78f6b1060069fd27f7cb37"
+  },
+  "shared_helpers": {
+    "            auto shared_refill_issue =": "fa70deb736f737de1f0361a7a1a65d71e3841101e8df12f5925f4e8cd73965a9",
+    "            auto shared_refill_wait =": "88015c86b2ca8fba115a7cee386c694425d127acf5f62bfe9f94bac2febccadc",
+    "            auto shared_refill_one =": "e15b69ce436c7756605a40ac55a4a8f0ddd171f34301ee8813aae21eb67103d7",
+    "            auto shared_prefix_refill =": "0ce425629d1a635ee8739672ff1f809d1e0707f095643e7987930d5428ad51fb",
+    "            auto shared_prefix_lend =": "40ba033994e3133f5d66392443a577ac05eed17bf05b01145cbc44b3127b1637"
+  },
+  "note": "Shared helpers are exact original bodies with only explicit strict-mode/reference parameters and callee names rewritten; no numerical branch/body change."
+}

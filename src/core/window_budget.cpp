@@ -96,10 +96,16 @@ ReservationResult WindowBudget::reserve(const WindowResources& resources, Reserv
     case ReservationPurpose::private_attachment: break;
     default: return {ReservationError::invalid_vector,-1,{}};
     }
+    // Shared parents need authenticated retention, not exclusive ownership.
+    // A live pointer aliased to an unrelated control block can pass every
+    // pointee check yet release the real parent's charge before its child dies.
+    if (returned && !returned->canonical_owner(returned))
+        return {return_related ? ReservationError::return_unavailable : ReservationError::invalid_vector,-1,{}};
     std::shared_ptr<ReservationLease> lease;
     try {
         // Allocate before taking the ledger lock; failed allocation never changes admission.
         lease = std::shared_ptr<ReservationLease>(new ReservationLease(state_,resources,purpose,std::move(returned)));
+        lease->owner_ = lease;
         if (obligation) lease->obligation_ = *obligation;
     } catch (const std::bad_alloc&) { return {ReservationError::allocation_failed,-1,{}}; }
     std::lock_guard lock(state_->mutex);
@@ -138,3 +144,21 @@ WindowBudgetSnapshot WindowBudget::snapshot() const {
     return {state_->capacity,state_->baseline,state_->reserved,!check(*state_,zero)};
 }
 } // namespace strata::core
+
+namespace strata::core {
+bool WindowBudget::shrink_foreground(const std::shared_ptr<const ReservationLease>& owner,WindowResources retained) {
+    if(!owner||owner.use_count()!=1||!owner->canonical_owner(owner)||owner->state_!=state_||
+       owner->purpose_!=ReservationPurpose::foreground||owner->return_||!owner->charged_)return false;
+    std::lock_guard lock(state_->mutex);
+    const auto& old=owner->resources_;
+    if(!valid(retained,old.device_bytes.size()))return false;
+    for(size_t device=0;device<old.device_bytes.size();++device)
+        if(retained.device_bytes[device]>old.device_bytes[device])return false;
+    for(auto field:{&WindowResources::host_bytes,&WindowResources::pinned_bytes,&WindowResources::disk_bytes,
+                    &WindowResources::io_slots,&WindowResources::shadows})
+        if(retained.*field>old.*field)return false;
+    charge(state_->reserved,old,false);charge(state_->reserved,retained,true);
+    const_cast<ReservationLease*>(owner.get())->resources_=std::move(retained);
+    return true;
+}
+}

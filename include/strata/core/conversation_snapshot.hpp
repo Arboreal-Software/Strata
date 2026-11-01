@@ -145,3 +145,10 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
                                                           const QsaState* draft, std::string& error);
 
 } // namespace strata::core
+
+// Disposable native qualification only; retains actual empty endpoint bytes.
+namespace strata::core {
+bool conversation_snapshot_empty_save(SavedConversation&,const SessionState&,const ModelGeometry&,std::string&);
+bool conversation_snapshot_empty_validate(const SavedConversation&,const SessionState&,const ModelGeometry&,const QsaState*,std::string&);
+ConversationRestore conversation_snapshot_empty_restore(const SavedConversation&,SessionState&,const ModelGeometry&,const QsaState*,std::string&);
+}

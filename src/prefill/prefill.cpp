@@ -1577,7 +1577,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
             }
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, kMaxStagerThreads) : files ? kMaxStagerThreads : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
@@ -2552,6 +2552,14 @@ core::PrefillCpuShareObservation Prefill::cpu_share_policy() const noexcept {
         r.measurement_pending = impl_->cpu_pend || impl_->pend_wall != 0;
     }
     return core::classify_cpu_share(r);
+}
+Prefill::ReplayActivity Prefill::replay_activity() const noexcept {
+    ReplayActivity r;r.next=next_;r.begin=stage_lb_;r.end=stage_le_;
+    r.taps=!tap_layers_.empty()||bool(on_taps);r.pending_force=force_chunk_!=0;
+    if(impl_){const auto& m=*impl_;r.initialized=true;r.session=m.ss;r.source=m.src;
+        r.cache=m.cache;r.residency=m.host_res;r.device=m.device;r.helper=bool(m.help_pp);
+        r.peer=bool(m.pp);r.borrow_spill=m.borrow_spill;}
+    return r;
 }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::arm_cpu_share(bool applies, bool by_default) {

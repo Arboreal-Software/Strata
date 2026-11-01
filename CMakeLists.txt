@@ -13,6 +13,9 @@ project(strata VERSION 0.1.51 LANGUAGES CXX)
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
 if(STRATA_ENABLE_SYCL)
+  if(STRATA_RESIDENT_FAULT_QUALIFICATION)
+    message(FATAL_ERROR "Resident fault qualification requires the Linux CUDA window-state build")
+  endif()
   if(STRATA_WINDOW_NVCOMP OR STRATA_WINDOW_HIPCOMP)
     message(FATAL_ERROR "Window SDK codecs require their CUDA/HIP backend, not SYCL")
   endif()
@@ -125,6 +128,15 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_BUILD_WINDOW_STATE "Build opt-in complete window state runtime adapters (unqualified)" OFF)
+option(STRATA_RESIDENT_FAULT_QUALIFICATION "Enable explicit disposable-process resident CUDA fault qualification (never serving)" OFF)
+if(STRATA_RESIDENT_FAULT_QUALIFICATION)
+  if(NOT STRATA_BUILD_WINDOW_STATE OR NOT STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR
+     NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Resident fault qualification requires Linux CUDA and STRATA_BUILD_WINDOW_STATE")
+  endif()
+  # All participating headers/TUs must see the same inline copy-hook definition.
+  add_compile_definitions(STRATA_RESIDENT_FAULT_QUALIFICATION=1)
+endif()
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
 
 # Optional local SDKs: RAW/stub support never requires a vendor SDK or download.
@@ -212,6 +224,33 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(window_hash_test src/core/window_hash_test.cpp src/core/window_hash.cpp)
   target_include_directories(window_hash_test PRIVATE include)
   add_test(NAME window_hash_test COMMAND window_hash_test)
+  # Bounded causal-root DATA only: no device/runtime/model dependency.
+  add_executable(window_repair_ancestry_test tests/core/window_repair_ancestry/test.cpp
+    src/core/window_repair_ancestry.cpp)
+  target_include_directories(window_repair_ancestry_test PRIVATE include)
+  add_test(NAME window_repair_ancestry_test COMMAND window_repair_ancestry_test)
+  set_tests_properties(window_repair_ancestry_test PROPERTIES TIMEOUT 30)
+  add_executable(verifier_setup_quote_test tests/core/verifier_setup_quote/test.cpp
+    src/core/verifier_setup_quote.cpp)
+  target_include_directories(verifier_setup_quote_test PRIVATE include)
+  add_test(NAME verifier_setup_quote_test COMMAND verifier_setup_quote_test)
+  set_tests_properties(verifier_setup_quote_test PROPERTIES TIMEOUT 30)
+  # Exercise the actual strict/default completion branch without a GPU.
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  set(_capture_fixture_dir ${CMAKE_CURRENT_BINARY_DIR}/verifier_capture_completion)
+  add_custom_command(OUTPUT ${_capture_fixture_dir}/capture_tail.inc
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${_capture_fixture_dir}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/verifier_capture_completion/prepare.py
+      --source ${CMAKE_CURRENT_SOURCE_DIR}/src/core/verify.cpp
+      --output ${_capture_fixture_dir}/capture_tail.inc
+    DEPENDS src/core/verify.cpp tests/core/verifier_capture_completion/prepare.py
+    VERBATIM)
+  add_executable(verifier_capture_completion_test
+    tests/core/verifier_capture_completion/test.cpp ${_capture_fixture_dir}/capture_tail.inc)
+  target_include_directories(verifier_capture_completion_test PRIVATE ${_capture_fixture_dir})
+  add_test(NAME verifier_capture_completion_test COMMAND verifier_capture_completion_test)
+  set_tests_properties(verifier_capture_completion_test PROPERTIES TIMEOUT 30)
   add_executable(window_profile_test src/core/window_profile_test.cpp src/core/window_profile.cpp src/core/window_hash.cpp)
   target_include_directories(window_profile_test PRIVATE include)
   # This test uses assertions as executable checks, including in Release builds.
@@ -232,6 +271,28 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   find_package(Threads REQUIRED)
   target_link_libraries(window_budget_test PRIVATE Threads::Threads)
   add_test(NAME window_budget_test COMMAND window_budget_test)
+  # This allocation-oracle fixture currently uses the Linux allocator profile.
+  # Other platform qualification remains separate from the portable adapter.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(window_suffix_test tests/core/window_suffix/test.cpp
+      src/core/window_suffix.cpp src/core/window_native.cpp src/core/window_state.cpp
+      src/core/window_hash.cpp src/core/window_budget.cpp)
+    target_include_directories(window_suffix_test PRIVATE include src/core)
+    target_link_libraries(window_suffix_test PRIVATE Threads::Threads)
+    add_test(NAME window_suffix_test COMMAND window_suffix_test)
+    set_tests_properties(window_suffix_test PROPERTIES TIMEOUT 60)
+    add_executable(window_repair_suffix_test tests/core/window_repair_suffix/test.cpp
+      src/core/window_repair_suffix.cpp src/core/window_repair_ancestry.cpp
+      src/core/window_native.cpp src/core/window_state.cpp
+      src/core/window_hash.cpp src/core/window_budget.cpp)
+    target_include_directories(window_repair_suffix_test PRIVATE include src/core)
+    target_link_libraries(window_repair_suffix_test PRIVATE Threads::Threads)
+    add_test(NAME window_repair_suffix_test COMMAND window_repair_suffix_test)
+    set_tests_properties(window_repair_suffix_test PROPERTIES TIMEOUT 60)
+  endif()
+  add_executable(suffix_experiment_metrics_test src/program/suffix_experiment_metrics_test.cpp)
+  add_test(NAME suffix_experiment_metrics_test COMMAND suffix_experiment_metrics_test)
+  set_tests_properties(suffix_experiment_metrics_test PROPERTIES TIMEOUT 30)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(verified_artifact_test src/core/verified_artifact_test.cpp
       src/core/verified_artifact.cpp src/core/window_hash.cpp src/core/window_budget.cpp)
@@ -263,6 +324,34 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   target_include_directories(thread_dependencies_test PRIVATE include)
   target_link_libraries(thread_dependencies_test PRIVATE Threads::Threads)
   add_test(NAME thread_dependencies_test COMMAND thread_dependencies_test)
+  add_executable(serving_thread_bridge_test tests/core/serving_raw_contracts/test_serving_thread_bridge.cpp
+    src/core/thread_priority.cpp src/core/thread_dependencies.cpp src/core/window_budget.cpp)
+  target_include_directories(serving_thread_bridge_test PRIVATE include src/program)
+  target_link_libraries(serving_thread_bridge_test PRIVATE Threads::Threads)
+  add_test(NAME serving_thread_bridge_test COMMAND serving_thread_bridge_test)
+  set_tests_properties(serving_thread_bridge_test PROPERTIES TIMEOUT 120)
+  add_test(NAME serving_thread_bridge_source_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+    --source-root ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(serving_thread_bridge_source_test PROPERTIES TIMEOUT 30)
+  set(_managed_startup_fixture ${CMAKE_CURRENT_BINARY_DIR}/serving_thread_startup/actual.cpp)
+  add_custom_command(OUTPUT ${_managed_startup_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_startup.py
+      --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_managed_startup_fixture}
+    DEPENDS src/program/generate.cpp tests/core/serving_raw_contracts/test_serving_thread_startup.py
+      tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+    VERBATIM)
+  add_executable(serving_thread_startup_test ${_managed_startup_fixture} src/core/window_budget.cpp)
+  target_include_directories(serving_thread_startup_test PRIVATE include src/program)
+  target_link_libraries(serving_thread_startup_test PRIVATE Threads::Threads)
+  add_test(NAME serving_thread_startup_test COMMAND serving_thread_startup_test)
+  set_tests_properties(serving_thread_startup_test PROPERTIES TIMEOUT 120)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME serving_thread_bridge_nonce_test COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_bridge_nonce.py
+      $<TARGET_FILE:serving_thread_bridge_test>)
+    set_tests_properties(serving_thread_bridge_nonce_test PROPERTIES TIMEOUT 30)
+  endif()
   add_executable(window_edit_test src/core/window_edit_test.cpp src/core/window_edit.cpp src/core/window_state.cpp src/core/window_hash.cpp)
   target_include_directories(window_edit_test PRIVATE include)
   add_test(NAME window_edit_test COMMAND window_edit_test)
@@ -562,6 +651,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
+  if(STRATA_RESIDENT_FAULT_QUALIFICATION)
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/resident_deferred_trap.cu)
+  endif()
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
@@ -719,14 +811,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/qsa_host_release.cpp src/core/qsa_private_upload.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
-    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/verify_drain.cpp src/core/mtp.cpp src/core/dflash2.cpp
+    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/verifier_setup_quote.cpp src/core/verify_drain.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   if(STRATA_BUILD_WINDOW_STATE)
+    # Owned slot setup consumes WindowBudget; keep that dependency out of the
+    # feature-OFF engine archive, which does not link strata_window_state.
+    target_compile_definitions(strata_engine PRIVATE STRATA_OWNED_BATCH_AVAILABLE=1)
     add_library(strata_window_state STATIC ${_strata_window_codec_sources}
       src/core/window_model_owner.cpp src/core/window_buffer.cpp src/core/window_ple_weights.cpp src/core/window_ple.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_capture.cpp src/core/window_restore.cpp src/core/window_selection.cpp src/core/window_lease.cpp src/core/window_budget.cpp
-      src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp src/core/window_disk.cpp src/core/window_manager.cpp src/core/window_admission.cpp src/core/vmm_managed.cpp src/core/owned_qsa_elastic.cpp
-      src/core/window_edit.cpp src/core/window_token_ledger.cpp src/core/window_profile.cpp src/core/window_loader_profile.cpp src/core/expert_runtime_profile.cpp src/core/expert_policy_inventory.cpp src/core/expert_policy_runtime.cpp src/core/expert_host_execution.cpp src/core/verified_artifact.cpp src/core/verified_inputs.cpp src/core/verified_input_manifest.cpp src/core/thread_priority.cpp src/core/thread_dependencies.cpp)
+      src/core/window_native.cpp src/core/window_suffix.cpp src/core/window_repair_suffix.cpp src/core/window_repair_ancestry.cpp src/core/window_state.cpp src/core/window_hash.cpp src/core/window_disk.cpp src/core/window_manager.cpp src/core/window_admission.cpp src/core/vmm_managed.cpp src/core/owned_qsa_elastic.cpp
+      src/core/window_edit.cpp src/core/window_token_ledger.cpp src/core/window_profile.cpp src/core/window_loader_profile.cpp src/core/expert_runtime_profile.cpp src/core/expert_policy_inventory.cpp src/core/expert_policy_runtime.cpp src/core/remote_policy_publication.cpp src/core/expert_host_execution.cpp src/core/verified_artifact.cpp src/core/verified_inputs.cpp src/core/verified_input_manifest.cpp src/core/running_engine_identity.cpp src/core/thread_priority.cpp src/core/thread_dependencies.cpp)
     target_include_directories(strata_window_state PUBLIC include)
     target_link_libraries(strata_window_state PUBLIC strata_engine)
     if(STRATA_WINDOW_NVCOMP)
@@ -799,6 +894,34 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_subdirectory(tests/core/verifier_copy_query)
         add_subdirectory(tests/core/verifier_terminal_copy_query)
         add_subdirectory(tests/core/verifier_serial_copy)
+        add_subdirectory(tests/core/chain_async_launch)
+        add_subdirectory(tests/core/all_resident_remote_combine)
+        add_subdirectory(tests/core/verifier_completion_gate)
+        add_subdirectory(tests/resident_admission)
+        # CPU gate for the repeated-restore future-page fix: production planner/preflight/dispatch over host
+        # buffers.  Proves range/dispatch correctness only; the live-device proof is the GPU qualification.
+        add_subdirectory(tests/core/raw_int8_restore_clear)
+        add_subdirectory(tests/core/conversation_suffix_provenance)
+        add_subdirectory(tests/core/suffix_edit_span)
+        # CPU gate for the serving suffix-reuse ADMISSION decision: the exact function the request path calls.
+        add_subdirectory(tests/core/suffix_import_policy)
+        # CPU gate for the serving RAW adapter lifecycle contract (phase/cut/destruction rules).
+        add_subdirectory(tests/core/serving_raw_contracts)
+        add_subdirectory(tests/core/native_owned_batch_serving)
+        add_subdirectory(tests/core/owned_batch_slot_sessions)
+        # CPU gate for the retained repair owner registry gates and incoming-prompt identity.
+        add_subdirectory(tests/core/serving_repair_owners)
+        # CPU gate for demand/age hard eligibility, importance selection and monotonic root projection.
+        add_subdirectory(tests/core/serving_repair_scheduler)
+        # CPU gate for the qualification bundle record codec (export/load integrity only).
+        add_subdirectory(tests/core/suffix_bundle_record)
+        add_subdirectory(tests/core/canonical_admission_consumers)
+        add_subdirectory(tests/core/checked_device)
+        add_subdirectory(tests/core/lookahead_drain)
+        if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+          add_subdirectory(tests/core/remote_policy_publication)
+        endif()
+        add_subdirectory(tests/core/remote_optimizer_lifecycle)
         # Actual worker methods with CPU service mocks; no real IO/device proof.
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         find_package(Threads REQUIRED)
@@ -832,6 +955,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_compile_options(verified_input_manifest_test PRIVATE -UNDEBUG)
         add_test(NAME verified_input_manifest_test COMMAND verified_input_manifest_test)
         set_tests_properties(verified_input_manifest_test PROPERTIES TIMEOUT 120)
+        add_subdirectory(tests/core/running_engine_identity)
       endif()
       if(STRATA_ENABLE_CUDA AND UNIX)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -1147,6 +1271,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(TARGET strata_window_state)
     target_link_libraries(strata PRIVATE strata_window_state)
     target_compile_definitions(strata PRIVATE STRATA_WINDOW_STATE_AVAILABLE=1)
+    # The disposable RAW suffix driver is initially Linux CUDA only. Merely
+    # linking its private transaction helper does not enable an experiment.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+      target_sources(strata PRIVATE src/program/suffix_raw_runtime.cpp)
+    endif()
   endif()
   if(WIN32 AND STRATA_ENABLE_HIP)
     # 0.2.1.2: the ROCm math libraries live in <package>\rocm\bin, which is on PATH only when the launcher starts the engine; load them on first

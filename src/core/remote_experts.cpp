@@ -35,7 +35,8 @@ struct DeviceScope {
     bool ok = false;
     cudaError_t status = cudaSuccess;
     const char* failed_step = nullptr;
-    explicit DeviceScope(int device) {
+    cudaError_t* restore_status = nullptr;
+    explicit DeviceScope(int device, cudaError_t* restored = nullptr) : restore_status(restored) {
         status = cudaGetDevice(&previous);
         if (status != cudaSuccess) {
             previous = -1;
@@ -49,7 +50,13 @@ struct DeviceScope {
         }
         ok = true;
     }
-    ~DeviceScope() { if (previous >= 0) cudaSetDevice(previous); }
+    cudaError_t restore() noexcept {
+        const int target=std::exchange(previous,-1);
+        const auto result=target>=0?cudaSetDevice(target):cudaSuccess;
+        if (restore_status) *restore_status=result;
+        return result;
+    }
+    ~DeviceScope() { if (previous >= 0) (void) restore(); }
     std::string error(int device) const {
         return std::string("CUDA") + std::to_string(device) + " experts: " +
                (failed_step ? failed_step : "device switch") +
@@ -64,6 +71,336 @@ bool check(cudaError_t result, const char* what, std::string& err, int device) {
     return false;
 }
 } // namespace
+
+// BEGIN owned remote routing admission (source-extracted CPU fixtures)
+namespace {
+std::atomic<uint64_t> remote_quarantines{0};
+[[noreturn]] void remote_ownership_fatal() noexcept {
+    std::fputs("strata: remote helper ownership or DMA completion uncertain; worker restart required\n", stderr);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+}
+uint64_t RemoteExperts::owned_routing_quarantines() noexcept { return remote_quarantines.load(); }
+bool RemoteExperts::bound_to_runtime(const std::shared_ptr<NativeRuntimeAttachment>& runtime) const noexcept {
+    std::shared_ptr<NativeRuntimeAttachment> observed;
+    bool available=false;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        available=owned_bound_&&!owned_unknown_&&!owned_closed_;
+        if(available)observed=runtime_owner_.lock();
+    }
+    // Promotion may be the last reference to another owner. Destroy it only
+    // after releasing ownership_mu_, including every mismatch/refusal path.
+    return available&&runtime&&observed&&observed.get()==runtime.get()&&
+           !observed.owner_before(runtime)&&!runtime.owner_before(observed);
+}
+void RemoteExperts::unknown_locked(const std::shared_ptr<NativeRuntimeAttachment>& owner) noexcept {
+    if (!owned_unknown_) {
+        owned_unknown_ = true;
+        // This is deliberately a retained active cycle if owner owns this helper.
+        // No allocation and no overwritten shared owner/destructor under the lock.
+        unknown_owner_ = owner;
+        remote_quarantines.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+bool RemoteExperts::set_strict_retirement(bool enabled,const std::vector<int>& devices,std::string& error) {
+    // Startup only: no producers or concurrent open/bind are permitted here.
+    if (owned_bound_ || remote_open_started_) {
+        error="remote routing: strict retirement must precede open"; return false;
+    }
+    if (!cache_.set_strict_retirement(enabled,devices,error)) return false;
+    strict_retirement_configured_=enabled;
+    return true;
+}
+bool RemoteExperts::copy_reader_guard_bytes(uint32_t readers, uint64_t& bytes) noexcept {
+    if (!readers || uint64_t(readers) > UINT64_MAX / uint64_t(sizeof(CopyRead))) return false;
+    bytes = uint64_t(readers) * uint64_t(sizeof(CopyRead));
+    return true;
+}
+
+bool RemoteExperts::bind_owned_routing(const std::shared_ptr<NativeRuntimeAttachment>& owner,
+                                      uint32_t max_copy_readers, std::string& error) {
+    bool accepted = false;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        if (!owned_bound_ && strict_retirement_configured_ && owner && max_copy_readers && device_ >= 0 && stream_ && read_stream_) {
+            runtime_owner_ = owner;
+            max_copy_readers_ = max_copy_readers;
+            owned_bound_ = true;
+            accepted = true;
+        }
+    }
+    if (!accepted) error = "remote routing: invalid or repeated owner binding";
+    return accepted;
+}
+bool RemoteExperts::owned_routing_healthy() const noexcept {
+    std::lock_guard<std::mutex> lock(ownership_mu_);
+    return owned_bound_ && !owned_unknown_ && !owned_closed_ && !runtime_owner_.expired();
+}
+RemoteExperts::RoutingRead::~RoutingRead() noexcept { reset(); }
+RemoteExperts::RoutingRead::RoutingRead(RoutingRead&& other) noexcept {
+    remote_=std::exchange(other.remote_,nullptr); generation_=std::exchange(other.generation_,0);
+    owner_=std::move(other.owner_);
+}
+RemoteExperts::RoutingRead& RemoteExperts::RoutingRead::operator=(RoutingRead&& other) noexcept {
+    if (this != &other) {
+        reset(); remote_=std::exchange(other.remote_,nullptr); generation_=std::exchange(other.generation_,0);
+        owner_=std::move(other.owner_);
+    }
+    return *this;
+}
+void RemoteExperts::RoutingRead::reset() noexcept {
+    if (remote_) remote_->end_routing(generation_);
+    remote_=nullptr; generation_=0; owner_.reset(); // outside remote mutex/method
+}
+RemoteExperts::PlacementWrite::~PlacementWrite() noexcept { reset(); }
+RemoteExperts::PlacementWrite::PlacementWrite(PlacementWrite&& other) noexcept {
+    remote_=std::exchange(other.remote_,nullptr); generation_=std::exchange(other.generation_,0);
+    owner_=std::move(other.owner_);
+}
+RemoteExperts::PlacementWrite& RemoteExperts::PlacementWrite::operator=(PlacementWrite&& other) noexcept {
+    if (this != &other) {
+        reset(); remote_=std::exchange(other.remote_,nullptr); generation_=std::exchange(other.generation_,0);
+        owner_=std::move(other.owner_);
+    }
+    return *this;
+}
+void RemoteExperts::PlacementWrite::reset() noexcept {
+    if (remote_) remote_->end_writer(generation_,owner_);
+    remote_=nullptr; generation_=0; owner_.reset();
+}
+RemoteExperts::Admission RemoteExperts::try_routing_read(RoutingRead& out) noexcept {
+    if (out) return Admission::invalid;
+    std::lock_guard<std::mutex> lock(ownership_mu_);
+    if (!owned_bound_) return Admission::unbound;
+    if (owned_unknown_ || owned_closed_) return Admission::unknown;
+    if (routing_generation_ || writer_generation_ || compute_generation_) return Admission::busy;
+    if (next_generation_ == UINT64_MAX) return Admission::exhausted;
+    auto owner=runtime_owner_.lock();
+    if (!owner) return Admission::unknown;
+    out.owner_=std::move(owner); out.remote_=this; out.generation_=next_generation_++;
+    routing_generation_=out.generation_;
+    return Admission::acquired;
+}
+RemoteExperts::Admission RemoteExperts::try_placement_write(PlacementWrite& out) noexcept {
+    if (out) return Admission::invalid;
+    std::lock_guard<std::mutex> lock(ownership_mu_);
+    if (!owned_bound_) return Admission::unbound;
+    if (owned_unknown_ || owned_closed_) return Admission::unknown;
+    if (routing_generation_ || compute_generation_ || copy_readers_ || writer_generation_) return Admission::busy;
+    if (next_generation_ == UINT64_MAX) return Admission::exhausted;
+    auto owner=runtime_owner_.lock();
+    if (!owner) return Admission::unknown;
+    out.owner_=std::move(owner); out.remote_=this; out.generation_=next_generation_++;
+    writer_generation_=out.generation_;
+    writer_attempted_=writer_before_drained_=writer_copies_drained_=false;
+    return Admission::acquired;
+}
+void RemoteExperts::end_routing(uint64_t generation) noexcept {
+    std::lock_guard<std::mutex> lock(ownership_mu_);
+    if (generation && routing_generation_==generation) routing_generation_=0;
+}
+void RemoteExperts::end_writer(uint64_t generation,const std::shared_ptr<NativeRuntimeAttachment>& owner) noexcept {
+    std::lock_guard<std::mutex> lock(ownership_mu_);
+    if (!generation || writer_generation_!=generation) return;
+    if (writer_attempted_) unknown_locked(owner);
+    writer_generation_=0;
+}
+bool RemoteExperts::PlacementWrite::mark_attempted() noexcept {
+    if (!remote_) return false;
+    std::lock_guard<std::mutex> lock(remote_->ownership_mu_);
+    if (remote_->owned_unknown_ || remote_->writer_generation_!=generation_ ||
+        !remote_->writer_before_drained_ || remote_->writer_attempted_) return false;
+    remote_->writer_attempted_=true;
+    return true;
+}
+bool RemoteExperts::PlacementWrite::drain_before_overwrite(std::string& error) {
+    return remote_ && remote_->writer_drain(generation_,true,owner_,error);
+}
+bool RemoteExperts::PlacementWrite::drain_copies(std::string& error) {
+    return remote_ && remote_->writer_drain(generation_,false,owner_,error);
+}
+bool RemoteExperts::writer_drain(uint64_t generation,bool before,
+                                 const std::shared_ptr<NativeRuntimeAttachment>& owner,std::string& error) {
+    {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        if (owned_unknown_ || writer_generation_!=generation ||
+            (before ? writer_attempted_ || writer_before_drained_ : !writer_attempted_ || writer_copies_drained_))
+            return false;
+    }
+    // Sole writer/controller owns this operation; no state mutex across CUDA.
+    // Both streams matter: the prefill cache reader has a separate stream.
+    DeviceScope scope(device_);
+    cudaError_t status=scope.status;
+    if (scope.ok) {
+        status=cudaStreamSynchronize(stream_);
+        const auto read_status=cudaStreamSynchronize(read_stream_);
+        if (status==cudaSuccess) status=read_status;
+    }
+    const auto restored=scope.restore();
+    if (status==cudaSuccess) status=restored;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        if (status!=cudaSuccess) unknown_locked(owner);
+        else if (before) writer_before_drained_=true;
+        else writer_copies_drained_=true;
+    }
+    if (status!=cudaSuccess) {
+        error="remote routing: checked stream/device drain failed";
+        return false;
+    }
+    return true;
+}
+bool RemoteExperts::PlacementWrite::finish_publication() noexcept {
+    if (!remote_) return false;
+    {
+        std::lock_guard<std::mutex> lock(remote_->ownership_mu_);
+        if (remote_->owned_unknown_ || remote_->writer_generation_!=generation_ ||
+            !remote_->writer_attempted_ || !remote_->writer_copies_drained_) return false;
+        remote_->writer_attempted_=false;
+        remote_->writer_generation_=0;
+    }
+    remote_=nullptr; generation_=0; owner_.reset();
+    return true;
+}
+bool RemoteExperts::holds(int64_t layer,int32_t expert) const {
+    if (!owned_bound_) return cache_.slot_of(layer,expert)>=0;
+    std::lock_guard<std::mutex> lock(ownership_mu_);
+    return !owned_unknown_ && !owned_closed_ && !writer_generation_ && cache_.slot_of(layer,expert)>=0;
+}
+bool RemoteExperts::finish_compute(bool unknown) noexcept {
+    std::shared_ptr<NativeRuntimeAttachment> retired;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        if (unknown || owned_unknown_) { unknown_locked(compute_owner_); return false; }
+        compute_generation_=0; compute_ready_=compute_finishing_=false;
+        retired=std::move(compute_owner_);
+    }
+    // The controller holds its own runtime reference across every method call.
+    return true;
+}
+RemoteExperts::CopyRead::~CopyRead() noexcept {
+    if (remote) {
+        std::lock_guard<std::mutex> lock(remote->ownership_mu_);
+        --remote->copy_readers_;
+    }
+    // owner is destroyed after the lock; successful copies retain no cycle.
+}
+bool RemoteExperts::begin(int64_t layer,const float* x,const int32_t* ids,int64_t n_tok,int64_t k,
+                           const int32_t* kind,const int32_t* primary_res,std::string& error) {
+    if (!owned_bound_) return begin_impl(layer,x,ids,n_tok,k,kind,primary_res,error);
+    // Bound the multiplication in the legacy implementation before entering it.
+    if (n_tok<=0 || n_tok>strata::kernels::cpu::MAXT || k!=10) {
+        error="remote routing: invalid managed routing dimensions"; return false;
+    }
+    bool admitted=false;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        if (!owned_unknown_ && !owned_closed_ && routing_generation_ && !writer_generation_ &&
+            !compute_generation_ && next_generation_!=UINT64_MAX) {
+            compute_owner_=runtime_owner_.lock();
+            if (compute_owner_) { compute_generation_=next_generation_++; admitted=true; }
+        }
+    }
+    if (!admitted) { error="remote routing: compute admission refused"; return false; }
+    bool attempted=false;
+    cudaError_t restored=cudaSuccess;
+    try {
+        const bool ok=begin_impl(layer,x,ids,n_tok,k,kind,primary_res,error,&attempted,&restored);
+        if (!ok || restored!=cudaSuccess) {
+            finish_compute(attempted || restored!=cudaSuccess);
+            return false;
+        }
+        // Success retains the exact operation until finish, even with no hits.
+        bool healthy;
+        { std::lock_guard<std::mutex> lock(ownership_mu_); healthy=!owned_unknown_; compute_ready_=healthy; }
+        if (!healthy) { finish_compute(true); return false; }
+        return true;
+    } catch (...) {
+        finish_compute(attempted || restored!=cudaSuccess);
+        throw;
+    }
+}
+bool RemoteExperts::finish(float* out,std::string& error) {
+    if (!owned_bound_) return finish_impl(out,error);
+    bool admitted=false;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        if (!owned_unknown_ && !owned_closed_ && compute_generation_ && compute_ready_ && !compute_finishing_) {
+            compute_finishing_=true; admitted=true;
+        }
+    }
+    if (!admitted) { error="remote routing: finish admission refused"; return false; }
+    cudaError_t restored=cudaSuccess;
+    try {
+        const bool ok=finish_impl(out,error,&restored);
+        return finish_compute(!ok || restored!=cudaSuccess);
+    } catch (...) { finish_compute(true); throw; }
+}
+bool RemoteExperts::copy_cached_blobs(const int32_t* layers,const int32_t* experts,uint8_t* const* dst,
+                                       size_t n,uint8_t* hit,std::string& error) {
+    if (!owned_bound_) return copy_cached_blobs_legacy(layers,experts,dst,n,hit,error);
+    CopyRead admission;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        if (!owned_unknown_ && !owned_closed_ && !writer_generation_ && copy_readers_<max_copy_readers_) {
+            admission.owner=runtime_owner_.lock();
+            if (admission.owner) { ++copy_readers_; admission.remote=this; }
+        }
+    }
+    if (!admission.remote) {
+        std::fill(hit,hit+n,0);
+        error="remote routing: cache read admission refused"; return false;
+    }
+    // Admission destruction is after read_mu_ release. No GPU work holds ownership_mu_.
+    std::lock_guard<std::mutex> reader(read_mu_);
+    std::fill(hit,hit+n,0);
+    bool healthy;
+    { std::lock_guard<std::mutex> lock(ownership_mu_); healthy=!owned_unknown_ && !owned_closed_; }
+    if (!healthy) { error="remote routing: queued cache read became unhealthy"; return false; }
+    DeviceScope scope(device_);
+    bool dirty=false;
+    auto drain_destination=[&]() noexcept {
+        if (dirty) {
+            if (cudaStreamSynchronize(read_stream_)!=cudaSuccess) remote_ownership_fatal();
+            dirty=false;
+        }
+    };
+    try {
+        if (!scope.ok) {
+            if (scope.restore()!=cudaSuccess) remote_ownership_fatal();
+            error="remote routing: cache read device selection failed";
+            return false;
+        }
+        bool ok=true;
+        const auto& layout=strata::kernels::cpu::expert_layout();
+        for (size_t i=0;i<n;++i) {
+            if (!dst[i]) continue;
+            const auto slot=cache_.slot_of(layers[i],experts[i]);
+            if (slot<0) continue;
+            dirty=true; // BEFORE even a failing submission; destination cannot escape uncertain
+            const auto status=cudaMemcpyAsync(dst[i],cache_.device_slot(slot),size_t(layout.blob_bytes(layers[i])),
+                                               cudaMemcpyDeviceToHost,read_stream_);
+            if (status!=cudaSuccess) { ok=false; break; }
+            hit[i]=1;
+        }
+        drain_destination();
+        if (scope.restore()!=cudaSuccess) {
+            { std::lock_guard<std::mutex> lock(ownership_mu_); unknown_locked(admission.owner); }
+            error="remote routing: cache read device restoration failed";
+            return false;
+        }
+        if (!ok) error="remote routing: cache read submission failed (destination drained)";
+        return ok;
+    } catch (...) {
+        // Source/layout/diagnostic exceptions never return a still-written caller buffer.
+        drain_destination();
+        if (scope.restore()!=cudaSuccess) remote_ownership_fatal();
+        throw;
+    }
+}
+// END owned remote routing admission
 
 RemoteExperts::~RemoteExperts() { close(); }
 
@@ -97,25 +434,37 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
 }
 
 void RemoteExperts::close() {
+    if (owned_bound_) {
+        std::lock_guard<std::mutex> lock(ownership_mu_);
+        if (owned_unknown_ || routing_generation_ || compute_generation_ || writer_generation_ || copy_readers_)
+            remote_ownership_fatal();
+        owned_closed_=true;
+    }
     if (device_ < 0) return;
     DeviceScope scope(device_);
+    if (strict_retirement_configured_ && !scope.ok) remote_ownership_fatal();
     if (scope.ok) {
-        if (stream_) cudaStreamSynchronize(stream_);
-        if (read_stream_) cudaStreamSynchronize(read_stream_);
+        // Pre-open strict configuration covers partial startup BEFORE binding.
+        // Missing streams do not imply completed work or require a fake drain.
+        if (stream_ && cudaStreamSynchronize(stream_)!=cudaSuccess && strict_retirement_configured_)
+            remote_ownership_fatal();
+        if (read_stream_ && cudaStreamSynchronize(read_stream_)!=cudaSuccess && strict_retirement_configured_)
+            remote_ownership_fatal();
         cache_.close();
-        if (d_x_) cudaFree(d_x_);
-        if (d_out_) cudaFree(d_out_);
-        if (d_q8_) cudaFree(d_q8_);
-        if (d_scales_) cudaFree(d_scales_);
-        if (d_xr_) cudaFree(d_xr_);
-        if (d_scratch_) cudaFree(d_scratch_);
-        if (d_meta_) cudaFree(d_meta_);
-        if (h_x_) cudaFreeHost(h_x_);
-        if (h_out_) cudaFreeHost(h_out_);
-        if (h_meta_) cudaFreeHost(h_meta_);
-        if (stream_) cudaStreamDestroy(stream_);
-        if (read_stream_) cudaStreamDestroy(read_stream_);
+        if (d_x_ && cudaFree(d_x_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (d_out_ && cudaFree(d_out_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (d_q8_ && cudaFree(d_q8_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (d_scales_ && cudaFree(d_scales_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (d_xr_ && cudaFree(d_xr_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (d_scratch_ && cudaFree(d_scratch_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (d_meta_ && cudaFree(d_meta_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (h_x_ && cudaFreeHost(h_x_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (h_out_ && cudaFreeHost(h_out_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (h_meta_ && cudaFreeHost(h_meta_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (stream_ && cudaStreamDestroy(stream_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
+        if (read_stream_ && cudaStreamDestroy(read_stream_)!=cudaSuccess && strict_retirement_configured_) remote_ownership_fatal();
     }
+    if (strict_retirement_configured_ && scope.restore()!=cudaSuccess) remote_ownership_fatal();
     device_ = -1;
     stream_ = nullptr;
     read_stream_ = nullptr;
@@ -136,6 +485,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          const std::vector<std::pair<int32_t, int32_t>>& ranked,
                          const ExpertCache& primary, ExpertSource& source,
                          std::vector<uint8_t>& claimed, std::string& err, bool auto_size, ExpertTierOpenObserver* observer) {
+    if (owned_bound_) { err="remote routing: bound helper cannot reopen"; return false; }
+    remote_open_started_=true;
     ExpertTierOpenTransaction observation(observer);
     if(!observation.valid(ranked.size())) {err="remote open observer storage/callbacks invalid";return false;}
     close();
@@ -274,9 +625,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     return true;
 }
 
-bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
+bool RemoteExperts::begin_impl(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                           int64_t k, const int32_t* kind, const int32_t* primary_res,
-                          std::string& err) {
+                          std::string& err, bool* attempted, cudaError_t* restore_status) {
     // cumulative host time in here (staging and launches), reported per request by the driver
     struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
@@ -331,7 +682,8 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     meta->count = (int32_t) group_id_.size();
     const bool reduce = remote_opt_ && remote_opt_->active();
     if (reduce) remote_opt_->prepare(*this, meta + 1);
-    DeviceScope scope(device_);
+    if (attempted) *attempted=true; // retained before first device selection/submission
+    DeviceScope scope(device_, restore_status);
     if (!scope.ok) { err = scope.error(device_); return false; }
     groups_ = (int32_t) group_id_.size();
     const cudaStream_t s = stream_;
@@ -369,9 +721,9 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     return true;
 }
 
-bool RemoteExperts::finish(float* out, std::string& err) {
+bool RemoteExperts::finish_impl(float* out, std::string& err, cudaError_t* restore_status) {
     if (group_id_.empty()) return true;
-    DeviceScope scope(device_);
+    DeviceScope scope(device_, restore_status);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto w0 = std::chrono::steady_clock::now();
     // Spin on the stream like PeerExperts::finish instead of the blocking sync: the layer waits for this helper
@@ -402,7 +754,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     return true;
 }
 
-bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst,
+bool RemoteExperts::copy_cached_blobs_legacy(const int32_t* layers, const int32_t* experts, uint8_t* const* dst,
                                       size_t n, uint8_t* hit, std::string& err) {
     std::fill(hit, hit + n, 0);
     if (device_ < 0 || read_stream_ == nullptr || n == 0) return true;

@@ -27,6 +27,10 @@ namespace strata::kernels::cpu { class ExpertPool; }
 
 namespace strata::prefill {
 
+// Actual Stager worker ceiling, shared with host reader-admission planning.
+// Changing this requires revisiting helper copy-reader metadata reservations.
+inline constexpr int kMaxStagerThreads = 32;
+
 struct PrefillStats {
     int64_t tokens = 0;
     int64_t chunks = 0;
@@ -64,6 +68,15 @@ public:
     // Owner-thread/quiescent only, including process-wide policy writers.
     // Does not resolve lazy configuration; incomplete and not a compatibility seal.
     core::PrefillCpuShareObservation cpu_share_policy() const noexcept;
+    // Quiescent owner-thread observation for the fixed serving qualification
+    // adapter. Not a synchronization fence or a general compatibility seal.
+    struct ReplayActivity {
+        const void* session=nullptr;const void* source=nullptr;const void* cache=nullptr;
+        const int32_t* residency=nullptr;const Prefill* next=nullptr;
+        int device=-1;int64_t begin=0,end=0;
+        bool initialized=false,helper=false,peer=false,taps=false,borrow_spill=false,pending_force=false;
+    };
+    ReplayActivity replay_activity() const noexcept;
     Prefill();
     ~Prefill();
     /// CUDA ownership mode: configure before init; cleanup uncertainty terminates the worker.

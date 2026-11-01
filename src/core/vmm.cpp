@@ -452,7 +452,7 @@ bool VmmRange::prepare_managed_metadata(uint64_t count,uint64_t gran,
         uint64_t required=0;
         if(managed_||base_||!h_.empty()||device<0||!count||count>INT64_MAX||count>SIZE_MAX||
            !gran||count>SIZE_MAX/gran||count>std::vector<ManagedSlot>().max_size()||count>std::vector<VmmChunk>().max_size()||
-           !managed_host_bound(count,required)||!lease||lease.use_count()!=1||
+           !managed_host_bound(count,required)||!lease||!lease->canonical_owner(lease)||lease.use_count()!=1||
            lease->purpose()!=ReservationPurpose::foreground||lease->resources().host_bytes<required||
            lease->resources().pinned_bytes||lease->resources().disk_bytes||lease->resources().io_slots||lease->resources().shadows){
             error="managed host preparation requires fresh range and dedicated bounded metadata";return false;
@@ -468,7 +468,7 @@ bool VmmRange::prepare_managed_metadata(uint64_t count,uint64_t gran,
 bool VmmRange::prepare_managed(std::shared_ptr<const ReservationLease> lease,int device,std::string& error) {
     uint64_t required=0;
     if(managed_ || !base_ || mapped_count()!=0 || !managed_domain(device) ||
-       !lease || lease.use_count()!=1 || lease->purpose()!=ReservationPurpose::foreground || !managed_host_bound(h_.size(),required) ||
+       !lease || !lease->canonical_owner(lease) || lease.use_count()!=1 || lease->purpose()!=ReservationPurpose::foreground || !managed_host_bound(h_.size(),required) ||
        lease->resources().host_bytes<required || lease->resources().pinned_bytes ||
        lease->resources().disk_bytes || lease->resources().io_slots || lease->resources().shadows) {
         error="managed range requires empty reserved range and dedicated metadata admission";return false;

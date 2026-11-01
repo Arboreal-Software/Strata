@@ -8,6 +8,9 @@
 #include <vector>
 
 namespace strata::core {
+// Internal DATA selector, never a completed/drained proof. Default NONE.
+// Layout is unconditional so feature-enabled/default TUs have identical ABI.
+enum class NativeAllocationQualificationFault : uint32_t { none, second_arena_cuda_refusal };
 struct NativeSessionRequest {
     int device = -1;
     int64_t layer_begin = 0, layer_end = 0;
@@ -23,6 +26,8 @@ struct NativeSessionRequest {
         const std::shared_ptr<const ReservationLease>&,
         std::vector<std::shared_ptr<QsaElasticView>>&,std::string&)> prepare_elastic;
 
+    NativeAllocationQualificationFault qualification_fault=NativeAllocationQualificationFault::none;
+    int qualification_receipt_fd=-1; // borrowed from concrete synchronous driver
 };
 struct OwnedNativeSession {
     int device = -1;

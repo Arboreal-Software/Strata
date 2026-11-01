@@ -51,3 +51,16 @@ a=header.index('    std::atomic<bool> terminal_copy_query_failed_')
 b=header.index('    bool capture_commit(',a)
 if header[a:b] != (HERE.parent/'verifier_terminal_copy_query/latch.inc').read_text():
     raise SystemExit('stale shared terminal-copy guard')
+
+# Exact current-source counterfactual: remove only the batch-specific repair.
+mutant=actual
+assert mutant.count('    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return false; }\n')==1
+mutant=mutant.replace('    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return false; }\n', "")
+assert mutant.count('    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return -1; }\n')==1
+mutant=mutant.replace('    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return -1; }\n', "")
+assert mutant.count('    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return SnapshotDrain::unhealthy; }\n')==1
+mutant=mutant.replace('    if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return SnapshotDrain::unhealthy; }\n', "")
+block='    if (qc != cudaSuccess) {\n        // Keep the unresolved batch busy and latch BEFORE diagnostic allocation.\n        // A later successful query cannot certify this failed window or reuse it.\n        batch_copy_failed_ = true;\n        err = std::string("verify batch copy stream: ") + cudaGetErrorString(qc);\n        return -1;\n    }\n'
+assert mutant.count(block)==1
+mutant=mutant.replace(block, "")
+assert mutant==(HERE/"before-methods.inc").read_text(), "stale batch counterfactual"

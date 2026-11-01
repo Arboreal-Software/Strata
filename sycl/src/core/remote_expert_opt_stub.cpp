@@ -7,6 +7,23 @@ namespace strata::core {
 
 RemoteExpertOpt::~RemoteExpertOpt() = default;
 
+bool RemoteExpertOpt::set_strict_retirement(bool enabled, const std::vector<int>&,
+                                          std::string& error) {
+    if (!enabled) return true;
+    error = "strict remote optimizer retirement is not supported by the SYCL engine";
+    return false;
+}
+
+bool RemoteExpertOpt::attach_checked(RemoteExperts&, std::string& error) {
+    error = "checked remote optimizer attach is not supported by the SYCL engine";
+    return false;
+}
+
+bool RemoteExpertOpt::close_after_callers_joined() noexcept {
+    // No checked closure proof is available, even for the unsupported stub.
+    return false;
+}
+
 void RemoteExpertOpt::attach(RemoteExperts&) {}
 
 bool RemoteExpertOpt::init(std::string& err) {

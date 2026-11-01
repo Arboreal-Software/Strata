@@ -1,0 +1,86 @@
+[
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "struct SuffixRawTransaction::HostCap {",
+    "end": "struct SuffixRawTransaction::Storage {",
+    "output": "tests/resident_admission/bookkeeping.inc",
+    "sha256": "eafed036d7ab72affd9d5134e7c92e76af5221ae745739731437caa9720ed203"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "SuffixRawResult invalid(const char* why)",
+    "end": "bool bounded_metadata(",
+    "output": "tests/resident_admission/arithmetic.inc",
+    "sha256": "5703000b5d776f9d6332b1f205ee7f9e90199d8f3f6b341be480c0c79efe4b87"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "bool present(const StateDigest& digest)",
+    "end": "bool capture_metadata(",
+    "output": "tests/resident_admission/present.inc",
+    "sha256": "de586c1f1c88f64ec04a814d1c5f94bdfa94345653febeeaef3eb765e3482c77"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "SuffixRawResult SuffixRawTransaction::initialize()",
+    "end": "SuffixRawResult SuffixRawTransaction::initialize_resident_shared_host(",
+    "output": "tests/resident_admission/initialize.inc",
+    "sha256": "ed7aad171914310fda665422e2d261ad87ac4bfa569dc9f8577b34c3bd89589f"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "SuffixRawResult SuffixRawTransaction::admit_host(",
+    "end": "SuffixRawResult SuffixRawTransaction::admit_controller_host(",
+    "output": "tests/resident_admission/admit_host.inc",
+    "sha256": "7a886488e2568b65455e270c0a0896c683eb0fdfa55c1fae74771b486b7a2d77"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "SuffixRawResult SuffixRawTransaction::admit_resident_setup(",
+    "end": "SuffixRawResult SuffixRawTransaction::claim_external_splice(",
+    "output": "tests/resident_admission/admissions.inc",
+    "sha256": "a94279a5c9bf5c14ffd323b195a3e2fbce3660faa0a020e3d3f4b39445d1f7d1"
+  },
+  {
+    "source": "src/core/verify.cpp",
+    "start": "bool Verifier::prepare_serial_completion_gate(",
+    "end": "bool Verifier::set_strict_retirement(",
+    "output": "tests/resident_admission/gate_factory.inc",
+    "sha256": "989ccabc63d51af19cb30003ad0fb50120be1a9db58e58c592d76da6e768745b"
+  },
+  {
+    "source": "include/strata/core/verify.hpp",
+    "start": "    void mark_completion_unhealthy()",
+    "end": "    bool strict_retirement_",
+    "output": "tests/resident_admission/gate_hooks.inc",
+    "sha256": "874c12c4368536766f3fa74e02b0819c053da5ad65f8bed6e66e216669e281c6"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "bool SuffixRawTransaction::identity_matches(",
+    "end": "SuffixRawResult SuffixRawTransaction::initialize()",
+    "output": "tests/resident_admission/identity.inc",
+    "sha256": "f96de8e18f8381e24cd473b61de28b3fe67510885c0e09ec90bef17b67e55d11"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "SuffixRawResult SuffixRawTransaction::initialize_resident_shared_host(",
+    "end": "SuffixRawResult SuffixRawTransaction::initialize_slot_shared_host(",
+    "output": "tests/resident_admission/shared_initialize.inc",
+    "sha256": "959001553ae855d2b3695719dfc1e9236959157d045affbd15f488e37a9c2e3a"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.hpp",
+    "start": "    struct HostUsage {",
+    "end": "    enum class Phase",
+    "output": "tests/resident_admission/host_usage.inc",
+    "sha256": "e2d172a3d0f43fc3f912d4f14d8a04a501d5206bfd6d7067cee2db43c4ffebcc"
+  },
+  {
+    "source": "src/program/suffix_raw_runtime.cpp",
+    "start": "SuffixRawResult SuffixRawTransaction::initialize_slot_shared_host(",
+    "end": "SuffixRawResult SuffixRawTransaction::begin_driver_work()",
+    "output": "tests/resident_admission/slot_shared_initialize.inc",
+    "sha256": "99545f98727f028dea101d24fc2cf1f73c23549c132ff799bb1892ca2d195c4d"
+  }
+]

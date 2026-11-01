@@ -1,0 +1,5 @@
+{
+  "sycl/src/kernels/cuda/native_rope.dp.cpp": "a267e3e8c06565a99b3b16fe276ed1d5ba851bb438c78ae851060dcbc5ea9e53",
+  "include/strata/kernels/native_rope.hpp": "619cb05346306e8bcabfebd168ac65d5c19b524b006ee9d51e5949f7e388c4ec",
+  "extracted_sha256": "946e55da2a2dc0949fc827c91c8808065d4527c6075dfe85afd85fd9ffac8ce1"
+}

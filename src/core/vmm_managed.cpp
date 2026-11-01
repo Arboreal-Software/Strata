@@ -50,6 +50,7 @@ bool PreparedVmmAllocationBatch::prepare(std::span<const VmmBatchDevicePlan> pla
     try {
         uint64_t host=0;
         if(out||!host_bound(plans.size(),host)||!physical||!metadata||
+           !physical->canonical_owner(physical)||!metadata->canonical_owner(metadata)||
            physical.use_count()!=1||metadata.use_count()!=1||physical.get()==metadata.get()||
            metadata->purpose()!=ReservationPurpose::foreground||
            (physical->purpose()!=ReservationPurpose::foreground&&physical->purpose()!=ReservationPurpose::private_attachment)) {

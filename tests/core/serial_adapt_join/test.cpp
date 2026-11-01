@@ -53,7 +53,10 @@ static int run(bool serving,int mode){
  }catch(const std::runtime_error&){assert(mode==1);}
  return 0;
 }
+// Additional actual run-to-launch integration, with explicit mock boundaries.
+#include "controller_cases.hpp"
 int main(){
+ check_controller_entry();
  for(bool serving:{false,true})for(int mode=0;mode<7;++mode){
   if(mode==5&&!serving)continue;
   const auto pid=fork();assert(pid>=0);

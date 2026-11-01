@@ -25,3 +25,14 @@ all-gang cancellation are outside this fixture's proof.
 Public registration and this source checkpoint are prepared, not executed.
 
 Follow-up source checkpoint adds complete route_stats_report and release_gpu_waits extracts (no release stub). Terminal report refuses before allocation/device/host resets. Actual release raises all mapped flags and preserves terminal refusal afterward; stream query errors return false rather than drained. Added same-object NotReady→Success→one finish→no further done announcement and unused-copy/no-query modes. pl_finish itself is not an idempotent public API; this fixture uses the existing done-gated caller protocol, not a fabricated second-finish guarantee. CUDA calls, clock/device scope and CPU sfence remain explicit mocks. No production destructor or caller-level join proof. New follow-up cases remain unexecuted.
+
+## Current-source negative control
+
+`before-methods.inc` is a counterfactual derived from the current complete
+production methods, not a literal historical checkout. The mandatory freshness
+checker binds the exact narrow transformation: the terminal fixture restores
+the defective copy-query check, and the batch fixture removes only the
+batch-specific failure latch guards and error branch. Unrelated current
+checked-device, completion-gate and cleanup behavior remains present. Historical
+frozen candidates and their receipts are separate immutable evidence. This
+reconciled control is prepared and unrun.

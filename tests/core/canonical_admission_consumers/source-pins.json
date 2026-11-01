@@ -1,0 +1,13 @@
+{
+  "include/strata/core/vmm.hpp": "5b5cd0c6d728a84d9f84935bb75b8ac2a81e3913ce838105b3fb996e3eb79390",
+  "include/strata/core/native_retirement.hpp": "b3a9809375980e9b2751c51f8543b2aa80dfd37ff8efc53f3a004c75034c1790",
+  "include/strata/core/owned_qsa_elastic.hpp": "52d4dc39b4cf3ec927305d5e6f611488881f6a517a20f4e9f80e0829d30d0113",
+  "include/strata/core/qsa_elastic_view.hpp": "fed531107127030cfb16b8c50f4e0ad0b471cb30cdf72f0abb986940dfa2d946",
+  "include/strata/core/geometry.hpp": "e9869988fbdc9e18ef3d144dd91e9266c18a190e9ec1a7351ce5c7b858bbd838",
+  "include/strata/artifact/model_family.hpp": "c9d887c922ef86e26dee155e1e61a7fec3fe43417a0b46a44bd2f98d1cca3186",
+  "include/strata/core/window_budget.hpp": "dec3b95c838f31fa7f483d828e1f49c58788ea4d8c9a4bfb01c0e5a6519ec3c9",
+  "src/core/window_budget.cpp": "e613a9b91db3345d3478927cc3f35376054fbb4d2404b9a8e3a41ce340c72a94",
+  "src/core/vmm.cpp": "75830f0d7cbb3c40d52f5f6556b90ef6529dfff075262548fc570bc06ae65dba",
+  "src/core/vmm_managed.cpp": "de1995e9c7c25fd87aff715ab6ffe1f6015cfadfb81bacdb5308f00715deb68c",
+  "src/core/owned_qsa_elastic.cpp": "23028e9b27f9dbca81d78aecb084ec7fd07bba27de421f7bce2b293282b7861c"
+}

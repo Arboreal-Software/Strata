@@ -24,3 +24,14 @@ CTest entries. A parent test configuration must opt into this subdirectory.
 Sanitizer flags are inherited from that configuration. No engine/GPU SDK or model
 is needed. The standalone mock does not establish full production class ABI,
 backend linkage, inter-thread behavior or pipeline-controller ownership safety.
+
+## Current-source negative control
+
+`before-methods.inc` is a counterfactual derived from the current complete
+production methods, not a literal historical checkout. The mandatory freshness
+checker binds the exact narrow transformation: the terminal fixture restores
+the defective copy-query check, and the batch fixture removes only the
+batch-specific failure latch guards and error branch. Unrelated current
+checked-device, completion-gate and cleanup behavior remains present. Historical
+frozen candidates and their receipts are separate immutable evidence. This
+reconciled control is prepared and unrun.

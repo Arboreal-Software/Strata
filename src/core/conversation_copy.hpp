@@ -4,6 +4,7 @@
 #include "strata/core/progress.hpp"
 
 #include <cuda_runtime.h>
+#include "strata/core/resident_copy_fault.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -41,7 +42,11 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
     cudaStream_t s = nullptr;
     cudaError_t e = private_stream(s);
     if (e != cudaSuccess) return e;
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+    e = core::ResidentCopyFault::copy(dst,src,bytes,cudaMemcpyDefault,s);
+#else
     e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
+#endif
     if (e != cudaSuccess || queued) return e;
     e = cudaStreamSynchronize(s);
     core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress

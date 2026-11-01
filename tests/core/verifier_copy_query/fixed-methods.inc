@@ -1,7 +1,7 @@
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return false; }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
@@ -39,7 +39,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (now - last_ring() <= std::chrono::milliseconds(2) || now - ext_checked_ < std::chrono::milliseconds(1))
                 return 0;
             ext_checked_ = now;   // (at most one query a millisecond: pump calls this in a loop)
-            const OnDevice on_device(device_);
+            const OnDevice on_device(device_, strict_retirement_);
             const cudaError_t q = cudaStreamQuery(cs_);
             if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (k + 1)) {
                 err = "verify batch: layer " + std::to_string(lb_ + k) + " never rang (" +
@@ -56,7 +56,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             return 0;
         }
     }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const int S = last_t_;
     // the layers that have rung so far (batch_serve); with one still to ring: did the graph finish without it, or
     // has it waited too long?

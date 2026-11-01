@@ -1,11 +1,46 @@
 class RouterLookahead {
 public:
     RouterLookahead() = default;
+    // Exact additional logical residency-array payload; output unchanged on
+    // overflow/invalid dimensions. Zero layers is valid for legacy empty start.
+    static bool residency_snapshot_bytes(size_t layers, int64_t experts, uint64_t& out) noexcept;
+    // Owned startup only. Consumes a genuine exclusive dedicated foreground
+    // lease after validating exact host bytes and no other resource charges.
+    // Caller uses the actual runtime ledger, not an untrusted aliased lease.
+    // No WindowBudget operation is linked into the default source translation unit.
+    bool configure_residency_snapshot(size_t layers, int64_t experts,
+        std::shared_ptr<const ReservationLease>& lease) noexcept;
     ~RouterLookahead();
     // Terminal stop/join only: preserves source/FS targets and all buffers for
     // the caller's subsequent GPU drain. False requires retaining this owner.
     // Concurrent/reentrant/self close refuses; no join under worker mutex.
     bool close_for_retirement() noexcept;
+    // Reversible writer boundary for the actual borrowed residency table/source.
+    // Caller retains this RouterLookahead through guard destruction, serializes
+    // guard access and freezes configuration. Never destroy the owner via a callback.
+    class SubmittedDrain {
+    public:
+        SubmittedDrain() = default;
+        ~SubmittedDrain() noexcept;
+        void reset() noexcept; // known writer completion/cancellation only
+        SubmittedDrain(const SubmittedDrain&) = delete;
+        SubmittedDrain& operator=(const SubmittedDrain&) = delete;
+        SubmittedDrain(SubmittedDrain&&) = delete;
+        SubmittedDrain& operator=(SubmittedDrain&&) = delete;
+    private:
+        friend class RouterLookahead;
+        RouterLookahead* owner_ = nullptr;
+    };
+    enum class DrainResult { drained, busy, refused };
+    // No deadline means a nonblocking poll. A supplied absolute steady-clock
+    // deadline bounds waiting; callers must not wait on work needing their reactor.
+    // Busy retains the seal in guard for retry; destruction releases it. While
+    // sealed submit drops speculative predictions (counts skipped), never queues.
+    // Only drained authorizes mutation, and only while the same guard is alive.
+    // This joins our submitted warm/predict callbacks, NOT downstream source or
+    // Foresight GPU completion; those owners retain their own ordering contracts.
+    DrainResult drain_submitted(SubmittedDrain& guard,
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
     RouterLookahead(const RouterLookahead&) = delete;
     RouterLookahead& operator=(const RouterLookahead&) = delete;
     /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits, n_expert rows of n_embd.
@@ -17,6 +52,8 @@ public:
     void set_foresight(ForesightSwap* fs);
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
+    /// Caller supplies full startup geometry and serializes writes through this
+    /// synchronous copy. Only the private snapshot survives submit returning.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
     /// STRATA_IO_PREFETCH_DEPTH: how many layers ahead of `layer` are predicted and warmed (default 1, the next layer).
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
@@ -46,8 +83,16 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
+    SubmittedDrain* submitted_drain_ = nullptr; // mu_, nonmovable guard identity
+    std::thread::id worker_id_{}; // mu_, avoids racing thread_ join
+    bool worker_failed_ = false; // sticky, never a successful drain proof
     int64_t layer_ = -1, n_tok_ = 0;
-    const int32_t* host_res_ = nullptr;
+    // Charge declared before allocation: storage is destroyed before its lease.
+    std::shared_ptr<const ReservationLease> residency_lease_;
+    std::vector<int32_t> residency_snapshot_;
+    size_t admitted_layers_ = 0;
+    int64_t admitted_experts_ = 0;
+    bool has_residency_ = false;
     uint64_t sub_gen_ = 0;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;

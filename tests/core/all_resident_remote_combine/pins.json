@@ -1,0 +1,7 @@
+{
+  "src/core/verify.cpp": "d1e0817cf4ebf491bc4ce92c1f2a7ba8d3bbe2c7dc7c1a823f04b8db4b5e51b9",
+  "include/strata/core/verify.hpp": "368b1e244f858a4fc1d54774b3c6232ed7d1754fd2c08ae6f578e4dfcc8ddca6",
+  "src/core/remote_expert_opt.cu": "db4700ef079aadb4775c3a290a19a4ea46a4d4a650cb5aff7ef937d4c14bdd0e",
+  "include/strata/core/remote_expert_opt.hpp": "9eb71f50ca3775cfe98842c0875f77300228d731f18bcd325b44d2c80589c0ee",
+  "tests/core/all_resident_remote_combine/before.inc": "7a8e8d186b55e40d65384dadbc93d5c060008a7357d879d4b70b08bec7a0b9fb"
+}

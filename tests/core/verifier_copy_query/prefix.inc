@@ -22,12 +22,13 @@ static int cudaGraphLaunch(void*,void*){++queries;return 0;}
 static const char* cudaGetErrorString(int){return "injected copy query failure";}
 static void progress_beat(){++beats;}
 static std::string released_note(int){return {};}
-struct OnDevice {explicit OnDevice(int){++device_calls;}};
+struct OnDevice {explicit OnDevice(int,bool checked=false){if(checked)std::_Exit(88);++device_calls;}}; // default-only seam; actual checked scopes have independent tests
 struct WindowDeviceScope {explicit WindowDeviceScope(int){++device_calls;}bool ok(){return true;}bool finish(){++device_calls;return true;}};
 struct SessionState {int ple_prev[2]{};};
 using Clock=std::chrono::steady_clock;
 using PoolMultiFn=void(*)();
 struct Verifier {
+ bool strict_retirement_=false,retirement_init_started_=true;
 #include "../verifier_terminal_copy_query/latch.inc"
  bool batch_copy_failed_=false;std::atomic<bool>b_running_{true},ext_serve_{false},released_{false};
  std::atomic<int64_t>b_k_{0};int64_t b_steps_=0;int lb_=0,le_=1,device_=0,last_t_=1,last_pos_b_=0;

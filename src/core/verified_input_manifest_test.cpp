@@ -1,4 +1,5 @@
 #include "strata/core/verified_input_manifest.hpp"
+#include "strata/core/running_engine_identity.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include <cassert>
 #include <filesystem>
@@ -28,6 +29,25 @@ struct Fixture {
 static const VerifiedManifestParseLimits bounds{65536,256,4096,4096};
 static std::string replace(std::string text,const std::string& from,const std::string& to){auto at=text.find(from);assert(at!=std::string::npos);text.replace(at,from.size(),to);return text;}
 int main(){Fixture f;auto b=budget();std::shared_ptr<const ParsedVerifiedInputs> plan;auto r=ParsedVerifiedInputs::read(f.path,hash(f.text),bounds,b,plan);if(!r)std::cerr<<r.detail<<'\n';assert(r&&plan&&plan->digest()==hash(f.text)&&b.snapshot().reserved.host_bytes>0&&b.snapshot().reserved.io_slots==0);
+    assert(!plan->expected_running_executable(b)); // Legacy v1 cannot mint executable authority.
+    {
+        auto v2=replace(f.text,"MANIFEST\t1\n","MANIFEST\t2\n")+"BIND\texpert-profile\t-\n";
+        write(f.path,v2);std::shared_ptr<const ParsedVerifiedInputs> legacy;
+        assert(ParsedVerifiedInputs::read(f.path,hash(v2),bounds,b,legacy));
+        assert(!legacy->expected_running_executable(b));
+        const auto image="MAIN_IMAGE\t256\t"+hex(hash("expected executable"))+"\n";
+        auto v3=replace(v2,"MANIFEST\t2\n","MANIFEST\t3\n")+image;
+        write(f.path,v3);std::shared_ptr<const ParsedVerifiedInputs> current;
+        assert(ParsedVerifiedInputs::read(f.path,hash(v3),bounds,b,current));
+        auto expected=current->expected_running_executable(b);assert(expected&&expected->bytes()==256&&expected->digest()==hash("expected executable"));
+        auto old=current;
+        for(const auto& bad:{replace(v2,"MANIFEST\t2\n","MANIFEST\t3\n"),v3+image,v2+image,
+                            replace(v3,"MAIN_IMAGE\t256","MAIN_IMAGE\t0")}) {
+            write(f.path,bad);assert(!ParsedVerifiedInputs::read(f.path,hash(bad),bounds,b,current));assert(current==old);
+        }
+        std::weak_ptr<const ParsedVerifiedInputs> held=current;old.reset();current.reset();assert(!held.expired());expected.reset();assert(held.expired());
+        write(f.path,f.text);
+    }
     auto rejects=[&](const std::string& text){write(f.path,text);auto output=plan;auto prior=b.snapshot().reserved;auto result=ParsedVerifiedInputs::read(f.path,hash(text),bounds,b,output);assert(!result&&output==plan&&b.snapshot().reserved==prior);};
     rejects(replace(f.text,"MANIFEST\t1","MANIFEST\t2"));rejects(f.text+"BIND\tpack\tpack\n");rejects(replace(f.text,"BIND\tple\t-\n",""));rejects(replace(f.text,"BIND\tembedding\t-","BIND\tunknown\t-"));rejects(replace(f.text,"max_files\t32","max_files\t18446744073709551616"));rejects(replace(f.text,"GGUF\tmain\t0","GGUF\tmain\t1"));rejects(replace(f.text,"ALIAS\tdense.bin\tpack/dense.bin","ALIAS\tdense.bin\t../dense.bin"));rejects(replace(f.text,"head-primary\t-","head-primary\tmodels/model.gguf"));rejects(replace(f.text,"PACK\tpack\tmodels/model.gguf","PACK\tpack\tmissing"));rejects(replace(f.text,"artifact_block_bytes\t64","artifact_block_bytes\t0"));rejects(replace(f.text,"allow_full_copy\t1","allow_full_copy\t2"));rejects(f.text+"UNKNOWN\tx\n");
     write(f.path,f.text);auto expected=hash(f.text);expected[0]^=1;auto output=plan;r=ParsedVerifiedInputs::read(f.path,expected,bounds,b,output);assert(r.error==VerifiedArtifactError::hash_mismatch&&output==plan);output.reset();

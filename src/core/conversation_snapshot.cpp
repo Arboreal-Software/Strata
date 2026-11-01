@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/raw_int8_restore_clear.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
@@ -109,6 +110,32 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     }
     return true;
 }
+
+namespace {
+/// Destination rows beyond a restored prefix are omitted by the copy and keep whatever the session held before.
+/// They are READ: attention's partial page covers positions that were never computed, and the next capture
+/// rounds them into the serialized image.  Canonicalize that tail on the live destination whenever the shape is
+/// one the shared planner is proven for; other shapes (streamed, ring, Q4_0, K8V4, rotated, elastic/VMM) keep
+/// their existing behavior and must be qualified separately rather than cleared by guesswork.
+/// Returns true for a genuine no-op on an unsupported shape; false only on a real submission/drain failure.
+bool canonicalize_restored_suffix(const QsaState& st, const ModelGeometry& g, int64_t cells, std::string& error) {
+    RawInt8RestoreClearPlan plan;
+    if (!raw_int8_restore_clear_plan(st, g, uint64_t(cells), strata::kernels::qsa_real_shapes().page_size, plan))
+        return true;
+    cudaStream_t stream = nullptr;
+    // Same private non-blocking copy stream, acquired on the device that is current for this restore.
+    const bool cleared = apply_raw_int8_restore_clear_plan(plan, [&](void* data, size_t offset, size_t bytes) {
+        if (!stream && conversation_detail::private_stream(stream) != cudaSuccess) return false;
+        return cudaMemsetAsync(static_cast<uint8_t*>(data) + offset, 0, bytes, stream) == cudaSuccess;
+    });
+    if (!cleared) { error = "conversation snapshot: INT8 suffix canonicalization failed"; return false; }
+    if (stream && cudaStreamSynchronize(stream) != cudaSuccess) {
+        error = "conversation snapshot: INT8 suffix canonicalization drain failed";
+        return false;
+    }
+    return true;
+}
+} // namespace
 
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
@@ -260,6 +287,12 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    // The restored extent is the layout's page-rounded cell count; if that cannot be computed, canonicalize
+    // nothing rather than assuming extent 0 (which would clear the whole pool).
+    Layout whole{};
+    std::string ignored;
+    if (layout(st, g, upto, index, whole, ignored) && !canonicalize_restored_suffix(st, g, whole.cells, error))
+        return false;
     return refresh_residency(st, g, upto, error);
 }
 
@@ -281,6 +314,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    if (!canonicalize_restored_suffix(st, g, l.cells, error)) return false;
     return refresh_residency(st, g, upto, error);
 }
 

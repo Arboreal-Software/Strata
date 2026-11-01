@@ -1,3 +1,10 @@
+#include "strata/core/native_batch_slot_binding.hpp"
+#include "strata/core/native_batch_group_completion.hpp"
+#include "strata/core/native_batch_setup_admission.hpp"
+#include "strata/core/window_budget.hpp"
+#include <limits>
+#include <cmath>
+#include <type_traits>
 #include "strata/core/strict_retirement.hpp"
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
@@ -111,14 +118,14 @@ struct RouteResidentCfg {
     // picks the block by the host thread's current device.  nullptr (the allocation failed): the kernel runs without counters.
     std::mutex mu;
     std::map<int, unsigned long long*> blocks;
-    unsigned long long* stats_on(int dev) {
+    unsigned long long* stats_on(int dev, bool checked = false) {
         if (margin <= 0.0f || dev < 0) return nullptr;
         std::lock_guard<std::mutex> lk(mu);
         const auto it = blocks.find(dev);
         if (it != blocks.end()) return it->second;
         unsigned long long* p = nullptr;
         {
-            const OnDevice on(dev);
+            const OnDevice on(dev, checked);
             if (cudaMalloc((void**) &p, 8 * sizeof(unsigned long long)) != cudaSuccess ||
                 cudaMemset(p, 0, 8 * sizeof(unsigned long long)) != cudaSuccess) {
                 (void) cudaGetLastError();
@@ -466,7 +473,7 @@ void release_live_verifiers(std::FILE* f) {
             if (f != nullptr)
                 std::fprintf(f, "strata: released the verify window's GPU waits (#267): the GPU %s\n",
                              done ? ("finished in " + std::to_string((long long) ms_since(t0)) + " ms").c_str()
-                                  : "did not finish within 5 s");
+                                  : "drain not confirmed (query failed or timed out)");
         }
     if (f != nullptr) std::fflush(f);
 }
@@ -486,7 +493,7 @@ int64_t trace_now_ns() {
 }
 std::string released_note(bool drained) {
     return drained ? "; its GPU waits were released and the GPU finished (#267)"
-                   : "; its GPU waits were released but the GPU did not finish within 5 s (#267)";
+                   : "; its GPU waits were released but drain was not confirmed (query failed or timed out) (#267)";
 }
 // #267 test hook: STRATA_TEST_VERIFY_STALL=N withholds the last layer's flag in the N-th window (1-based), so the
 // GPU spins on a flag nobody raises - the bounded window wait and the release are then what ends it.  Unset: never.
@@ -510,6 +517,7 @@ const int64_t g_test_drop = [] {
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
+    mark_completion_unhealthy(); // linearize request BEFORE flags/drain
     released_.store(true);
     trace_ev("RELEASE", -1, -1, timeout_ms);
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
@@ -519,7 +527,13 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
-    const OnDevice on_device(device_);
+    // An unused strict verifier may still participate in no-work cleanup.
+    // Never treat a partially initialized/stream-owning object as this case.
+    if (strict_retirement_ && !retirement_init_started_ && device_ < 0 && !cs_ && !copy_) {
+        trace_ev("RELEASE-DRAINED", -1, -1, 0);
+        return true;
+    }
+    const OnDevice on_device(device_, strict_retirement_);
     const Clock::time_point t0 = Clock::now();
     for (cudaStream_t s : {cs_, copy_}) {
         if (s == nullptr) continue;
@@ -612,7 +626,46 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 
+bool Verifier::prepare_serial_completion_gate(Verifier& root,
+    std::shared_ptr<const ReservationLease> metadata,
+    std::shared_ptr<VerifierCompletionGate>& output,std::string& error,
+    std::shared_ptr<const void> lifetime_credit) {
+    // Bind before init can publish a stage to the watchdog registry. Caller
+    // excludes topology mutation; allocation failure leaves stages untouched.
+    if(output||!metadata||!metadata->canonical_owner(metadata)||metadata.use_count()!=1||
+       metadata->purpose()!=ReservationPurpose::foreground)return false;
+    const auto& charge=metadata->resources();
+    if(charge.host_bytes<VerifierCompletionGate::metadata_bytes()||charge.pinned_bytes||
+       charge.disk_bytes||charge.io_slots||charge.shadows)return false;
+    for(uint64_t bytes:charge.device_bytes)if(bytes)return false;
+    std::array<Verifier*,VerifierCompletionGate::max_stages> stages{};
+    std::size_t count=0;
+    for(Verifier* p=&root;p;p=p->next_) {
+        if(count==stages.size()||p->retirement_init_started_||!p->strict_retirement_||p->completion_gate_||
+           p->released_.load(std::memory_order_acquire)||
+           p->terminal_copy_query_failed_.load(std::memory_order_acquire))return false;
+        for(std::size_t i=0;i<count;++i)if(stages[i]==p)return false;
+        stages[count++]=p;
+    }
+    try {
+        // Retain both admissions before allocating Gate. shared_ptr constructor
+        // failure invokes this deleter before releasing its captured owners.
+        VerifierCompletionGate::RetainedDelete retained{std::move(lifetime_credit),std::move(metadata)};
+        VerifierCompletionGate::RetainedAllocator<VerifierCompletionGate> allocator{
+            retained.lifetime_credit,retained.metadata};
+        auto gate=std::shared_ptr<VerifierCompletionGate>(new VerifierCompletionGate,
+            std::move(retained),std::move(allocator));
+        gate->count_=count;
+        for(std::size_t i=0;i<count;++i)gate->identities_[i]=stages[i];
+        for(std::size_t i=0;i<count;++i) {
+            stages[i]->completion_stage_=i;stages[i]->completion_gate_=gate;
+        }
+        output=std::move(gate);error.clear();return true;
+    }catch(const std::bad_alloc&){return false;}
+}
+
 bool Verifier::set_strict_retirement(bool enabled, std::string& error) {
+    if(completion_gate_) { error="verifier completion policy is sealed";return false; }
     if (retirement_init_started_) { error = "strict retirement must be configured before init"; return false; }
 #if defined(STRATA_GPU_METAL)
     if (enabled) { error = "strict retirement is unsupported by Metal"; return false; }
@@ -621,11 +674,38 @@ bool Verifier::set_strict_retirement(bool enabled, std::string& error) {
     return true;
 }
 
+bool Verifier::set_checked_requested_layout(VerifierSetupQuoteLimits limits,std::string& error) {
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    (void)limits;error="checked requested layout initially supports CUDA only";return false;
+#else
+    if(retirement_init_started_||checked_layout_enabled_||!strict_retirement_||
+       !limits.max_device_bytes||!limits.max_host_bytes) {
+        error="checked requested layout requires strict preinit and positive explicit caps";return false;
+    }
+    checked_layout_limits_=limits;checked_layout_enabled_=true;return true;
+#endif
+}
+
 RouteTailPolicyObservation Verifier::route_tail_policy() const noexcept {
     return observe_tail_skip_policy();
 }
 
+bool Verifier::diagnostic_contains_address(std::uintptr_t address) {
+    return g_verifier_readers.contains_address(address);
+}
+
 Verifier::~Verifier() {
+    if(owned_batch_setup_){
+        auto& setup=*const_cast<NativeBatchSetupAdmission*>(owned_batch_setup_.get());
+        setup.ready_=false; // revoke every group before the first graph borrower dies
+        for(size_t stage=0;stage<setup.count_;++stage)if(auto* verifier=setup.stages_[stage]){
+            const OnDevice device(verifier->device_,true);
+            retirement_check(true,cudaStreamSynchronize(verifier->cs_),"owned batch all-stage compute retirement");
+            retirement_check(true,cudaStreamSynchronize(verifier->copy_),"owned batch all-stage copy retirement");
+        }
+        for(size_t stage=0;stage<setup.count_;++stage)if(setup.stages_[stage]==this)setup.stages_[stage]=nullptr;
+    }
+    mark_completion_unhealthy(); // no future publication while this stage retires
     g_verifier_readers.retire(this);   // before Metal/device/member cleanup, outside the registry lock
     StrictRetirementDevice retirement(strict_retirement_ && device_ >= 0, device_);
 #if defined(STRATA_GPU_METAL)
@@ -700,7 +780,7 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     if (refuse_copy_query_failure(err)) return false;
     if (next_ && !next_->set_logit_bias(bias, err)) return false;
     if (le_ < g_->n_layers) return true;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
         err = "logit_bias vocabulary size mismatch"; return false;
     }
@@ -719,12 +799,41 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
+    if(checked_layout_enabled_) {
+        // Inspect ACTUAL state/configuration, never caller-supplied flags. This
+        // only restricts explicitly enumerated requests; cold shared init,
+        // streams/events/graphs remain SEPARATE admitted-owner obligations.
+        if(!strict_retirement_||arena_||max_t!=2||ss.k!=10||!ss.qsa_states||ss.qsa_alloc<=0||
+           g.qsa_interval<=0||g.n_layers<=0||g.n_layers>4096||ss.qsa_ord0<0||
+           ss.qsa_alloc>g.n_qsa_layers()||ss.qsa_ord0>g.n_qsa_layers()-ss.qsa_alloc||
+           bal_||!tap_req_.empty()||remote_opt_||adapt_gate_||!slots_.empty()||
+           always_publish_||pre_launch_||hflag_in_d_||hflag_out_d_) {
+            err="unsupported actual checked requested-layout profile";return false;
+        }
+        const int64_t cells=ss.qsa_states[ss.qsa_primary()].max_cells;
+        if(cells<=0||cells>INT32_MAX-7||cells%4) {
+            err="checked-layout actual QSA capacity/int cast bound";return false;
+        }
+        for(const char* name:{"STRATA_TAP_FILE","STRATA_VERIFY_PROFILE","STRATA_VERIFY_TRACE",
+            "STRATA_ROUTE_STATS","STRATA_VERIFY_DEVICE_PLAN","STRATA_DF_BRANCH","STRATA_HC_PERSIST",
+            "STRATA_VERIFY_ASYNC_LAUNCH","STRATA_VERIFY_NODES","STRATA_DBG_NAN"})
+            if(std::getenv(name)!=nullptr){err="unpriced optional checked-layout policy";return false;}
+        if(!std::isfinite(route_resident_cfg().margin)||route_resident_cfg().margin>0){err="unpriced shared route counter policy";return false;}
+        for(int64_t value:{g.n_embd,g.hc,g.hc_lr,g.ssm_conv_channels,g.ssm_value_dim,g.ssm_v_heads,
+            g.n_head,g.n_head_kv,g.head_dim,g.idx_q_heads,g.idx_key_dim,g.n_ff,g.n_expert})
+            if(value<=0||value>INT32_MAX){err="checked-layout dimension/int cast bound";return false;}
+        if(g.head_dim!=256||g.idx_block!=4||g.idx_top_k<=0||g.idx_top_k>INT32_MAX-3||
+           g.n_head>INT32_MAX/g.head_dim||
+           g.n_embd%32||g.n_ff%32||std::max<int64_t>({g.n_embd,g.ssm_value_dim,g.n_head*g.head_dim})%32) {
+            err="checked-layout native quantizer/attention geometry";return false;
+        }
+    }
     retirement_init_started_ = true;
     (void) g_verifier_readers.publish(this);   // fixed capacity, best effort as before
     diag_verify_fn().store(&diag_active_verifier);
     release_gpu_fn().store(&release_live_verifiers);
     retirement_check(strict_retirement_, cudaGetDevice(&device_), "Verifier init device");   // a layer split's stage on another GPU: its streams, graphs and buffers live there
-    rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
+    rr_stats_ = route_resident_cfg().stats_on(device_, strict_retirement_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
     wt_ = &wt;
@@ -785,8 +894,87 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
+    VerifierSetupLayout checked_layout;
+    bool checked_had_gu=false;
+    if(checked_layout_enabled_) {
+        const auto& layout=strata::kernels::cpu::expert_layout();
+        if(!layout.native||layout.max_blob<=0){err="checked layout requires actual native expert layout";return false;}
+        for(const auto& format:layout.fmt)checked_had_gu=checked_had_gu||format.had_gu;
+        // Optional resident/device planning allocates extra slot tables outside
+        // the restricted enumeration. Refuse from actual residency BEFORE any
+        // enumerated mapped/arena allocation; no forged all_resident boolean.
+        const char* ar_env=std::getenv("STRATA_VERIFY_ALL_RESIDENT");
+        if(hits.h_res&&(!ar_env||std::atoi(ar_env)!=0)) {
+            bool all=true;
+            for(int64_t l=lb_;l<le_&&all;++l)for(int64_t e=0;e<g.n_expert;++e)
+                if(hits.h_res[l*g.n_expert+e]<0){all=false;break;}
+            if(all){err="unpriced actual all-resident slot-table policy";return false;}
+        }
+        if(strata::kernels::kStepCount!=4||strata::kernels::kVerifyMaxT!=8||
+           strata::kernels::kNonfiniteBlocks!=16||kStagingBlobs!=16||sizeof(unsigned)!=4) {
+            err="checked layout compile-time request constants changed";return false;
+        }
+        VerifierSetupDimensions d;
+        d.max_t=T;d.k=K;d.n_layers=g.n_layers;d.n_gdn_layers=nG;d.n_qsa_layers=nQ;
+        d.n_embd=N;d.hc=HC;d.hc_lr=g.hc_lr;d.conv_channels=C;d.value_dim=ZV;d.v_heads=HV;
+        d.n_head=NH;d.head_dim=HD;d.n_head_kv=NKV;d.idx_q_heads=IQ;d.idx_key_dim=ID;d.idx_block=s.idx_block;
+        d.n_ff=g.n_ff;d.n_expert=g.n_expert;d.n_vocab=n_vocab_;d.max_cells=ss.qsa_states[ss.qsa_primary()].max_cells;d.selection_cap=cap_;
+        // These are ACTUAL helpers. No layout/native bytes accepted from API.
+        VerifierSetupNativeRequests requests{
+            std::max<uint64_t>(strata::kernels::moe_hit_grouped_scratch_bytes(T*K,g.n_embd,g.n_ff),
+                strata::kernels::native_expert_scratch_bytes(T*K,g.n_ff)),
+            strata::kernels::argmax_rows_scratch_bytes(int(T)),uint64_t(layout.max_blob)};
+        VerifierSetupProfile profile;profile.had_gu_any=checked_had_gu;
+        profile.qfuse_counters=g_qfuse()||g_qfuse_hc();profile.external_main_stream=ext_stream_!=nullptr;
+        profile.side_mixer_mode=uint8_t(g_side_mixer());
+        if(enumerate_verifier_explicit_setup(d,requests,profile,checked_layout_limits_,checked_layout)!=VerifierSetupQuoteStatus::ok) {
+            err="checked explicit requested layout refused dimensions/overflow/caps";return false;
+        }
+        auto actual_bytes_match=[&](VerifierArenaField field,uint64_t bytes) noexcept {
+            const auto* entry=checked_layout.find(field);return entry&&entry->requested_bytes==bytes;
+        };
+        if(!actual_bytes_match(VerifierArenaField::xq,strata::kernels::native_q8_1_bytes(max_in,int(T)))||
+           !actual_bytes_match(VerifierArenaField::sh_xq,strata::kernels::native_q8_1_bytes(max_in,int(T)))||
+           !actual_bytes_match(VerifierArenaField::xil,strata::kernels::native_q8_1_il_bytes(max_in,std::max(4,int(T))))||
+           !actual_bytes_match(VerifierArenaField::attn_scratch,uint64_t(attn_scratch_floats_)*T*4)||
+           !actual_bytes_match(VerifierArenaField::hist_snap,T*HS*4)||
+           !actual_bytes_match(VerifierArenaField::ple_key,T*strata::kernels::NG_HC_DIM*4)||
+           !actual_bytes_match(VerifierArenaField::tail_snap,nQ*TS*4)||
+           checked_layout.mapped_count!=17||checked_layout.arena_count!=(checked_had_gu?64u:63u)||
+           checked_layout.quote.arena_bytes>uint64_t(PTRDIFF_MAX)||checked_layout.quote.arena_bytes>SIZE_MAX) {
+            err="actual helper/constants differ from shared named layout";return false;
+        }
+    }
     // ---- mapped staging
-    bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
+    bool ok=false;
+    if(checked_layout_enabled_) {
+        ok=true;
+        for(uint32_t i=0;i<checked_layout.mapped_count&&ok;++i) {
+            const auto& entry=checked_layout.mapped[i];void** host=nullptr;void** device=nullptr;
+            switch(entry.field) {
+            case VerifierMappedField::tok:host=(void**)&h_tok_;device=(void**)&m_tok_;break;
+            case VerifierMappedField::step:host=(void**)&h_step_;device=(void**)&m_step_;break;
+            case VerifierMappedField::pos:host=(void**)&h_pos_;device=(void**)&m_pos_;break;
+            case VerifierMappedField::commit:host=(void**)&h_commit_;device=(void**)&m_commit_;break;
+            case VerifierMappedField::ple:host=(void**)&h_ple_;device=(void**)&m_ple_;break;
+            case VerifierMappedField::out:host=(void**)&h_out_;device=(void**)&m_out_;break;
+            case VerifierMappedField::nf:host=(void**)&h_nf_;device=(void**)&m_nf_;break;
+            case VerifierMappedField::x:host=(void**)&h_x_;device=(void**)&m_x_;break;
+            case VerifierMappedField::ids:host=(void**)&h_ids_;device=(void**)&m_ids_;break;
+            case VerifierMappedField::w:host=(void**)&h_w_;device=(void**)&m_w_;break;
+            case VerifierMappedField::seq:host=(void**)&h_seq_;device=(void**)&m_seq_;break;
+            case VerifierMappedField::flag:host=(void**)&h_flag_;device=(void**)&m_flag_;break;
+            case VerifierMappedField::flagA:host=(void**)&h_flagA_;device=(void**)&m_flagA_;break;
+            case VerifierMappedField::flagB:host=(void**)&h_flagB_;device=(void**)&m_flagB_;break;
+            case VerifierMappedField::plan_err:host=(void**)&h_plan_err_;device=(void**)&m_plan_err_;break;
+            case VerifierMappedField::ymiss:host=(void**)&h_ymiss_;device=(void**)&m_ymiss_;break;
+            case VerifierMappedField::plan:host=(void**)&h_plan_;device=(void**)&m_plan_;break;
+            default:ok=false;break;
+            }
+            if(ok)ok=entry.requested_bytes<=SIZE_MAX&&mapped(size_t(entry.requested_bytes),host,device);
+        }
+    } else {
+        ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
@@ -803,6 +991,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+    }
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
     const char* tap_path = std::getenv("STRATA_TAP_FILE");
@@ -858,7 +1047,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
         plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
-        if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
+        if(checked_layout_enabled_ && (plan_i32_!=168||!h_plan_||!m_plan_)) {
+            err="actual plan schema differs from checked mapped request";return false;
+        }
+        if (!checked_layout_enabled_ && !mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed " + strata::core::pin_exhausted_hint();
             return false;
         }
@@ -882,7 +1074,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu_any = had_gu_any || lay.fmt[l].had_gu;
     }
-    // ---- the device arena: the same sequence counted, then carved
+    if(checked_layout_enabled_&&had_gu_any!=checked_had_gu){err="native format changed during checked init";return false;}
+    // ---- the device arena: default carve remains untouched; opt-in binds NAMED requests.
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
@@ -924,12 +1117,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
     };
     Bump count;
-    carve(count);
+    if(checked_layout_enabled_)count.used=checked_layout.quote.arena_bytes;
+    else carve(count);
     if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
-    cudaMemset(arena_, 0, count.used);
+    if(checked_layout_enabled_) {
+        if(cudaMemset(arena_,0,count.used)!=cudaSuccess){err="checked arena zero failed";return false;}
+    } else cudaMemset(arena_, 0, count.used);
     if (hflag_out_d_ != nullptr && hcount_d_ == nullptr) {   // the overlapped split's hand-off counter
         if (cudaMalloc((void**) &hcount_d_, 64) != cudaSuccess) { err = "verify: hand-off counter allocation failed"; return false; }
         cudaMemset(hcount_d_, 0, 64);
@@ -970,9 +1166,96 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
     }
+    if(checked_layout_enabled_) {
+        uint64_t seen=0;uint32_t bound=0;
+        const uintptr_t base=reinterpret_cast<uintptr_t>(arena_);
+        auto bind=[&](auto*& pointer,VerifierArenaField field,bool optional=false) noexcept {
+            using Pointer=std::remove_reference_t<decltype(pointer)>;
+            using Element=std::remove_pointer_t<Pointer>;
+            const auto* entry=checked_layout.find(field);
+            if(!entry){if(optional){pointer=nullptr;return true;}return false;}
+            const auto id=uint32_t(field);if(id>=64||(seen&(uint64_t(1)<<id)))return false;
+            if(!base||entry->aligned_offset%256||entry->aligned_bytes%256||entry->requested_bytes>entry->aligned_bytes||
+               entry->aligned_offset>count.used||entry->aligned_bytes>count.used-entry->aligned_offset||
+               entry->aligned_offset>UINTPTR_MAX-base)return false;
+            const uintptr_t address=base+uintptr_t(entry->aligned_offset);
+            if constexpr(!std::is_void_v<Element>)
+                if(address%alignof(Element)||entry->requested_bytes%sizeof(Element))return false;
+            // Zero-length named spans keep the valid boundary pointer, including
+            // one-past arena; no pointer is dereferenced during binding.
+            pointer=reinterpret_cast<Pointer>(address);seen|=uint64_t(1)<<id;++bound;return true;
+        };
+        bool bound_ok=true;
+        bound_ok=bound_ok&&bind(tok_,VerifierArenaField::tok);
+        bound_ok=bound_ok&&bind(step_,VerifierArenaField::step);
+        bound_ok=bound_ok&&bind(pos_,VerifierArenaField::pos);
+        bound_ok=bound_ok&&bind(commit_,VerifierArenaField::commit);
+        bound_ok=bound_ok&&bind(ple_,VerifierArenaField::ple);
+        bound_ok=bound_ok&&bind(emb_,VerifierArenaField::emb);
+        bound_ok=bound_ok&&bind(R_,VerifierArenaField::R);
+        bound_ok=bound_ok&&bind(mixed_,VerifierArenaField::mixed);
+        bound_ok=bound_ok&&bind(bo_,VerifierArenaField::bo);
+        bound_ok=bound_ok&&bind(inj_,VerifierArenaField::inj);
+        bound_ok=bound_ok&&bind(inj2_,VerifierArenaField::inj2);
+        bound_ok=bound_ok&&bind(lo_,VerifierArenaField::lo);
+        bound_ok=bound_ok&&bind(rs_,VerifierArenaField::rs);
+        bound_ok=bound_ok&&bind(xn_,VerifierArenaField::xn);
+        bound_ok=bound_ok&&bind(xq_,VerifierArenaField::xq);
+        bound_ok=bound_ok&&bind(sh_xq_,VerifierArenaField::sh_xq);
+        bound_ok=bound_ok&&bind(xil_,VerifierArenaField::xil);
+        bound_ok=bound_ok&&bind(qkv_L_,VerifierArenaField::qkv_L);
+        bound_ok=bound_ok&&bind(h_L_,VerifierArenaField::h_L);
+        bound_ok=bound_ok&&bind(gate_L_,VerifierArenaField::gate_L);
+        bound_ok=bound_ok&&bind(beta_L_,VerifierArenaField::beta_L);
+        bound_ok=bound_ok&&bind(z_,VerifierArenaField::z);
+        bound_ok=bound_ok&&bind(y_,VerifierArenaField::y);
+        bound_ok=bound_ok&&bind(y_dummy_,VerifierArenaField::y_dummy);
+        bound_ok=bound_ok&&bind(qfull_,VerifierArenaField::qfull);
+        bound_ok=bound_ok&&bind(qcur_,VerifierArenaField::qcur);
+        bound_ok=bound_ok&&bind(kcur_,VerifierArenaField::kcur);
+        bound_ok=bound_ok&&bind(vcur_,VerifierArenaField::vcur);
+        bound_ok=bound_ok&&bind(idx_raw_L_,VerifierArenaField::idx_raw_L);
+        bound_ok=bound_ok&&bind(qidx_,VerifierArenaField::qidx);
+        bound_ok=bound_ok&&bind(scores_,VerifierArenaField::scores);
+        bound_ok=bound_ok&&bind(sel_,VerifierArenaField::sel);
+        bound_ok=bound_ok&&bind(attn_,VerifierArenaField::attn);
+        bound_ok=bound_ok&&bind(attn32_,VerifierArenaField::attn32);
+        bound_ok=bound_ok&&bind(attn_scratch_,VerifierArenaField::attn_scratch);
+        bound_ok=bound_ok&&bind(tail_snap_,VerifierArenaField::tail_snap);
+        bound_ok=bound_ok&&bind(logits_,VerifierArenaField::logits);
+        bound_ok=bound_ok&&bind(w_,VerifierArenaField::w);
+        bound_ok=bound_ok&&bind(ids_,VerifierArenaField::ids);
+        bound_ok=bound_ok&&bind(shared_,VerifierArenaField::shared);
+        bound_ok=bound_ok&&bind(parts_,VerifierArenaField::parts);
+        bound_ok=bound_ok&&bind(hit_out_,VerifierArenaField::hit_out);
+        bound_ok=bound_ok&&bind(hit_slot_,VerifierArenaField::hit_slot);
+        bound_ok=bound_ok&&bind(hit_dst_,VerifierArenaField::hit_dst);
+        bound_ok=bound_ok&&bind(hit_count_,VerifierArenaField::hit_count);
+        bound_ok=bound_ok&&bind(plan_,VerifierArenaField::plan);
+        bound_ok=bound_ok&&bind(staging_,VerifierArenaField::staging);
+        bound_ok=bound_ok&&bind(hit_xq_,VerifierArenaField::hit_xq);
+        bound_ok=bound_ok&&bind(hit_xs_,VerifierArenaField::hit_xs);
+        bound_ok=bound_ok&&bind(nat_xq_,VerifierArenaField::nat_xq);
+        bound_ok=bound_ok&&bind(nat_xr_,VerifierArenaField::nat_xr,!had_gu_any);
+        bound_ok=bound_ok&&bind(hit_scratch_,VerifierArenaField::hit_scratch);
+        bound_ok=bound_ok&&bind(head_mixed_,VerifierArenaField::head_mixed);
+        bound_ok=bound_ok&&bind(head_inj_,VerifierArenaField::head_inj);
+        bound_ok=bound_ok&&bind(sh_bf16_,VerifierArenaField::sh_bf16);
+        bound_ok=bound_ok&&bind(sh_gate_,VerifierArenaField::sh_gate);
+        bound_ok=bound_ok&&bind(sh_up_,VerifierArenaField::sh_up);
+        bound_ok=bound_ok&&bind(sh_g_,VerifierArenaField::sh_g);
+        bound_ok=bound_ok&&bind(head_logits_,VerifierArenaField::head_logits);
+        bound_ok=bound_ok&&bind(arg_scratch_,VerifierArenaField::arg_scratch);
+        bound_ok=bound_ok&&bind(one_,VerifierArenaField::one);
+        bound_ok=bound_ok&&bind(hist_snap_,VerifierArenaField::hist_snap);
+        bound_ok=bound_ok&&bind(ple_key_,VerifierArenaField::ple_key);
+        bound_ok=bound_ok&&bind(ple_val_,VerifierArenaField::ple_val);
+        if(!bound_ok||bound!=checked_layout.arena_count){err="checked named arena pointer binding failed";return false;}
+    } else {
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    }
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -2220,7 +2503,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
-        if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
+        // The zero-doorbell graph never resets/populates remote sums.
+        if (remote_opt_ && !ar_on()) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
         if (tap_on_ && !batch_rec_ && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
@@ -2605,6 +2889,14 @@ bool Verifier::capture(int T, std::string& err) {
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
+    if (strict_retirement_ && (ue != cudaSuccess || us != cudaSuccess)) {
+        // Always attempt the stream drain, even after upload fails. Neither a
+        // later successful drain nor cached exec_t can heal this terminal cut.
+        // Failstop directly: the bookkeeping latch takes a host mutex and is
+        // unnecessary before process termination. Retain borrowed owners until
+        // OS context teardown instead of unwinding through uncertain GPU work.
+        retirement_failed(ue != cudaSuccess ? "Verifier capture graph upload" : "Verifier capture upload drain");
+    }
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
@@ -2864,7 +3156,7 @@ bool Verifier::chain_overlap() const {
 
 bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     prelaunched_ = 0;
     cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[T] : exec_[T];   // #871: the variant the previous stage refreshed
     if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
@@ -2897,7 +3189,7 @@ bool Verifier::finish_serial_copies(std::string& err) {
     if (status != cudaSuccess) {
         // Preserve outstanding-work flags even if diagnostic allocation throws.
         // Cleanup remains callable; a successful later sync cannot heal this state.
-        terminal_copy_query_failed_.store(true, std::memory_order_release);
+        latch_copy_query_failure();
         err = std::string("verify: serial copy-stream synchronization failed: ") + cudaGetErrorString(status);
         return false;
     }
@@ -2913,8 +3205,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     (void) user;
     return strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err);
 #endif
+    // A new prelaunch thread uses the child's own policy. Refuse a mixed
+    // chain before capture/launch rather than silently downgrading its scopes.
+    if (strict_retirement_ && next_ != nullptr && !next_->strict_retirement_)
+        retirement_failed("Verifier unchecked child device scope");
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -2930,7 +3226,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (!capture(T, err) || !capture_commit(err)) return false;
     const bool chain = chain_overlap();
     if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
-        const OnDevice on_next(next_->device_);
+        const OnDevice on_next(next_->device_, strict_retirement_ || next_->strict_retirement_);
         next_->refresh_ar();                     // #871: the variant its prelaunch and its run() will both use
         if (!next_->capture(T, err) || !next_->capture_commit(err)) return false;
     }
@@ -3149,7 +3445,18 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         nl.handed = true;
         ++windows;
         const bool ok = next_->run(T, tokens, pos0, pool, next_user_, out, err);
-        const OnDevice back(device_);
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        // Host service and the downstream stage are done: join this stage's
+        // launcher before certifying completion. A pending status() is not a
+        // successful launch, and destructor cleanup must not release waits on
+        // a successful chained window.
+        const cudaError_t launch_result = launch_o ? launch_o->finish() : cudaSuccess;
+        if (launch_result != cudaSuccess) {
+            err = std::string("verify: launch: ") + cudaGetErrorString(launch_result);
+            return false;
+        }
+#endif
+        const OnDevice back(device_, strict_retirement_);
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (!finish_serial_copies(err)) return false;
         if (!ok) return false;
@@ -3348,7 +3655,7 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
                                std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
 #if defined(STRATA_GPU_METAL)
     // the head logits are the Metal window's (window_copy_logits, row by row)
     if (n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
@@ -3423,7 +3730,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
 #if defined(STRATA_GPU_METAL)
     return strata::metal_engine::window_commit(metal_, n_keep, err);
 #endif
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (!commit_failure_.empty()) { err = commit_failure_; return false; }
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -3481,9 +3788,227 @@ bool Verifier::commit(int n_keep, std::string& err) {
 
 // ================================ BATCH WINDOWS (see init_slots) ================================
 
+bool Verifier::owned_batch_slot_matches(const NativeBatchSlotInspection& observed) const noexcept {
+    if(!observed.owner_ || observed.verifier_!=this || !slot_inventory_ready_ ||
+       !slot_verifier_incarnation_ || observed.verifier_incarnation_!=slot_verifier_incarnation_ ||
+       !slot_inventory_generation_ || observed.inventory_generation_!=slot_inventory_generation_ ||
+       released_.load(std::memory_order_acquire) || terminal_copy_query_failed_.load(std::memory_order_acquire) ||
+       batch_copy_failed_ || !snapshot_failure_.empty() || !commit_failure_.empty() || !g_ || !ss_ ||
+       observed.owner_->geometry()!=g_ || slots_.size()!=NativeBatchSlotBindings::slot_count)return false;
+    for(size_t slot=0;slot<slots_.size();++slot){
+        const auto* native=observed.owner_->stage(observed.owner_->token(slot),observed.stage_);
+        if(!native || native->device!=device_ || slots_[slot]!=native->session ||
+           native->session->layer_lo!=ss_->layer_lo || native->session->layer_hi!=ss_->layer_hi ||
+           native->session->max_cells!=ss_->max_cells || native->session->k!=ss_->k ||
+           native->session->gdn_ord0!=ss_->gdn_ord0 || native->session->qsa_ord0!=ss_->qsa_ord0)return false;
+    }
+    const auto* own=observed.owner_->stage(observed.token_,observed.stage_);
+    return own && observed.token_.slot<slots_.size() && slots_[observed.token_.slot]==own->session;
+}
+bool Verifier::inspect_owned_batch_slot(std::shared_ptr<const NativeBatchSlotBindings> owner,NativeBatchSlotToken token,
+                                      size_t stage,NativeBatchSlotInspection& output) const {
+    if(output.present())return false;
+    NativeBatchSlotInspection candidate;candidate.owner_=std::move(owner);candidate.verifier_=this;
+    candidate.token_=token;candidate.stage_=stage;candidate.inventory_generation_=slot_inventory_generation_;
+    candidate.verifier_incarnation_=slot_verifier_incarnation_;
+    if(!owned_batch_slot_matches(candidate))return false;
+    output=std::move(candidate);return true;
+}
+
+bool Verifier::prepare_owned_batch_slots(WindowBudget& budget,
+        std::shared_ptr<const NativeBatchSlotBindings> bindings,uint64_t host_setup_capacity,std::string& error) {
+#if !defined(STRATA_OWNED_BATCH_AVAILABLE)
+    (void)budget;(void)bindings;(void)host_setup_capacity;
+    error="owned batch slots require the window state build";
+    return false;
+#else
+    if(!bindings||host_setup_capacity<NativeBatchSetupAdmission::metadata_bytes())return false;
+    std::array<Verifier*,NativeBatchGroupCompletion::max_stages> chain{};
+    std::array<size_t,NativeBatchGroupCompletion::max_stages> free_before{};
+    std::array<int,NativeBatchGroupCompletion::max_stages> devices{};
+    size_t count=0;int64_t frontier=0;
+    for(Verifier* stage=this;stage;stage=stage->next_){
+        if(count==chain.size()||!stage->g_||stage->g_!=bindings->geometry()||stage->lb_!=frontier||
+           stage->le_<=frontier||!stage->ss_||stage->lb_!=stage->ss_->layer_lo||
+           stage->le_!=stage->ss_->layer_hi||stage->owned_batch_setup_||!stage->slots_.empty()||stage->arena_b_||
+           stage->max_t_!=2||!stage->strict_retirement_||stage->released_.load()||
+           !stage->exec_bm_.empty()||!stage->commit_bm_.empty())return false;
+        for(size_t before=0;before<count;++before)if(chain[before]==stage||devices[before]==stage->device_)return false;
+        for(size_t slot=0;slot<2;++slot){const auto* native=bindings->stage(bindings->token(slot),count);
+            if(!native||native->device!=stage->device_)return false;}
+        chain[count]=stage;devices[count]=stage->device_;++count;frontier=stage->le_;
+    }
+    if(!count||frontier!=bindings->geometry()->n_layers||bindings->stage_count()!=count)return false;
+    // Reserve capacity before the first batch allocation/capture. This API is
+    // called only during exclusive, drained startup: no ambient device allocator
+    // may allocate/free between the before/after measurements.
+    const auto snapshot=budget.snapshot();if(snapshot.overcommitted)return false;
+    WindowResources request;request.device_bytes.resize(snapshot.capacity.device_bytes.size());
+    request.host_bytes=host_setup_capacity;request.pinned_bytes=host_setup_capacity;
+    for(size_t i=0;i<count;++i){const auto device=size_t(devices[i]);
+        if(device>=request.device_bytes.size())return false;
+        request.device_bytes[device]=snapshot.capacity.device_bytes[device]-snapshot.baseline.device_bytes[device]-snapshot.reserved.device_bytes[device];
+        if(!request.device_bytes[device])return false;
+    }
+    auto reservation=budget.reserve(request,ReservationPurpose::foreground);if(!reservation)return false;
+    std::shared_ptr<NativeBatchSetupAdmission> admitted;
+    try{admitted=std::make_shared<NativeBatchSetupAdmission>();}catch(...){return false;}
+    admitted->credit_=std::move(reservation.lease);admitted->bindings_=bindings;
+    for(size_t i=0;i<count;++i){const OnDevice device(devices[i],true);size_t total=0;
+        if(cudaStreamSynchronize(chain[i]->cs_)!=cudaSuccess||cudaStreamSynchronize(chain[i]->copy_)!=cudaSuccess||
+           cudaMemGetInfo(&free_before[i],&total)!=cudaSuccess)return false;
+    }
+    // Attach the complete capacity owner before native work; failed setup keeps
+    // it attached until the actual verifier graph/arena retirement, never drops
+    // credit while a partially constructed allocation can still be referenced.
+    admitted->count_=count;
+    for(size_t i=0;i<count;++i){admitted->stages_[i]=chain[i];chain[i]->owned_batch_setup_=admitted;}
+    bool success=true;const int both[]={0,1};
+    for(size_t i=0;i<count&&success;++i){Verifier& stage=*chain[i];const OnDevice device(devices[i],true);
+        std::vector<SessionState*> sessions;
+        try{for(size_t slot=0;slot<2;++slot)sessions.push_back(bindings->stage(bindings->token(slot),i)->session);}catch(...){success=false;break;}
+        if(!stage.init_slots(sessions,error)){success=false;break;}
+        for(int shape=0;shape<3&&success;++shape){const int* rows=shape<2?both+shape:both;const int n=shape<2?1:2;
+            success=stage.capture_batch(rows,n,0,error)&&stage.capture_commit_batch(rows,n,0,error);
+            if(success&&!batch_self_commits(rows,n)){
+                const auto found=stage.commit_bm_.find(stage.bkey(rows,n,0));
+                if(found==stage.commit_bm_.end()||!found->second){success=false;break;}
+                const auto upload=cudaGraphUpload(found->second,stage.cs_);
+                const auto drained=cudaStreamSynchronize(stage.cs_);
+                if(upload!=cudaSuccess||drained!=cudaSuccess){stage.batch_copy_failed_=true;success=false;}
+            }
+        }
+    }
+    auto retained=request;
+    for(size_t i=0;i<count;++i){Verifier& stage=*chain[i];const OnDevice device(devices[i],true);size_t available=0,total=0;
+        if(cudaStreamSynchronize(stage.cs_)!=cudaSuccess||cudaStreamSynchronize(stage.copy_)!=cudaSuccess||
+           cudaMemGetInfo(&available,&total)!=cudaSuccess||available>free_before[i]){success=false;continue;}
+        const uint64_t used=free_before[i]-available;
+        if(used>request.device_bytes[size_t(devices[i])])success=false;
+        retained.device_bytes[size_t(devices[i])]=used;
+    }
+    if(success&&!budget.shrink_foreground(admitted->credit_,std::move(retained)))success=false;
+    if(!success){for(size_t i=0;i<count;++i){chain[i]->slot_inventory_ready_=false;chain[i]->batch_copy_failed_=true;}return false;}
+    admitted->ready_=true;return true;
+#endif
+}
+
+bool Verifier::run_owned_slot_group(const NativeBatchSlotInspection* bindings,size_t stages,
+        uint64_t operation,const int* rows,int count,const int32_t* tokens,const int64_t* positions,
+        const int* accepted,PoolMultiFn pool,void* user,int32_t* output,
+        std::shared_ptr<const ReservationLease> metadata,
+        std::shared_ptr<const NativeBatchGroupCompletion>& completed,std::string& error) {
+    if(completed||owned_group_busy_||operation<=owned_group_last_operation_||!bindings||!operation||!rows||!tokens||!positions||!accepted||!output||
+       !stages||stages>NativeBatchGroupCompletion::max_stages||count<1||
+       size_t(count)>NativeBatchGroupCompletion::max_rows||!metadata||
+       !metadata->canonical_owner(metadata)||metadata.use_count()!=1||
+       metadata->purpose()!=ReservationPurpose::foreground)return false;
+    // A returned native receipt still owns its base slot state until consumed.
+    // No second group may overwrite that state behind an uncommitted RAW cut.
+    for(const auto& weak:owned_slot_occupancies_)if(auto occupancy=weak.lock();occupancy&&
+        occupancy->submitted_group_.load(std::memory_order_acquire))return false;
+    const auto& charge=metadata->resources();
+    if(charge.host_bytes<NativeBatchGroupCompletion::metadata_bytes()||charge.pinned_bytes||
+       charge.disk_bytes||charge.io_slots||charge.shadows)return false;
+    for(auto bytes:charge.device_bytes)if(bytes)return false;
+    std::array<Verifier*,NativeBatchGroupCompletion::max_stages> chain{};
+    Verifier* next=this;int64_t frontier=0;
+    for(size_t stage=0;stage<stages;++stage){
+        if(!next||!next->owned_batch_setup_||!next->owned_batch_setup_->ready_||
+           !next->g_||next->g_!=g_||!next->ss_||next->lb_!=next->ss_->layer_lo||
+           next->le_!=next->ss_->layer_hi||next->lb_!=frontier||next->le_<=frontier||
+           !next->owned_batch_slot_matches(bindings[stage*2])||
+           !next->owned_batch_slot_matches(bindings[stage*2+1])||
+           bindings[stage*2].stage_!=stage||bindings[stage*2+1].stage_!=stage||
+           bindings[stage*2].token_.slot!=0||bindings[stage*2+1].token_.slot!=1||
+           bindings[stage*2].owner_!=bindings[0].owner_||
+           bindings[stage*2+1].owner_!=bindings[0].owner_)return false;
+        for(size_t before=0;before<stage;++before)if(chain[before]==next)return false;
+        chain[stage]=next;frontier=next->le_;next=next->next_;
+    }
+    if(next||frontier!=g_->n_layers||count>2)return false;
+    const int64_t vocabulary=chain[stages-1]->n_vocab_;
+    if(vocabulary<=0)return false;
+    std::array<int,2> counts{};std::array<int,2> row_index{-1,-1};int previous=-1;
+    for(int row=0;row<count;++row){
+        const int slot=rows[row];
+        if(slot<0||slot>=2||slot<=previous||positions[row]<0||positions[row]>=INT32_MAX||
+           tokens[row]<0||int64_t(tokens[row])>=vocabulary)return false;
+        for(size_t stage=0;stage<stages;++stage){
+            const auto* native=bindings[stage*2+size_t(slot)].owner_->stage(
+                bindings[stage*2+size_t(slot)].token_,stage);
+            if(!native||positions[row]>=native->session->max_cells)return false;
+        }
+        previous=slot;++counts[slot];row_index[size_t(slot)]=row;
+    }
+    for(size_t slot=0;slot<2;++slot)
+        if((counts[slot]&&(accepted[slot]<1||accepted[slot]>counts[slot]))||
+           (!counts[slot]&&accepted[slot]))return false;
+    // Construct the complete pending owner before native submission. Only this
+    // function may publish it, after actual dispatch/commit and all-stage drain.
+    std::shared_ptr<NativeBatchGroupCompletion> pending;
+    try{
+        auto retained=[credit=std::move(metadata)](NativeBatchGroupCompletion* p){delete p;};
+        pending=std::shared_ptr<NativeBatchGroupCompletion>(new NativeBatchGroupCompletion,std::move(retained));
+    }catch(...){error="owned batch group metadata allocation failed";return false;}
+    pending->operation_=operation;pending->rows_=size_t(count);pending->stages_=stages;
+    for(size_t stage=0;stage<stages*2;++stage)pending->bindings_[stage]=bindings[stage];
+    for(size_t stage=0;stage<stages;++stage)pending->setup_owners_[stage]=chain[stage]->owned_batch_setup_;
+    for(int row=0;row<count;++row){pending->row_slots_[row]=rows[row];pending->positions_[row]=positions[row];pending->tokens_[row]=tokens[row];}
+    pending->accepted_={accepted[0],accepted[1]};
+    for(size_t slot=0;slot<2;++slot)if(counts[slot]){
+        auto occupancy=owned_slot_occupancies_[slot].lock();
+        if(occupancy){
+            if(!occupancy->active()||!occupancy->running_.load(std::memory_order_acquire)||
+               occupancy->token_!=bindings[slot].token_||
+               occupancy->pending_token_!=pending->tokens_[size_t(row_index[slot])]||
+               occupancy->pending_position_!=pending->positions_[size_t(row_index[slot])])return false;
+            for(size_t stage=0;stage<stages;++stage)
+                if(chain[stage]->owned_slot_occupancies_[slot].lock()!=occupancy)return false;
+            pending->occupancies_[slot]=std::move(occupancy);
+        }
+    }
+
+    for(size_t slot=0;slot<2;++slot)if(auto& occupancy=pending->occupancies_[slot]){
+        uint64_t unused=0;
+        if(!occupancy->submitted_group_.compare_exchange_strong(unused,operation,std::memory_order_acq_rel))return false;
+    }
+    owned_group_last_operation_=operation;owned_group_busy_=true;
+    struct EndOwnedGroup {bool& busy;~EndOwnedGroup(){busy=false;}} end_group{owned_group_busy_};
+    bool success=false;
+    try{
+        success=run_slot_rows(pending->row_slots_.data(),count,pending->tokens_.data(),
+                             pending->positions_.data(),pool,user,output,error);
+        if(success)success=commit_slot_prefixes(pending->accepted_.data(),error);
+    }catch(...){error="owned batch dispatch or commit threw";}
+
+    // Even a failed submission may have touched any stage. Never issue evidence
+    // from a mere successful return, or skip the copy stream completion check.
+    for(size_t stage=0;stage<stages;++stage){
+        Verifier& verifier=*chain[stage];const OnDevice device(verifier.device_,verifier.strict_retirement_);
+        const auto compute=cudaStreamSynchronize(verifier.cs_);
+        const auto copy=cudaStreamSynchronize(verifier.copy_);
+        if(compute!=cudaSuccess||copy!=cudaSuccess){
+            verifier.terminal_copy_query_failed_.store(true,std::memory_order_release);
+            success=false;error="owned batch group stream completion failed";
+        }
+        if(!verifier.owned_batch_slot_matches(pending->bindings_[stage*2])||
+           !verifier.owned_batch_slot_matches(pending->bindings_[stage*2+1]))success=false;
+    }
+    if(!success){
+        for(size_t stage=0;stage<stages;++stage){
+            chain[stage]->batch_copy_failed_=true;
+            const_cast<NativeBatchSetupAdmission*>(chain[stage]->owned_batch_setup_.get())->ready_=false;
+        }
+        return false;
+    }
+    for(int row=0;row<count;++row){pending->outputs_[size_t(row)]=output[row];pending->nonfinite_[size_t(row)]=nonfinite_in(row);}
+    completed=std::move(pending);return true;
+}
+
 bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
     if (slots.empty()) {
         err = "verify: init_slots needs at least one session";
@@ -3496,6 +4021,8 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
             return false;
         }
     }
+    if(slot_inventory_generation_==UINT64_MAX){err="verify: slot inventory generation exhausted";return false;}
+    ++slot_inventory_generation_;slot_inventory_ready_=false;
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
     const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
@@ -3516,6 +4043,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
                  (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
+    slot_inventory_ready_=true;
     return true;
 }
 
@@ -3544,8 +4072,11 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
     retirement_check(strict_retirement_, cudaGraphDestroy(graph), "Verifier replacement cleanup");
     if (!made) return false;
-    cudaGraphUpload(ex, cs_);
-    cudaStreamSynchronize(cs_);
+    const auto upload_status=cudaGraphUpload(ex,cs_);
+    const auto upload_drain=cudaStreamSynchronize(cs_);
+    if(owned_batch_setup_&&(upload_status!=cudaSuccess||upload_drain!=cudaSuccess)){
+        batch_copy_failed_=true;err="owned batch graph upload or drain failed";return false;
+    }
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
@@ -3705,7 +4236,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
     cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
     int freed = 0;
-    for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
+    for (bool evicted = true; !owned_batch_setup_ && ie == cudaErrorMemoryAllocation && evicted;) {
         (void) cudaGetLastError();
         if (!evict_batch_graph(key, evicted, err)) return false;
         if (evicted) {
@@ -3742,6 +4273,13 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             return false;
         }
     refresh_ar();
+    if(owned_batch_setup_){
+        const bool shape=hbase==0&&((S==1&&(rows[0]==0||rows[0]==1))||(S==2&&rows[0]==0&&rows[1]==1));
+        if(!owned_batch_setup_->ready_||!shape||exec_bm_.find(bkey(rows,S,hbase))==exec_bm_.end()||
+           (!batch_self_commits(rows,S)&&commit_bm_.find(bkey(rows,S,hbase))==commit_bm_.end())){
+            err="owned batch shape was not admitted and prewarmed";return false;
+        }
+    }
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
     const auto key = bkey(rows, S, hbase);
@@ -3813,7 +4351,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                              void* user, int32_t* out, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const ModelGeometry& g = *g_;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
@@ -3839,7 +4377,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         }
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-        cudaStreamSynchronize(copy_);
+        const auto copy_status=cudaStreamSynchronize(copy_);
+        if(owned_batch_setup_&&copy_status!=cudaSuccess){
+            batch_copy_failed_=true;err="owned batch copy stream failed";return false;
+        }
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -3903,7 +4444,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-    cudaStreamSynchronize(copy_);
+    const auto copy_status=cudaStreamSynchronize(copy_);
+    if(owned_batch_setup_&&copy_status!=cudaSuccess){
+        batch_copy_failed_=true;err="owned batch copy stream failed";return false;
+    }
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -3924,7 +4468,7 @@ bool Verifier::commit_slots(std::string& err) {
 
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
@@ -3984,7 +4528,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     if (batch_copy_failed_) { err = "verify batch: previous copy-stream failure; reconstruct verifier"; return false; }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
@@ -4071,7 +4615,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (now - last_ring() <= std::chrono::milliseconds(2) || now - ext_checked_ < std::chrono::milliseconds(1))
                 return 0;
             ext_checked_ = now;   // (at most one query a millisecond: pump calls this in a loop)
-            const OnDevice on_device(device_);
+            const OnDevice on_device(device_, strict_retirement_);
             const cudaError_t q = cudaStreamQuery(cs_);
             if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (k + 1)) {
                 err = "verify batch: layer " + std::to_string(lb_ + k) + " never rang (" +
@@ -4088,7 +4632,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             return 0;
         }
     }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const int S = last_t_;
     // the layers that have rung so far (batch_serve); with one still to ring: did the graph finish without it, or
     // has it waited too long?
@@ -4223,7 +4767,7 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
 
 bool Verifier::capture_all(std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -4279,7 +4823,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
 
 bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
@@ -4331,7 +4875,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         const double now = now_ms();
         if (now - fl_flush_ms_ <= 2.0 && now - fl_since_ms_ <= 20000.0) return 0;
     }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const int T = fl_T_;
@@ -4415,7 +4959,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
 bool Verifier::done(std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     if (!fl_active_ || fl_k_ < fl_total_) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const cudaError_t q = cudaEventQuery(ev_done_);
     if (q == cudaErrorNotReady) {
         const double now = now_ms();
@@ -4432,7 +4976,7 @@ bool Verifier::done(std::string& err) {
         if (copy_status != cudaSuccess) {
             // Latch BEFORE diagnostic allocation. Keep all outstanding-work
             // flags/counters intact; neither a retry nor pl_finish may certify it.
-            terminal_copy_query_failed_.store(true, std::memory_order_release);
+            latch_copy_query_failure();
             err = std::string("verify: copy-stream query failed: ") + cudaGetErrorString(copy_status);
             return false;
         }
@@ -4444,7 +4988,7 @@ bool Verifier::done(std::string& err) {
 bool Verifier::pl_finish(int32_t* out, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const ModelGeometry& g = *g_;
     fl_active_ = false;
     if (fl_prof_) accumulate_profile(prof_pin_);
@@ -4471,7 +5015,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
 
 bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();

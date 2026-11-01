@@ -37,7 +37,7 @@ bool OwnedQsaElasticPool::prepare(const ModelGeometry& g,const QsaElasticPlan& p
     std::shared_ptr<const ReservationLease> owner,std::shared_ptr<const ReservationLease> range,
     std::unique_ptr<PreparedVmmAllocationBatch>& batch,std::shared_ptr<OwnedQsaElasticPool>& out,std::string& error){
     uint64_t ob=0,rb=0;
-    auto metadata=[](const auto& l,uint64_t n){if(!l||l.use_count()!=1||l->purpose()!=ReservationPurpose::foreground||l->resources().host_bytes<n||
+    auto metadata=[](const auto& l,uint64_t n){if(!l||!l->canonical_owner(l)||l.use_count()!=1||l->purpose()!=ReservationPurpose::foreground||l->resources().host_bytes<n||
         l->resources().pinned_bytes||l->resources().disk_bytes||l->resources().io_slots||l->resources().shadows)return false;
         for(auto d:l->resources().device_bytes)if(d)return false;return true;};
     if(out||!batch||!qsa_elastic_plan_matches(g,plan)||!host_bound(plan,ob,rb)||!metadata(owner,ob)||!metadata(range,rb)){

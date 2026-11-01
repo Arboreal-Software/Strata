@@ -4,11 +4,30 @@
 #include <mutex>
 #include <new>
 #include <set>
+#include <limits>
+#include <cstdio>
+#include "strata/core/resident_fault_receipt.hpp"
+#include "strata/core/resident_fault_precondition.hpp"
+#include "strata/core/strict_retirement.hpp"
 
 namespace strata::core {
 namespace {
 // Serialize native init/release (stable global configuration is still required).
 // Recursive for same-thread partial-allocation cleanup, not callback allocation.
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+static_assert(int(cudaErrorInvalidValue)==1 && int(cudaErrorMemoryAllocation)==2,
+    "qualification parser requires pinned CUDA13 invalid-value/allocation status values");
+void allocation_fault_record(int fd,const char* phase,size_t stage,int device,size_t requested,
+    uint64_t planned,int status,bool pointer,size_t completed)noexcept {
+    const char* kind=status<0?"not_called":status==int(cudaSuccess)?"success":
+        status==int(cudaErrorInvalidValue)?"invalid_value":status==int(cudaErrorMemoryAllocation)?"memory_allocation":"other";
+    char record[768];const int n=std::snprintf(record,sizeof(record),
+        "resident_allocation_fault case=second_arena_cuda_refusal phase=%s stage=%zu device=%d request_bytes=%zu planned_bytes=%llu status=%d refusal_class=%s pointer_nonnull=%u completed_stages=%zu\n",
+        phase,stage,device,requested,(unsigned long long)planned,status,kind,unsigned(pointer),completed);
+    if(n<=0||size_t(n)>=sizeof(record)||!resident_fault_receipt::write_record(fd,record,size_t(n)))
+        retirement_failed("resident allocation fault durable receipt failed");
+}
+#endif
 std::recursive_mutex operation_mutex;
 // Only health/quarantine metadata; never held across device/IO work or owner destruction.
 std::mutex allocator_mutex;
@@ -225,6 +244,22 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t c
         for(size_t j=0;j<i;++j)if(fresh[i].get()==fresh[j].get())
             return {NativeAllocationStatus::invalid,"duplicate native session owner"};
     }
+    bool qualification_fault=false;
+    (void)qualification_fault;
+    for(size_t i=0;i<requests.size();++i){const auto& r=requests[i];
+        if(r.qualification_fault==NativeAllocationQualificationFault::none){
+            if(r.qualification_receipt_fd!=-1)return {NativeAllocationStatus::invalid,"unarmed native fault receipt"};
+            continue;
+        }
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+        if(qualification_fault||r.qualification_fault!=NativeAllocationQualificationFault::second_arena_cuda_refusal||
+           requests.size()!=2||i!=1||requests[0].device==r.device||!resident_fault_receipt::valid_fd(r.qualification_receipt_fd))
+            return {NativeAllocationStatus::invalid,"invalid explicit second-stage allocation fault scope"};
+        qualification_fault=true;
+#else
+        return {NativeAllocationStatus::invalid,"native fault qualification unavailable in this build"};
+#endif
+    }
     // Temporary containment: pool/VMM retirement still drains while releasing.
     // Until every pool supports a non-destructive preparation phase followed by
     // no-drain release, a later failure could follow earlier borrowed frees.
@@ -331,6 +366,7 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t c
         for(size_t i=0;i<storage->stages.size();++i)storage->stages[i].session=std::move(fresh[i]);
         { std::lock_guard lock(allocator_mutex);storage->uncertain=true; }
         attempted=true;
+        size_t completed_stages=0; // derived ONLY after real sync+device restoration
         for(size_t i=0;i<requests.size();++i) {
             const auto& request=requests[i];auto& stage=storage->stages[i];
             WindowDeviceScope device(stage.device);
@@ -339,7 +375,24 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t c
                 std::string error;
                 if(!pool->initialize_checked(error))return {NativeAllocationStatus::unhealthy,"elastic QSA initialization failed: "+error};
             }
-            if(cudaMalloc(&stage.arena,size_t(stage.plan.device_bytes))!=cudaSuccess)
+            size_t arena_request=size_t(stage.plan.device_bytes);
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+            if(qualification_fault&&i==1){
+                if(completed_stages!=1||!storage->stages[0].arena)retirement_failed("native fault prior stage not actually complete");
+                if(stage.arena)retirement_failed("native fault arena was already allocated");
+                arena_request=std::numeric_limits<size_t>::max();
+                (void)resident_fault_precondition::check(request.qualification_receipt_fd,"second_arena_cuda_refusal",stage.device);
+                allocation_fault_record(request.qualification_receipt_fd,"before_api",i,stage.device,arena_request,stage.plan.device_bytes,-1,stage.arena!=nullptr,completed_stages);
+            }
+#endif
+            const cudaError_t arena_status=cudaMalloc(&stage.arena,arena_request); // REAL API, no status override
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+            if(qualification_fault&&i==1){
+                allocation_fault_record(request.qualification_receipt_fd,"api_return",i,stage.device,arena_request,stage.plan.device_bytes,int(arena_status),stage.arena!=nullptr,completed_stages);
+                if(arena_status==cudaSuccess)return {NativeAllocationStatus::unhealthy,"impossible native fault allocation unexpectedly succeeded"};
+            }
+#endif
+            if(arena_status!=cudaSuccess)
                 return {NativeAllocationStatus::unhealthy,"native session arena allocation failed"};
             const auto used=stage.elastic_pools.empty()
                 ? session_init_private(g,cells,k,stage.arena,*stage.session,stage.uploads,request.layer_begin,request.layer_end)
@@ -363,6 +416,11 @@ NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t c
             }
             if(cudaDeviceSynchronize()!=cudaSuccess||!device.finish())
                 return {NativeAllocationStatus::unhealthy,"native allocation drain/device restoration failed"};
+            ++completed_stages;(void)completed_stages;
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+            if(qualification_fault&&i==0)allocation_fault_record(requests[1].qualification_receipt_fd,"stage0_completed",i,stage.device,
+                size_t(stage.plan.device_bytes),stage.plan.device_bytes,int(cudaSuccess),stage.arena!=nullptr,completed_stages);
+#endif
         }
         {
             std::lock_guard lock(allocator_mutex);

@@ -20,12 +20,17 @@
 // Requires the default native decode configuration (native projections, fused GR, fused GDN, fast attention and
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
+#include "strata/core/verifier_setup_quote.hpp"
+#include "strata/core/verifier_incarnation.hpp"
 
 #include <cstdio>
+#include <cstdint>
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/verifier_completion_gate.hpp"
+#include "strata/core/strict_retirement.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -38,7 +43,15 @@
 #include <string>
 #include <vector>
 
+namespace strata::program {class ServingRawSession;}
 namespace strata::core {
+class NativeBatchSlotBindings;
+struct NativeBatchSlotToken;
+class NativeBatchSlotInspection;
+class NativeBatchGroupCompletion;
+class NativeBatchSetupAdmission;
+class NativeBatchSlotOccupancy;
+class WindowBudget;
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
@@ -78,6 +91,8 @@ struct VerifyHits {
 
 class Verifier {
 public:
+    // Read-only qualification observation; never acquires a lease or authorizes work.
+    static bool diagnostic_contains_address(std::uintptr_t);
     friend struct VerifierDrainTestPeer;
     // Quiescent partial observation: custom pool callback applicability is unverified.
     RouteTailPolicyObservation route_tail_policy() const noexcept;
@@ -85,9 +100,28 @@ public:
     ~Verifier();
     /// CUDA ownership mode: configure before init; cleanup uncertainty terminates the worker.
     bool set_strict_retirement(bool enabled, std::string& error);
+    // Opt-in explicit REQUESTED layout caps, NOT a reservation/graph/runtime
+    // admission or resident-ready capability. Real owner must retain actual
+    // setup+hidden-runtime leases through checked destruction before init.
+    bool set_checked_requested_layout(VerifierSetupQuoteLimits,std::string&);
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
+
+    // Actual serial routing configuration. Caller freezes setters/session/layout
+    // for validation and use; this does not certify device work or authorize it.
+    struct SerialRoutingBinding {
+        const Verifier* next=nullptr;
+        const void* next_user=nullptr;
+        const RemoteExpertOpt* optimizer=nullptr;
+        const SessionState* session=nullptr;
+        const ModelGeometry* geometry=nullptr;
+        const GpuPlanSink* plan=nullptr;
+        int64_t layer_begin=0,layer_end=0;
+    };
+    SerialRoutingBinding serial_routing_binding() const noexcept {
+        return {next_,next_user_,remote_opt_,ss_,g_,&sink_,lb_,le_};
+    }
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -194,7 +228,19 @@ public:
     }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
-    void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    void set_next(Verifier* next, void* next_user) {
+        if(completion_gate_) retirement_failed("sealed verifier completion topology");
+        next_ = next; next_user_ = next_user;
+    }
+    // Host-only, strictly BEFORE init/registry publication for every stage.
+    // Configure strict policy and set_next first. Caller retains all
+    // actual chain owners and admitted metadata. Output must be empty. No CUDA.
+    // Optional lifetime_credit retains quota ownership through every Token/Cut;
+    // it supplies no capacity validation or execution/completion authority.
+    static bool prepare_serial_completion_gate(Verifier& root,
+        std::shared_ptr<const ReservationLease> metadata,
+        std::shared_ptr<VerifierCompletionGate>& output,std::string& error,
+        std::shared_ptr<const void> lifetime_credit = {});
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -272,6 +318,20 @@ public:
     /// for this object's lifetime. Drained is NOT a logical common-cut certificate:
     /// caller must still reconcile every stage's accepted/forwarded state and bindings.
     SnapshotDrain poll_snapshot_drain(std::string& err);
+    // Owned-slot host observations only, never a drain/common-cut/RAW certificate.
+    bool inspect_owned_batch_slot(std::shared_ptr<const NativeBatchSlotBindings>,NativeBatchSlotToken,
+                                  size_t stage,NativeBatchSlotInspection& output) const;
+    bool owned_batch_slot_matches(const NativeBatchSlotInspection&) const noexcept;
+    // Exclusive synchronous owned group. Output publishes only after every real
+    // stage dispatch, accepted-prefix commit, and checked compute+copy drain.
+    bool prepare_owned_batch_slots(WindowBudget&,std::shared_ptr<const NativeBatchSlotBindings>,
+        uint64_t host_setup_capacity,std::string& error);
+    bool run_owned_slot_group(const NativeBatchSlotInspection* bindings,size_t stages,
+        uint64_t operation,const int* rows,int count,const int32_t* tokens,const int64_t* positions,
+        const int* accepted,PoolMultiFn pool,void* user,int32_t* output,
+        std::shared_ptr<const ReservationLease> metadata,
+        std::shared_ptr<const NativeBatchGroupCompletion>& completed,std::string& error);
+
     bool snapshot_binding_matches(const SessionState* session, int device) const {
         return ss_ == session && device_ == device;
     }
@@ -302,6 +362,7 @@ public:
         adapt_gate_ = g;
         return true;
     }
+    bool has_adapt_gate() const noexcept { return adapt_gate_ != nullptr; }
     double ms_gate = 0;   ///< host time spent holding a layer's plan for the adaptive copies (decode timing prints it)
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
@@ -385,12 +446,29 @@ public:
     std::string route_stats_report();
 
 private:
+    friend class strata::program::ServingRawSession;
+    std::array<std::weak_ptr<const NativeBatchSlotOccupancy>,2> owned_slot_occupancies_;
+    std::shared_ptr<VerifierCompletionGate> completion_gate_;
+    std::size_t completion_stage_=0;
+    void mark_completion_unhealthy()noexcept {
+        if(completion_gate_)completion_gate_->fail_stage(completion_stage_);
+    }
+    void latch_copy_query_failure()noexcept {
+        mark_completion_unhealthy();
+        terminal_copy_query_failed_.store(true,std::memory_order_release);
+    }
     bool strict_retirement_ = false;
     bool retirement_init_started_ = false;
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
+    std::shared_ptr<const NativeBatchSetupAdmission> owned_batch_setup_;
     std::vector<SessionState*> slots_;
+    const uint64_t slot_verifier_incarnation_=next_verifier_incarnation();
+    uint64_t slot_inventory_generation_=0;
+    bool slot_inventory_ready_=false;
+    uint64_t owned_group_last_operation_=0;
+    bool owned_group_busy_=false;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
@@ -527,7 +605,7 @@ private:
     // released. Never reset on init/relaunch; reconstruct this verifier instead.
     std::atomic<bool> terminal_copy_query_failed_{false};
     bool refuse_copy_query_failure(std::string& err) const {
-        if (!terminal_copy_query_failed_.load(std::memory_order_acquire)) return false;
+        if (!terminal_copy_query_failed_.load(std::memory_order_acquire)&&!(owned_batch_setup_&&batch_copy_failed_)) return false;
         err = "verify: previous terminal copy-stream query failure; reconstruct verifier";
         return true;
     }
@@ -650,6 +728,8 @@ private:
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
+    bool checked_layout_enabled_=false;
+    VerifierSetupQuoteLimits checked_layout_limits_{};
     void* arena_ = nullptr;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;

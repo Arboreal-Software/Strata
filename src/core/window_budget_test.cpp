@@ -17,6 +17,40 @@ WindowResources caps() { return {{100,80},200,20,1000,2,1}; }
 int main() {
     {
         WindowBudget budget(caps(),zero());
+        auto admitted=budget.reserve({{0,0},32,0,0,0,0},ReservationPurpose::foreground);
+        check(bool(admitted),"canonical reservation admitted");
+        using Lease=std::shared_ptr<const ReservationLease>;
+        auto rebox=[](const Lease& owner) { return Lease(std::make_shared<Lease>(owner),owner.get()); };
+        auto first=rebox(admitted.lease), second=rebox(admitted.lease);
+        check(first.use_count()==1 && second.use_count()==1,"independent reboxes bypass count-only check");
+        check(!first->canonical_owner(first) && !second->canonical_owner(second),"reboxed groups refused");
+        check(admitted.lease->canonical_owner(admitted.lease),"original owning group authenticated");
+        Lease same_group(admitted.lease,admitted.lease.get());
+        check(same_group->canonical_owner(same_group),"same-group alias authenticated, not exclusive");
+        check(same_group.use_count()>1,"authentication does not imply exclusivity");
+        Lease empty;
+        check(!admitted.lease->canonical_owner(empty),"empty ownership refused");
+        auto other=budget.reserve({{0,0},1,0,0,0,0},ReservationPurpose::foreground);
+        check(bool(other),"independent reservation admitted");
+        check(!admitted.lease->canonical_owner(other.lease),"different reservation refused");
+        other.lease.reset();same_group.reset();admitted.lease.reset();
+        check(budget.snapshot().reserved.host_bytes==32,"reboxes retain genuine charge");
+        first.reset();
+        check(budget.snapshot().reserved.host_bytes==32,"last alias group still retains charge");
+        second.reset();
+        check(budget.snapshot().reserved.host_bytes==0,"weak canonical identity does not leak charge");
+        auto moved=budget.reserve({{0,0},32,0,0,0,0},ReservationPurpose::foreground);
+        std::weak_ptr<const ReservationLease> weak=moved.lease;
+        Lease owner=std::move(moved.lease);
+        check(owner.use_count()==1 && owner->canonical_owner(owner),"canonical move remains exclusive");
+        auto promoted=weak.lock();
+        check(promoted && promoted->canonical_owner(promoted) && promoted.use_count()==2,
+              "weak promotion retains canonical group but is not exclusive");
+        promoted.reset();owner.reset();
+        check(weak.expired() && budget.snapshot().reserved.host_bytes==0,"canonical weak owner permits final release");
+    }
+    {
+        WindowBudget budget(caps(),zero());
         auto r = budget.reserve({{20,81},10,0,0,0,0},ReservationPurpose::foreground);
         check(r.error == ReservationError::device_limit && r.device == 1,"GPU1-only shortage identified");
         check(budget.snapshot().reserved == zero(),"failed gang reservation holds no GPU0 capacity");
@@ -134,6 +168,42 @@ int main() {
         parent.lease.reset();
         check(budget.snapshot().reserved.shadows==1&&budget.snapshot().reserved.host_bytes==30,"child retains whole parent reservation");
         child.lease.reset();check(budget.snapshot().reserved==zero(),"child releases own and last parent charge");
+    }
+    {
+        // The submitted pointer is live during admission but its ownership group
+        // retains an unrelated object. Refusal must precede child charge/flags.
+        WindowBudget budget(caps(),zero());
+        const WindowReturnObligation obligation{"shared-parent",{{0,0},30,0,0,0,0}};
+        auto parent=budget.reserve(obligation.required,ReservationPurpose::foreground_return,{},&obligation);
+        check(bool(parent),"shared return parent admitted");
+        std::shared_ptr<const ReservationLease> unrelated(std::make_shared<int>(7),parent.lease.get());
+        const WindowResources work{{0,0},10,0,0,0,1};
+        check(budget.reserve(work,ReservationPurpose::saved_maintenance,unrelated,&obligation).error==ReservationError::return_unavailable,
+              "live unrelated group cannot retain return parent");
+        check(budget.snapshot().reserved.host_bytes==30&&budget.snapshot().reserved.shadows==0,
+              "return alias refusal leaves charges unchanged");
+        auto shared=parent.lease;
+        auto child=budget.reserve(work,ReservationPurpose::saved_maintenance,shared,&obligation);
+        check(bool(child),"genuine shared return remains supported and refusal did not mark busy");
+        parent.lease.reset();shared.reset();unrelated.reset();
+        check(budget.snapshot().reserved.host_bytes==40,"accepted child truly retains return parent");
+        child.lease.reset();check(budget.snapshot().reserved==zero(),"shared return releases once after child");
+    }
+    {
+        WindowBudget budget(caps(),zero());
+        auto parent=budget.reserve({{0,0},10,0,0,0,1},ReservationPurpose::private_work);
+        std::shared_ptr<const ReservationLease> unrelated(std::make_shared<int>(9),parent.lease.get());
+        const WindowResources request{{0,0},20,0,0,1,0};
+        check(budget.reserve(request,ReservationPurpose::private_attachment,unrelated).error==ReservationError::invalid_vector,
+              "live unrelated group cannot retain attachment parent");
+        check(budget.snapshot().reserved.host_bytes==10&&budget.snapshot().reserved.io_slots==0,
+              "attachment alias refusal does not charge");
+        auto shared=parent.lease;
+        auto child=budget.reserve(request,ReservationPurpose::private_attachment,shared);
+        check(bool(child),"genuine multiply-owned attachment parent accepted");
+        parent.lease.reset();shared.reset();unrelated.reset();
+        check(budget.snapshot().reserved.host_bytes==30,"attachment retains real parent charge");
+        child.lease.reset();check(budget.snapshot().reserved==zero(),"attachment and parent finally released");
     }
     std::puts("window_budget_test passed");
 }

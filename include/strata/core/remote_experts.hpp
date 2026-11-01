@@ -9,17 +9,82 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace strata::core {
 class RemoteExpertOpt;
+struct NativeRuntimeAttachment;
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.
 class RemoteExperts {
 public:
+    // Opt-in, trusted controller binding, after open and before any producers.
+    // All guards must be acquired before RemoteExpertOpt::begin / route planning.
+    // The controller serializes guard methods, retains its own runtime reference
+    // across calls, and acquires ALL helper writers before adaptation scans.
+    // Binding is weak; active work retains the actual runtime. No owner cycles
+    // persist after successful retirement. Unknown work intentionally retains it.
+    // Actual post-bind owner identity; not a pre-open/factory capability.
+    // A returned true does not replace routing admission or frozen topology.
+    bool bound_to_runtime(const std::shared_ptr<NativeRuntimeAttachment>&) const noexcept;
+    enum class Admission : uint8_t { acquired, busy, unbound, unknown, exhausted, invalid };
+    class RoutingRead {
+    public:
+        RoutingRead() = default;
+        ~RoutingRead() noexcept;
+        RoutingRead(const RoutingRead&) = delete;
+        RoutingRead& operator=(const RoutingRead&) = delete;
+        RoutingRead(RoutingRead&&) noexcept;
+        RoutingRead& operator=(RoutingRead&&) noexcept;
+        explicit operator bool() const noexcept { return remote_ != nullptr; }
+        void reset() noexcept; // host scope only; never proves GPU completion
+    private:
+        friend class RemoteExperts;
+        RemoteExperts* remote_ = nullptr;
+        uint64_t generation_ = 0;
+        std::shared_ptr<NativeRuntimeAttachment> owner_;
+    };
+    class PlacementWrite {
+    public:
+        PlacementWrite() = default;
+        ~PlacementWrite() noexcept;
+        PlacementWrite(const PlacementWrite&) = delete;
+        PlacementWrite& operator=(const PlacementWrite&) = delete;
+        PlacementWrite(PlacementWrite&&) noexcept;
+        PlacementWrite& operator=(PlacementWrite&&) noexcept;
+        explicit operator bool() const noexcept { return remote_ != nullptr; }
+        bool drain_before_overwrite(std::string&);
+        bool mark_attempted() noexcept; // before any external mutation/submission
+        bool drain_copies(std::string&);
+        // Trusted controller calls ONLY after actual cache and tracker publication.
+        bool finish_publication() noexcept;
+        void reset() noexcept; // attempted abandonment is sticky unknown
+    private:
+        friend class RemoteExperts;
+        RemoteExperts* remote_ = nullptr;
+        uint64_t generation_ = 0;
+        std::shared_ptr<NativeRuntimeAttachment> owner_;
+    };
+    // Must precede the FIRST open attempt; forwards the actual complete consumer
+    // topology to the cache's checked retirement path. Required for owned binding.
+    bool set_strict_retirement(bool enabled, const std::vector<int>& consumer_devices, std::string& error);
+    // Exact logical stack-guard storage for this many concurrent admitted copy
+    // calls, including readers queued on read_mu_. No reader array is allocated.
+    // Excludes worker stacks, TLS, destination buffers, IO and allocator costs;
+    // it is NOT a complete prefill workspace quote. False leaves bytes unchanged.
+    static bool copy_reader_guard_bytes(uint32_t readers, uint64_t& bytes) noexcept;
+    bool bind_owned_routing(const std::shared_ptr<NativeRuntimeAttachment>& actual_runtime,
+                            uint32_t max_copy_readers, std::string& error);
+    Admission try_routing_read(RoutingRead&) noexcept;
+    Admission try_placement_write(PlacementWrite&) noexcept;
+    bool owned_routing_healthy() const noexcept;
+    // Count helpers quarantined by unknown operations, not leaked byte accounting.
+    static uint64_t owned_routing_quarantines() noexcept;
+
     RemoteExperts() = default;
     ~RemoteExperts();
     RemoteExperts(const RemoteExperts&) = delete;
@@ -41,7 +106,7 @@ public:
                std::string& err);
     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
-    bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
+    bool holds(int64_t layer, int32_t expert) const;
     bool optimized_decode() const { return remote_opt_ != nullptr; }
     bool finish(float* out, std::string& err);
     int64_t resident() const { return cache_.resident(); }
@@ -60,11 +125,46 @@ public:
     /// Misses are left to the caller.  False with `err` on a CUDA failure; the hits copied so far are
     /// complete (the stream is drained), so the caller falls back for the rest.  Safe from several threads
     /// (one stream, one lock): the prompt path's stager is threaded.
+    /// Owned routing mode fails the worker before returning an uncertain DMA
+    /// destination; the caller does not supply a retained destination owner.
     bool copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n,
                            uint8_t* hit, std::string& err);
 
 private:
     friend class RemoteExpertOpt;
+    // Once bound, no rebind/open resurrection. The controller must not destroy
+    // this object during a call. No state mutex spans CUDA, source callbacks,
+    // read_mu_, CPU workers, joins or owner destruction.
+    mutable std::mutex ownership_mu_;
+    bool owned_bound_ = false, owned_unknown_ = false, owned_closed_ = false;
+    bool strict_retirement_configured_ = false, remote_open_started_ = false;
+    bool compute_ready_ = false, compute_finishing_ = false;
+    bool writer_attempted_ = false, writer_before_drained_ = false, writer_copies_drained_ = false;
+    uint64_t next_generation_ = 1, routing_generation_ = 0, compute_generation_ = 0, writer_generation_ = 0;
+    uint32_t copy_readers_ = 0, max_copy_readers_ = 0;
+    std::weak_ptr<NativeRuntimeAttachment> runtime_owner_;
+    std::shared_ptr<NativeRuntimeAttachment> compute_owner_, unknown_owner_;
+    struct CopyRead {
+        CopyRead() = default;
+        CopyRead(const CopyRead&) = delete;
+        CopyRead& operator=(const CopyRead&) = delete;
+        RemoteExperts* remote = nullptr;
+        std::shared_ptr<NativeRuntimeAttachment> owner;
+        ~CopyRead() noexcept;
+    };
+    void unknown_locked(const std::shared_ptr<NativeRuntimeAttachment>&) noexcept;
+    void end_routing(uint64_t) noexcept;
+    void end_writer(uint64_t, const std::shared_ptr<NativeRuntimeAttachment>&) noexcept;
+    bool writer_drain(uint64_t, bool before, const std::shared_ptr<NativeRuntimeAttachment>&, std::string&);
+    bool finish_compute(bool unknown) noexcept;
+    bool begin_impl(int64_t,const float*,const int32_t*,int64_t,int64_t,const int32_t*,const int32_t*,
+                    std::string&,bool* attempted=nullptr,cudaError_t* restore_status=nullptr);
+    bool finish_impl(float*,std::string&,cudaError_t* restore_status=nullptr);
+    bool copy_cached_blobs_legacy(const int32_t*,const int32_t*,uint8_t* const*,size_t,uint8_t*,std::string&);
+#if defined(STRATA_REMOTE_OWNERSHIP_TEST)
+    friend struct RemoteOwnershipTestAccess;
+#endif
+
     RemoteExpertOpt* remote_opt_ = nullptr;
     int device_ = -1;
     int64_t n_expert_ = 0;

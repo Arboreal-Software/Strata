@@ -33,11 +33,20 @@ public:
     ReservationLease& operator=(const ReservationLease&) = delete;
     const WindowResources& resources() const { return resources_; }
     ReservationPurpose purpose() const { return purpose_; }
+    // Authenticate the ownership group published by reserve(). Pointer identity
+    // and use_count alone accept reboxed aliases with independent control blocks.
+    // This is not exclusive consumption: callers needing a dedicated lease must
+    // additionally require exclusive ownership before retaining it for storage.
+    bool canonical_owner(const std::shared_ptr<const ReservationLease>& owner) const noexcept {
+        return owner.get() == this && !owner_.owner_before(owner) && !owner.owner_before(owner_);
+    }
 private:
     friend class WindowBudget;
     ReservationLease(std::shared_ptr<WindowBudgetState>, WindowResources, ReservationPurpose,
                      std::shared_ptr<const ReservationLease> return_lease);
     std::shared_ptr<WindowBudgetState> state_;
+    // Set once before publication. Weak ownership avoids a self-retaining cycle.
+    std::weak_ptr<const ReservationLease> owner_;
     WindowResources resources_;
     ReservationPurpose purpose_;
     std::shared_ptr<const ReservationLease> return_;
@@ -69,6 +78,9 @@ public:
     // Records actual external allocations, including growth beyond budget.
     // Existing leases stay charged. New work is refused while overcommitted.
     bool observe_baseline(const WindowResources&);
+    // Exclusive initialization only: reduce an unshared genuine foreground lease
+    // without an uncharged interval for its still-live native allocations.
+    bool shrink_foreground(const std::shared_ptr<const ReservationLease>&,WindowResources retained);
     WindowBudgetSnapshot snapshot() const;
 private:
     std::shared_ptr<WindowBudgetState> state_;

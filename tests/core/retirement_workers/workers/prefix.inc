@@ -8,6 +8,9 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <limits>
+#include <optional>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -17,6 +20,7 @@
 namespace strata::platform { inline void name_this_thread(const char*) {} }
 namespace strata::aux_cpus { inline void pin_current_thread() {} }
 namespace strata::core {
+class ReservationLease; // no lease operations in this stop/join fixture
 struct ExpertSource {
     std::function<void()> callback;
     int blobs=0;uint8_t data[8]={};

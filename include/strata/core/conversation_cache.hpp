@@ -164,6 +164,12 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
+    /// APPROXIMATE provenance (P12 suffix reuse).  Set when this state was produced through an approximate suffix
+    /// import: its recurrent/indexer/PLE endpoint state reflects the OLD preceding text, not this prompt's.  Such
+    /// an entry can never certify an exact reuse - ConversationCache::best() refuses it - so approximate state
+    /// cannot contaminate the exact conversation cache.  Only an explicitly approximate divergence-match path
+    /// may use it, and it must report itself as approximate.  Default false: today's exact behavior, unchanged.
+    bool approximate = false;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
@@ -254,6 +260,9 @@ public:
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
+            // Approximate state never satisfies an exact match: an imported endpoint state describes different
+            // preceding text, so certifying it as reusable would silently upgrade an approximation to a guarantee.
+            if (e.approximate) continue;
             if (e.cvec != cvec) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
@@ -261,6 +270,37 @@ public:
             };
             consider(e.live, true);
             for (const auto& c : e.checkpoints) consider(c, false);
+        }
+        return best;
+    }
+
+    /// Divergence lookup for the P12 suffix-reuse measurement.  Unlike best(), which requires an EXACT prefix and
+    /// therefore returns nothing at all for an edited prompt, this finds the parked entry that a changed question
+    /// most plausibly edited: the same token count with the deepest common prefix, preferring exact candidates
+    /// (eligible for an approximate suffix import) over approximate ones.  It restores nothing and certifies
+    /// nothing; callers may only report or refuse.  Approximate entries are reported separately so the exact path
+    /// can never consume them.
+    struct Divergence {
+        size_t index = 0;
+        uint64_t serial = 0;
+        int64_t common = 0;      // longest common prefix length
+        int64_t tokens = 0;      // |entry.live.ids| == |prompt| for a same-length edit
+        bool approximate = false;
+        bool found = false;
+    };
+
+    template <class Token>
+    Divergence divergence_candidate(const std::vector<Token>& prompt, bool cvec) const {
+        Divergence best;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& e = entries_[i];
+            if (e.cvec != cvec) continue;
+            const int64_t n = (int64_t)e.live.ids.size();
+            if (n != (int64_t)prompt.size()) continue;   // the bounded milestone: a same-length edit
+            int64_t c = 0;
+            while (c < n && e.live.ids[(size_t)c] == prompt[(size_t)c]) ++c;
+            if (c == 0 || c == n) continue;              // nothing in common, or an exact match (best() handles it)
+            if (c > best.common) best = {i, serials_[i], c, n, e.approximate, true};
         }
         return best;
     }

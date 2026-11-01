@@ -5,7 +5,11 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
+#include "strata/core/strict_retirement.hpp"
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <climits>
 #include <cstring>
 
 namespace strata::core {
@@ -48,12 +52,94 @@ __global__ void copy_cpu_rows(float4* dst, const volatile float4* src, const int
 }
 } // namespace
 
+bool RemoteExpertOpt::set_strict_retirement(bool enabled, const std::vector<int>& consumers,
+                                          std::string& error) {
+    if (lifecycle_started_) { error = "remote optimizer lifecycle already started"; return false; }
+    if (enabled) {
+        if (consumers.empty()) { error = "remote optimizer requires complete consumer topology"; return false; }
+        for (size_t i = 0; i < consumers.size(); ++i) {
+            if (consumers[i] < 0 || std::find(consumers.begin(), consumers.begin() + i,
+                                            consumers[i]) != consumers.begin() + i) {
+                error = "invalid remote optimizer consumer topology"; return false;
+            }
+        }
+    }
+    // Strong allocation boundary: no helper or device effects before commit.
+    std::vector<int> topology(enabled ? consumers : std::vector<int>{});
+    std::vector<Peer> peers;
+    if (enabled) peers.reserve(3);
+    retirement_consumers_.swap(topology);
+    peers_.swap(peers);
+    strict_retirement_ = enabled;
+    return true;
+}
+
+bool RemoteExpertOpt::attach_checked(RemoteExperts& remote, std::string& error) {
+    if (!strict_retirement_) { error = "checked attach requires strict retirement"; return false; }
+    lifecycle_started_ = true;
+    if (init_attempted_ || retirement_closed_ || peers_.size() == 3 || remote.remote_opt_ ||
+        std::any_of(peers_.begin(), peers_.end(), [&](const Peer& p) { return p.remote == &remote; })) {
+        error = "remote optimizer attach refused"; return false;
+    }
+    // Capacity was prepaid before any attach. Publish the borrowed backpointer
+    // only after the owning record exists.
+    peers_.push_back({&remote});
+    remote.remote_opt_ = this;
+    return true;
+}
+
 void RemoteExpertOpt::attach(RemoteExperts& remote) {
+    lifecycle_started_ = true;
+    if (strict_retirement_) {
+        std::string error;
+        if (!attach_checked(remote, error)) retirement_failed("remote optimizer attach");
+        return;
+    }
     remote.remote_opt_ = this;
     peers_.push_back({&remote});
 }
 
 bool RemoteExpertOpt::init(std::string& err) {
+    lifecycle_started_ = true;
+    if (strict_retirement_) {
+        if (init_attempted_ || retirement_closed_) { err = "remote optimizer init refused"; return false; }
+        init_attempted_ = true;
+        int previous = -1, count = 0;
+        retirement_check(true, cudaGetDevice(&previous), "optimizer init get device");
+        retirement_check(true, cudaGetDeviceCount(&count), "optimizer init device count");
+        const auto covered = [&](int device) {
+            return device >= 0 && device < count &&
+                std::find(retirement_consumers_.begin(), retirement_consumers_.end(), device) != retirement_consumers_.end();
+        };
+        if (!covered(previous) || std::any_of(retirement_consumers_.begin(), retirement_consumers_.end(),
+                                             [&](int d) { return d >= count; })) {
+            err = "remote optimizer allocation device missing from topology"; return false;
+        }
+        for (const auto& p : peers_) {
+            if (!covered(p.remote->device_) || p.remote->remote_opt_ != this) {
+                err = "remote optimizer helper missing from topology"; return false;
+            }
+        }
+        for (size_t i = 0; i < peers_.size(); ++i)
+            peer_allocation_devices_[i] = peers_[i].remote->device_;
+        allocation_device_ = previous;
+        struct Restore {
+            int device;
+            ~Restore() { retirement_check(true, cudaSetDevice(device), "optimizer init restore device"); }
+        } restore{previous};
+        void* mapped = nullptr;
+        if (!check(cudaHostAlloc((void**) &h_sum_, MAXT * (H + K) * sizeof(float),
+                                 cudaHostAllocPortable | cudaHostAllocMapped), err) ||
+            !check(cudaHostGetDevicePointer(&mapped, h_sum_, 0), err)) return false;
+        m_sum_ = (float*) mapped;
+        h_mask_ = reinterpret_cast<int32_t*>(h_sum_ + MAXT * H);
+        m_mask_ = reinterpret_cast<int32_t*>(m_sum_ + MAXT * H);
+        for (size_t i = 0; i < peers_.size(); ++i) {
+            retirement_check(true, cudaSetDevice(peer_allocation_devices_[i]), "optimizer init select helper");
+            if (!check(cudaMalloc((void**) &peers_[i].sum, MAXT * H * sizeof(float)), err)) return false;
+        }
+        return true;
+    }
     void* mapped = nullptr;
     if (!check(cudaHostAlloc((void**) &h_sum_, MAXT * (H + K) * sizeof(float),
                              cudaHostAllocPortable | cudaHostAllocMapped), err) ||
@@ -68,7 +154,58 @@ bool RemoteExpertOpt::init(std::string& err) {
     return true;
 }
 
+bool RemoteExpertOpt::close_after_callers_joined() noexcept {
+    if (!strict_retirement_) return false;
+    if (retirement_closed_) return true;
+    lifecycle_started_ = true;
+    const bool allocated = h_sum_ || std::any_of(peers_.begin(), peers_.end(),
+                                                [](const Peer& p) { return p.sum != nullptr; });
+    for (size_t i = 0; i < peers_.size(); ++i) {
+        if (peers_[i].remote->remote_opt_ != this ||
+            (allocated && peers_[i].remote->device_ != peer_allocation_devices_[i]))
+            retirement_failed("optimizer close helper identity/device");
+    }
+    if (allocated) {
+        int previous = -1;
+        retirement_check(true, cudaGetDevice(&previous), "optimizer close get device");
+        // Gang barrier: no allocation or borrowed target is released until ALL
+        // consumers (including primary mapped readers) have completed.
+        for (int device : retirement_consumers_) {
+            retirement_check(true, cudaSetDevice(device), "optimizer close select consumer");
+            retirement_check(true, cudaDeviceSynchronize(), "optimizer close drain consumer");
+        }
+        for (const auto& p : peers_) {
+            retirement_check(true, cudaSetDevice(p.remote->device_), "optimizer close select stream device");
+            if (p.remote->stream_)
+                retirement_check(true, cudaStreamSynchronize(p.remote->stream_), "optimizer close helper stream");
+        }
+        for (size_t i = 0; i < peers_.size(); ++i) {
+            if (!peers_[i].sum) continue;
+            retirement_check(true, cudaSetDevice(peer_allocation_devices_[i]), "optimizer close select allocation device");
+            retirement_check(true, cudaFree(peers_[i].sum), "optimizer close free helper sum");
+            peers_[i].sum = nullptr;
+        }
+        if (h_sum_) {
+            retirement_check(true, cudaSetDevice(allocation_device_), "optimizer close select mapped device");
+            retirement_check(true, cudaFreeHost(h_sum_), "optimizer close free mapped sum");
+            h_sum_ = nullptr;
+        }
+        retirement_check(true, cudaSetDevice(previous), "optimizer close restore device");
+    }
+    for (auto& p : peers_) {
+        if (p.remote->remote_opt_ != this) retirement_failed("optimizer close helper identity");
+        p.remote->remote_opt_ = nullptr;
+    }
+    m_sum_ = nullptr; h_mask_ = m_mask_ = nullptr; weights_ = nullptr;
+    retirement_closed_ = true;
+    return true;
+}
+
 RemoteExpertOpt::~RemoteExpertOpt() {
+    if (strict_retirement_) {
+        if (!close_after_callers_joined()) retirement_failed("remote optimizer close");
+        return;
+    }
     for (auto& p : peers_) {
         const OnDevice on(p.remote->device_);
         if (p.remote->stream_) cudaStreamSynchronize(p.remote->stream_);
@@ -197,5 +334,203 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
         }
     }
     return true;
+}
+struct RemoteExpertOpt::OwnedAdaptWorkspace::Storage {
+    struct Swap { float gain; int32_t layer, in, out; };
+    bool active_ = false;
+    size_t rows_ = 0, experts_ = 0, swaps_ = 0;
+    std::array<RemoteExperts::PlacementWrite, 3> writers_;
+    std::unique_ptr<uint8_t[]> resident_;
+    std::unique_ptr<std::pair<float, int32_t>[]> candidates_, victims_;
+    std::unique_ptr<Swap[]> swaps_storage_;
+    std::unique_ptr<AdaptPlanEntry[]> plans_;
+};
+RemoteExpertOpt::OwnedAdaptWorkspace::OwnedAdaptWorkspace() = default;
+RemoteExpertOpt::OwnedAdaptWorkspace::~OwnedAdaptWorkspace() = default;
+
+bool RemoteExpertOpt::OwnedAdaptWorkspace::required_bytes(size_t rows, size_t experts,
+                                                         size_t swaps, uint64_t& bytes) noexcept {
+    if (!rows || !experts || experts > rows || !swaps || swaps > rows ||
+        rows > size_t(INT32_MAX) || experts > size_t(INT32_MAX)) return false;
+    uint64_t total = sizeof(OwnedAdaptWorkspace) + sizeof(Storage) + 4096;
+    auto add = [&](uint64_t count, uint64_t width) {
+        if (count > (UINT64_MAX - total) / width) return false;
+        total += count * width; return true;
+    };
+    if (!add(rows, sizeof(uint8_t) + sizeof(Storage::Swap)) ||
+        !add(experts, 2 * sizeof(std::pair<float, int32_t>)) ||
+        !add(swaps, 3 * sizeof(AdaptPlanEntry)) || total > SIZE_MAX) return false;
+    bytes = total;
+    return true;
+}
+
+bool RemoteExpertOpt::OwnedAdaptWorkspace::prepare(size_t rows, size_t experts,
+                                                   size_t swaps, std::string& error) {
+    uint64_t bytes = 0;
+    if (storage_ || !required_bytes(rows, experts, swaps, bytes)) {
+        error = "remote adapt: invalid or already prepared workspace"; return false;
+    }
+    // No allocation in constructor. Caller admits the complete quoted envelope
+    // before this host-only preparation; no arbitrary charge marker is accepted.
+    auto storage = std::make_unique<Storage>();
+    storage->resident_ = std::make_unique<uint8_t[]>(rows);
+    storage->candidates_ = std::make_unique<std::pair<float, int32_t>[]>(experts);
+    storage->victims_ = std::make_unique<std::pair<float, int32_t>[]>(experts);
+    storage->swaps_storage_ = std::make_unique<Storage::Swap[]>(rows);
+    storage->plans_ = std::make_unique<AdaptPlanEntry[]>(3 * swaps);
+    storage->rows_ = rows; storage->experts_ = experts; storage->swaps_ = swaps;
+    storage_ = std::move(storage);
+    return true;
+}
+
+RemoteExpertOpt::AdaptResult RemoteExpertOpt::adapt_owned(
+        const std::vector<float>& usage, const std::vector<int32_t>& primary,
+        const std::vector<std::pair<int32_t, int32_t>>& pending, int max_swaps,
+        ExpertSource& source, OwnedAdaptWorkspace& workspace, AdaptPublication& publication,
+        std::string& error) {
+    if (!workspace.storage_) {
+        error = "remote adapt: workspace is unprepared"; return AdaptResult::failed;
+    }
+    auto& w = *workspace.storage_;
+    if (w.active_ || peers_.size() > 3 ||
+        primary.size() > w.rows_ || usage.size() != primary.size() ||
+        max_swaps < 0 || size_t(max_swaps) > w.swaps_) {
+        error = "remote adapt: unprepared/insufficient workspace or invalid input";
+        return AdaptResult::failed;
+    }
+    // Checked controller contract: configuration/attach cannot race this call.
+    // These validations read immutable geometry, never mutable cache residency.
+    for (size_t p = 0; p < peers_.size(); ++p) {
+        auto* r = peers_[p].remote;
+        if (!r || r->n_expert_ <= 0 || uint64_t(r->n_expert_) > w.experts_ ||
+            r->layers_present_.size() > size_t(INT32_MAX) ||
+            r->layers_present_.size() > primary.size() / size_t(r->n_expert_)) {
+            error = "remote adapt: helper geometry exceeds workspace"; return AdaptResult::failed;
+        }
+        for (size_t q = 0; q < p; ++q) if (peers_[q].remote == r) {
+            error = "remote adapt: duplicate helper"; return AdaptResult::failed;
+        }
+    }
+    for (const auto& item : pending) if (item.first < 0 || size_t(item.first) >= primary.size()) {
+        error = "remote adapt: pending index out of range"; return AdaptResult::failed;
+    }
+    w.active_ = true;
+    std::array<bool, 3> attempted{}, drained{}, finished{};
+    bool prepared_publication = false;
+    // Every attempted exit drains BEFORE borrowed source state may unwind.
+    // Failure to prove that drain is fatal; quarantine alone cannot own blob().
+    auto cleanup = [&]() noexcept {
+        for (size_t p = 0; p < peers_.size(); ++p) {
+            if (attempted[p] && !drained[p]) {
+                try {
+                    if (!w.writers_[p].drain_copies(error)) retirement_failed("remote adapt copy drain");
+                    drained[p] = true;
+                } catch (...) { retirement_failed("remote adapt copy drain exception"); }
+            }
+            if (attempted[p] && !finished[p]) publication.fail_unknown(uint32_t(p));
+        }
+        if (prepared_publication) publication.abandon_unattempted();
+        for (auto& writer : w.writers_) writer.reset();
+        w.active_ = false;
+    };
+    struct Cleanup { decltype(cleanup)& f; ~Cleanup() noexcept { f(); } } exit{cleanup};
+    for (size_t p = 0; p < peers_.size(); ++p) {
+        const auto status = peers_[p].remote->try_placement_write(w.writers_[p]);
+        if (status == RemoteExperts::Admission::busy) return AdaptResult::deferred;
+        if (status != RemoteExperts::Admission::acquired) {
+            error = "remote adapt: helper writer unavailable"; return AdaptResult::failed;
+        }
+    }
+    try {
+        for (size_t p = 0; p < peers_.size(); ++p)
+            if (!w.writers_[p].drain_before_overwrite(error)) return AdaptResult::failed;
+        if (max_swaps == 0) return AdaptResult::complete;
+        const auto& layout = strata::kernels::cpu::expert_layout();
+        for (size_t i = 0; i < primary.size(); ++i) w.resident_[i] = primary[i] >= 0;
+        for (const auto& item : pending) w.resident_[size_t(item.first)] = 1;
+        for (const auto& peer : peers_) {
+            const auto& r = *peer.remote;
+            for (int32_t l = 0; l < int32_t(r.layers_present_.size()); ++l)
+                for (int32_t e = 0; e < r.n_expert_; ++e)
+                    if (r.cache_.slot_of(l,e) >= 0) w.resident_[size_t(l)*r.n_expert_+e] = 1;
+        }
+        std::array<size_t, 3> starts{}, counts{};
+        size_t total = 0;
+        for (size_t p = 0; p < peers_.size(); ++p) {
+            auto& r = *peers_[p].remote;
+            size_t ns = 0;
+            for (int32_t l = 0; l < int32_t(r.layers_present_.size()); ++l) {
+                size_t nc = 0, nv = 0; float cold = 1.0e30f;
+                const size_t base = size_t(l)*r.n_expert_;
+                for (int32_t e = 0; e < r.n_expert_; ++e) {
+                    const float u = usage[base+e];
+                    if (!std::isfinite(u)) { error="remote adapt: nonfinite usage"; return AdaptResult::failed; }
+                    if (primary[base+e] >= 0) cold = std::min(cold,u);
+                    if (r.cache_.slot_of(l,e) >= 0) w.victims_[nv++] = {u,e};
+                    else if (!w.resident_[base+e] && u >= 2.0f) w.candidates_[nc++] = {u,e};
+                }
+                const size_t n = std::min(nc,nv);
+                std::sort(w.candidates_.get(),w.candidates_.get()+nc,[](auto&a,auto&b){return a.first>b.first;});
+                std::partial_sort(w.victims_.get(),w.victims_.get()+n,w.victims_.get()+nv,[](auto&a,auto&b){return a.first<b.first;});
+                for (size_t i = 0; i < n; ++i) {
+                    if (w.victims_[i].first > cold || w.candidates_[i].first < w.victims_[i].first+1.5f) break;
+                    w.swaps_storage_[ns++] = {w.candidates_[i].first-w.victims_[i].first,l,w.candidates_[i].second,w.victims_[i].second};
+                }
+            }
+            std::sort(w.swaps_storage_.get(),w.swaps_storage_.get()+ns,[](auto&a,auto&b){return a.gain>b.gain;});
+            ns = std::min(ns,size_t(max_swaps)); starts[p] = total; counts[p] = ns;
+            for (size_t i = 0; i < ns; ++i) {
+                const auto& s = w.swaps_storage_[i];
+                const int32_t slot = r.cache_.slot_of(s.layer,s.out);
+                const auto bytes = layout.blob_bytes(s.layer);
+                if (slot < 0 || bytes <= 0 || uint64_t(bytes)>uint64_t(INT64_MAX) ||
+                    uint64_t(bytes)>r.cache_.slot_offset(int64_t(slot)+1)-r.cache_.slot_offset(slot)) {
+                    error="remote adapt: invalid actual slot/extent"; return AdaptResult::failed;
+                }
+                w.plans_[total++] = {uint32_t(p),slot,s.layer,s.out,s.in,uint64_t(bytes)};
+                const size_t base = size_t(s.layer)*r.n_expert_;
+                w.resident_[base+s.out]=0; w.resident_[base+s.in]=1;
+            }
+        }
+        if (!total) return AdaptResult::complete;
+        prepared_publication = true; // partial prepare/throw also requires abandonment
+        if (!publication.prepare_all(w.plans_.get(),total)) return AdaptResult::failed;
+        for (size_t p = 0; p < peers_.size(); ++p) {
+            if (!counts[p]) continue;
+            auto& r = *peers_[p].remote;
+            if (!w.writers_[p].mark_attempted()) return AdaptResult::failed;
+            attempted[p] = true;
+            if (!publication.begin_attempt(uint32_t(p))) return AdaptResult::failed;
+            int previous = -1;
+            if (cudaGetDevice(&previous)!=cudaSuccess) return AdaptResult::failed;
+            struct Restore {
+                int previous;
+                ~Restore() noexcept { if (cudaSetDevice(previous)!=cudaSuccess) retirement_failed("remote adapt restore device"); }
+            } restore{previous};
+            if (cudaSetDevice(r.device_)!=cudaSuccess) return AdaptResult::failed;
+            for (size_t i = starts[p]; i < starts[p]+counts[p]; ++i) {
+                const auto& plan = w.plans_[i];
+                const uint8_t* blob = source.blob(plan.layer,plan.in);
+                uint64_t submitted = 0;
+                if (!r.cache_.fill_slot(plan.slot,blob,r.stream_,error,int64_t(plan.bytes),&submitted)) return AdaptResult::failed;
+                source.note_async_read(blob,r.stream_);
+                if (submitted!=plan.bytes) { error="remote adapt: submitted extent differs from plan"; return AdaptResult::failed; }
+            }
+            try {
+                if (!w.writers_[p].drain_copies(error)) retirement_failed("remote adapt publication drain");
+                drained[p] = true;
+            } catch (...) { retirement_failed("remote adapt publication drain exception"); }
+            for (size_t i = starts[p]; i < starts[p]+counts[p]; ++i) {
+                const auto& plan = w.plans_[i]; r.cache_.replace(plan.layer,plan.out,plan.in);
+            }
+            if (!publication.publish_after_copies(uint32_t(p),w.plans_.get()+starts[p],counts[p])) return AdaptResult::failed;
+            if (!w.writers_[p].finish_publication()) return AdaptResult::failed;
+            finished[p] = true;
+        }
+        return AdaptResult::complete;
+    } catch (...) {
+        // Cleanup drains before returning; no diagnostic allocation on this path.
+        return AdaptResult::failed;
+    }
 }
 } // namespace strata::core

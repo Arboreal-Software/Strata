@@ -476,3 +476,35 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
     return ConversationRestore::restored;
 }
 } // namespace strata::core
+
+// Diagnostic-only empty-image primitives. Ordinary nonempty snapshot validation
+// above remains unchanged. Empty native endpoint tensors are copied/restored,
+// never replaced by an assumed zero metadata descriptor.
+namespace strata::core {
+bool conversation_snapshot_empty_save(SavedConversation& image,const SessionState& ss,const ModelGeometry& g,std::string& error){
+    ConversationStateSizes sizes;
+    if(!conversation_session_sizes(g,ss,sizes,error)||!sync(error))return false;
+    SavedConversation captured;captured.cvec=false;captured.geometry=geometry_key(g);captured.layer_lo=ss.layer_lo;captured.layer_hi=ss.layer_hi;
+    if(!conversation_checkpoint_save(captured.live,ss,g,error))return false;
+    captured.kv.resize(owned_qsa(ss));
+    for(size_t i=0;i<captured.kv.size();++i)if(!conversation_kv_save(captured.kv[i],owned(ss,i),g,0,true,error))return false;
+    // The RAW layer preallocates child-stage storage before native capture.
+    // Preserve it when replacing the root stage, without allocating after copies.
+    captured.stage_images.swap(image.stage_images);
+    image=std::move(captured);return true;
+}
+bool conversation_snapshot_empty_validate(const SavedConversation& image,const SessionState& ss,const ModelGeometry& g,const QsaState* draft,std::string& error){
+    if(draft||image.geometry!=geometry_key(g)||image.layer_lo!=ss.layer_lo||image.layer_hi!=ss.layer_hi||
+       image.cvec||!image.live.ids.empty()||!image.live.imgs.empty()||!image.live.stage_parts.empty()||!image.checkpoints.empty()||
+       image.kv.size()!=owned_qsa(ss)||!conversation_checkpoint_validate(image.live,ss,g,error))return false;
+    for(size_t i=0;i<image.kv.size();++i)if(!conversation_kv_validate(image.kv[i],owned(ss,i),g,0,true,error))return false;
+    return true;
+}
+ConversationRestore conversation_snapshot_empty_restore(const SavedConversation& image,SessionState& ss,const ModelGeometry& g,const QsaState* draft,std::string& error){
+    if(!conversation_snapshot_empty_validate(image,ss,g,draft,error))return ConversationRestore::invalid;
+    if(!sync(error))return ConversationRestore::transfer_failed;
+    for(size_t i=0;i<image.kv.size();++i)if(!conversation_kv_restore(image.kv[i],owned(ss,i),g,0,true,error))return ConversationRestore::transfer_failed;
+    if(!conversation_checkpoint_restore(image.live,ss,g,error))return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
+}

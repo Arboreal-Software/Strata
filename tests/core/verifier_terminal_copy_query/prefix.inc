@@ -31,7 +31,7 @@ static const char* cudaGetErrorString(int){return "injected terminal copy query 
 static double now_ms(){return 0;}
 static void progress_beat(){++beats;}
 static std::string released_note(bool){return {};}
-struct OnDevice {explicit OnDevice(int){++device_calls;}};
+struct OnDevice {explicit OnDevice(int,bool checked=false){if(checked)std::_Exit(88);++device_calls;}}; // default-only seam; actual checked scopes have independent tests
 struct WindowDeviceScope {explicit WindowDeviceScope(int){++device_calls;}bool ok(){return true;}bool finish(){++device_calls;return true;}};
 using Clock=std::chrono::steady_clock;
 static double ms_since(Clock::time_point){return 0;}
@@ -42,6 +42,11 @@ struct SamplerParams {bool greedy=true;float temperature=0;const float* logit_bi
 template<class...T>void sample_tokens(T...){++samples;}
 }
 struct Verifier {
+ bool strict_retirement_=false,retirement_init_started_=true;
+    // Gate-mark seam; actual gate tested independently.
+    int completion_marks=0;
+    void mark_completion_unhealthy()noexcept{++completion_marks;}
+#include "completion-latch.inc"
 #include "latch.inc"
  bool fl_active_=true,copy_used_=true,fl_prof_=true,head_sampling_=false,commit_pending_=true;
  bool batch_copy_failed_=false,pl_prestaged_=false;

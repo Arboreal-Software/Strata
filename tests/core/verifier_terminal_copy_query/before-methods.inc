@@ -1,7 +1,7 @@
 bool Verifier::done(std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     if (!fl_active_ || fl_k_ < fl_total_) return false;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const cudaError_t q = cudaEventQuery(ev_done_);
     if (q == cudaErrorNotReady) {
         const double now = now_ms();
@@ -21,7 +21,7 @@ bool Verifier::done(std::string& err) {
 bool Verifier::pl_finish(int32_t* out, std::string& err) {
     if (refuse_copy_query_failure(err)) return false;
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const ModelGeometry& g = *g_;
     fl_active_ = false;
     if (fl_prof_) accumulate_profile(prof_pin_);
@@ -169,6 +169,7 @@ std::string Verifier::route_stats_report() {
     return out;
 }
 bool Verifier::release_gpu_waits(int timeout_ms) {
+    mark_completion_unhealthy(); // linearize request BEFORE flags/drain
     released_.store(true);
     trace_ev("RELEASE", -1, -1, timeout_ms);
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
@@ -178,7 +179,13 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
-    const OnDevice on_device(device_);
+    // An unused strict verifier may still participate in no-work cleanup.
+    // Never treat a partially initialized/stream-owning object as this case.
+    if (strict_retirement_ && !retirement_init_started_ && device_ < 0 && !cs_ && !copy_) {
+        trace_ev("RELEASE-DRAINED", -1, -1, 0);
+        return true;
+    }
+    const OnDevice on_device(device_, strict_retirement_);
     const Clock::time_point t0 = Clock::now();
     for (cudaStream_t s : {cs_, copy_}) {
         if (s == nullptr) continue;

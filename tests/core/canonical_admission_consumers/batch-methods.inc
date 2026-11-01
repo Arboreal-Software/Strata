@@ -1,0 +1,47 @@
+namespace {
+std::atomic<uint64_t> managed_next{1};
+uint64_t mint_chunks(uint64_t count) noexcept {
+    auto n = managed_next.load();
+    while (n && count && count <= UINT64_MAX-n) {
+        if (managed_next.compare_exchange_weak(n,n+count)) return n;
+    }
+    return 0;
+}
+}
+bool PreparedVmmAllocationBatch::host_bound(uint64_t entries,uint64_t& bytes) noexcept {
+    if(entries!=1)return false;
+    bytes=4096+sizeof(PreparedVmmAllocationBatch);return true;
+}
+bool PreparedVmmAllocationBatch::prepare(std::span<const VmmBatchDevicePlan> plans,
+    std::shared_ptr<const ReservationLease> physical,
+    std::shared_ptr<const ReservationLease> metadata,
+    std::unique_ptr<PreparedVmmAllocationBatch>& out,std::string& error) {
+    try {
+        uint64_t host=0;
+        if(out||!host_bound(plans.size(),host)||!physical||!metadata||
+           !physical->canonical_owner(physical)||!metadata->canonical_owner(metadata)||
+           physical.use_count()!=1||metadata.use_count()!=1||physical.get()==metadata.get()||
+           metadata->purpose()!=ReservationPurpose::foreground||
+           (physical->purpose()!=ReservationPurpose::foreground&&physical->purpose()!=ReservationPurpose::private_attachment)) {
+            error="prepaid VMM requires exclusive dedicated admissions and one domain";return false;
+        }
+        const auto& plan=plans[0];const auto& r=physical->resources();const auto& m=metadata->resources();
+        if(plan.physical_device<0||!plan.chunks||plan.chunks>SIZE_MAX||!plan.expected_granularity||
+           plan.chunks>UINT64_MAX/plan.expected_granularity||plan.budget_index>=r.device_bytes.size()||
+           r.host_bytes||r.pinned_bytes||r.disk_bytes||r.io_slots||r.shadows||
+           m.host_bytes<host||m.pinned_bytes||m.disk_bytes||m.io_slots||m.shadows) {
+            error="prepaid VMM plan or resource envelope invalid";return false;
+        }
+        for(size_t i=0;i<r.device_bytes.size();++i)
+            if(r.device_bytes[i]!=(i==plan.budget_index?plan.chunks*plan.expected_granularity:0)) {
+                error="prepaid VMM physical bytes differ from exact plan";return false;
+            }
+        for(auto n:m.device_bytes)if(n){error="prepaid VMM metadata contains physical charge";return false;}
+        auto candidate=std::unique_ptr<PreparedVmmAllocationBatch>(new PreparedVmmAllocationBatch);
+        const auto first=mint_chunks(plan.chunks);
+        if(!first){error="prepaid VMM allocation incarnations exhausted";return false;}
+        candidate->plan_=plan;candidate->first_incarnation_=first;
+        candidate->metadata_=std::move(metadata);candidate->physical_=std::move(physical);
+        out=std::move(candidate);return true;
+    }catch(const std::bad_alloc&){error.clear();return false;}
+}

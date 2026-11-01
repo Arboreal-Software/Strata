@@ -1,5 +1,6 @@
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
-    const OnDevice on_device(device_);
+    if (refuse_copy_query_failure(err)) return false;
+    const OnDevice on_device(device_, strict_retirement_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
@@ -23,6 +24,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     return true;
 }
 int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+    if (refuse_copy_query_failure(err)) return -1;
     if (!b_running_) return 1;
     // set_external_serve: another thread serves the doorbells (batch_serve) and this one only checks for a window that
     // will not finish, as below: its graph ended (or failed) with a layer still to ring, or no layer rang for 20 s.
@@ -35,7 +37,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (now - last_ring() <= std::chrono::milliseconds(2) || now - ext_checked_ < std::chrono::milliseconds(1))
                 return 0;
             ext_checked_ = now;   // (at most one query a millisecond: pump calls this in a loop)
-            const OnDevice on_device(device_);
+            const OnDevice on_device(device_, strict_retirement_);
             const cudaError_t q = cudaStreamQuery(cs_);
             if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (k + 1)) {
                 err = "verify batch: layer " + std::to_string(lb_ + k) + " never rang (" +
@@ -52,7 +54,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             return 0;
         }
     }
-    const OnDevice on_device(device_);
+    const OnDevice on_device(device_, strict_retirement_);
     const int S = last_t_;
     // the layers that have rung so far (batch_serve); with one still to ring: did the graph finish without it, or
     // has it waited too long?
@@ -92,6 +94,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     return 1;
 }
 Verifier::SnapshotDrain Verifier::poll_snapshot_drain(std::string& err) {
+    if (refuse_copy_query_failure(err)) return SnapshotDrain::unhealthy;
 #if defined(STRATA_GPU_METAL)
     err = "verify: snapshot drain is not implemented for Metal";
     return SnapshotDrain::unsupported;

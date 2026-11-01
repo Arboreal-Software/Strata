@@ -1,0 +1,5 @@
+{
+  "src/kernels/cuda/native_rope.cu": "f2be90f88eb5bb0c79a15d36200acd2e8e8d2d652317af640e444f1ddc53580d",
+  "include/strata/kernels/native_rope.hpp": "619cb05346306e8bcabfebd168ac65d5c19b524b006ee9d51e5949f7e388c4ec",
+  "extracted_sha256": "946e55da2a2dc0949fc827c91c8808065d4527c6075dfe85afd85fd9ffac8ce1"
+}

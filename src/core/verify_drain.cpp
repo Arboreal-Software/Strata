@@ -1,5 +1,6 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/window_device.hpp"
+#include "strata/core/resident_deferred_fault.hpp"
 
 namespace strata::core {
 bool Verifier::wait_commit(std::string& err) {
@@ -51,10 +52,19 @@ Verifier::SnapshotDrain Verifier::poll_snapshot_drain(std::string& err) {
     };
     // Query all owned work, even if an earlier stream is pending: a later error
     // must not be hidden behind a stream that cannot finish after that error.
-    for (cudaStream_t stream : {cs_, sh_cs_, copy_, side_, side2_, df_side_[0], df_side_[1]})
-        if (stream && !observe(cudaStreamQuery(stream))) return SnapshotDrain::unhealthy;
+    for (cudaStream_t stream : {cs_, sh_cs_, copy_, side_, side2_, df_side_[0], df_side_[1]}) {
+        if (!stream) continue;
+        const cudaError_t status=cudaStreamQuery(stream);
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+        resident_deferred_fault::observe(this,resident_deferred_fault::QueryApi::stream,stream,status);
+#endif
+        if (!observe(status)) return SnapshotDrain::unhealthy;
+    }
     if (commit_pending_) {
         const cudaError_t status = cudaEventQuery(commit_done_);
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+        resident_deferred_fault::observe(this,resident_deferred_fault::QueryApi::event,nullptr,status);
+#endif
         if (!observe(status)) { commit_failure_ = snapshot_failure_; return SnapshotDrain::unhealthy; }
         if (status == cudaSuccess) commit_pending_ = false;
     }

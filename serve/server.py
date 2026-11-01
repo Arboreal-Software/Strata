@@ -960,6 +960,9 @@ class _EngineEpoch:
     slots: object
     ctl: object
     slot_cv: object
+    strict_owned: bool = False
+    receipt_env: tuple = ()
+    scheduler: object = None
 
 
 @dataclass
@@ -1250,6 +1253,13 @@ class StrataEngine:
         # the slot that has its start (the engine checks it again); when the slot was last used
         slots.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         slots.slot_used = [0.0] * self.batch
+        strict_owned = self._strict_owned_two()
+        child_env = self.spawn[4] if self.spawn[4] is not None else os.environ
+        receipt_env = tuple((key, child_env.get(key)) for key in
+                            ('STRATA_HTTP_NATIVE_RECEIPTS', 'STRATA_HTTP_TWO_SLOT_RECEIPTS'))
+        if strict_owned:
+            from .two_slot_receipts import OwnedSlotObservations
+            slots.owned_observations = OwnedSlotObservations()
         slots.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
@@ -1269,18 +1279,118 @@ class StrataEngine:
             self.lines = lines
             for name in self._SLOT_FIELDS:
                 setattr(self, name, getattr(slots, name))
-            self._epoch = _EngineEpoch(self.proc, self.gen, lines, slots, self.ctl, self.slot_cv)
+            scheduler = None
+            if child_env.get('STRATA_SERVING_THREAD_POLICY_V1') is not None:
+                from .scheduler_control import SchedulerControl
+                captured_proc, captured_gen = self.proc, self.gen
+                def write_scheduler(frame):
+                    # Capture the actual process as well as generation; never retarget.
+                    if self.proc is not captured_proc:
+                        raise EngineDied('scheduler engine changed before write')
+                    self._send(frame.rstrip('\n'), born=captured_gen)
+                def fail_scheduler(reason):
+                    # The callback owns this captured process, even after replacement.
+                    try:
+                        captured_proc.terminate()
+                    except OSError:
+                        pass
+                scheduler = SchedulerControl(write_scheduler, on_failure=fail_scheduler)
+                scheduler.retirements = queue.SimpleQueue()
+            self._epoch = _EngineEpoch(self.proc, self.gen, lines, slots, self.ctl, self.slot_cv,
+                                       strict_owned, receipt_env, scheduler)
             self._stdin_closing = False
             self.ended = False                          # READY: publication and writer generation agree
         self.pump = threading.Thread(target=self._pump, args=(self._epoch,), daemon=True)
         self.pump.start()
 
+    def _strict_owned_two(self):
+        env = self.spawn[4] if self.spawn[4] is not None else os.environ
+        return self.batch == 2 and env.get("STRATA_OWNED_BATCH_ALLOCATION") == "1"
+
+    def _owned_stop(self, epoch, slot, request):
+        if not epoch.strict_owned:
+            return f"BSTOP {slot}"
+        return epoch.slots.owned_observations.stop(slot, request)
+
+    def _cancel_managed_request(self, epoch, request):
+        manager = getattr(self, 'scheduler_manager', None)
+        if epoch.scheduler is not None and manager is not None:
+            manager.schedule_cancel(request, client=epoch.scheduler)
+
+    def _send_owned_stop(self, epoch, slot, request):
+        self._send(self._owned_stop(epoch, slot, request), born=epoch.gen)
+        self._cancel_managed_request(epoch, request)
+
     def _pump(self, epoch=None):
         epoch = epoch or self._capture_epoch()
         proc, lines = epoch.proc, epoch.lines             # this process's: a restart replaces both (#344)
         slot_q = epoch.slots.slot_q
+        native_receipt = None
+        native_env = dict(epoch.receipt_env)
+        if native_env.get('STRATA_HTTP_NATIVE_RECEIPTS') == '1':
+            from .native_receipts import NativeReceipt
+            native_receipt = NativeReceipt.enabled(proc.pid, epoch.gen, native_env)
+        two_receipt = None
+        if native_env.get('STRATA_HTTP_TWO_SLOT_RECEIPTS') == '1':
+            from .two_slot_receipts import TwoSlotReceipt
+            two_receipt = TwoSlotReceipt.enabled(proc.pid, epoch.gen, native_env)
+        owned_terminals = None
+        if epoch.strict_owned:
+            from .two_slot_receipts import OwnedTerminalPairing
+            owned_terminals = OwnedTerminalPairing(epoch.slots.owned_observations)
         line = None
         for line in proc.stdout:
+            if epoch.scheduler is not None:
+                try:
+                    if epoch.scheduler.observe(line):
+                        continue
+                    if line.startswith('SCHED'):
+                        raise ValueError('Malformed scheduler record')
+                except (ValueError, RuntimeError) as error:
+                    epoch.scheduler.close(str(error))
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.silent_note = 'Scheduler protocol failure: '+str(error)
+                            self.ended = True
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    break
+            if epoch.strict_owned:
+                try:
+                    paired = owned_terminals.observe(line)
+                    if epoch.scheduler is not None and line.startswith('BOWN_DONE '):
+                        epoch.scheduler.retirements.put(json.loads(line.split(' ', 1)[1])['request'])
+                    if paired is not None:
+                        retired_slot, terminal_line = paired
+                        slot_q[retired_slot].put(terminal_line)
+                    if line.startswith("BDONE "):
+                        if two_receipt is not None:
+                            two_receipt.observe(line)
+                        continue  # no routing until BOTH real terminal and retirement arrive
+                except (ValueError, KeyError, IndexError, TypeError) as error:
+                    # Fail the captured epoch, wake all consumers below, and retire
+                    # this exact process. Never synthesize a successful BDONE.
+                    line = "BOWN_ERROR protocol_failure"
+                    if two_receipt is not None:
+                        two_receipt.observe(line)
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.silent_note = "Owned batch2 protocol failure: " + str(error)
+                            self.ended = True
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    break
+            if two_receipt is not None:
+                two_receipt.observe(line)
+            if native_receipt is not None:
+                native_receipt.observe(line)  # exact received native line, before routing/consumer filtering
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1315,11 +1425,27 @@ class StrataEngine:
                 except (IndexError, ValueError):
                     pass
             lines.put(line)
+        if epoch.scheduler is not None:
+            epoch.scheduler.close('Captured engine stdout closed', failed=False)
         with self._state_lock():
             if self._epoch_current(epoch):                           # a killed engine's pump must not mark its successor dead
                 self.ended = True                           # its output closed: it is gone, even before the OS says so
                 if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
                     self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
+        if native_receipt is not None:
+            try:
+                native_exit = proc.wait(timeout=2)
+            except Exception:
+                native_exit = None
+            native_receipt.write({'kind': 'eof', 'exit_code': native_exit})
+            native_receipt.close()
+        if two_receipt is not None:
+            try:
+                two_exit = proc.wait(timeout=2)
+            except Exception:
+                two_exit = None
+            two_receipt.write({'kind': 'eof', 'exit_code': two_exit})
+            two_receipt.close()
         lines.put(None)
         for q in slot_q:
             q.put(None)
@@ -1737,7 +1863,7 @@ class StrataEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, *, born: int | None = None, epoch=None):
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, *, born: int | None = None, epoch=None, request=None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
@@ -1748,7 +1874,7 @@ class StrataEngine:
         if slot >= len(slots.slot_q):                    # the engine restarted with fewer slots: this one is gone
             return
         try:
-            self._send(f"BSTOP {slot}", born=epoch.gen)
+            self._send_owned_stop(epoch, slot, request)
         except EngineDied:
             return
         q, busy, held = slots.slot_q[slot], slots.slot_busy, slots.slot_held   # this process's: restart() replaces them
@@ -1966,6 +2092,13 @@ class StrataEngine:
         control.lock = self.ctl if ok is True else ok
         epoch = self._capture_epoch()
         slots = epoch.slots
+        strict_owned = epoch.strict_owned
+        request = getattr(cancel, "_strata_request_id", None)
+        if strict_owned:
+            from .two_slot_receipts import request_key
+            if not request_key(request):
+                raise ValueError("Owned batch2 requires the existing HTTP request identity")
+            keys += " http_request=" + request
         holding, born = True, epoch.gen                  # (the engine it now has the control lines of)
         btrace("ctl acquired")
         slot, gen0, reserved = None, None, None
@@ -1979,6 +2112,8 @@ class StrataEngine:
             if sent and self.gen != born:
                 raise EngineDied("the engine changed after this request was admitted")
             epoch = self._capture_epoch(born if sent else None)
+            if epoch.strict_owned != strict_owned:
+                raise EngineDied("the engine serving mode changed while admission waited")
             slots = epoch.slots
             born = epoch.gen
         yields, solo_again, refused = 0, 0, 0
@@ -1993,7 +2128,7 @@ class StrataEngine:
                 self._check_epoch(epoch)
                 with epoch.slot_cv:
                     alone = not any(slots.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                if not strict_owned and alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     with self._epoch_state(epoch):
                         self._last_done = None                  # (#879: this request's DONE decides below)
@@ -2135,6 +2270,38 @@ class StrataEngine:
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                     slots.slot_live[slot] = live
+                    if epoch.scheduler is not None:
+                        manager = getattr(cancel, '_strata_scheduler_manager', None)
+                        thread = getattr(cancel, '_strata_scheduler_thread', None)
+                        if manager is None or thread is None:
+                            raise ValueError('Managed serving requires an issued scheduler thread handle')
+                        manager.attach(epoch.scheduler)
+                        from .scheduler_manager import SchedulerRequestCancelled
+                        try:
+                            bound = manager.bind(thread, slot, request,
+                                                 operations=getattr(cancel, '_strata_scheduler_operations', None))
+                        except SchedulerRequestCancelled:
+                            cancel.set()
+                            return  # No BGEN was sent; finally reconciles the unbound pair.
+                        if not bound:
+                            # No native binding/admission exists. Give the prerequisite
+                            # HTTP worker BOTH control and physical capacity to run.
+                            with epoch.slot_cv:
+                                slots.slot_live[slot] = None
+                                slots.slot_busy[slot] = False
+                                slots.slot_claims.discard(slot)
+                                epoch.slot_cv.notify_all()
+                            slot = None
+                            control.release()
+                            holding = False
+                            if cancel.wait(0.05):
+                                manager.schedule_cancel(request, client=epoch.scheduler)
+                                return
+                            self._check_epoch(epoch)
+                            yield None
+                            continue
+                    if strict_owned:
+                        slots.owned_observations.register(slot, request, prompt, left)
                     with self._epoch_state(epoch):
                         self._last_done = None                  # (#879: this admission's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}", born=born)
@@ -2151,11 +2318,16 @@ class StrataEngine:
                     with self._epoch_state(epoch):
                         self._ctl_erred = False
                     asked = False
+                    admission_cancel_sent = False
 
                     def ask():        # as give_way above, for the slot this admission reads into
-                        nonlocal asked
+                        nonlocal asked, admission_cancel_sent
                         self._check_epoch(epoch)
-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                        if strict_owned and cancel.is_set() and not admission_cancel_sent:
+                            self._send(f"BCANCEL {slot} request={request}", born=born)
+                            self._cancel_managed_request(epoch, request)
+                            admission_cancel_sent = True
+                        if (not strict_owned and not asked and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             self._send(f"BYIELD {slot}", born=born)
                             asked = True
@@ -2165,7 +2337,7 @@ class StrataEngine:
                         if self.progress and live["state"] == "reading":
                             live["prompt_read"] = self.progress[0]
                     try:
-                        for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()), born=born, epoch=epoch):
+                        for x in self._control(threading.Event() if strict_owned else cancel, pending.append, on_quiet=lambda: (ask(), note_progress()), born=born, epoch=epoch):
                             while pending:
                                 t = pending.pop(0)
                                 out.append(t)
@@ -2213,7 +2385,7 @@ class StrataEngine:
                 if not cont:
                     return
                 live.update(state="decoding", first_token=time.time(), generated=len(out))
-                gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
+                gen0 = max(0, len(out) - 1) if strict_owned else len(out) - 1  # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
                     self._check_epoch(epoch)
@@ -2221,7 +2393,7 @@ class StrataEngine:
                         line = slots.slot_q[slot].get(timeout=10.0)
                     except queue.Empty:
                         if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}", born=born)
+                            self._send_owned_stop(epoch, slot, request)
                             stop_sent = True
                         self._check_epoch(epoch)
                         yield None
@@ -2236,14 +2408,14 @@ class StrataEngine:
                         live["generated"] = len(out)
                         if cancel.is_set():
                             if not stop_sent:
-                                self._send(f"BSTOP {slot}", born=born)
+                                self._send_owned_stop(epoch, slot, request)
                                 stop_sent = True
                             continue
                         self._check_epoch(epoch)
                         yield t
-                        if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
+                        if not strict_owned and not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
-                            self._send(f"BSTOP {slot}", born=born)         # alone now: on with the drafts (below)
+                            self._send_owned_stop(epoch, slot, request)         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
                         phase = "none"
@@ -2293,6 +2465,9 @@ class StrataEngine:
                     self._send("STOP", born=born)
                     self._drain_control("DONE", born=born)
                 elif phase == "admit":
+                    if strict_owned:
+                        self._send(f"BCANCEL {slot} request={request}", born=born)
+                        self._cancel_managed_request(epoch, request)
                     line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
@@ -2335,13 +2510,15 @@ class StrataEngine:
                 elif phase == "slot":
                     slots.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream, born=born, epoch=epoch)    # freed at its BDONE
+                    self._release_slot_when_done(slot, stream, born=born, epoch=epoch, request=request)    # freed at its BDONE
                     slots.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with epoch.slot_cv:
                         slots.slot_busy[slot] = False
                         slots.slot_claims.discard(slot)
                         epoch.slot_cv.notify_all()
+            if epoch.scheduler is not None and not sent:
+                self._cancel_managed_request(epoch, request)
             if trace_error is not None:
                 raise trace_error
 
@@ -2718,6 +2895,9 @@ class StrataEngine:
             if proc is None:
                 return
             write_failed = getattr(self, "_stdin_failed", False)
+            captured_epoch = self.__dict__.get('_epoch')
+        if captured_epoch is not None and captured_epoch.proc is proc and captured_epoch.scheduler is not None:
+            captured_epoch.scheduler.close('Captured engine closing', failed=False)
         closer = self.__dict__.setdefault("_close_lock", threading.Lock())
         if not closer.acquire(timeout=remaining(ENGINE_QUIT_WAIT_S)):
             raise EngineStuck("another engine shutdown is still in progress")
@@ -4125,6 +4305,49 @@ def slot_save_dir(value, base: str | None = None) -> str:
     return path
 
 class Service:
+    def scheduler_manager(self):
+        if not self.api_key:
+            raise ValueError('Scheduler controls require an authenticated service owner')
+        engine = self.engine
+        epoch = engine._capture_epoch() if isinstance(engine, StrataEngine) else None
+        if epoch is None or epoch.scheduler is None:
+            raise ValueError('Managed scheduler is disabled')
+        path = os.environ.get('STRATA_SERVING_THREAD_STATE_V1')
+        if not path:
+            raise ValueError('Managed scheduler requires an explicit durable state path')
+        with self.status_lock:
+            manager = getattr(self, '_scheduler_manager', None)
+            if manager is None:
+                from .scheduler_manager import SchedulerManager
+                manager = self._scheduler_manager = SchedulerManager(path)
+                engine.scheduler_manager = manager
+        manager.attach(epoch.scheduler)
+        configured_base = os.environ.get('STRATA_SERVING_THREAD_DEFAULT_BASE_V1')
+        if configured_base is None or re.fullmatch(r'-?(0|[1-9][0-9]*)', configured_base) is None:
+            raise ValueError('Managed scheduler requires an explicit default base')
+        manager.ensure_default(int(configured_base))
+        return manager
+
+    def scheduler_request(self, req, cancel):
+        selected = req.get('strata_scheduler')
+        epoch = self.engine._capture_epoch() if isinstance(self.engine, StrataEngine) else None
+        enabled = epoch is not None and epoch.scheduler is not None
+        if not enabled and selected is None:
+            return
+        if not enabled:
+            raise ValueError('Managed scheduler is disabled')
+        manager = self.scheduler_manager()
+        if selected is None:
+            selected = {'thread': manager.default_thread}
+        if type(selected) is not dict or set(selected) not in ({'thread'}, {'thread', 'foreground', 'repair'}):
+            raise ValueError('strata_scheduler requires issued thread and optional operation handles')
+        operations = (selected['foreground'], selected['repair']) if 'foreground' in selected else None
+        manager.validate_selection(selected['thread'], operations)
+        cancel._strata_scheduler_manager = manager
+        cancel._strata_scheduler_thread = selected['thread']
+        if 'foreground' in selected:
+            cancel._strata_scheduler_operations = (selected['foreground'], selected['repair'])
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = True):
@@ -7063,6 +7286,14 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
+            if path == '/v1/scheduler':
+                try:
+                    manager = svc.scheduler_manager()
+                    body = json.loads(self._body() or b'{}')
+                    self._json(200, manager.action(body))
+                except (ValueError, RuntimeError, OSError) as error:
+                    self._json(400, {'error': {'type': 'invalid_request_error', 'message': str(error)}})
+                return
             reserved = False
             try:
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
@@ -7468,6 +7699,7 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
+            svc.scheduler_request(req, cancel)
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -7533,6 +7765,7 @@ def make_handler(svc: Service):
             if title is not None:
                 return self._responses_ready(req, title)
             cancel = threading.Event()
+            svc.scheduler_request(req, cancel)
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
@@ -7704,6 +7937,7 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
+            svc.scheduler_request(req, cancel)
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))

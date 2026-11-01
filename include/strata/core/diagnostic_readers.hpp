@@ -90,6 +90,14 @@ public:
         return acquire_locked(index < Capacity ? &slots_[index] : nullptr);
     }
 
+    // Qualification observation: include retiring occupied slots, whose reader
+    // drain has not yet completed. Integer address token was taken while live.
+    bool contains_address(std::uintptr_t address) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for(const auto& slot:slots_)
+            if(slot.object&&reinterpret_cast<std::uintptr_t>(slot.object)==address)return true;
+        return false;
+    }
     void retire(T* object) noexcept {
         Slot* retiring = nullptr;
         {

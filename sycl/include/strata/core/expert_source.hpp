@@ -199,6 +199,9 @@ protected:
 class RouterLookahead {
 public:
     RouterLookahead() = default;
+    // Exact additional logical array payload; false leaves out unchanged.
+    // SYCL's separate generator currently has no owned-runtime ledger binding.
+    static bool residency_snapshot_bytes(size_t layers, int64_t experts, uint64_t& out) noexcept;
     ~RouterLookahead();
     RouterLookahead(const RouterLookahead&) = delete;
     RouterLookahead& operator=(const RouterLookahead&) = delete;
@@ -207,6 +210,8 @@ public:
                std::string& err);
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
+    // Caller supplies [startup layers][experts] and serializes table writes
+    // through this synchronous copy. Worker retains only private storage.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
@@ -223,7 +228,8 @@ private:
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
-    const int32_t* host_res_ = nullptr;
+    std::vector<int32_t> residency_snapshot_; // allocated before worker start
+    bool has_residency_ = false;              // mu_; null input keeps legacy meaning
     std::vector<float> x_;
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};

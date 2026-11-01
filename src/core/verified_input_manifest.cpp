@@ -1,4 +1,5 @@
 #include "strata/core/verified_input_manifest.hpp"
+#include "strata/core/running_engine_identity.hpp"
 #include "strata/core/expert_profile_inventory.hpp"
 #include <algorithm>
 #include <charconv>
@@ -51,15 +52,21 @@ VerifiedArtifactResult ParsedVerifiedInputs::read(const std::string& path,const 
         WindowHasher hash;hash.update(text.data(),text.size());plan->digest_=hash.digest();if(plan->digest_!=expected)return {VerifiedArtifactError::hash_mismatch,0,"full manifest digest mismatch"};need(text.back()=='\n'&&text.find('\0')==std::string::npos&&text.find('\r')==std::string::npos,"manifest requires LF-terminated NUL-free records");
         std::map<std::string,uint64_t> limits;std::map<std::string,VerifiedInputFile> files;std::vector<std::pair<std::string,std::string>> aliases;std::map<std::string,std::map<uint64_t,std::string>> groups;uint64_t records=0;unsigned schema=0;size_t at=0;
         while(at<text.size()){const auto end=text.find('\n',at);need(end-at<=bounds.max_line_bytes&&++records<=bounds.max_records,"manifest line/record bound");std::vector<std::string> f;for(size_t p=at;;){auto e=text.find('\t',p);if(e==std::string::npos||e>end)e=end;need(e>p&&e-p<=bounds.max_field_bytes&&f.size()<8,"manifest field bound/empty field");f.push_back(text.substr(p,e-p));if(e==end)break;p=e+1;}at=end+1;
-            if(records==1){need(f.size()==2&&f[0]=="STRATA_VERIFIED_INPUT_MANIFEST"&&(f[1]=="1"||f[1]=="2"),"unsupported manifest schema");schema=unsigned(f[1][0]-'0');continue;}
-            if(f[0]=="LIMIT"){need(f.size()==3&&limits.emplace(f[1],number(f[2])).second,"duplicate/malformed limit");}
+            if(records==1){need(f.size()==2&&f[0]=="STRATA_VERIFIED_INPUT_MANIFEST"&&(f[1]=="1"||f[1]=="2"||f[1]=="3"),"unsupported manifest schema");schema=unsigned(f[1][0]-'0');continue;}
+            if(f[0]=="MAIN_IMAGE"){
+                need(schema==3&&f.size()==3&&!plan->main_image_present_,"unexpected/duplicate MAIN_IMAGE");
+                plan->main_image_bytes_=number(f[1]);need(plan->main_image_bytes_>=64&&plan->main_image_bytes_<=(2ull<<30),"main image extent bound");
+                plan->main_image_digest_=digest_hex(f[2]);plan->main_image_present_=true;
+            }
+            else if(f[0]=="LIMIT"){need(f.size()==3&&limits.emplace(f[1],number(f[2])).second,"duplicate/malformed limit");}
             else if(f[0]=="FILE"){need(f.size()==5&&identifier(f[1]),"malformed FILE");VerifiedInputFile file{f[4],number(f[2]),digest_hex(f[3]),{}};need(files.emplace(f[1],std::move(file)).second,"duplicate FILE id");}
             else if(f[0]=="ALIAS"){need(f.size()==3&&identifier(f[1]),"malformed ALIAS");aliases.emplace_back(f[1],f[2]);}
             else if(f[0]=="GGUF"){need(f.size()==4&&identifier(f[1]),"malformed GGUF");need(groups[f[1]].emplace(number(f[2]),f[3]).second,"duplicate GGUF ordinal");}
             else if(f[0]=="PACK"){need(f.size()==3,"malformed PACK");plan->manifest_.packs.push_back({f[1],f[2]});}
-            else if(f[0]=="BIND"){need(f.size()==3&&roles().contains(f[1])&&(schema==2||f[1]!="expert-profile")&&plan->binds_.emplace(f[1],f[2]).second,"unknown/duplicate BIND role");}
+            else if(f[0]=="BIND"){need(f.size()==3&&roles().contains(f[1])&&(schema>=2||f[1]!="expert-profile")&&plan->binds_.emplace(f[1],f[2]).second,"unknown/duplicate BIND role");}
             else need(false,"unknown manifest record");
         }
+        need((schema==3)==plan->main_image_present_,"schema3 requires exactly one MAIN_IMAGE");
         const std::vector<std::string> limit_keys={"max_files","max_aliases","max_path_bytes","max_depth","max_metadata_bytes","view_host_bytes","view_disk_bytes","artifact_max_file_bytes","artifact_block_bytes","artifact_metadata_host_bytes","artifact_disk_overhead_bytes","allow_full_copy"};
         need(limits.size()==limit_keys.size(),"missing/unknown manifest limits");for(const auto& key:limit_keys)need(limits.contains(key),"missing/unknown manifest limit");
         auto& l=plan->limits_;l={limits.at("max_files"),limits.at("max_aliases"),limits.at("max_path_bytes"),limits.at("max_depth"),limits.at("max_metadata_bytes"),limits.at("view_host_bytes"),limits.at("view_disk_bytes"),{limits.at("artifact_max_file_bytes"),limits.at("artifact_block_bytes"),limits.at("artifact_metadata_host_bytes"),limits.at("artifact_disk_overhead_bytes"),limits.at("allow_full_copy")!=0}};
@@ -84,6 +91,18 @@ VerifiedArtifactResult ParsedVerifiedInputs::read(const std::string& path,const 
         // Workspace and IO released before replacing arbitrary old output owners.
         std::string().swap(text);admission.reset();out=std::move(plan);return {};
     }catch(const Failure& f){return result(f);}catch(const std::bad_alloc&){return {VerifiedArtifactError::budget_refused,0,"manifest metadata allocation failed"};}catch(const std::exception& e){return {VerifiedArtifactError::invalid,0,e.what()};}catch(...){return {VerifiedArtifactError::invalid,0,"manifest callback failed"};}
+#endif
+}
+std::shared_ptr<const ExpectedRunningExecutable> ParsedVerifiedInputs::expected_running_executable(WindowBudget budget)const noexcept {
+    if(!main_image_present_)return {};
+#ifdef __linux__
+    try {
+        auto lease=reserve(budget,512+sizeof(ExpectedRunningExecutable),0);
+        return std::shared_ptr<const ExpectedRunningExecutable>(
+            new ExpectedRunningExecutable(main_image_bytes_,main_image_digest_,shared_from_this(),std::move(lease)));
+    } catch(...) {return {};}
+#else
+    (void)budget;return {};
 #endif
 }
 VerifiedArtifactResult ParsedVerifiedInputs::validate_overrides(const VerifiedDriverOverrides& overrides)const{
