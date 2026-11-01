@@ -14,7 +14,7 @@ def generate(root):
         at = source.index(marker)
         block = body(source, marker)
         return source[at:source.index(block, at)] + block
-    producer = actual(cpp, 'bool Prefill::admit_owned_workspace(')
+    producer = actual(cpp, 'WorkspaceAdmission Prefill::admit_owned_workspace(')
     guard = actual(cpp, 'if(workspace_credit_&&')
     driver_body = body(driver, 'auto admit_prefill_workspace =')
     constants = re.search(r'constexpr int64_t N =[^;]+;', cpp)[0]
@@ -45,7 +45,7 @@ static int64_t MAXBLOB(){return 4096;} // explicit backend byte-count fixture, n
 struct Stager{struct Job{const uint8_t* src;size_t bytes;core::ExpertSource* from=nullptr;int32_t l=0,e=0;};};
 struct Prefill {
     struct Impl{const core::ModelGeometry* g=nullptr;bool pp=false,help_pp=false;};
-    using WorkspaceAdmitter=std::function<bool(const OwnedWorkspaceBytes&,std::shared_ptr<const void>&)>;
+    using WorkspaceAdmitter=std::function<WorkspaceAdmission(const OwnedWorkspaceBytes&,std::shared_ptr<const void>&)>;
     bool strict_retirement_=true;void* cpu_pool_=nullptr;Prefill* helper_=nullptr;void* embd_rows=nullptr;
     std::function<void()> on_routes,on_taps;
     std::shared_ptr<const void> workspace_credit_;
@@ -55,7 +55,7 @@ struct Prefill {
     std::unique_ptr<Impl> impl_=std::make_unique<Impl>();Prefill* next_=nullptr;
     static uint64_t bytes_needed(const core::ModelGeometry&,const core::SessionState&,int64_t chunk,bool){return (16ULL<<20)+uint64_t(chunk)*4096;}
     static uint64_t bytes_needed_owned(const core::ModelGeometry& g,const core::SessionState& s,int64_t c,bool src){return bytes_needed(g,s,c,src);}
-    bool admit_owned_workspace(const core::ModelGeometry&,const core::SessionState&,core::ExpertSource*,int64_t,bool,const WorkspaceAdmitter&,std::string&);
+    WorkspaceAdmission admit_owned_workspace(const core::ModelGeometry&,const core::SessionState&,core::ExpertSource*,int64_t,bool,const WorkspaceAdmitter&,std::string&);
     bool init_binding(const core::ModelGeometry& g,core::SessionState& ss,core::ExpertSource* src,int64_t chunk,void* borrow,bool borrow_spill,std::string& err){
 ''' + guard + r'''
         return true;
@@ -64,14 +64,16 @@ struct Prefill {
 ''' + producer + r'''
 }
 using namespace strata;
+static prefill::WorkspaceAdmission last_admission=prefill::WorkspaceAdmission::invalid;
 static bool actual_driver(prefill::Prefill& consumer,const core::ModelGeometry& g,const core::SessionState& session,
                           core::ExpertSource* source,int64_t chunk,bool borrowed,int device,bool enabled,
                           std::unique_ptr<core::WindowBudget>& model_budget,std::string& err){
     const bool owned_batch_allocation=enabled;struct Options{int64_t prefill_chunk;};Options o{chunk};
-    auto invoke=[&](prefill::Prefill& consumer,const core::SessionState& session,core::ExpertSource* source,bool borrowed,int device)->bool
+    auto invoke=[&](prefill::Prefill& consumer,const core::SessionState& session,core::ExpertSource* source,bool borrowed,int device)->prefill::WorkspaceAdmission
 #define STRATA_WINDOW_STATE_AVAILABLE 1
 ''' + driver_body + r''';
-    return invoke(consumer,session,source,borrowed,device);
+    last_admission=invoke(consumer,session,source,borrowed,device);
+    return last_admission==prefill::WorkspaceAdmission::ready;
 }
 static auto budget(uint64_t host,uint64_t device=512ULL<<20){return std::make_unique<core::WindowBudget>(core::WindowResources{{device,device},host,host},core::WindowResources{{0,0}});}
 int main(){
@@ -101,12 +103,14 @@ int main(){
         auto short_host=budget(1);prefill::Prefill p;
         require(!actual_driver(p,g,a,&source,1024,false,0,true,short_host,err)&&short_host->snapshot().reserved.host_bytes==0&&!p.workspace_credit_,
             "actual ledger refusal happens before init without partial charge");
+        require(last_admission==prefill::WorkspaceAdmission::budget_refused,"actual quota refusal is eligible for existing checked smaller-chunk retry");
     }
     {
         prefill::Prefill p;auto current=ledger->snapshot().reserved;
         require(actual_driver(p,g,a,&source,1024,false,0,false,ledger,err)&&!p.workspace_credit_&&ledger->snapshot().reserved==current,
             "actual default-off driver path unchanged");
         require(!actual_driver(p,g,a,&source,0,false,0,true,ledger,err),"actual zero shape refused");
+        require(last_admission==prefill::WorkspaceAdmission::invalid,"invalid shape is never mislabeled capacity shrink");
         p.cpu_pool_=reinterpret_cast<void*>(1);
         require(!actual_driver(p,g,a,&source,1024,false,0,true,ledger,err),"actual uncovered CPU consumer refused");
     }

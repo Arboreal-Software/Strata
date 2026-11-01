@@ -14,6 +14,7 @@ struct OwnedWorkspaceShape {
     bool borrowed=false,successor=false;
 };
 struct OwnedWorkspaceBytes {uint64_t device=0,host=0,pinned=0;};
+enum class WorkspaceAdmission { ready,invalid,budget_refused };
 inline bool owned_workspace_quote(const OwnedWorkspaceShape& s,OwnedWorkspaceBytes& output)noexcept {
     if(!s.chunk||!s.embedding||!s.routes||!s.experts||!s.layers||!s.step_count||!s.ple_heads||
        !s.stager_slots||!s.max_blob||!s.upload_slots||!s.upload_min_bytes||!s.object_bytes||!s.stager_job_bytes||!s.atomic_bytes||

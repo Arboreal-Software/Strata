@@ -54,7 +54,7 @@ class OutputCapacitySource(unittest.TestCase):
         self.assertIn('receipts_.snapshot(receipt_count_', self.controller)
         self.assertIn('fatal("cohort RAW commit refused after authentic group completion")', self.controller)
         eligibility = (ROOT / 'include/strata/core/native_owned_batch_serving.hpp').read_text()
-        for restriction in ['p.spec==0', 'p.batch_groups==1', 'p.prefill_chunk==16', '!p.vision']:
+        for restriction in ['p.spec==0', 'p.batch_groups==1', 'p.prefill_chunk>0 && p.prefill_chunk<=32768', '!p.vision']:
             self.assertIn(restriction, eligibility)
         for removed in ['facts.max_generated>64', 'budget>64||!fresh_owned_slot', 'bimg||mn>64']:
             self.assertNotIn(removed, self.source)

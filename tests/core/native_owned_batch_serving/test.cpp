@@ -25,12 +25,14 @@ int main(){
     auto refused=[&](auto member,auto value){auto changed=p;changed.*member=value;assert(!batch::eligible(true,changed,true));};
     for(auto field:{&Policy::serve,&Policy::owned_session_lifetime,&Policy::owned_model_lifetime,&Policy::suffix_cache})refused(field,false);
     for(auto field:{&Policy::suffix_cache_unrepaired_experiment,&Policy::batch_groups_auto,&Policy::batch_mtp,
-        &Policy::keep_canonical,&Policy::prefill_auto,&Policy::prefill_head_alias,&Policy::vision,
+        &Policy::keep_canonical,&Policy::prefill_head_alias,&Policy::vision,
         &Policy::kv_grow,&Policy::vram_elastic,&Policy::adapt_async_self,&Policy::spec_split,&Policy::split_skip_if_fits})refused(field,true);
     for(auto field:{&Policy::spec,&Policy::spec_corrupt,&Policy::suffix_draft,&Policy::lookup_chain,
         &Policy::pipeline_windows,&Policy::kv_resident,&Policy::prompt_cache,&Policy::adapt_every,&Policy::adapt_async,&Policy::adapt_warm_every})refused(field,1);
     refused(&Policy::batch,1);refused(&Policy::batch,3);refused(&Policy::batch_groups,2);
-    refused(&Policy::prefill_chunk,32);refused(&Policy::short_read,65);refused(&Policy::peer_device,0);
+    refused(&Policy::prefill_chunk,0);refused(&Policy::prefill_chunk,32769);refused(&Policy::short_read,65);refused(&Policy::peer_device,0);
+    for(int chunk:{16,1024,8192,32768}){auto supported=p;supported.prefill_chunk=chunk;assert(batch::eligible(true,supported,true));
+        supported.prefill_auto=true;assert(batch::eligible(true,supported,true));}
     refused(&Policy::suffix_cache_host_bytes,uint64_t(0));
     for(auto field:{&Policy::mtp,&Policy::draft,&Policy::draft_model,&Policy::spec_oracle,&Policy::spec_follow})refused(field,std::string("enabled"));
     refused(&Policy::native_preset,std::string());refused(&Policy::kv,std::string("fp16"));

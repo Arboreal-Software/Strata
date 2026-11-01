@@ -3701,6 +3701,9 @@ public:
         out.published=c.published_->metadata;out.next_cut=c.next_cut_;
         return true;
     }
+    static bool private_cache_restored(const Outcome& out)noexcept {
+        return out.controller&&!out.retired&&out.controller->original_private_residency_restored();
+    }
     // ---- retained repair across a response boundary (OPT-IN: STRATA_SERVING_REPAIR_OWNER_SLOTS) ----------
     // The three operations below are the serving-side half of the certified yield.  They add no admission of
     // their own: every decision is the controller's (`retained_yield_allowed` / `retained_private_unit_allowed`,
@@ -5182,6 +5185,14 @@ int main(int argc, char** argv) {
        (!strata::core::native_owned_batch_serving::eligible(true,o,true)||!owned_batch_environment())){
         std::fputs("strata serve: owned two-slot profile or explicit setup/prefill envelope refused\n",stderr);return 2;
     }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+    if(owned_batch_requested&&(o.prefill_chunk!=16||o.prefill_auto)){
+        const auto config=strata::program::serving_thread_config();
+        if(!config.enabled||!config.valid){
+            std::fputs("strata serve: larger/auto owned foreground prefill requires explicit managed safe-unit policy and limits\n",stderr);return 2;
+        }
+    }
+#endif
 #if !defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
     if(owned_batch_requested){
         std::fputs("strata serve: owned two-slot execution requires native suffix repair support\n",stderr);return 2;
@@ -12320,6 +12331,16 @@ int main(int argc, char** argv) {
             );
         auto& sp=sp_storage.get();
         if(!configure_retirement(sp))return 1;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        auto actual_prefix_policy = [&](uint64_t short_read) {
+            strata::program::PrefixReplayPolicy policy;
+            policy.configured_max=uint64_t(o.prefill_chunk);
+            policy.allocated_max=uint64_t(sp.replay_activity().allocated_chunk);
+            policy.automatic=o.prefill_auto;
+            policy.auto_requested_max=o.prefill_auto?uint64_t(o.prefill_auto_max):0;
+            policy.short_read=short_read;return policy;
+        };
+#endif
 #if defined(STRATA_WINDOW_STATE_AVAILABLE)
         strata::core::WindowConsumerDrainGuard serve_prefill_consumers{owned_model};
 #endif
@@ -12719,22 +12740,48 @@ int main(int argc, char** argv) {
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
         auto admit_prefill_workspace = [&](strata::prefill::Prefill& consumer,const strata::core::SessionState& session,
-                                          strata::core::ExpertSource* source,bool borrowed,int device) -> bool {
+                                          strata::core::ExpertSource* source,bool borrowed,int device) -> strata::prefill::WorkspaceAdmission {
+            using Admission=strata::prefill::WorkspaceAdmission;
 #if defined(STRATA_WINDOW_STATE_AVAILABLE)
             if(owned_batch_allocation){
-                if(!model_budget||device<0){err="owned prefill has no actual model ledger/device";return false;}
+                if(!model_budget||device<0){err="owned prefill has no actual model ledger/device";return Admission::invalid;}
                 return consumer.admit_owned_workspace(g,session,source,o.prefill_chunk,borrowed,
                     [&](const strata::prefill::OwnedWorkspaceBytes& quote,std::shared_ptr<const void>& credit){
                         const auto dimensions=model_budget->snapshot().capacity.device_bytes.size();
-                        if(size_t(device)>=dimensions)return false;
+                        if(size_t(device)>=dimensions)return Admission::invalid;
                         strata::core::WindowResources resources;resources.device_bytes.resize(dimensions);
                         resources.device_bytes[size_t(device)]=quote.device;resources.host_bytes=quote.host;resources.pinned_bytes=quote.pinned;
                         auto admitted=model_budget->reserve(resources,strata::core::ReservationPurpose::foreground);
-                        if(!admitted)return false;credit=std::move(admitted.lease);return true;
+                        if(!admitted){
+                            using Error=strata::core::ReservationError;
+                            switch(admitted.error){
+                                case Error::device_limit:case Error::host_limit:case Error::pinned_limit:
+                                    return Admission::budget_refused;
+                                default:return Admission::invalid;
+                            }
+                        }
+                        credit=std::move(admitted.lease);
+                        std::fprintf(stderr,"PREFILL_WORKSPACE v=1 phase=admitted device=%d capacity=%lld borrowed=%d device_quote=%llu host_quote=%llu pinned_quote=%llu\n",
+                            device,(long long)o.prefill_chunk,int(borrowed),(unsigned long long)quote.device,
+                            (unsigned long long)quote.host,(unsigned long long)quote.pinned);
+                        return Admission::ready;
                     },err);
             }
 #endif
-            return true; // legacy/default-OFF allocation path remains unchanged
+            return Admission::ready; // legacy/default-OFF allocation path remains unchanged
+        };
+        auto report_prefill_workspace=[&](const strata::prefill::Prefill& consumer,int expected_device,bool borrowed)->bool {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_batch_allocation){
+                const auto actual=consumer.replay_activity();
+                if(!actual.initialized||!actual.workspace_paid||actual.device!=expected_device||
+                   actual.allocated_chunk!=o.prefill_chunk||actual.chunk<=0||actual.ring_slots<=0){
+                    err="owned prefill resolved workspace/owner differs from actual admission";return false;}
+                std::fprintf(stderr,"PREFILL_WORKSPACE v=1 phase=ready device=%d capacity=%lld chunk=%lld ring=%lld borrowed=%d paid=1\n",
+                    actual.device,(long long)actual.allocated_chunk,(long long)actual.chunk,(long long)actual.ring_slots,int(borrowed));
+            }
+#endif
+            return true;
         };
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
@@ -12749,22 +12796,28 @@ int main(int argc, char** argv) {
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
                 if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
-                if(!admit_prefill_workspace(st.sp,st.ss,srcp,sb!=nullptr,st.dev))return 1;
+                const auto workspace=admit_prefill_workspace(st.sp,st.ss,srcp,sb!=nullptr,st.dev);
+                if(workspace!=strata::prefill::WorkspaceAdmission::ready)
+                    return workspace==strata::prefill::WorkspaceAdmission::budget_refused?2:1;
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
                 }
+                if(!report_prefill_workspace(st.sp,st.dev,sb!=nullptr))return 1;
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
 #if defined(STRATA_WINDOW_STATE_AVAILABLE)
             const strata::core::OnDevice owned_primary_prefill_device(owned_batch_allocation?primary_device:-1);
 #endif
-            if(!admit_prefill_workspace(sp,ss,prefill_src,borrow!=nullptr,primary_device))return 1;
+            const auto workspace=admit_prefill_workspace(sp,ss,prefill_src,borrow!=nullptr,primary_device);
+            if(workspace!=strata::prefill::WorkspaceAdmission::ready)
+                return workspace==strata::prefill::WorkspaceAdmission::budget_refused?2:1;
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
+            if(!report_prefill_workspace(sp,primary_device,borrow!=nullptr))return 1;
             return 0;
         };
         static constexpr int64_t kStepChunks[] = {6144, 4096, 3072, 2048, 1536, 1024, 512};
@@ -16633,7 +16686,8 @@ int main(int argc, char** argv) {
 
         std::function<void(size_t)> owned_slot_numerical_oracle;
         std::function<bool()> owned_slot_maintenance;
-        auto batch_step = [&]() -> bool {
+        auto batch_step = [&](bool restricted_prefill=false,bool* deferred=nullptr) -> bool {
+            if(deferred)*deferred=false;
             std::vector<int> keep(bs.size(),0); // allocate before any native work begins
             if(in_shared->input_error.load())return false;
 #if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
@@ -16643,11 +16697,16 @@ int main(int argc, char** argv) {
                 for(auto& peer:serving_thread_cohort_units)peer.reset();
                 if(!serving_prefill_peer_winner&&!serving_process_controls())return false;
                 bool input_ended=false;{std::lock_guard<std::mutex> lock(in_mu);input_ended=in_eof;}
+                if(restricted_prefill&&(input_ended||stop_req.load())){
+                    if(deferred)*deferred=true;return false;
+                }
                 for(size_t i=0;i<bs.size();++i){auto& lane=bs[i];
                     if(lane.alignment_unpublished&&serving_threads->cancellation_pending(i)){
+                        if(restricted_prefill){if(deferred)*deferred=true;return false;}
                         stop_req.store(true);return false; // admission owns real RAW retirement
                     }
                     if((lane.active||lane.repair_finishing)&&(input_ended||serving_threads->cancellation_pending(i))){
+                        if(restricted_prefill){if(deferred)*deferred=true;return false;}
                         if(!lane.owned_raw)std::terminate();
                         accept_batch_stop("BSTOP "+std::to_string(i)+" occupancy="+
                             std::to_string(lane.owned_raw->slot_occupancy_incarnation()));
@@ -17365,13 +17424,15 @@ int main(int argc, char** argv) {
             };
             report_oracle_boundary("begin");
             auto oracle_check = [&](const strata::program::PrefixReplayPlan& recorded,std::string& error)->bool {
-                if(&recorded!=&plan||!recorded.origin_matches(serving_raw_session->edited_key(),owned_runtime->remote_policy_incarnation,0)||
+                if(&recorded!=&plan||!recorded.policy_matches(actual_prefix_policy(uint64_t(o.short_read)))||
+                   !recorded.origin_matches(serving_raw_session->edited_key(),owned_runtime->remote_policy_incarnation,0)||
                    recorded.source!=srcp||recorded.runtime!=owned_runtime.get()||recorded.participant_count!=pf_parts.size()||
                    recorded.pipe!=strata::prefill::Prefill::pipe_setting()||recorded.base!=host_res){error="owned-slot oracle authentic prefix base differs";return false;}
                 for(size_t i=0;i<pf_parts.size();++i){const auto& part=pf_parts[i];const auto& saved=recorded.participants[i];
                     const auto activity=part.sp->replay_activity();const auto cpu=part.sp->cpu_share_policy();
                     if(!part.lent.empty()||saved.cache!=part.cache||saved.prefill!=part.sp||saved.session!=part.ses||
                        saved.offsets!=part.cache->slot_offsets()||saved.slots!=part.cache->slots()||saved.begin!=part.lb||saved.end!=part.le||
+                       saved.allocated_chunk!=activity.allocated_chunk||
                        !activity.initialized||activity.session!=part.ses||activity.cache!=part.cache||activity.source!=srcp||
                        activity.residency!=host_res.data()||activity.helper||activity.peer||activity.taps||activity.borrow_spill||activity.pending_force||
                        !cpu.explicit_resolved||cpu.mode!=strata::core::NumericPolicyMode::disabled||cpu.dynamic_assignment||cpu.measured_ratios||cpu.measurement_pending||cpu.measured_gate){
@@ -17389,9 +17450,11 @@ int main(int argc, char** argv) {
                     if(recording&&!saved.loan_seen){
                         if(p.lent.size()>saved.loan.capacity())return plan.reject("prefix loan exceeds credited directory");
                         saved.loan.assign(p.lent.begin(),p.lent.end());saved.first=p.first_now;
-                        saved.chunk=p.sp->chunk();saved.lent_chunk=p.lent_chunk;saved.loan_seen=true;
+                        saved.chunk=p.sp->chunk();saved.lent_chunk=p.lent_chunk;
+                        saved.ring_slots=p.sp->replay_activity().ring_slots;saved.loan_seen=true;
                     }else if(!saved.loan_seen||saved.first!=p.first_now||saved.chunk!=p.sp->chunk()||
-                             saved.lent_chunk!=p.lent_chunk||saved.loan!=p.lent)
+                             saved.lent_chunk!=p.lent_chunk||saved.loan!=p.lent||
+                             saved.ring_slots!=p.sp->replay_activity().ring_slots)
                         return plan.reject("prefix profile requires one identical actual loan shape per stage");
                     for(const auto& pair:p.lent){
                         if(pair.first<0||size_t(pair.first)>=plan.base.size()||
@@ -17414,7 +17477,14 @@ int main(int argc, char** argv) {
                 std::array<SavedCallbacks,8> saved;
                 try {
                     if(event.to>plan.tokens.size()||history.size()<event.to)return false;
-                    if(event.lend&&(!shared_prefix_lend(event.lend_tokens,e,event.lend_exact,true,replay_lend)||!oracle_loans(false)))
+                    auto replay_loan=[&](){return shared_prefix_lend(event.lend_tokens,e,event.lend_exact,true,replay_lend)&&oracle_loans(false);};
+                    if(event.returned_before_lend){
+                        bool outstanding=false;for(const auto& p:pf_parts)outstanding=outstanding||!p.lent.empty();
+                        if(!outstanding&&!replay_loan())strata::core::retirement_failed("owned-slot prefix initial loan differs");
+                        for(uint64_t cycle=0;cycle<event.loan_cycles;++cycle)
+                            if(!shared_prefix_refill(true,e)||!replay_loan())
+                                strata::core::retirement_failed("owned-slot prefix recorded loan cycle failed");
+                    }else if(event.lend&&!replay_loan())
                         strata::core::retirement_failed("prefix replay actual loan differs after mutation");
                     for(uint64_t at=event.from;at<event.to;++at)plan.tokens[size_t(at)]=history[size_t(at)];
                     for(size_t i=0;i<pf_parts.size();++i){auto& v=*pf_parts[i].sp;auto& old=saved[i];old.sp=&v;
@@ -20107,7 +20177,8 @@ int main(int argc, char** argv) {
                 auto zero=[](const char* name){const char* v=std::getenv(name);return v&&std::strcmp(v,"0")==0;};
                 auto absent_or_zero=[](const char* name){const char* v=std::getenv(name);return !v||std::strcmp(v,"0")==0;};
                 if((!sfx_prefix_reset_from_zero&&!sfx_prefix_origin_replay)||!req_imgs.empty()||
-                   o.prefill_chunk!=16||o.short_read!=64||req_short_read!=64||o.prefill_auto||
+                   ((!o.native_owned_batch_serving)&&(o.prefill_chunk!=16||o.prefill_auto))||
+                   !actual_prefix_policy(uint64_t(req_short_read)).valid()||o.short_read!=64||req_short_read!=64||
                    (!o.native_serial_serving&&!o.native_owned_batch_serving)||(o.batch&&!o.native_owned_batch_serving)||pipe||pl_pw||o.pipeline_windows||use_mtp||batch_mtp||
                    !std::isfinite(strata::prefill::Prefill::pipe_setting())||strata::prefill::Prefill::pipe_setting()<0||
                    !zero("STRATA_PREFILL_CPU_SHARE")||!absent_or_zero("STRATA_PREFILL_HELP")||
@@ -20123,6 +20194,7 @@ int main(int argc, char** argv) {
                     if(!a.initialized||a.session!=p.ses||a.cache!=p.cache||a.source!=srcp||
                        a.residency!=host_res.data()||a.device!=device||a.begin!=p.lb||a.end!=p.le||a.next!=next||
                        a.helper||a.peer||a.taps||a.borrow_spill||a.pending_force||p.sp->embd_rows||p.sp->on_routes||
+                       (o.native_owned_batch_serving&&!a.workspace_paid)||
                        !cpu.explicit_resolved||cpu.mode!=strata::core::NumericPolicyMode::disabled||
                        cpu.dynamic_assignment||cpu.measured_ratios||cpu.measurement_pending||cpu.measured_gate)
                         return "actual Prefill activity is outside fixed prefix replay profile";
@@ -20135,12 +20207,14 @@ int main(int argc, char** argv) {
                 if(const char* why=sfx_prefix_policy())return plan.reject(why);
                 for(const auto& p:pf_parts)if(!p.lent.empty())return plan.reject("base prefix cache has an outstanding loan");
                 try {
-                    if(!plan.prepare(sfx_qualification.credit,host_res))return false;
+                    if(!plan.bind_policy(actual_prefix_policy(uint64_t(req_short_read)))||
+                       !plan.prepare(sfx_qualification.credit,host_res))return false;
                     plan.source=srcp;plan.runtime=owned_runtime.get();plan.participant_count=pf_parts.size();
                     plan.pipe=strata::prefill::Prefill::pipe_setting();
                     for(size_t i=0;i<pf_parts.size();++i){const auto& p=pf_parts[i];auto& saved=plan.participants[i];
                         saved.cache=p.cache;saved.prefill=p.sp;saved.session=p.ses;saved.offsets=p.cache->slot_offsets();
                         saved.device=p.dev<0?primary_device:p.dev;saved.begin=p.lb;saved.end=p.le;saved.slots=p.cache->slots();
+                        saved.allocated_chunk=p.sp->replay_activity().allocated_chunk;
                         saved.loan.reserve(size_t(p.le-p.lb)*size_t(g.n_expert));
                     }
                     return true;
@@ -20155,9 +20229,11 @@ int main(int argc, char** argv) {
                     if(recording&&!saved.loan_seen){
                         if(p.lent.size()>saved.loan.capacity())return plan.reject("prefix loan exceeds credited directory");
                         saved.loan.assign(p.lent.begin(),p.lent.end());saved.first=p.first_now;
-                        saved.chunk=p.sp->chunk();saved.lent_chunk=p.lent_chunk;saved.loan_seen=true;
+                        saved.chunk=p.sp->chunk();saved.lent_chunk=p.lent_chunk;
+                        saved.ring_slots=p.sp->replay_activity().ring_slots;saved.loan_seen=true;
                     }else if(!saved.loan_seen||saved.first!=p.first_now||saved.chunk!=p.sp->chunk()||
-                             saved.lent_chunk!=p.lent_chunk||saved.loan!=p.lent)
+                             saved.lent_chunk!=p.lent_chunk||saved.loan!=p.lent||
+                             saved.ring_slots!=p.sp->replay_activity().ring_slots)
                         return plan.reject("prefix profile requires one identical actual loan shape per stage");
                     for(const auto& pair:p.lent){
                         if(pair.first<0||size_t(pair.first)>=plan.base.size()||
@@ -20174,12 +20250,14 @@ int main(int argc, char** argv) {
                    !plan.origin_matches(serving_suffix_active->published.key,owned_runtime->remote_policy_incarnation,
                        ajob?uint64_t(a_swapped):uint64_t(adapt_nswaps)))){
                     e="retained prefix runtime/content/residency origin differs";return false;}
-                if(plan.source!=srcp||plan.runtime!=owned_runtime.get()||plan.participant_count!=pf_parts.size()||
+                if(!plan.policy_matches(actual_prefix_policy(uint64_t(req_short_read)))||
+                   plan.source!=srcp||plan.runtime!=owned_runtime.get()||plan.participant_count!=pf_parts.size()||
                    plan.pipe!=strata::prefill::Prefill::pipe_setting()||plan.base!=host_res){e="actual full prefix base mapping/owner differs";return false;}
                 for(size_t i=0;i<pf_parts.size();++i){const auto& p=pf_parts[i];const auto& saved=plan.participants[i];
                     if(!p.lent.empty()||saved.cache!=p.cache||saved.prefill!=p.sp||saved.session!=p.ses||
                        saved.offsets!=p.cache->slot_offsets()||saved.slots!=p.cache->slots()||
                        saved.device!=(p.dev<0?primary_device:p.dev)||saved.begin!=p.lb||saved.end!=p.le||
+                       saved.allocated_chunk!=p.sp->replay_activity().allocated_chunk||
                        (saved.loan_seen&&(saved.first!=p.first_now||saved.chunk!=p.sp->chunk()))){
                         e="actual prefix base has outstanding loan or changed cache/layout";return false;}}
                 return true;
@@ -20198,7 +20276,14 @@ int main(int argc, char** argv) {
                 std::array<SavedCallbacks,8> saved;
                 try {
                     if(event.to>plan.tokens.size()||history.size()<event.to)return false;
-                    if(event.lend&&(!lend(event.lend_tokens,e,event.lend_exact)||!sfx_prefix_loans(false)))
+                    auto replay_loan=[&](){return shared_prefix_lend(event.lend_tokens,e,event.lend_exact,true,seg_lend)&&sfx_prefix_loans(false);};
+                    if(event.returned_before_lend){
+                        bool outstanding=false;for(const auto& p:pf_parts)outstanding=outstanding||!p.lent.empty();
+                        if(!outstanding&&!replay_loan())strata::core::retirement_failed("prefix replay initial loan differs");
+                        for(uint64_t cycle=0;cycle<event.loan_cycles;++cycle)
+                            if(!shared_prefix_refill(true,e)||!replay_loan())
+                                strata::core::retirement_failed("prefix replay recorded loan cycle failed");
+                    }else if(event.lend&&!replay_loan())
                         strata::core::retirement_failed("prefix replay actual loan differs after mutation");
                     for(uint64_t at=event.from;at<event.to;++at)plan.tokens[size_t(at)]=history[size_t(at)];
                     for(size_t i=0;i<pf_parts.size();++i){auto& v=*pf_parts[i].sp;auto& old=saved[i];old.sp=&v;
@@ -20246,7 +20331,8 @@ int main(int argc, char** argv) {
                 strata::program::PrefixReplayView{&sfx_prefix_plan,&sfx_prefix_callbacks,
                     sfx_prefix_origin_replay?sfx_prefix_plan.request:0}:strata::program::PrefixReplayView{};};
             int64_t sfx_prefix_lend_tokens=0,sfx_prefix_lend_exact=0;
-            bool sfx_prefix_first_piece=false;
+            bool sfx_prefix_first_piece=false,sfx_prefix_returned_before_lend=false;
+            uint64_t sfx_prefix_loan_cycles=0;
 #endif
             // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
             // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
@@ -20258,6 +20344,88 @@ int main(int argc, char** argv) {
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
             }();
             bool batch_fatal = false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // The request owns this paid known-prefix scratch across segments.
+            // Endpoints below are written ONLY by successful joined stage callbacks.
+            std::shared_ptr<const void> prefill_turn_credit;
+            std::vector<int32_t> prefill_turn_history;
+            std::shared_ptr<strata::program::ServingRawSession> prefill_turn_credit_main,prefill_joined_main;
+            strata::core::WindowKey prefill_joined_key{};
+            strata::core::StateDigest prefill_joined_history{};
+            uint64_t prefill_turn_max=0,prefill_joined_request=0;
+            bool prefill_turn_unavailable=false;
+            std::array<int64_t,64> prefill_joined_stage_end{};
+            prefill_joined_stage_end.fill(-1);
+            uint64_t prefill_joined_end=UINT64_MAX;
+            auto admit_prefill_turn_scratch=[&](const auto& main)->bool {
+                if(prefill_turn_credit)return prefill_turn_credit_main.get()==main.get()&&
+                    ids.size()==prefill_turn_max&&prefill_turn_history.capacity()>=prefill_turn_max;
+                const uint64_t requested_max=ids.size();
+                uint64_t bytes=sizeof(prefill_turn_history)+2*sizeof(strata::core::WindowKey);
+                const auto& key=main->key();
+                for(const auto* text:{&key.session_id,&key.thread_id,&key.window_id}){
+                    if(text->size()>(UINT64_MAX-bytes)/2)return false;
+                    bytes+=2*text->size();
+                }
+                if(requested_max>(UINT64_MAX-bytes)/sizeof(int32_t))return false;
+                bytes+=requested_max*sizeof(int32_t);
+                std::shared_ptr<const void> temporary;
+                if(auto admitted=main->admit_host(bytes,temporary);!admitted)return false;
+                if(!temporary||ids.size()!=requested_max)return false;
+                try{prefill_turn_history.reserve(size_t(requested_max));}catch(...){return false;}
+                prefill_turn_credit=std::move(temporary);prefill_turn_max=requested_max;prefill_turn_credit_main=main;
+                return true;
+            };
+            auto serving_prefill_safe_turn = [&](uint64_t endpoint,auto&& dispatch,std::string& e) -> bool {
+                prefill_turn_unavailable=false;
+                auto main=serving_raw_session;
+                if(!serving_threads||!main||!main->healthy()||
+                   !main->request_open()||main->phase()!=strata::program::ServingRawSession::Phase::running||
+                   stages.size()>=prefill_joined_stage_end.size()||stages.size()>=size_t(SplitDrive::kMax)||
+                   live_approximate||endpoint>ids.size()||serving_raw_cut==UINT64_MAX||serving_raw_cut<main->cut().id){
+                    e="prefill turn lacks its exact running MAIN owner";return false;}
+                if(prefill_joined_end!=endpoint||prefill_joined_main.get()!=main.get()||
+                   prefill_joined_request!=owned_admission_scope.request||prefill_joined_key!=main->key()){
+                    e="prefill turn has no authenticated joined endpoint for this MAIN/request";return false;}
+                for(size_t i=0;i<=stages.size();++i)if(prefill_joined_stage_end[i]!=int64_t(endpoint)){
+                    e="prefill turn stage endpoints disagree";return false;}
+                if(prefill_turn_credit&&(prefill_turn_credit_main.get()!=main.get()||ids.size()!=prefill_turn_max||
+                   prefill_turn_history.capacity()<prefill_turn_max)){
+                    e="prefill turn credited owner/history maximum changed";return false;}
+                if(!admit_prefill_turn_scratch(main)){prefill_turn_unavailable=true;return false;}
+                if(endpoint>prefill_turn_max||prefill_turn_history.capacity()<endpoint){
+                    e="prefill turn exceeds its credited immutable history maximum";return false;}
+                prefill_turn_history.clear();
+                for(size_t i=0;i<size_t(endpoint);++i)prefill_turn_history.push_back(int32_t(ids[i]));
+                const auto history=strata::core::window_history_digest(prefill_turn_history);
+                if(history!=prefill_joined_history){e="prefill turn actual joined history changed";return false;}
+                const auto prior=main->cut();
+                const auto owner=main->key();
+                const bool prior_fence=serving_raw_fence_running;
+                const bool prior_ordinary_fence=serving_ordinary_fence;
+                // Return ALL actual cache loans and complete original-map uploads;
+                // a CUDA join alone grants neither this cut nor a private turn.
+                if(!shared_prefix_refill(true,e))strata::core::retirement_failed("prefill turn strict loan return failed");
+                const strata::core::StateCut cut{serving_raw_cut+1,endpoint,endpoint,endpoint,prior.output_watermark,
+                    history};
+                if(!main->drain_work(true,cut,e)||!main->close_request(e))
+                    strata::core::retirement_failed("prefill turn MAIN common cut/close failed");
+                serving_raw_cut=cut.id;serving_raw_fence_running=false;
+                // Only the caller's restricted peer/repair_unit(false) dispatch
+                // is permitted here. It cannot capture/reset/restore MAIN scratch.
+                bool okay=false;
+                try{okay=dispatch();}catch(...){strata::core::retirement_failed("prefill turn dispatch exception retains MAIN owner");}
+                if(serving_raw_session.get()!=main.get()||!main->healthy()||main->key()!=owner||main->cut()!=cut||main->request_open()||
+                   main->phase()!=strata::program::ServingRawSession::Phase::drained||serving_raw_cut!=cut.id||
+                   serving_raw_fence_running||serving_ordinary_fence!=prior_ordinary_fence||
+                   prefill_turn_history.size()!=endpoint||strata::core::window_history_digest(prefill_turn_history)!=history)
+                    strata::core::retirement_failed("prefill turn changed preserved MAIN ownership/cut");
+                if(!main->open_request(e)||!main->begin_work(e))
+                    strata::core::retirement_failed("prefill turn MAIN reopen failed");
+                serving_raw_fence_running=prior_fence;
+                return okay;
+            };
+#endif
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
             int64_t yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
@@ -20318,6 +20486,19 @@ int main(int argc, char** argv) {
                     req_chunk = planned ? std::min(plan.chunk, b0 - a0) : std::min(sp.chunk(), b0 - a0);
                 }
                 seg_plan = plan;   // the checkpoints taken inside it keep it; cleared when the segment is done
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(serving_threads&&admit_slot>=0){const auto* owner=serving_threads->binding(size_t(admit_slot));
+                    if(owner&&owner->request==owned_admission_scope.request){
+                        const auto actual=sp.replay_activity();
+                        std::fprintf(stderr,"SCHED_PREFILL_PLAN v=1 engine=%llu slot=%d request=%012llx operation=%llu result=%llu configured_max=%lld allocated_max=%lld chunk=%lld ring=%lld auto_mode=%d auto_max=%lld from=%lld to=%lld planned=%d single=%d chunked=%d stages=%zu\n",
+                            (unsigned long long)serving_threads->engine(),admit_slot,(unsigned long long)(owner->request-1),
+                            (unsigned long long)owner->foreground.serial,(unsigned long long)owner->foreground.result_revision,
+                            (long long)o.prefill_chunk,(long long)actual.allocated_chunk,(long long)(planned?plan.chunk:actual.chunk),
+                            (long long)actual.ring_slots,int(o.prefill_auto),(long long)(o.prefill_auto?o.prefill_auto_max:0),
+                            (long long)a0,(long long)b0,int(planned),int(plan_single),int(plan.chunked),stages.size()+1);
+                    }
+                }
+#endif
                 struct SegPlanScope {
                     ConvCheckpoint::PromptPlan& p;
                     ~SegPlanScope() { p = {}; }
@@ -20337,9 +20518,11 @@ int main(int argc, char** argv) {
                         event.from=uint64_t(q);event.to=uint64_t(r);event.chunk=plan.chunk;
                         event.planned=planned;event.single=plan_single;event.chunked=plan.chunked;
                         event.lend=sfx_prefix_first_piece;event.lend_tokens=sfx_prefix_lend_tokens;event.lend_exact=sfx_prefix_lend_exact;
+                        event.returned_before_lend=sfx_prefix_returned_before_lend;
+                        event.loan_cycles=sfx_prefix_loan_cycles;
                         if(!ran||sp.stopped_at()>=0)sfx_prefix_plan.reject("actual prefix prefill did not finish its recorded piece");
                         else if(!sfx_prefix_plan.refused)sfx_prefix_plan.record(event);
-                        sfx_prefix_first_piece=false;
+                        sfx_prefix_first_piece=false;sfx_prefix_returned_before_lend=false;sfx_prefix_loan_cycles=0;
                     }
 #endif
                     return ran;
@@ -20373,34 +20556,160 @@ int main(int argc, char** argv) {
                             current.class_weight=serving_repair_schedule.foreground_weight;
                             strata::program::ServingRepairSelectionBoundary boundary;
                             boundary.safe_boundary=true;boundary.max_candidates=3;
+                            boundary.foreground.context_room=true;
+                            boundary.foreground.current_request_generating=true;
+                            boundary.foreground_weight=serving_repair_schedule.foreground_weight;
+                            boundary.max_consecutive_escalated_units=serving_repair_schedule.max_consecutive;
                             std::array<strata::program::ServingThreadUnit,3> candidates{};size_t count=1;candidates[0]=current;
-                            for(size_t i=0;i<bs.size()&&i<2;++i){const auto& lane=bs[i];const auto* peer=serving_threads->binding(i);
-                                if(!peer||!peer->occupancy||!lane.active)continue;
-                                auto& unit=candidates[count++];unit.slot=i;unit.request=peer->request;unit.occupancy=peer->occupancy;
-                                unit.operation=peer->foreground;unit.unit=strata::core::AdmissionUnit::decode;
-                                unit.demand=unit.resource_ready=lane.owned_raw&&lane.owned_raw->healthy()&&lane.owned_raw->request_open();
-                                unit.class_weight=serving_repair_schedule.foreground_weight;
+                            const bool can_turn=!live_approximate&&prefill_joined_end==uint64_t(at);
+                            auto collect=[&](bool repairs){
+                                count=1;candidates={};candidates[0]=current;
+                                const auto now=strata::program::serving_repair_clock_now(owned_runtime->remote_policy_incarnation);
+                                boundary.now_ns=now.ticks_ns;boundary.clock_domain=now.domain;
+                                boundary.consecutive_escalated_units=serving_repair_consecutive_escalated;
+                                for(size_t i=0;i<bs.size()&&i<2;++i){
+                                    if(i==size_t(admit_slot))continue;
+                                    const auto& lane=bs[i];const auto* peer=serving_threads->binding(i);
+                                    if(!peer||!peer->occupancy||!lane.owned_raw)continue;
+                                    if(peer->occupancy!=lane.owned_raw->slot_occupancy_incarnation())
+                                        strata::core::retirement_failed("prefill peer occupancy changed");
+                                    if(lane.active){auto& u=candidates[count++];u.slot=i;u.request=peer->request;
+                                        u.occupancy=peer->occupancy;u.operation=peer->foreground;u.unit=strata::core::AdmissionUnit::decode;
+                                        u.demand=true;u.resource_ready=lane.owned_raw->healthy()&&lane.owned_raw->request_open();
+                                        u.class_weight=serving_repair_schedule.foreground_weight;
+                                    }
+                                    if(repairs&&serving_repair_idle_unit&&lane.owned_repair&&(lane.active||lane.repair_finishing)){
+                                        const auto age=strata::program::ServingSuffixRepairOperation::repair_age(*lane.owned_repair,now);
+                                        auto& u=candidates[count++];u.slot=i;u.request=peer->request;u.occupancy=peer->occupancy;
+                                        u.operation=peer->repair;u.unit=strata::core::AdmissionUnit::repair;
+                                        u.demand=age.age.token_debt>0;u.resource_ready=age.valid&&lane.owned_raw->healthy();
+                                        u.class_weight=serving_repair_schedule.live_weight;
+                                        u.repair.work.demand=u.demand;u.repair.work.resource_ready=u.resource_ready;
+                                        u.repair.work.work_class=strata::core::DependencyWorkClass::live_repair;
+                                        u.repair.work.unit=strata::core::AdmissionUnit::repair;
+                                        u.repair.age=age.age;u.repair.observed_at_ns=now.ticks_ns;u.repair.clock_domain=now.domain;
+                                        u.repair.record_version=lane.owned_repair->published.cut.id;u.repair.ancestry_serial=age.ancestry_serial;
+                                    }
+                                }
+                            };
+                            collect(can_turn);
+                            bool competing=false;
+                            const auto* current_op=serving_threads->operation(current.operation);
+                            for(size_t i=1;current_op&&i<count;++i){const auto& u=candidates[i];const auto* op=serving_threads->operation(u.operation);
+                                if(!strata::program::ServingThreadBridge::runnable(op)||!u.demand||!u.resource_ready||
+                                   op->effective_priority<current_op->effective_priority)continue;
+                                if(u.unit==strata::core::AdmissionUnit::decode||
+                                   strata::program::serving_repair_selection_admission(serving_repair_schedule.policy,boundary,u.repair,true).admitted())
+                                    competing=true;
                             }
-                            const auto time=serving_thread_now_ms();
-                            auto selected=serving_threads->select(serving_repair_schedule.policy,boundary,
-                                std::span<const strata::program::ServingThreadUnit>(candidates.data(),count),time,0);
-                            if(selected.total_weight){const auto ticket=strata::program::serving_repair_uniform_ticket(serving_repair_random_state,selected.total_weight);
+                            strata::program::ServingThreadSelection selected;
+                            auto turn_main=serving_raw_session;
+                            auto report_turn=[&](const char* phase){
+                                const auto& cut=turn_main->cut();const auto digest=strata::program::SuffixExperimentDriver::qualification_hex(cut.history);
+                                std::fprintf(stderr,"SCHED_PREFILL_TURN v=1 phase=%s engine=%llu slot=%d request=%012llx operation=%llu result=%llu window=%llu cut=%llu forwarded=%llu accepted=%llu watermark=%llu history=%s stages=%zu\n",
+                                    phase,(unsigned long long)serving_threads->engine(),admit_slot,(unsigned long long)(current.request-1),
+                                    (unsigned long long)current.operation.serial,(unsigned long long)current.operation.result_revision,
+                                    (unsigned long long)turn_main->key().window_generation,(unsigned long long)cut.id,
+                                    (unsigned long long)cut.forwarded,(unsigned long long)cut.accepted,
+                                    (unsigned long long)cut.output_watermark,digest.data(),stages.size()+1);
+                            };
+                            bool other_serviced=false,deferred_peer=false;
+                            auto choose_and_service=[&](bool restricted)->bool {
+                                if(!serving_process_controls()){e="scheduler control failed";return false;}
+                                {std::lock_guard<std::mutex> lock(in_mu);if(in_eof||in_shared->input_error.load()){
+                                    stop_req.store(true);e="terminal input before prefill turn";return false;}}
+                                if(stop_req.load()||!serving_threads->request_ready(size_t(admit_slot),current.request)){
+                                    stop_req.store(true);e="cancelled";return false;}
+                                collect(restricted);
+                                const auto time=serving_thread_now_ms();
                                 selected=serving_threads->select(serving_repair_schedule.policy,boundary,
-                                    std::span<const strata::program::ServingThreadUnit>(candidates.data(),count),time,ticket);}
-                            if(!selected.ready){stop_req.store(true);e="cancelled";return false;}
-                            if(selected.candidate!=0){
-                                // Main state is drained and retained across this
-                                // independent peer foreground window. Private
-                                // repair remains excluded while its fence is open.
-                                serving_prefill_peer_winner=std::move(selected);
+                                    std::span<const strata::program::ServingThreadUnit>(candidates.data(),count),time,0);
+                                if(selected.total_weight){const auto ticket=strata::program::serving_repair_uniform_ticket(serving_repair_random_state,selected.total_weight);
+                                    selected=serving_threads->select(serving_repair_schedule.policy,boundary,
+                                        std::span<const strata::program::ServingThreadUnit>(candidates.data(),count),time,ticket);}
+                                if(!selected.ready){stop_req.store(true);e="cancelled";return false;}
+                                if(selected.candidate==0)return true;
+                                const auto chosen=candidates[selected.candidate];other_serviced=true;
+                                if(chosen.unit==strata::core::AdmissionUnit::repair){
+                                    auto& lane=bs[chosen.slot];
+                                    if(!restricted||selected.admission.reason!=strata::program::RepairAdmissionReason::admitted_age_escalated||
+                                       !strata::program::ServingSuffixRepairOperation::private_cache_restored(*lane.owned_repair))
+                                        strata::core::retirement_failed("prefill private turn lacks aged entitlement/original cache map");
+                                    {std::lock_guard<std::mutex> lock(in_mu);if(in_eof||in_shared->input_error.load()){
+                                        stop_req.store(true);e="terminal input before private dispatch";return false;}}
+                                    if(!strata::program::ServingSuffixRepairOperation::repair_unit(*lane.owned_repair,false,e,serving_repair_idle_unit))
+                                        strata::core::retirement_failed("prefill private bounded unit failed");
+                                    const auto evidence=strata::program::ServingSuffixRepairOperation::owner_evidence(*lane.owned_repair);
+                                    if(!serving_threads->acknowledge_unit(selected,chosen,lane.owned_raw->slot_occupancy_incarnation(),evidence.private_cut().id))
+                                        strata::core::retirement_failed("prefill private actual cut acknowledgement failed");
+                                    std::fprintf(stderr,"SCHED_PREFILL_SERVICE v=1 kind=private engine=%llu request=%012llx main_window=%llu main_cut=%llu slot=%zu occupancy=%llu operation=%llu result=%llu graph=%llu native_cut=%llu original_map_equal=1 age_ns=%llu observed_ns=%llu clock_domain=%llu\n",
+                                        (unsigned long long)serving_threads->engine(),(unsigned long long)(current.request-1),
+                                        (unsigned long long)turn_main->key().window_generation,(unsigned long long)turn_main->cut().id,
+                                        chosen.slot,(unsigned long long)chosen.occupancy,(unsigned long long)chosen.operation.serial,
+                                        (unsigned long long)chosen.operation.result_revision,(unsigned long long)selected.graph_revision,
+                                        (unsigned long long)evidence.private_cut().id,
+                                        (unsigned long long)selected.admission.oldest_unresolved_inherited_age_ns.value_or(0),
+                                        (unsigned long long)chosen.repair.observed_at_ns,(unsigned long long)chosen.repair.clock_domain);
+                                    ++serving_repair_consecutive_escalated;return true;
+                                }
+                                const auto before=owned_runtime->batch_group_operation;
+                                serving_prefill_peer_winner=selected;
                                 const bool was_prompt=in_prompt_read;in_prompt_read=true;
-                                const bool peer_ran=batch_step();in_prompt_read=was_prompt;
+                                const bool peer_ran=batch_step(restricted,&deferred_peer);in_prompt_read=was_prompt;
                                 serving_prefill_peer_winner.reset();
+                                if(deferred_peer)return true;
                                 if(!peer_ran){e="peer foreground unit failed";return false;}
-                                continue;
-                            }
+                                if(owned_runtime->batch_group_operation>before){
+                                    serving_repair_consecutive_escalated=0;
+                                    std::fprintf(stderr,"SCHED_PREFILL_SERVICE v=1 kind=peer engine=%llu request=%012llx main_window=%llu main_cut=%llu slot=%zu occupancy=%llu operation=%llu result=%llu graph=%llu native_group=%llu\n",
+                                        (unsigned long long)serving_threads->engine(),(unsigned long long)(current.request-1),
+                                        (unsigned long long)turn_main->key().window_generation,(unsigned long long)turn_main->cut().id,
+                                        chosen.slot,(unsigned long long)chosen.occupancy,(unsigned long long)chosen.operation.serial,
+                                        (unsigned long long)chosen.operation.result_revision,(unsigned long long)selected.graph_revision,
+                                        (unsigned long long)owned_runtime->batch_group_operation);
+                                }
+                                return true;
+                            };
+                            if(can_turn&&competing){
+                                auto loan_digest=[&](){strata::core::WindowHasher hash;
+                                    for(const auto& p:pf_parts){const auto activity=p.sp->replay_activity();
+                                        hash.update(&p.first_now,sizeof(p.first_now));hash.update(&p.lent_chunk,sizeof(p.lent_chunk));
+                                        hash.update(&activity.chunk,sizeof(activity.chunk));hash.update(&activity.ring_slots,sizeof(activity.ring_slots));
+                                        for(const auto& pair:p.lent){hash.update(&pair.first,sizeof(pair.first));hash.update(&pair.second,sizeof(pair.second));}}
+                                    return hash.digest();};
+                                const auto original_loan=loan_digest();const int64_t original_lend=seg_lend;
+                                bool had_loan=false;for(const auto& p:pf_parts)had_loan=had_loan||!p.lent.empty();
+                                const bool turned=serving_prefill_safe_turn(uint64_t(at),[&](){
+                                    report_turn("closed");return choose_and_service(true);},e);
+                                if(!turned){
+                                    if(!prefill_turn_unavailable||!choose_and_service(false))return false;
+                                }else{
+                                report_turn("reopened");
+                                if(!shared_prefix_lend(b0-a0,e,original_lend,true,seg_lend)||loan_digest()!=original_loan)
+                                    strata::core::retirement_failed("prefill turn did not restore identical actual loan shape");
+                                if(had_loan&&sfx_prefix_recording&&uint64_t(at)<sfx_prefix_plan.boundary){
+                                    sfx_prefix_first_piece=true;sfx_prefix_returned_before_lend=true;
+                                    if(sfx_prefix_loan_cycles==UINT64_MAX)strata::core::retirement_failed("prefill loan cycle counter exhausted");
+                                    ++sfx_prefix_loan_cycles;
+                                    sfx_prefix_lend_tokens=b0-a0;sfx_prefix_lend_exact=original_lend;
+                                    if(!sfx_prefix_loans(true))strata::core::retirement_failed("prefill turn relend differs from qualified prefix");
+                                }
+                                const auto loan_hash=strata::program::SuffixExperimentDriver::qualification_hex(original_loan);
+                                std::fprintf(stderr,"SCHED_PREFILL_LOAN v=1 phase=relent engine=%llu slot=%d request=%012llx window=%llu cut=%llu endpoint=%lld had_loan=%d equal=1 digest=%s prefix_cycles=%llu\n",
+                                    (unsigned long long)serving_threads->engine(),admit_slot,(unsigned long long)(current.request-1),
+                                    (unsigned long long)turn_main->key().window_generation,(unsigned long long)turn_main->cut().id,
+                                    (long long)at,int(had_loan),loan_hash.data(),(unsigned long long)sfx_prefix_loan_cycles);
+                                if(deferred_peer){
+                                    const bool was_prompt=in_prompt_read;in_prompt_read=true;
+                                    const bool handled=batch_step();in_prompt_read=was_prompt;
+                                    if(!handled){e="deferred prefill peer control failed";return false;}
+                                }
+                                }
+                            }else if(!choose_and_service(false))return false;
+                            if(other_serviced)continue;
                             const int64_t end=at+std::min<int64_t>(quantum,r-at);
-                            if(stages.size()+1>64)strata::core::retirement_failed("prefill priority stage observation cap exceeded");
+                            if(stages.size()>=64||stages.size()>=size_t(SplitDrive::kMax))
+                                strata::core::retirement_failed("prefill priority stage observation cap exceeded");
                             std::array<int64_t,64> stage_forwarded{};stage_forwarded.fill(-1);
                             using Callback=decltype(sp.on_stage_chunk);
                             std::array<Callback,64> prior;
@@ -20434,6 +20743,26 @@ int main(int argc, char** argv) {
                             proof.pipeline_joined=true;proof.devices_drained=true;
                             if(!serving_threads->acknowledge_prefill(selected,current,proof))
                                 strata::core::retirement_failed("managed prefill actual endpoint acknowledgement failed");
+                            // Bind the real joined observation only after its
+                            // successful executor ACK. Scratch refusal disables
+                            // optional turns, never the admitted foreground.
+                            prefill_joined_end=UINT64_MAX;prefill_joined_main.reset();
+                            auto joined_main=serving_raw_session;
+                            if(joined_main&&joined_main->healthy()&&admit_prefill_turn_scratch(joined_main)){
+                                if(uint64_t(end)>prefill_turn_max||prefill_turn_history.capacity()<size_t(end))
+                                    strata::core::retirement_failed("joined prefill exceeds its paid history maximum");
+                                prefill_turn_history.clear();
+                                for(size_t i=0;i<size_t(end);++i)prefill_turn_history.push_back(int32_t(ids[i]));
+                                try{
+                                    auto key=joined_main->key();
+                                    prefill_joined_history=strata::core::window_history_digest(prefill_turn_history);
+                                    prefill_joined_key=std::move(key);prefill_joined_request=owned_admission_scope.request;
+                                    prefill_joined_main=std::move(joined_main);
+                                    for(size_t i=0;i<=stages.size();++i)prefill_joined_stage_end[i]=stage_forwarded[i];
+                                    prefill_joined_end=uint64_t(end);
+                                }catch(...){prefill_joined_main.reset();prefill_joined_end=UINT64_MAX;}
+                            }
+                            serving_repair_consecutive_escalated=0;
                             at=end;
                             if(!serving_process_controls()){e="scheduler control failed";return false;}
                         }

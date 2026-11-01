@@ -621,10 +621,15 @@ static bool qualify_serving_frontier(Context& c,SerialUnit& serial,ServingRawSes
                 prefix_at=step.cut.forwarded;
                 if(!was_cancelled&&prefix_at!=prefix.plan->boundary)failstop("prefix replay incomplete boundary");
                 const auto schedule=qualification_hex(prefix.plan->digest);
-                std::fprintf(stderr,"suffix_repair_prefix_replay req=%llu origin_req=%llu boundary=%llu reached=%llu schedule=%s events=%zu batches=%llu windows=%llu ancestry=reset_from0 mapping_equal=1 completed=%u stages=%d policy=fixed_prefill16_short64 elapsed_ms=%.6f binary=%s source=%s\n",
+                const auto& replay_policy=prefix.plan->policy;
+                const char* policy_name=!replay_policy.automatic&&replay_policy.configured_max==16?
+                    "fixed_prefill16_short64":"resolved_prefill_short64_v1";
+                std::fprintf(stderr,"suffix_repair_prefix_replay req=%llu origin_req=%llu boundary=%llu reached=%llu schedule=%s events=%zu batches=%llu windows=%llu ancestry=reset_from0 mapping_equal=1 completed=%u stages=%d policy=%s configured_max=%llu allocated_max=%llu auto_mode=%u auto_max=%llu elapsed_ms=%.6f binary=%s source=%s\n",
                     (unsigned long long)ordinal,(unsigned long long)prefix.plan->request,(unsigned long long)prefix.plan->boundary,
                     (unsigned long long)prefix_at,schedule.data(),prefix.plan->events.size(),
-                    (unsigned long long)batches,(unsigned long long)windows,unsigned(!was_cancelled),c.stage_count,elapsed(prefix_started),
+                    (unsigned long long)batches,(unsigned long long)windows,unsigned(!was_cancelled),c.stage_count,policy_name,
+                    (unsigned long long)replay_policy.configured_max,(unsigned long long)replay_policy.allocated_max,
+                    unsigned(replay_policy.automatic),(unsigned long long)replay_policy.auto_requested_max,elapsed(prefix_started),
                     admission.binary.data(),admission.source.data());std::fflush(stderr);
             }
             for(uint64_t at=prefix_at;!was_cancelled&&at<forwarded;++at) {

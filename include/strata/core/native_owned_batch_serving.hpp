@@ -22,8 +22,8 @@ bool eligible(bool native_pack,const Policy& p,bool explicit_selector) noexcept 
         p.owned_model_lifetime && p.suffix_cache && !p.suffix_cache_unrepaired_experiment &&
         p.suffix_cache_host_bytes>0 && p.spec==0 && p.batch==2 &&
         p.batch_groups==1 && !p.batch_groups_auto && !p.batch_mtp &&
-        !p.native_preset.empty() && !p.keep_canonical && p.prefill_chunk==16 &&
-        p.short_read==64 && !p.prefill_auto && !p.prefill_head_alias &&
+        !p.native_preset.empty() && !p.keep_canonical && p.prefill_chunk>0 && p.prefill_chunk<=32768 &&
+        p.short_read==64 && !p.prefill_head_alias &&
         p.mtp.empty() && p.draft.empty() && p.draft_model.empty() &&
         p.spec_oracle.empty() && p.spec_follow.empty() && p.spec_corrupt==0 &&
         p.suffix_draft==0 && p.lookup_chain==0 && p.pipeline_windows==0 &&

@@ -402,6 +402,9 @@ class ResidentRepairController final {
         try { advance_private_to(target); busy_=false; return true; }
         catch(...){fatal("repair actual work exception");}
     }
+    bool original_private_residency_restored()const noexcept {
+        return runtime_&&runtime_->dispatch_&&runtime_->dispatch_->original_residency_restored();
+    }
 #if defined(STRATA_WINDOW_STATE_AVAILABLE)
     // The transaction phase as the public contract spells it (serving_raw_contracts.hpp:26). Observation only:
     // this reads the transaction's own field, it never sets one.

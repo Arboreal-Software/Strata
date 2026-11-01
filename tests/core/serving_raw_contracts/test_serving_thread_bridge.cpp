@@ -70,6 +70,33 @@ int main(int argc,char** argv){
     check(cfg.enabled&&cfg.valid,"explicit policy and limits");
     for(const char* bad:{"-100,100,100,10000,8,4,32,32,64,1024,8,1","-100,100,100,10000,8,4,32,32,64,1024,08,8388608"})
         check(!program::parse_serving_thread_config(program::kServingThreadPolicy,bad).valid,"insufficient/noncanonical limits refuse");
+    // Closed MAIN fence: actual queued prefill has request authority but no slot
+    // occupancy yet. The occupied peer repair must see that runnable foreground.
+    {
+        World admission;admission.call("CREATE t 0");admission.call("CREATE peer 40");
+        auto incoming=admission.open("t",1,"foreground"),incoming_repair=admission.open("t",1,"live_repair");
+        auto peer_fg=admission.open("peer",2,"foreground"),peer_repair=admission.open("peer",2,"live_repair");
+        admission.bind(0,"000000000000",incoming,incoming_repair);
+        admission.bind(1,"000000000001",peer_fg,peer_repair);
+        check(admission.bridge->attach(1,2,11),"real occupied peer generation");
+        check(admission.bridge->binding(0)->occupancy==0&&admission.bridge->request_ready(0,1),"incoming prefill bound but MAIN closed/no physical occupancy");
+        auto prefill=unit(0,incoming,false,1);prefill.unit=core::AdmissionUnit::prefill;prefill.occupancy=0;
+        auto repair=unit(1,peer_repair,true,1);
+        auto closed=boundary();closed.foreground.current_request_generating=false;
+        program::ServingRepairAdmissionPolicy admission_policy;admission_policy.live_repair_age_escalation_ns=50;
+        const bool omit=argc==2&&std::string_view(argv[1])=="--omit-waiting-prefill";
+        for(int age=0;age<3;++age){
+            repair.repair.age.oldest_unresolved_inherited_age_ns=age==2?100:0;
+            if(age==1)repair.repair.age.oldest_unresolved_inherited_age_ns.reset();
+            std::array candidates{prefill,repair};
+            const auto runnable=omit?std::span<const program::ServingThreadUnit>(&candidates[1],1):std::span<const program::ServingThreadUnit>(candidates);
+            auto selected=admission.bridge->select(admission_policy,closed,runnable,0,0);
+            if(age<2)check(selected.ready&&selected.operation.key==incoming,
+                "waiting prefill excludes young/unknown peer repair even at closed MAIN fence");
+            else check(selected.ready&&selected.operation.key==peer_repair,
+                "authentically aged higher-priority peer repair can compete with waiting prefill");
+        }
+    }
     World w;auto t=w.call("CREATE t 0");auto other=w.call("CREATE other 0");
     check(t.generation==1&&other.generation==2&&t.accepted==1&&t.applied==0,"managed identities and acceptance separate");
     auto fg=w.open("t",1,"foreground"),bg=w.open("t",1,"live_repair");

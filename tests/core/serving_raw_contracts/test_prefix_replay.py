@@ -80,9 +80,10 @@ namespace strata::prefill {
 namespace mmq {inline int direct_mode(){return 0;}}
 struct Prefill {
     struct Impl {core::SessionState* ss=nullptr;core::ExpertSource* src=nullptr;core::ExpertCache* cache=nullptr;
-        const int32_t* host_res=nullptr;int device=0;bool help_pp=false,pp=false,borrow_spill=false;};
+        const int32_t* host_res=nullptr;int64_t T_max=16,T=16,ring=2;int device=0;bool help_pp=false,pp=false,borrow_spill=false;};
     ACTUAL_ACTIVITY_TYPE
     std::unique_ptr<Impl> impl_=std::make_unique<Impl>();
+    std::shared_ptr<const void> workspace_credit_=std::make_shared<int>(1); // recording admitted workspace lifetime, no native allocation claim
     Prefill* next_=nullptr;int64_t stage_lb_=0,stage_le_=2,force_chunk_=0,stopped_at_=-1;
     std::vector<int> tap_layers_;const float* hand_in_=nullptr;const float* const* embd_rows=nullptr;
     std::future<bool> next_run_;std::string next_err_;
@@ -170,7 +171,7 @@ int main(int argc,char**){
     require(!PrefixReplayPlan::quote(UINT64_MAX,8,quote),"actual quote overflow refusal");
     setenv("STRATA_PREFILL_CPU_SHARE","0",1);setenv("STRATA_PREFILL_HELP","0",1);
     unsetenv("STRATA_PREFILL_HELPER_SOURCE");unsetenv("STRATA_CKPT_REREAD");unsetenv("STRATA_PIPELINE_SWITCH");
-    struct Options {int prefill_chunk=16,short_read=64,batch=0,pipeline_windows=0,peer_device=-1;bool prefill_auto=false,native_serial_serving=true,native_owned_batch_serving=false;} o;
+    struct Options {int prefill_auto_max=8192,prefill_chunk=16,short_read=64,batch=0,pipeline_windows=0,peer_device=-1;bool prefill_auto=false,native_serial_serving=true,native_owned_batch_serving=false;} o;
     int64_t read_from=0,resume=0,reread_to=0,req_short_read=64;struct {int64_t chunk=0;} resume_plan;
     std::vector<int> req_imgs;bool pipe=false,remote_caches=false,remote_opt=false,fs_swap=false;
     struct {bool on=false;} ram_adapt2;struct {bool valid()const{return false;}} peer;
@@ -207,7 +208,10 @@ int main(int argc,char**){
     ACTUAL_REFILL
     auto lend=[&](int64_t,std::string&,int64_t){++seam::lends;
         for(auto& p:pf_parts){if(p.lent.empty()){int32_t i=int32_t(p.lb*g.n_expert);p.lent.emplace_back(i,host_res[size_t(i)]);host_res[size_t(i)]=core::kNotResident;}p.lent_chunk=16;}return true;};
+    int64_t seg_lend=0; // actual replay callback captures this request-local loan extent
+    auto shared_prefix_lend=[&](int64_t tokens,std::string& e,int64_t exact,bool,int64_t& segment){segment=tokens;return lend(tokens,e,exact);};
     if(argc>1)resume=16;
+    ACTUAL_PREFIX_POLICY
     ACTUAL_RESET_WITNESS
     ACTUAL_POLICY
     ACTUAL_PREPARE
@@ -253,7 +257,7 @@ int main(int argc,char**){
     auto canonical=pf_parts[1].lent;pf_parts[1].lent[0].second++;
     require(!sfx_prefix_loans(false),"actual changed canonical loan refuses");pf_parts[1].lent=canonical;sfx_qualification.prefix.refused=false;
     PrefixReplayEvent batch;batch.kind=PrefixReplayEvent::Kind::prefill;batch.from=16;batch.to=96;
-    batch.chunk=16;batch.planned=true;batch.lend=true;batch.lend_tokens=80;
+    batch.chunk=16;batch.planned=true;batch.lend=true;batch.lend_tokens=80;batch.returned_before_lend=false;batch.loan_cycles=0;
     require(sfx_qualification.prefix.record(batch),"actual batch call recorded");
     std::vector<int32_t> history(100);for(size_t i=0;i<history.size();++i)history[i]=int32_t(i%10);
     core::WindowKey origin_key;origin_key.engine_generation=1;origin_key.window_generation=1;
@@ -418,8 +422,8 @@ int main(int argc,char**){
 '''
 
 
-def run(build):
-    root = Path(__file__).resolve().parents[3]
+def run(build, root=None):
+    root = root or Path(__file__).resolve().parents[3]
     paths = ['src/program/generate.cpp', 'src/program/serving_prefix_replay.hpp',
              'src/program/suffix_experiment_execution.inc', 'include/strata/prefill/prefill.hpp',
              'src/prefill/prefill.cpp', 'src/core/window_hash.cpp', 'src/program/serving_suffix_qualification.inc']
@@ -446,6 +450,7 @@ def run(build):
         'ACTUAL_REFILL_ONE': take(generate, '            auto shared_refill_one =') + ';',
         'ACTUAL_REFILL': take(generate, '            auto shared_prefix_refill =') + ';' + take(generate, '            auto refill =') + ';',
         'ACTUAL_RESET_WITNESS': generate[generate.index('            const bool sfx_prefix_reset_from_zero='):generate.index('            auto sfx_prefix_policy =')],
+        'ACTUAL_PREFIX_POLICY': take(generate, '        auto actual_prefix_policy =') + ';',
         'ACTUAL_POLICY': take(generate, '            auto sfx_prefix_policy =') + ';',
         'ACTUAL_PREPARE': take(generate, '            auto sfx_prefix_prepare =') + ';',
         'ACTUAL_LOANS': take(generate, '            auto sfx_prefix_loans =') + ';',
@@ -480,13 +485,14 @@ def run(build):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', type=Path)
+    parser.add_argument('--source-root', type=Path)
     args = parser.parse_args()
     if args.build_dir:
         args.build_dir.mkdir(parents=True, exist_ok=True)
-        run(args.build_dir)
+        run(args.build_dir,args.source_root)
     else:
         with tempfile.TemporaryDirectory(prefix='strata-prefix-replay-') as directory:
-            run(Path(directory))
+            run(Path(directory),args.source_root)
 
 
 if __name__ == '__main__':

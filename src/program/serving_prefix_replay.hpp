@@ -11,17 +11,27 @@
 #include <vector>
 
 namespace strata::program {
+struct PrefixReplayPolicy {
+    uint64_t configured_max=0,allocated_max=0,auto_requested_max=0,short_read=64;
+    bool automatic=false;
+    bool valid()const noexcept {
+        return configured_max&&configured_max==allocated_max&&short_read==64&&
+            (automatic?auto_requested_max>=allocated_max:auto_requested_max==0);
+    }
+    bool operator==(const PrefixReplayPolicy&)const=default;
+};
 struct PrefixReplayEvent {
     enum class Kind : uint8_t { window, prefill };
     Kind kind=Kind::window;
     uint64_t from=0,to=0;
     int64_t chunk=0,lend_tokens=0,lend_exact=0;
-    bool planned=false,single=false,chunked=false,lend=false;
+    uint64_t loan_cycles=0;
+    bool planned=false,single=false,chunked=false,lend=false,returned_before_lend=false;
 };
 struct PrefixReplayParticipant {
     const void* cache=nullptr;const void* prefill=nullptr;const void* session=nullptr;
     const void* offsets=nullptr;
-    int device=-1;int64_t begin=0,end=0,slots=0,chunk=0,lent_chunk=0;
+    int device=-1;int64_t begin=0,end=0,slots=0,chunk=0,lent_chunk=0,allocated_chunk=0,ring_slots=0;
     int32_t first=-1;
     bool loan_seen=false;
     std::vector<std::pair<int32_t,int32_t>> loan;
@@ -43,8 +53,18 @@ struct PrefixReplayPlan {
     size_t participant_count=0,leading_count=0;
     core::StateDigest conditioning{},digest{};
     bool active=false,sealed=false,refused=false;
+    PrefixReplayPolicy policy{};
+    bool policy_bound=false;
     const char* reason=nullptr;
     bool reject(const char* why) noexcept {if(!refused)reason=why;refused=true;return false;}
+    bool bind_policy(const PrefixReplayPolicy& actual)noexcept {
+        if(active||sealed||refused||!actual.valid()||(policy_bound&&policy!=actual))
+            return reject("actual resolved foreground prefill policy unavailable/changed");
+        policy=actual;policy_bound=true;return true;
+    }
+    bool policy_matches(const PrefixReplayPolicy& actual)const noexcept {
+        return policy_bound&&policy.valid()&&actual.valid()&&policy==actual;
+    }
     static bool quote(uint64_t boundary,uint64_t entries,uint64_t& bytes) noexcept {
         auto add=[&](uint64_t count,uint64_t unit){
             if(unit&&count>(UINT64_MAX-bytes)/unit)return false;
@@ -57,7 +77,7 @@ struct PrefixReplayPlan {
             add(entries,sizeof(int32_t)+sizeof(std::pair<int32_t,int32_t>));
     }
     bool prepare(std::shared_ptr<const void> admitted,std::span<const int32_t> mapping) {
-        if(active||refused||sealed||!admitted||boundary<=64||mapping.empty()||boundary>SIZE_MAX/4-4)
+        if(active||refused||sealed||!policy_bound||!policy.valid()||!admitted||boundary<=64||mapping.empty()||boundary>SIZE_MAX/4-4)
             return reject("prefix transcript preparation bounds");
         credit=std::move(admitted);
         base.assign(mapping.begin(),mapping.end());tokens.resize(size_t(boundary));
@@ -69,7 +89,10 @@ struct PrefixReplayPlan {
         if(refused||sealed||e.from!=reached||e.to<=e.from||e.to>boundary||
            (e.kind!=PrefixReplayEvent::Kind::window&&e.kind!=PrefixReplayEvent::Kind::prefill))
             return reject("actual prefix calls are not a complete ordered partition");
-        if(e.kind==PrefixReplayEvent::Kind::prefill&&!active)
+        if(e.returned_before_lend!=(e.loan_cycles!=0)||
+           (e.returned_before_lend&&(e.kind!=PrefixReplayEvent::Kind::prefill||!e.lend)))
+            return reject("actual prefix loan return has no recorded relend");
+        if(e.kind==PrefixReplayEvent::Kind::prefill&&(!active||e.chunk<=0||uint64_t(e.chunk)>policy.allocated_max))
             return reject("actual batched prefix lacks pre-admitted transcript");
         if(active){
             if(events.size()==events.capacity())return reject("prefix transcript event capacity");
@@ -89,6 +112,8 @@ struct PrefixReplayPlan {
     core::StateDigest transcript_digest() const {
         core::WindowHasher hash;hash.update(conditioning.data(),conditioning.size());
         auto add=[&](auto value){hash.update(&value,sizeof(value));};
+        add(policy_bound);add(policy.configured_max);add(policy.allocated_max);add(policy.auto_requested_max);
+        add(policy.short_read);add(policy.automatic);
         add(request);add(boundary);add(pipe);add(participant_count);add(events.size());add(base.size());
         add(origin_runtime_incarnation);add(origin_residency_generation);
         hash.update(origin_binary.data(),origin_binary.size());hash.update(origin_source.data(),origin_source.size());
@@ -99,15 +124,16 @@ struct PrefixReplayPlan {
         hash.update(origin_key.model_profile.data(),origin_key.model_profile.size());
         hash.update(origin_key.topology.data(),origin_key.topology.size());
         for(const auto& e:events){add(uint8_t(e.kind));add(e.from);add(e.to);add(e.chunk);
-            add(e.lend_tokens);add(e.lend_exact);add(e.planned);add(e.single);add(e.chunked);add(e.lend);}
+            add(e.lend_tokens);add(e.lend_exact);add(e.planned);add(e.single);add(e.chunked);add(e.lend);add(e.returned_before_lend);add(e.loan_cycles);}
         for(auto value:base)add(value);
         for(size_t i=0;i<participant_count;++i){const auto& p=participants[i];
-            add(p.device);add(p.begin);add(p.end);add(p.slots);add(p.first);add(p.chunk);add(p.lent_chunk);
+            add(p.device);add(p.begin);add(p.end);add(p.slots);add(p.first);add(p.chunk);add(p.lent_chunk);add(p.allocated_chunk);add(p.ring_slots);
             add(p.loan_seen);add(p.loan.size());for(const auto& pair:p.loan){add(pair.first);add(pair.second);}}
         return hash.digest();
     }
     bool seal(std::span<const int32_t> history) {
-        if(refused||sealed||reached!=boundary||history.size()<boundary||participant_count>participants.size())
+        if(refused||sealed||reached!=boundary||history.size()<boundary||participant_count>participants.size()||
+           (active&&(!policy_bound||!policy.valid())))
             return reject("actual prefix transcript incomplete at import");
         if(!active){sealed=true;return true;} // whollyT1: existing no-plan oracle
         conditioning=prefix_digest(history,boundary);digest=transcript_digest();sealed=true;return true;

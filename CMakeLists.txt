@@ -389,6 +389,26 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME prefill_owned_workspace_source_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_owned_workspace_source.py)
   set_tests_properties(prefill_owned_workspace_source_test PROPERTIES TIMEOUT 30)
+  add_executable(prefix_replay_policy_test tests/core/serving_raw_contracts/test_prefix_replay_policy.cpp
+    src/core/window_hash.cpp)
+  target_include_directories(prefix_replay_policy_test PRIVATE include src/program)
+  add_test(NAME prefix_replay_policy_test COMMAND prefix_replay_policy_test)
+  set_tests_properties(prefix_replay_policy_test PROPERTIES TIMEOUT 120)
+  set(_prefill_safe_turn_fixture ${CMAKE_CURRENT_BINARY_DIR}/prefill_safe_turn/actual.cpp)
+  add_custom_command(OUTPUT ${_prefill_safe_turn_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/generate_prefill_safe_turn_test.py
+      --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_prefill_safe_turn_fixture}
+    DEPENDS src/program/generate.cpp
+      tests/core/serving_raw_contracts/generate_prefill_safe_turn_test.py
+      tests/core/serving_raw_contracts/prefill_safe_turn_prelude.inc
+      tests/core/serving_raw_contracts/prefill_safe_turn_driver.inc
+    VERBATIM)
+  add_executable(prefill_safe_turn_test ${_prefill_safe_turn_fixture} src/core/window_hash.cpp)
+  target_include_directories(prefill_safe_turn_test PRIVATE include src/program)
+  add_test(NAME prefill_safe_turn_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_safe_turn.py
+    --binary $<TARGET_FILE:prefill_safe_turn_test>)
+  set_tests_properties(prefill_safe_turn_test PROPERTIES TIMEOUT 120)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME serving_thread_bridge_nonce_test COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_bridge_nonce.py

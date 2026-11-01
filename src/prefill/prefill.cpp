@@ -2515,14 +2515,14 @@ uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core:
     return bytes_needed(g, ss, chunk, src) - (uint64_t) stage_slots((size_t) chunk) * (uint64_t) MAXBLOB();
 }
 
-bool Prefill::admit_owned_workspace(const core::ModelGeometry& g,const core::SessionState& ss,core::ExpertSource* source,
+WorkspaceAdmission Prefill::admit_owned_workspace(const core::ModelGeometry& g,const core::SessionState& ss,core::ExpertSource* source,
                                    int64_t chunk,bool borrowed,const WorkspaceAdmitter& admit,std::string& error) {
     // This first paid producer covers the same strict text/no-CPU/helper/peer
     // profile as owned serving. It is not an envelope for optional writers.
-    if(!strict_retirement_||!impl_||impl_->g||workspace_credit_||!admit||chunk<=0||
+    if(!strict_retirement_||!impl_||impl_->g||workspace_credit_||!admit||chunk<=0||chunk>32768||
        g.n_embd!=N||g.hc!=HC||g.hc_lr!=LR||ss.k!=K||g.n_expert<=0||g.n_layers<=0||
        cpu_pool_||helper_||impl_->pp||impl_->help_pp||embd_rows||on_routes||on_taps){
-        error="owned prefill workspace needs fresh strict text/no-helper consumers";return false;
+        error="owned prefill workspace needs fresh strict text/no-helper consumers";return WorkspaceAdmission::invalid;
     }
     // init's stager may use its file-backed profile. Bound that existing branch
     // without repeating cached_share() (which could change between quote/init).
@@ -2546,12 +2546,14 @@ bool Prefill::admit_owned_workspace(const core::ModelGeometry& g,const core::Ses
     shape.borrowed=borrowed;shape.successor=next_!=nullptr;
     shape.arena_device_bytes=borrowed?bytes_needed(g,ss,chunk,source!=nullptr):bytes_needed_owned(g,ss,chunk,source!=nullptr);
     OwnedWorkspaceBytes quote;
-    if(!owned_workspace_quote(shape,quote)){error="owned prefill workspace quote overflow/unsupported shape";return false;}
+    if(!owned_workspace_quote(shape,quote)){error="owned prefill workspace quote overflow/unsupported shape";return WorkspaceAdmission::invalid;}
     std::shared_ptr<const void> credit;
-    if(!admit(quote,credit)||!credit){error="owned prefill workspace reservation refused before allocation";return false;}
+    const auto admitted=admit(quote,credit);
+    if(admitted!=WorkspaceAdmission::ready){error="owned prefill workspace reservation refused before allocation";return admitted;}
+    if(!credit){error="owned prefill workspace admission returned no retained credit";return WorkspaceAdmission::invalid;}
     workspace_geometry_=&g;workspace_session_=&ss;workspace_source_=source;workspace_chunk_=chunk;
     workspace_borrowed_=borrowed;workspace_successor_=next_!=nullptr;workspace_credit_=std::move(credit);
-    return true;
+    return WorkspaceAdmission::ready;
 }
 
 int64_t Prefill::ring_default_slots() {
@@ -2600,8 +2602,10 @@ core::PrefillCpuShareObservation Prefill::cpu_share_policy() const noexcept {
 }
 Prefill::ReplayActivity Prefill::replay_activity() const noexcept {
     ReplayActivity r;r.next=next_;r.begin=stage_lb_;r.end=stage_le_;
+    r.workspace_paid=bool(workspace_credit_);
     r.taps=!tap_layers_.empty()||bool(on_taps);r.pending_force=force_chunk_!=0;
     if(impl_){const auto& m=*impl_;r.initialized=true;r.session=m.ss;r.source=m.src;
+        r.allocated_chunk=m.T_max;r.chunk=m.T;r.ring_slots=m.ring;
         r.cache=m.cache;r.residency=m.host_res;r.device=m.device;r.helper=bool(m.help_pp);
         r.peer=bool(m.pp);r.borrow_spill=m.borrow_spill;}
     return r;

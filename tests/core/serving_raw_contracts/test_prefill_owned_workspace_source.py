@@ -34,7 +34,7 @@ class PaidPrefillWiring(unittest.TestCase):
         self.assertLess(test.index('#undef NDEBUG'), test.index('#include'))
 
     def test_producer_quotes_actual_shape_and_rejects_extra_consumers(self):
-        producer = body(self.cpp, 'bool Prefill::admit_owned_workspace(')
+        producer = body(self.cpp, 'WorkspaceAdmission Prefill::admit_owned_workspace(')
         for actual in ['sizeof(Impl)', 'sizeof(Stager::Job)', 'core::PinnedRing::kSlots',
                        'core::PinnedRing::minimum_slot_bytes()', 'bytes_needed_owned(g,ss,chunk,source!=nullptr)',
                        'source->transient(layer,expert)', 'workspace_credit_=std::move(credit)']:
@@ -61,12 +61,17 @@ class PaidPrefillWiring(unittest.TestCase):
         self.assertLess(retry.index('stp->sp.reset()'), retry.index('o.prefill_chunk = next'))
         self.assertLess(retry.index('sp.reset()'), retry.index('o.prefill_chunk = next'))
 
-    def test_first_unit_keeps_eligibility_closed(self):
+    def test_bounded_profiles_require_managed_safe_unit_policy(self):
         eligibility = (ROOT / 'include/strata/core/native_owned_batch_serving.hpp').read_text()
-        self.assertIn('p.prefill_chunk==16', eligibility)
-        self.assertIn('!p.prefill_auto', eligibility)
+        self.assertIn('p.prefill_chunk>0 && p.prefill_chunk<=32768', eligibility)
+        for restriction in ['p.short_read==64', 'p.spec==0', 'p.batch_groups==1', '!p.vision']:
+            self.assertIn(restriction, eligibility)
+        self.assertIn('owned_batch_requested&&(o.prefill_chunk!=16||o.prefill_auto)', self.driver)
+        self.assertIn('larger/auto owned foreground prefill requires explicit managed safe-unit policy and limits', self.driver)
+        self.assertIn('serving_prefill_safe_turn', self.driver)
+        self.assertIn('shared_prefix_refill(true', self.driver)
         generated = generate(ROOT)
-        self.assertIn(body(self.cpp, 'bool Prefill::admit_owned_workspace('), generated)
+        self.assertIn(body(self.cpp, 'WorkspaceAdmission Prefill::admit_owned_workspace('), generated)
         self.assertIn(body(self.driver, 'auto admit_prefill_workspace ='), generated)
 
 

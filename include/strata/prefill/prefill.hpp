@@ -75,7 +75,8 @@ public:
         const void* session=nullptr;const void* source=nullptr;const void* cache=nullptr;
         const int32_t* residency=nullptr;const Prefill* next=nullptr;
         int device=-1;int64_t begin=0,end=0;
-        bool initialized=false,helper=false,peer=false,taps=false,borrow_spill=false,pending_force=false;
+        int64_t allocated_chunk=0,chunk=0,ring_slots=0;
+        bool initialized=false,helper=false,peer=false,taps=false,borrow_spill=false,pending_force=false,workspace_paid=false;
     };
     ReplayActivity replay_activity() const noexcept;
     Prefill();
@@ -100,8 +101,8 @@ public:
     // Strict text/no-helper setup: quote the actual maximum workspace before
     // init. The driver supplies its genuine ledger, not a caller-provided seal.
     // Credit remains here through checked reset/destruction of all consumers.
-    using WorkspaceAdmitter=std::function<bool(const OwnedWorkspaceBytes&,std::shared_ptr<const void>&)>;
-    bool admit_owned_workspace(const core::ModelGeometry&,const core::SessionState&,core::ExpertSource*,
+    using WorkspaceAdmitter=std::function<WorkspaceAdmission(const OwnedWorkspaceBytes&,std::shared_ptr<const void>&)>;
+    WorkspaceAdmission admit_owned_workspace(const core::ModelGeometry&,const core::SessionState&,core::ExpertSource*,
                               int64_t chunk,bool borrowed,const WorkspaceAdmitter&,std::string& error);
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a

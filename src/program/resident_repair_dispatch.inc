@@ -18,6 +18,26 @@ private:
     friend class ResidentRepairController;
     ResidentDispatchBinding(ResidentRepairRuntime& runtime,const core::ModelGeometry& geometry)
         :runtime_(runtime),service_(runtime.service_),geometry_(geometry){}
+    bool current_residency_digest(core::StateDigest& output)const noexcept {
+        if(!drive_.d.host_res||!runtime_.stage_count_||runtime_.stage_count_>size_t(SplitDrive::kMax)||
+           runtime_.stage_count_>runtime_.stages_.size()||geometry_.n_layers<=0||geometry_.n_expert<=0||
+           uint64_t(geometry_.n_layers)>SIZE_MAX/sizeof(int32_t)/uint64_t(geometry_.n_expert))return false;
+        core::WindowHasher hash;constexpr char domain[]="resident-private-original-cache-map-v1";
+        hash.update(domain,sizeof(domain));
+        hash.update(drive_.d.host_res,size_t(geometry_.n_layers)*size_t(geometry_.n_expert)*sizeof(int32_t));
+        for(size_t i=0;i<runtime_.stage_count_;++i){const auto* cache=runtime_.stages_[i].service.cache;
+            if(!cache||cache->slots()<1||cache->slot_offsets()!=split_.cache_slot_off[i]||
+               cache->device_slot(0)!=split_.cache_base[i]||!cache->slot_offsets()||
+               uint64_t(cache->slots())>SIZE_MAX/sizeof(uint64_t))return false;
+            const int64_t count=cache->slots(),bytes=cache->bytes();
+            hash.update(&count,sizeof(count));hash.update(&bytes,sizeof(bytes));
+            hash.update(cache->slot_offsets(),size_t(count)*sizeof(uint64_t));
+        }
+        output=hash.digest();return true;
+    }
+    bool original_residency_restored()const noexcept {
+        core::StateDigest actual{};return residency_bound_&&current_residency_digest(actual)&&actual==original_residency_;
+    }
 
     // BEFORE init: bind new callbacks/topology, then seal the real gate. Main
     // creates gate_metadata via actual global foreground admission and retains
@@ -124,6 +144,8 @@ private:
                     core::retirement_failed("private postinit native stage drain");
             }
             if(!gate_->healthy_advisory())core::retirement_failed("private postinit completion gate unhealthy");
+            if(!current_residency_digest(original_residency_))core::retirement_failed("private original residency binding unavailable");
+            residency_bound_=true;
             drive_.d.plan=split_.plan[0];drive_.d.cache_base=split_.cache_base[0];drive_.d.cache_slot_off=split_.cache_slot_off[0];drive_.d.pcie_num=split_.pcie_num[0];
             r.phase_=RuntimePhase::ready;return true;
         }catch(...){core::retirement_failed("private init exception retains admitted owners");}
@@ -150,7 +172,7 @@ private:
         auto& r=runtime_;auto& s=*service_;
         if(private_sealed_||!s.live_slot_valid()||std::this_thread::get_id()!=r.controller_||s.active_||s.unhealthy_||
            (r.phase_!=RuntimePhase::ready&&r.phase_!=RuntimePhase::drained)||
-           !r.allocation_.healthy()||drive_.d.failed||position!=r.cut_.forwarded||
+           !r.allocation_.healthy()||drive_.d.failed||!original_residency_restored()||position!=r.cut_.forwarded||
            r.cut_.exact_frontier!=r.cut_.forwarded||token<0||token>=geometry_.n_vocab||position>=uint64_t(INT64_MAX)||s.operation_==UINT64_MAX){
             error="private forward operation refused before submission";return false;}
         core::VerifierCompletionGate::Token completion;
@@ -297,6 +319,8 @@ private:
     }
     ResidentRepairRuntime& runtime_; // runtime owns binding; nonowning avoids cycle
     std::shared_ptr<ResidentExpertService> service_;
+    core::StateDigest original_residency_{};
+    bool residency_bound_=false;
     const core::ModelGeometry& geometry_;
     std::shared_ptr<core::VerifierCompletionGate> gate_;
     ::Drive drive_{};
