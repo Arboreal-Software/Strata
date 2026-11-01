@@ -20,6 +20,7 @@ def take(text,marker,semi=False):
 
 PRELUDE=r'''
 #include "strata/core/window_state.hpp"
+#include "serving_output_capacity.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -30,6 +31,10 @@ PRELUDE=r'''
 #include <stdexcept>
 #include <string>
 #include <vector>
+namespace core=strata::core;
+using strata::program::serving_output_history_quote;
+using strata::program::serving_receipt_requirement;
+struct SuffixExperimentDriver {static bool serving_qualification_enabled(){return false;}};
 namespace strata::core {[[noreturn]] void retirement_failed(const char* why){throw std::runtime_error(why);}}
 struct Controller {
     struct Published {strata::core::SnapshotDescriptor metadata;uint64_t serial=1;};
@@ -39,7 +44,8 @@ struct Controller {
         Geometry* geometry_owner_=&geometry;} service;Service* service_=&service;} runtime;
     Runtime* runtime_=&runtime;
     std::shared_ptr<Published> published_=std::make_shared<Published>();
-    std::array<Receipt,64> receipts_{};
+    using ReceiptHistory=strata::program::ServingReceiptHistory<Receipt>;
+    ReceiptHistory receipts_;
     uint64_t receipt_count_=2,known_count_=1,foreground_count_=3,next_cut_=100,private_pos=5;
     unsigned partial_count_=1;
     KnownReceipt known;
@@ -56,6 +62,7 @@ struct Controller {
         m.approximation.clear();m.cut.exact_frontier=m.cut.forwarded;return true;}
     bool retire(std::string&){return true;}
 };
+namespace resident_repair_detail {using ResidentRepairController=Controller;}
 struct ServingRawSession {
     bool open=true,permit=true;uint64_t quote=0;std::vector<int32_t> native_B{99,98};
     strata::core::SnapshotDescriptor captured;
@@ -71,7 +78,8 @@ struct Harness {
         std::shared_ptr<const void> request_credit;
         std::shared_ptr<Controller> controller=std::make_shared<Controller>();
         std::vector<int32_t> request_tokens{10,20,30,40};
-        strata::core::SnapshotDescriptor published;strata::core::BundleHandle repaired_final;
+        strata::core::SnapshotDescriptor published,cohort_publication;strata::core::BundleHandle repaired_final;
+        uint64_t cohort_capacity_bound=0;
         bool retired=false,yielded=true,certified_exact=false;
         uint64_t next_operation=5,next_cut=100,max_generated=2,generated=2,known_forwarded=1,exact_frontier=0;
         uint64_t request_receipt_base=0,request_known_base=0,request_watermark_base=0;
@@ -87,7 +95,7 @@ int main(){try{
     initial.accepted_tokens={10,20,30,40,1000,1001};initial.pending_tokens={1001};
     initial.cut.accepted=6;initial.cut.forwarded=5;initial.cut.exact_frontier=5;initial.cut.output_watermark=2;initial.cut.id=50;
     initial.cut.history=strata::core::window_history_digest(initial.accepted_tokens);
-    controller->receipts_[0]={2,1,40,1000};controller->receipts_[1]={3,1,50,1001};out.published=initial;
+    controller->receipts_[0]={2,1,40,1000};controller->receipts_[1]={3,1,50,1001};out.published=initial;out.cohort_publication=initial;
     std::vector<int64_t> incoming(initial.accepted_tokens.begin(),initial.accepted_tokens.end());
     for(int i=0;i<59;++i)incoming.push_back(200+i);
     Harness::PreparedContinuationRequest pending;std::string error;
@@ -97,8 +105,9 @@ int main(){try{
         session.native_B==std::vector<int32_t>{99,98};};
     {auto wrong=incoming;wrong[5]=999;Harness::PreparedContinuationRequest refused;
         require(!Harness::prepare_continuation_request(session,out,wrong,3,refused,error)&&unchanged(),"changed actual pending accepted before displacement");}
-    {Harness::PreparedContinuationRequest refused;
-        require(!Harness::prepare_continuation_request(session,out,incoming,63,refused,error)&&unchanged(),"cumulative receipt capacity refusal");}
+    {Harness::PreparedContinuationRequest growth;
+        require(Harness::prepare_continuation_request(session,out,incoming,63,growth,error)&&unchanged(),"cumulative receipt growth admitted before displacement");
+        require(growth.receipts.capacity>=65&&controller->receipts_.size()==64,"paid receipt growth remains unpublished before adoption");}
     {auto too_long=incoming;too_long.resize(512,1);Harness::PreparedContinuationRequest refused;
         require(!Harness::prepare_continuation_request(session,out,too_long,1,refused,error)&&unchanged(),"actual window bound refusal");}
     {session.permit=false;Harness::PreparedContinuationRequest refused;
@@ -148,7 +157,7 @@ def run(build):
     end=text.index('live_approximate=!activated_state.approximation.empty();cvec_cached=want_cvec;',start)
     host=text[start:end+len('live_approximate=!activated_state.approximation.empty();cvec_cached=want_cvec;')]
     source.write_text(PRELUDE+actual+END.replace('ACTUAL_HOST_REBIND',host))
-    subprocess.run(['c++','-std=c++20','-O0','-Wall','-Wextra','-I'+str(root/'include'),str(source),str(root/'src/core/window_hash.cpp'),'-o',str(binary)],check=True)
+    subprocess.run(['c++','-std=c++20','-O0','-Wall','-Wextra','-I'+str(root/'include'),'-I'+str(root/'src/program'),str(source),str(root/'src/core/window_hash.cpp'),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True,timeout=20)
     wrapper=take(text,'    static bool activate_retained_owner(')
     if not wrapper.index('prepare_continuation_request(')<wrapper.index('session.capture(prior_metadata, prior_image)')<wrapper.index('session.restore(payload.retained_publication, identity)')<wrapper.index('adopt_continuation_request('):
