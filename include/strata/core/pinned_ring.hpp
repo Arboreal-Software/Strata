@@ -28,6 +28,7 @@ namespace strata::core {
 class PinnedRing {
 public:
     static constexpr int kSlots = 4;
+    static constexpr size_t minimum_slot_bytes() noexcept { return kMinCap; }
 
     PinnedRing() = default;
     PinnedRing(const PinnedRing&) = delete;

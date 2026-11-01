@@ -367,6 +367,28 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME serving_output_capacity_source_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_output_capacity_source.py)
   set_tests_properties(serving_output_capacity_source_test PROPERTIES TIMEOUT 30)
+  add_executable(prefill_owned_workspace_test tests/core/serving_raw_contracts/test_prefill_owned_workspace.cpp
+    src/core/window_budget.cpp)
+  target_include_directories(prefill_owned_workspace_test PRIVATE include)
+  target_link_libraries(prefill_owned_workspace_test PRIVATE Threads::Threads)
+  add_test(NAME prefill_owned_workspace_test COMMAND prefill_owned_workspace_test)
+  set_tests_properties(prefill_owned_workspace_test PROPERTIES TIMEOUT 120)
+  set(_prefill_workspace_fixture ${CMAKE_CURRENT_BINARY_DIR}/prefill_owned_workspace/actual.cpp)
+  add_custom_command(OUTPUT ${_prefill_workspace_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/generate_prefill_owned_workspace_test.py
+      --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_prefill_workspace_fixture}
+    DEPENDS src/program/generate.cpp src/prefill/prefill.cpp include/strata/prefill/prefill.hpp
+      tests/core/serving_raw_contracts/generate_prefill_owned_workspace_test.py
+      tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+    VERBATIM)
+  add_executable(prefill_owned_workspace_producer_test ${_prefill_workspace_fixture} src/core/window_budget.cpp)
+  target_include_directories(prefill_owned_workspace_producer_test PRIVATE include)
+  target_link_libraries(prefill_owned_workspace_producer_test PRIVATE Threads::Threads)
+  add_test(NAME prefill_owned_workspace_producer_test COMMAND prefill_owned_workspace_producer_test)
+  set_tests_properties(prefill_owned_workspace_producer_test PROPERTIES TIMEOUT 120)
+  add_test(NAME prefill_owned_workspace_source_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_owned_workspace_source.py)
+  set_tests_properties(prefill_owned_workspace_source_test PROPERTIES TIMEOUT 30)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME serving_thread_bridge_nonce_test COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_bridge_nonce.py

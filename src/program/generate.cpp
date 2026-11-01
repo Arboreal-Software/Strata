@@ -12718,6 +12718,24 @@ int main(int argc, char** argv) {
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+        auto admit_prefill_workspace = [&](strata::prefill::Prefill& consumer,const strata::core::SessionState& session,
+                                          strata::core::ExpertSource* source,bool borrowed,int device) -> bool {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_batch_allocation){
+                if(!model_budget||device<0){err="owned prefill has no actual model ledger/device";return false;}
+                return consumer.admit_owned_workspace(g,session,source,o.prefill_chunk,borrowed,
+                    [&](const strata::prefill::OwnedWorkspaceBytes& quote,std::shared_ptr<const void>& credit){
+                        const auto dimensions=model_budget->snapshot().capacity.device_bytes.size();
+                        if(size_t(device)>=dimensions)return false;
+                        strata::core::WindowResources resources;resources.device_bytes.resize(dimensions);
+                        resources.device_bytes[size_t(device)]=quote.device;resources.host_bytes=quote.host;resources.pinned_bytes=quote.pinned;
+                        auto admitted=model_budget->reserve(resources,strata::core::ReservationPurpose::foreground);
+                        if(!admitted)return false;credit=std::move(admitted.lease);return true;
+                    },err);
+            }
+#endif
+            return true; // legacy/default-OFF allocation path remains unchanged
+        };
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
@@ -12731,6 +12749,7 @@ int main(int argc, char** argv) {
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
                 if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
+                if(!admit_prefill_workspace(st.sp,st.ss,srcp,sb!=nullptr,st.dev))return 1;
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
@@ -12739,6 +12758,10 @@ int main(int argc, char** argv) {
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            const strata::core::OnDevice owned_primary_prefill_device(owned_batch_allocation?primary_device:-1);
+#endif
+            if(!admit_prefill_workspace(sp,ss,prefill_src,borrow!=nullptr,primary_device))return 1;
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;

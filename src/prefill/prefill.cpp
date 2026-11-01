@@ -1152,8 +1152,8 @@ void Prefill::reset() {
 }
 
 void Prefill::release() {
-    if (!impl_) return;
-    if (strict_retirement_ && !retirement_init_started_) { impl_.reset(); return; }
+    if (!impl_) {workspace_credit_.reset();return;}
+    if (strict_retirement_ && !retirement_init_started_) { impl_.reset();workspace_credit_.reset();return; }
     core::StrictRetirementDevice retirement(strict_retirement_ && impl_->device >= 0, impl_->device);
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
     if (strict_retirement_) {
@@ -1203,6 +1203,7 @@ void Prefill::release() {
         if (e) core::retirement_check(strict_retirement_, cudaEventDestroy(e), "prefill cleanup");
     for (void* p : impl_->owned) core::retirement_check(strict_retirement_, cudaFree(p), "prefill cleanup");
     if (strict_retirement_) impl_.reset(); // all GPU-owning members are now empty, still on the owning device
+    workspace_credit_.reset(); // every buffer, host worker and upload consumer is now retired
 }
 
 
@@ -1473,6 +1474,11 @@ void warm_gemm_libraries(int device) {
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes, bool borrow_spill) {
+    if(workspace_credit_&&(&g!=workspace_geometry_||&ss!=workspace_session_||src!=workspace_source_||
+       chunk!=workspace_chunk_||bool(borrow)!=workspace_borrowed_||bool(next_)!=workspace_successor_||borrow_spill||
+       cpu_pool_||helper_||impl_->pp||impl_->help_pp||embd_rows||on_routes||on_taps)){
+        err="prefill workspace admission does not match actual init owners/shape";return false;
+    }
     retirement_init_started_ = true;
     if (strict_retirement_) core::retirement_check(true, cudaGetDevice(&impl_->device), "Prefill init device");
     Impl& m = *impl_;
@@ -2507,6 +2513,45 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
 uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                         bool src) {
     return bytes_needed(g, ss, chunk, src) - (uint64_t) stage_slots((size_t) chunk) * (uint64_t) MAXBLOB();
+}
+
+bool Prefill::admit_owned_workspace(const core::ModelGeometry& g,const core::SessionState& ss,core::ExpertSource* source,
+                                   int64_t chunk,bool borrowed,const WorkspaceAdmitter& admit,std::string& error) {
+    // This first paid producer covers the same strict text/no-CPU/helper/peer
+    // profile as owned serving. It is not an envelope for optional writers.
+    if(!strict_retirement_||!impl_||impl_->g||workspace_credit_||!admit||chunk<=0||
+       g.n_embd!=N||g.hc!=HC||g.hc_lr!=LR||ss.k!=K||g.n_expert<=0||g.n_layers<=0||
+       cpu_pool_||helper_||impl_->pp||impl_->help_pp||embd_rows||on_routes||on_taps){
+        error="owned prefill workspace needs fresh strict text/no-helper consumers";return false;
+    }
+    // init's stager may use its file-backed profile. Bound that existing branch
+    // without repeating cached_share() (which could change between quote/init).
+    uint64_t stager_slots=16;
+    if(const char* configured=std::getenv("STRATA_STAGER_RING"))stager_slots=uint64_t(std::clamp(std::atoi(configured),2,256));
+    else {
+        bool transient=false;
+        for(int64_t layer=0;source&&!transient&&layer<g.n_layers;++layer)
+            for(int64_t expert=0;!transient&&expert<g.n_expert;++expert)transient=source->transient(layer,expert);
+        if(transient)stager_slots=std::max<uint64_t>(16,4*kMaxStagerThreads);
+    }
+    OwnedWorkspaceShape shape;
+    shape.chunk=uint64_t(chunk);shape.embedding=N;shape.handoff_width=D;shape.routes=K;
+    shape.experts=uint64_t(g.n_expert);shape.layers=uint64_t(g.n_layers);
+    shape.step_count=strata::kernels::kStepCount;shape.ple_heads=strata::kernels::PLE_N_HEADS;
+    shape.stager_slots=stager_slots;shape.max_blob=uint64_t(MAXBLOB());
+    shape.object_bytes=sizeof(Impl)+sizeof(Stager)+stager_slots*(sizeof(uint8_t*)+sizeof(char)+
+        sizeof(std::vector<uint8_t>)+sizeof(cudaEvent_t))+2*kMaxStagerThreads*sizeof(std::thread);
+    shape.stager_job_bytes=sizeof(Stager::Job);shape.atomic_bytes=sizeof(std::atomic<int>);
+    shape.upload_slots=core::PinnedRing::kSlots;shape.upload_min_bytes=core::PinnedRing::minimum_slot_bytes();
+    shape.borrowed=borrowed;shape.successor=next_!=nullptr;
+    shape.arena_device_bytes=borrowed?bytes_needed(g,ss,chunk,source!=nullptr):bytes_needed_owned(g,ss,chunk,source!=nullptr);
+    OwnedWorkspaceBytes quote;
+    if(!owned_workspace_quote(shape,quote)){error="owned prefill workspace quote overflow/unsupported shape";return false;}
+    std::shared_ptr<const void> credit;
+    if(!admit(quote,credit)||!credit){error="owned prefill workspace reservation refused before allocation";return false;}
+    workspace_geometry_=&g;workspace_session_=&ss;workspace_source_=source;workspace_chunk_=chunk;
+    workspace_borrowed_=borrowed;workspace_successor_=next_!=nullptr;workspace_credit_=std::move(credit);
+    return true;
 }
 
 int64_t Prefill::ring_default_slots() {

@@ -15,6 +15,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/prefill/owned_workspace.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -96,6 +97,12 @@ public:
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0,
               bool borrow_spill = false);
+    // Strict text/no-helper setup: quote the actual maximum workspace before
+    // init. The driver supplies its genuine ledger, not a caller-provided seal.
+    // Credit remains here through checked reset/destruction of all consumers.
+    using WorkspaceAdmitter=std::function<bool(const OwnedWorkspaceBytes&,std::shared_ptr<const void>&)>;
+    bool admit_owned_workspace(const core::ModelGeometry&,const core::SessionState&,core::ExpertSource*,
+                              int64_t chunk,bool borrowed,const WorkspaceAdmitter&,std::string& error);
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
@@ -307,6 +314,12 @@ private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
+    std::shared_ptr<const void> workspace_credit_; // destroyed AFTER Impl
+    const core::ModelGeometry* workspace_geometry_=nullptr;
+    const core::SessionState* workspace_session_=nullptr;
+    const core::ExpertSource* workspace_source_=nullptr;
+    int64_t workspace_chunk_=0;
+    bool workspace_borrowed_=false,workspace_successor_=false;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };
