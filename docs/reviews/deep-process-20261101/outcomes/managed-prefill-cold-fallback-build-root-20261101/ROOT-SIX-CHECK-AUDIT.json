@@ -1,0 +1,85 @@
+{
+  "status": "RELEASED",
+  "epoch": 1793570672.0809388,
+  "runner_absent": true,
+  "matching_client_pids": [],
+  "checks": [
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "name=^/strata-managed-priority-input-envelope-cpu-20261101T214902Z-ddaa4bb62dc5$",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "label=strata.repair-attempt=ddaa4bb62dc5486fb2f4a52f1b50986e",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "id=8d0a0a0f81e8f6050222607673a524fc4455facf57186f650ed93d18779a2f33",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "inspect",
+        "1ae3605d33df66f2bb8dca5d495deb585d917f287b33b29c4f948235161c2fad"
+      ],
+      "stdout": "[private inspection omitted; only selected baseline facts retained]",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n",
+      "stderr": "",
+      "exit": 0
+    }
+  ],
+  "supplemental_read_only_audit": true,
+  "source_manifest_sha256": "f983320af084b1f5544be03d0ff1b8c1c2ac7a4082a36e373064ca7735b1ed19",
+  "input_manifest_sha256": "f983320af084b1f5544be03d0ff1b8c1c2ac7a4082a36e373064ca7735b1ed19",
+  "recorded_release_sha256": "c1c0dada7866324f460133e19f72ce8988bc4a9a41a717fdde7b4973bf788b73",
+  "result_sha256": "5fbb6aa4083c0eb78a7bbf6477ccf56b979f77d794698aa40829574268df020b",
+  "attempt_record_sha256": "2ed3e06e187cf3100aead9b9ad2102d107e757f21ba9dff2cdf0af570988079d"
+}

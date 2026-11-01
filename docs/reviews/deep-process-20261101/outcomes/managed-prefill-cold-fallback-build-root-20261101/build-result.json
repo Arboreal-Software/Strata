@@ -1,0 +1,126 @@
+{
+  "token": "[REDACTED_ATTEMPT_TOKEN]",
+  "runner_pid": 3629477,
+  "container": "strata-managed-priority-input-envelope-cpu-20261101T214902Z-ddaa4bb62dc5",
+  "label": "ddaa4bb62dc5486fb2f4a52f1b50986e",
+  "input_manifest_sha256": "f983320af084b1f5544be03d0ff1b8c1c2ac7a4082a36e373064ca7735b1ed19",
+  "limits": {
+    "cpus": 6,
+    "memory": 17179869184,
+    "memory_swap": 17179869184,
+    "total_seconds": 1800,
+    "work_seconds": 1740,
+    "network": "none",
+    "gpu": false
+  },
+  "exit_code": 0,
+  "removed": true,
+  "launch_completion_uncertain": false,
+  "queries": [
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "exit": 0,
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "exit": 0,
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        "{{.Id}}\n{{index .Config.Labels \"strata.repair-attempt\"}}",
+        "8d0a0a0f81e8f6050222607673a524fc4455facf57186f650ed93d18779a2f33"
+      ],
+      "exit": 0,
+      "stdout": "8d0a0a0f81e8f6050222607673a524fc4455facf57186f650ed93d18779a2f33\nddaa4bb62dc5486fb2f4a52f1b50986e\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "rm",
+        "-f",
+        "8d0a0a0f81e8f6050222607673a524fc4455facf57186f650ed93d18779a2f33"
+      ],
+      "exit": 0,
+      "stdout": "8d0a0a0f81e8f6050222607673a524fc4455facf57186f650ed93d18779a2f33\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "name=^/strata-managed-priority-input-envelope-cpu-20261101T214902Z-ddaa4bb62dc5$",
+        "--format",
+        "{{.ID}}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "label=strata.repair-attempt=ddaa4bb62dc5486fb2f4a52f1b50986e",
+        "--format",
+        "{{.ID}}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "id=8d0a0a0f81e8f6050222607673a524fc4455facf57186f650ed93d18779a2f33",
+        "--format",
+        "{{.ID}}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "exit": 0,
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n",
+      "stderr": ""
+    }
+  ],
+  "daemon": "be76a944-ad6a-4ad6-983d-af0294b670e7",
+  "cid": "8d0a0a0f81e8f6050222607673a524fc4455facf57186f650ed93d18779a2f33",
+  "absence": {
+    "name": "",
+    "label": "",
+    "cid": ""
+  },
+  "elapsed_seconds": 921.1801641099155,
+  "independent_release_required": true,
+  "release_ready": true
+}

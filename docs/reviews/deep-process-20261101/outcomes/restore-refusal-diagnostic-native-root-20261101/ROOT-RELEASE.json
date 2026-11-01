@@ -1,0 +1,68 @@
+{
+  "status": "DIAGNOSTIC_INDEPENDENTLY_RELEASED_BASELINE_RESTORED",
+  "scope": "Diagnostic only; inspect typed refusal and actual numerical result separately; no qualification authority",
+  "epoch": 1793573338.1538358,
+  "campaign": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101",
+  "cid": "0d7df9a8b961efeef44ee043a0d88392b7af51d038cc540007cec38f65ed8429",
+  "attempt_label": "be8def4e140e433c8ad7dd5a605010ce",
+  "runner_absent": true,
+  "supervisor_absent": true,
+  "matching_client_pids": [],
+  "checks": [
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n"
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "name=^/strata-serve-suffix-repaired-4feea3f046fa4ad092aa4a673ed7cc5d$",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "label=strata.resident-repair-attempt=be8def4e140e433c8ad7dd5a605010ce",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "id=0d7df9a8b961efeef44ee043a0d88392b7af51d038cc540007cec38f65ed8429",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    }
+  ],
+  "baseline": {
+    "id": "1ae3605d33df66f2bb8dca5d495deb585d917f287b33b29c4f948235161c2fad",
+    "image": "sha256:ec8ab65b49dd35478d8b77a15cf1d7fb05c07c0e42adac30932ac5982679a757",
+    "healthy": true,
+    "context": 393216,
+    "parallel": 2
+  },
+  "supervisor_result_sha256": "f976708abd1bebc2b23ad3442bc5cedce22e8f0214ef00a5790235be7830a527",
+  "result_sha256": "2f7e11dad80ae77d9fda7c1e539ce67c44777119c8661174038749b4ea2fa140",
+  "native_pass": false,
+  "qualified": false
+}

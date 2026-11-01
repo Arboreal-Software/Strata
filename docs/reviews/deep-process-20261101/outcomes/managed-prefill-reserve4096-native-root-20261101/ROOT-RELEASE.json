@@ -1,0 +1,68 @@
+{
+  "status": "PRODUCT_FAIL_INDEPENDENTLY_RELEASED_BASELINE_RESTORED",
+  "failure": "Clean repaired-state restore refusal before continuation; no complete numerical verdict",
+  "epoch": 1793571880.0557306,
+  "campaign": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101",
+  "cid": "7a38708b0a784b88ea380d6b669250534898f5d378cd4e1b19072b1c28bc219a",
+  "attempt_label": "f01bf3937f5e4da0aa7a8e63e368457a",
+  "runner_absent": true,
+  "supervisor_absent": true,
+  "matching_client_pids": [],
+  "checks": [
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n"
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "name=^/strata-serve-suffix-repaired-fd2e05a4e8ea4a1e85db4dec185fd308$",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "label=strata.resident-repair-attempt=f01bf3937f5e4da0aa7a8e63e368457a",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "id=7a38708b0a784b88ea380d6b669250534898f5d378cd4e1b19072b1c28bc219a",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    }
+  ],
+  "baseline": {
+    "id": "1ae3605d33df66f2bb8dca5d495deb585d917f287b33b29c4f948235161c2fad",
+    "image": "sha256:ec8ab65b49dd35478d8b77a15cf1d7fb05c07c0e42adac30932ac5982679a757",
+    "healthy": true,
+    "context": 393216,
+    "parallel": 2
+  },
+  "supervisor_result_sha256": "501622ccfb64e528ecd01499d02219e71240418b8bfa69d544cbc4279153b5a7",
+  "result_sha256": "376631d7d4039cd5ae50ef6329961336282f14a67fddf02ce494891a550ad3a6",
+  "native_pass": false,
+  "qualified": false
+}

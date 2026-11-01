@@ -1,0 +1,15 @@
+{
+  "started": 1793572804.0013266,
+  "jobs": [
+    {
+      "name": "diagnostic-continuation-restore-reason",
+      "started": 1793572813.6689646,
+      "exit": 125,
+      "release_exit": 0
+    }
+  ],
+  "restored": true,
+  "error": "RuntimeError('test failed or cleanup unproved; remaining tests skipped')",
+  "finished": 1793573103.2306736,
+  "notification": "sent"
+}

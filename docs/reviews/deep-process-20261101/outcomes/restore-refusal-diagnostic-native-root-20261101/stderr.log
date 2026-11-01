@@ -1,0 +1,583 @@
+strata: sm_86 (Ampere): 9 exact speed switches on by default (STRATA_SM86_PERF=0 turns them off; a switch you set is kept): ADAPT_NOWAIT ADAPT_LAG CPU_IQ_ALL_EXACT1 SIDE_MIXER ATTN_DAILY GR_UP75 GU_SWIGLU QSA_ROWS B6_MMVQ_ROWS
+strata generate: memory guard: limit 32.0 GiB (source: flag), current 0.3 GiB, reclaimable cache credited 0.0 GiB; available 31.7 GiB (MemAvailable 57.1 GiB, --memory-limit-mib 32768), floor 2560 MiB
+strata serve: warning: conversation caching is disabled by --prompt-cache 0
+strata generate: layer split across 2 GPUs: CUDA0, then CUDA1 (split 24)
+strata generate: PCIe probe: 13.5 GB/s host->device (best of 13.5 13.5 13.5 13.5) -> pcie_frac 0.37 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata serve: owned two-slot intent requested_spec=0 verifier_capacity=2 rows_per_slot=1
+strata generate: native pack: /pack experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.4 s)
+strata generate: layer split: CUDA0 loads the dense weights of layers 0-23 only
+strata generate: 831 MiB of weights loaded from /pack in 0.5 s (662 canonical tensors skipped: served natively)
+strata generate: 150 native projection matrices, 988.19 MiB of weights, in 0.8 s
+strata generate: PLE direct read probe: 115062 rows/s (fine)
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: layer split: CUDA1 loads the dense weights of layers 24-47 only
+strata generate: layer split: CUDA1 PCIe probe 13.5 GB/s (best of 13.5 13.5 13.5 13.5) -> pcie_frac 0.37
+strata generate: layer split: CUDA1 holds its weights; 21.35 GiB free (its session follows the split search)
+strata generate: profile /qualification-profile: 24576 ranked pairs, built for 24576 slots
+strata generate: layer split: CUDA1 holds its weights, session [24, 48) and the head; 20.57 GiB free
+owned batch allocation dependency: two distinct slot gangs, 2 stages; execution admission remains closed
+strata generate: checked ownership retained for 2 model stages; window execution remains disabled
+strata generate: GPU 0: NVIDIA GeForce RTX 3090, compute capability 8.6
+strata generate: experts via mmap (--mmap-experts; the GGUF shards in place, no experts.bin)
+strata generate: file tier (Linux defaults, the GGUF read in place): page-cached experts computed from the mapping (STRATA_COLD_OVERLAP=4), io prefetch with whole-blob preads on 8 I/O threads, the decode's read-ahead only while the page cache has room for it and it pays (STRATA_IO_PF_GATE=1); off: STRATA_COLD_OVERLAP=0, STRATA_IO_PREFETCH=0, STRATA_IO_PF_GATE=0
+strata generate: GPU host-callback thread started before host-core pinning
+strata generate: CPU pool tasks/phase: 9 (automatic), participating threads: 3
+strata generate: 2 pool workers on logical processors 1,2, the host thread on 0 (draining too) (--host-core first)
+strata generate: CPU workers on logical processors 1,2 (2 workers, one per physical core; host on 0)
+strata aux cpus: threads that are neither pool workers nor the host go to CPUs 12,3,4,5,6,7,8,9,10,11,15,16,17,18,19,20,21,22,23 (off at start; a request's aux_cpus=1 turns it on)
+strata generate: expert cache auto: 20.45 GiB free, 4096 MiB reserved (+0 MiB for the draft head) -> 6635 slots
+strata generate: expert cache 9132 slots, 16.45 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: the profile fill asks for 256 pairs ahead (STRATA_FILL_AHEAD)
+strata generate: pre-filled 9132 of 9132 slots from the profile in 9.9 s (1783 MB/s); slot 0 verified
+strata generate: layer split, CUDA1: 20.00 GiB free of 23.56, room for experts 15.90 GiB
+strata generate: layer split: CUDA1 runs layers 24-47, expert cache 7931 slots (15.90 GiB), 7931 of its 12288 profiled pairs; slot 0 verified
+strata generate: layer split: CUDA0 runs layers 0-23
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 2 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.51)
+strata generate: token graph hit path: 17063 resident experts, decided on the device
+strata serve:   CUDA0 keeps its own prompt buffers (0.77 GiB of 4.00 GiB free): no loan
+strata serve:   CUDA1 keeps its own prompt buffers (0.77 GiB of 4.09 GiB free): no loan
+strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)
+PREFILL_WORKSPACE v=1 phase=admitted device=1 capacity=1024 borrowed=0 device_quote=878706688 host_quote=487956236 pinned_quote=487956236
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+PREFILL_WORKSPACE v=1 phase=ready device=1 capacity=1024 chunk=1024 ring=96 borrowed=0 paid=1
+PREFILL_WORKSPACE v=1 phase=admitted device=0 capacity=1024 borrowed=0 device_quote=878706688 host_quote=571842316 pinned_quote=571842316
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+PREFILL_WORKSPACE v=1 phase=ready device=0 capacity=1024 chunk=1024 ring=96 borrowed=0 paid=1
+strata hc: CUDA1: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 2 tokens, 52.0 MiB of device buffers
+strata serve: layer split: layers 0-23 (CUDA0), 24-47 (CUDA1), one hand-off per window
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 2 tokens, 52.0 MiB of device buffers
+strata verify: batch windows of up to 2 sequences (layers [0, 24))
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 1
+strata verify: captured the batch window over slots 0,1
+strata verify: batch windows of up to 2 sequences (layers [24, 48))
+strata verify: captured the batch window over slots 0
+strata verify: captured the batch window over slots 1
+strata verify: captured the batch window over slots 0,1
+strata serve: REPAIR_POLICY v=1 age_ns=1000000000000000000 live_weight=1 foreground_weight=1 max_escalated_units=2 seed=0
+strata serve: suffix cache (repaired): opt-in retained repair owner registry, slots=2 from STRATA_SERVING_REPAIR_OWNER_SLOTS, idle private unit cap=4 from STRATA_SERVING_REPAIR_IDLE_UNIT_TOKENS (0 means no idle private work; nothing is retained unless a certified yield succeeds)
+strata serve: adaptive overlap: off: not on a layer split
+strata serve: 3056 MiB of VRAM free with everything loaded
+strata serve: CUDA1: 3151 MiB of VRAM free with everything loaded
+strata serve: suffix cache: repaired native serving enabled; supported edits use an explicitly approximate foreground phase before exact CURRENT catchup
+strata serve: suffix cache: private RAW session owner acquired: ok host_cap=6442450944
+strata serve: suffix cache: refused exact_prefix=0 changed=[0,0) reused_suffix=0 frontier=0 fresh=0 approximate=0 exact_certificate=0 reason=not enabled
+strata serve: suffix cache (repaired): REQ_BEGIN req=1 consumed=0 pending=-1
+strata serve: suffix cache (repaired): refused exact_prefix=0 changed=[0,0) reused_suffix=0 donor_consumed=0 pending=-1 reason=conversation checkpointing is off
+strata serve: suffix cache (retained): ORDINARY_FENCE_OPEN req=1 cut=1 resume=0 live=0
+SCHED_PREFILL_PLAN v=1 engine=7134381075974763474 slot=0 request=a00000000001 operation=1 result=1 configured_max=1024 allocated_max=1024 chunk=1024 ring=96 auto_mode=0 auto_max=0 from=0 to=2789 planned=1 single=0 chunked=0 stages=2
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=1 slot=0 request=a00000000001 source_window=1 source_cut=0 source_bootstrap=1 from=0 to=1024 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=2 slot=0 request=a00000000001 source_window=1 source_cut=0 source_bootstrap=1 from=1024 to=2048 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=3 slot=0 request=a00000000001 source_window=1 source_cut=0 source_bootstrap=1 from=2048 to=2789 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+strata verify: capturing the 1-token window (3010 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata ab: GATE=STRATA_CPU_IQ_ALL_EXACT1 active=1
+strata verify: capturing the 1-token window (3095 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata serve: suffix cache (retained): ORDINARY_CERTIFY req=1 cut=1 forwarded=2790 accepted=2791 exact=1 pending=1
+strata batch: slot 0 takes 2790 tokens (copied in 469.5 ms)
+strata serve: prompt 2790 tokens = 0 reused + 2790 read in 21957 ms (127.1 tok/s), 1 generated in 26 ms (38.2 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: decode expert cache hit rate: 97.1% (466 hits / 480 lookups)
+strata serve: expert tiers: GPU 466 hits this request; since the start RAM 0 blobs, files 0 blobs 72393.9 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 49740.3 MB from storage (112902 major faults) for 72393.9 MB of expert reads; page cache held 72393.9 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 28812.4 ms in 17065 fetches; decode gate: cache room -1.00 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), open, closed in 0 windows so far, 0 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)
+SCHED_COHORT v=1 engine=7134381075974763474 mask=1 priority=0 selected_slot=0 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=4 slot=0 request=a00000000001 occupancy=6 native_cut=3 operation=1 result=1 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=1 priority=0 selected_slot=0 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=5 slot=0 request=a00000000001 occupancy=6 native_cut=4 operation=1 result=1 priority=0 class_weight=1 accepted=1 source_accepted=1
+strata serve: suffix cache: refused exact_prefix=0 changed=[0,0) reused_suffix=0 frontier=0 fresh=0 approximate=0 exact_certificate=0 reason=not enabled
+strata serve: suffix cache (repaired): REQ_BEGIN req=2 consumed=2790 pending=2
+strata serve: suffix cache (repaired): refused exact_prefix=0 changed=[0,0) reused_suffix=0 donor_consumed=2790 pending=2 reason=conversation checkpointing is off
+strata serve: suffix cache (retained): ORDINARY_FENCE_OPEN req=2 cut=2 resume=0 live=2790
+SCHED_PREFILL_PLAN v=1 engine=7134381075974763474 slot=1 request=b00000000001 operation=3 result=2 configured_max=1024 allocated_max=1024 chunk=1024 ring=96 auto_mode=0 auto_max=0 from=0 to=2790 planned=1 single=0 chunked=0 stages=2
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=6 slot=1 request=b00000000001 source_window=1 source_cut=1 source_bootstrap=0 from=0 to=1024 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=7 slot=1 request=b00000000001 source_window=1 source_cut=1 source_bootstrap=0 from=1024 to=2048 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=8 slot=1 request=b00000000001 source_window=1 source_cut=1 source_bootstrap=0 from=2048 to=2790 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+strata serve: suffix cache (retained): ORDINARY_CERTIFY req=2 cut=2 forwarded=2791 accepted=2792 exact=1 pending=1
+strata batch: slot 1 takes 2791 tokens (copied in 253.6 ms)
+strata serve: prompt 2791 tokens = 0 reused + 2791 read in 5668 ms (492.4 tok/s), 1 generated in 12 ms (80.6 tok/s), drafts accepted 0 of 0, 0 checkpoints
+strata serve: decode expert cache hit rate: 96.7% (464 hits / 480 lookups)
+strata serve: expert tiers: GPU 464 hits this request; since the start RAM 0 blobs, files 0 blobs 110040.1 MB read (the GGUF in place)
+strata serve: file tier I/O this request: the OS read 19.7 MB from storage (278 major faults) for 37646.3 MB of expert reads; page cache held 37646.3 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.62 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), open, closed in 0 windows so far, 0 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=9 slot=1 request=b00000000001 occupancy=7 native_cut=3 operation=3 result=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+strata serve: suffix cache: refused exact_prefix=0 changed=[0,0) reused_suffix=0 frontier=0 fresh=0 approximate=0 exact_certificate=0 reason=not enabled
+strata serve: suffix cache (repaired): REQ_BEGIN req=3 consumed=2791 pending=2
+strata serve: suffix cache (repaired): admitted exact_prefix=2688 changed=[2688,2692) reused_suffix=100 donor_consumed=2791 pending=2 reason=admitted
+strata serve: suffix cache (repaired): PREFIX_PHASE_OPEN boundary=2692 cut=3 consumed=2792
+SCHED_PREFILL_PLAN v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=5 result=3 configured_max=1024 allocated_max=1024 chunk=1024 ring=96 auto_mode=0 auto_max=0 from=0 to=2692 planned=1 single=0 chunked=0 stages=2
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=10 slot=0 request=a00000000002 source_window=1 source_cut=2 source_bootstrap=0 from=0 to=1024 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=11 slot=0 request=a00000000002 source_window=1 source_cut=2 source_bootstrap=0 from=1024 to=2048 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=12 slot=0 request=a00000000002 source_window=1 source_cut=2 source_bootstrap=0 from=2048 to=2692 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+strata verify: window up to 2 tokens, 52.0 MiB of device buffers
+strata verify: window up to 2 tokens, 52.0 MiB of device buffers
+strata verify: capturing the 1-token window (2654 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2739 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata serve: suffix cache: refused exact_prefix=0 changed=[0,0) reused_suffix=0 frontier=0 fresh=0 approximate=0 exact_certificate=0 reason=not enabled
+strata serve: suffix cache (repaired): REQ_BEGIN req=4 consumed=0 pending=-1
+strata serve: suffix cache (repaired): admitted exact_prefix=2688 changed=[2688,2692) reused_suffix=100 donor_consumed=0 pending=-1 reason=admitted
+strata serve: suffix cache (repaired): PREFIX_PHASE_OPEN boundary=2692 cut=5 consumed=2792
+SCHED_PREFILL_PLAN v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=7 result=4 configured_max=1024 allocated_max=1024 chunk=1024 ring=96 auto_mode=0 auto_max=0 from=0 to=2692 planned=1 single=0 chunked=0 stages=2
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=13 slot=0 request=a00000000002 occupancy=8 native_cut=11 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_SERVICE v=1 kind=peer engine=7134381075974763474 request=b00000000002 main_window=1 main_cut=4 slot=0 occupancy=8 operation=5 result=3 graph=28 native_group=4
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=14 slot=0 request=a00000000002 occupancy=8 native_cut=12 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_SERVICE v=1 kind=peer engine=7134381075974763474 request=b00000000002 main_window=1 main_cut=4 slot=0 occupancy=8 operation=5 result=3 graph=29 native_group=5
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=15 slot=0 request=a00000000002 occupancy=8 native_cut=13 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_SERVICE v=1 kind=peer engine=7134381075974763474 request=b00000000002 main_window=1 main_cut=4 slot=0 occupancy=8 operation=5 result=3 graph=30 native_group=6
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=16 slot=0 request=a00000000002 occupancy=8 native_cut=14 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_SERVICE v=1 kind=peer engine=7134381075974763474 request=b00000000002 main_window=1 main_cut=4 slot=0 occupancy=8 operation=5 result=3 graph=31 native_group=7
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=17 slot=0 request=a00000000002 occupancy=8 native_cut=15 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_SERVICE v=1 kind=peer engine=7134381075974763474 request=b00000000002 main_window=1 main_cut=4 slot=0 occupancy=8 operation=5 result=3 graph=32 native_group=8
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=18 slot=1 request=b00000000002 source_window=1 source_cut=4 source_bootstrap=0 from=0 to=1024 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=19 slot=0 request=a00000000002 occupancy=8 native_cut=16 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=20 slot=0 request=a00000000002 occupancy=8 native_cut=17 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=21 slot=0 request=a00000000002 occupancy=8 native_cut=18 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=22 slot=0 request=a00000000002 occupancy=8 native_cut=19 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=23 slot=0 request=a00000000002 occupancy=8 native_cut=20 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=24 slot=0 request=a00000000002 occupancy=8 native_cut=21 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=25 slot=0 request=a00000000002 occupancy=8 native_cut=22 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=26 slot=0 request=a00000000002 occupancy=8 native_cut=23 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=27 slot=0 request=a00000000002 occupancy=8 native_cut=24 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=28 slot=0 request=a00000000002 occupancy=8 native_cut=25 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=29 slot=0 request=a00000000002 occupancy=8 native_cut=26 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=30 slot=0 request=a00000000002 occupancy=8 native_cut=27 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=31 slot=0 request=a00000000002 occupancy=8 native_cut=28 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=32 slot=0 request=a00000000002 occupancy=8 native_cut=29 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=33 slot=0 request=a00000000002 occupancy=8 native_cut=30 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=34 slot=0 request=a00000000002 occupancy=8 native_cut=31 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=35 slot=0 request=a00000000002 occupancy=8 native_cut=32 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=36 slot=0 request=a00000000002 occupancy=8 native_cut=33 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=37 slot=0 request=a00000000002 occupancy=8 native_cut=34 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=38 slot=0 request=a00000000002 occupancy=8 native_cut=35 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=39 slot=0 request=a00000000002 occupancy=8 native_cut=36 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=40 slot=0 request=a00000000002 occupancy=8 native_cut=37 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=41 slot=0 request=a00000000002 occupancy=8 native_cut=38 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=42 slot=0 request=a00000000002 occupancy=8 native_cut=39 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=43 slot=0 request=a00000000002 occupancy=8 native_cut=40 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=44 slot=0 request=a00000000002 occupancy=8 native_cut=41 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=45 slot=0 request=a00000000002 occupancy=8 native_cut=42 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=46 slot=0 request=a00000000002 occupancy=8 native_cut=43 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=47 slot=0 request=a00000000002 occupancy=8 native_cut=44 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=48 slot=0 request=a00000000002 occupancy=8 native_cut=45 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=49 slot=0 request=a00000000002 occupancy=8 native_cut=46 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=50 slot=0 request=a00000000002 occupancy=8 native_cut=47 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=51 slot=0 request=a00000000002 occupancy=8 native_cut=48 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=52 slot=0 request=a00000000002 occupancy=8 native_cut=49 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=53 slot=0 request=a00000000002 occupancy=8 native_cut=50 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=54 slot=0 request=a00000000002 occupancy=8 native_cut=51 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=55 slot=0 request=a00000000002 occupancy=8 native_cut=52 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=56 slot=0 request=a00000000002 occupancy=8 native_cut=53 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=57 slot=0 request=a00000000002 occupancy=8 native_cut=54 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=58 slot=0 request=a00000000002 occupancy=8 native_cut=55 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=59 slot=0 request=a00000000002 occupancy=8 native_cut=56 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=60 slot=0 request=a00000000002 occupancy=8 native_cut=57 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=61 slot=0 request=a00000000002 occupancy=8 native_cut=58 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=62 slot=0 request=a00000000002 occupancy=8 native_cut=59 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=63 slot=0 request=a00000000002 occupancy=8 native_cut=60 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=64 slot=0 request=a00000000002 occupancy=8 native_cut=61 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=65 slot=0 request=a00000000002 occupancy=8 native_cut=62 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=66 slot=0 request=a00000000002 occupancy=8 native_cut=63 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=67 slot=0 request=a00000000002 occupancy=8 native_cut=64 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=68 slot=0 request=a00000000002 occupancy=8 native_cut=65 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=69 slot=0 request=a00000000002 occupancy=8 native_cut=66 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=70 slot=0 request=a00000000002 occupancy=8 native_cut=67 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=71 slot=0 request=a00000000002 occupancy=8 native_cut=68 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=72 slot=0 request=a00000000002 occupancy=8 native_cut=69 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=73 slot=0 request=a00000000002 occupancy=8 native_cut=70 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=74 slot=0 request=a00000000002 occupancy=8 native_cut=71 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=75 slot=0 request=a00000000002 occupancy=8 native_cut=72 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=76 slot=0 request=a00000000002 occupancy=8 native_cut=73 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=77 slot=0 request=a00000000002 occupancy=8 native_cut=74 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=78 slot=0 request=a00000000002 occupancy=8 native_cut=75 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=79 slot=0 request=a00000000002 occupancy=8 native_cut=76 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 phase=prefill_or_alignment engine=7134381075974763474 mask=1 priority=0
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=80 slot=0 request=a00000000002 occupancy=8 native_cut=77 operation=5 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=81 slot=1 request=b00000000002 source_window=1 source_cut=4 source_bootstrap=0 from=1024 to=2048 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_PREFILL_UNIT v=1 engine=7134381075974763474 admission_cut=82 slot=1 request=b00000000002 source_window=1 source_cut=4 source_bootstrap=0 from=2048 to=2692 stages=2 priority=0 class_weight=1 accepted=1 source_accepted=1
+strata verify: window up to 2 tokens, 52.0 MiB of device buffers
+strata verify: window up to 2 tokens, 52.0 MiB of device buffers
+strata verify: capturing the 1-token window (2296 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2381 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=83 slot=1 request=b00000000002 occupancy=11 native_cut=13 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=84 slot=1 request=b00000000002 occupancy=11 native_cut=14 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=85 slot=1 request=b00000000002 occupancy=11 native_cut=15 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=86 slot=1 request=b00000000002 occupancy=11 native_cut=16 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=87 slot=1 request=b00000000002 occupancy=11 native_cut=17 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=88 slot=1 request=b00000000002 occupancy=11 native_cut=18 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=89 slot=1 request=b00000000002 occupancy=11 native_cut=19 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=90 slot=1 request=b00000000002 occupancy=11 native_cut=20 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=91 slot=1 request=b00000000002 occupancy=11 native_cut=21 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=92 slot=1 request=b00000000002 occupancy=11 native_cut=22 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=93 slot=1 request=b00000000002 occupancy=11 native_cut=23 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=94 slot=1 request=b00000000002 occupancy=11 native_cut=24 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=95 slot=1 request=b00000000002 occupancy=11 native_cut=25 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=96 slot=1 request=b00000000002 occupancy=11 native_cut=26 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=97 slot=1 request=b00000000002 occupancy=11 native_cut=27 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=98 slot=1 request=b00000000002 occupancy=11 native_cut=28 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=99 slot=1 request=b00000000002 occupancy=11 native_cut=29 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=100 slot=1 request=b00000000002 occupancy=11 native_cut=30 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=101 slot=1 request=b00000000002 occupancy=11 native_cut=31 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=102 slot=1 request=b00000000002 occupancy=11 native_cut=32 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=103 slot=1 request=b00000000002 occupancy=11 native_cut=33 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=104 slot=1 request=b00000000002 occupancy=11 native_cut=34 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=105 slot=1 request=b00000000002 occupancy=11 native_cut=35 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=106 slot=1 request=b00000000002 occupancy=11 native_cut=36 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=107 slot=1 request=b00000000002 occupancy=11 native_cut=37 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=108 slot=1 request=b00000000002 occupancy=11 native_cut=38 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=109 slot=1 request=b00000000002 occupancy=11 native_cut=39 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=110 slot=1 request=b00000000002 occupancy=11 native_cut=40 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=111 slot=1 request=b00000000002 occupancy=11 native_cut=41 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=112 slot=1 request=b00000000002 occupancy=11 native_cut=42 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=113 slot=1 request=b00000000002 occupancy=11 native_cut=43 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=114 slot=1 request=b00000000002 occupancy=11 native_cut=44 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=115 slot=1 request=b00000000002 occupancy=11 native_cut=45 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=116 slot=1 request=b00000000002 occupancy=11 native_cut=46 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=117 slot=1 request=b00000000002 occupancy=11 native_cut=47 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=118 slot=1 request=b00000000002 occupancy=11 native_cut=48 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=119 slot=1 request=b00000000002 occupancy=11 native_cut=49 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=120 slot=1 request=b00000000002 occupancy=11 native_cut=50 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=121 slot=1 request=b00000000002 occupancy=11 native_cut=51 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=122 slot=1 request=b00000000002 occupancy=11 native_cut=52 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=123 slot=1 request=b00000000002 occupancy=11 native_cut=53 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=124 slot=1 request=b00000000002 occupancy=11 native_cut=54 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=125 slot=1 request=b00000000002 occupancy=11 native_cut=55 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=126 slot=1 request=b00000000002 occupancy=11 native_cut=56 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=127 slot=1 request=b00000000002 occupancy=11 native_cut=57 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=128 slot=1 request=b00000000002 occupancy=11 native_cut=58 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=129 slot=1 request=b00000000002 occupancy=11 native_cut=59 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=130 slot=1 request=b00000000002 occupancy=11 native_cut=60 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=131 slot=1 request=b00000000002 occupancy=11 native_cut=61 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=132 slot=1 request=b00000000002 occupancy=11 native_cut=62 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=133 slot=1 request=b00000000002 occupancy=11 native_cut=63 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=134 slot=1 request=b00000000002 occupancy=11 native_cut=64 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=135 slot=1 request=b00000000002 occupancy=11 native_cut=65 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=136 slot=1 request=b00000000002 occupancy=11 native_cut=66 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=137 slot=1 request=b00000000002 occupancy=11 native_cut=67 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=138 slot=1 request=b00000000002 occupancy=11 native_cut=68 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=139 slot=1 request=b00000000002 occupancy=11 native_cut=69 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=140 slot=1 request=b00000000002 occupancy=11 native_cut=70 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=141 slot=1 request=b00000000002 occupancy=11 native_cut=71 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=142 slot=1 request=b00000000002 occupancy=11 native_cut=72 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=143 slot=1 request=b00000000002 occupancy=11 native_cut=73 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=144 slot=1 request=b00000000002 occupancy=11 native_cut=74 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=145 slot=1 request=b00000000002 occupancy=11 native_cut=75 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=146 slot=1 request=b00000000002 occupancy=11 native_cut=76 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=147 slot=1 request=b00000000002 occupancy=11 native_cut=77 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=148 slot=1 request=b00000000002 occupancy=11 native_cut=78 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_COHORT v=1 engine=7134381075974763474 mask=2 priority=0 selected_slot=1 class_weight=1
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=149 slot=1 request=b00000000002 occupancy=11 native_cut=79 operation=7 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=11081656074 observed_ns=621991240118872 clock_domain=1 record=77 ancestry_serial=2 token_debt=163
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=150 slot=0 request=a00000000002 occupancy=8 native_cut=81 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=1970677423 observed_ns=621991293443063 clock_domain=1 record=79 ancestry_serial=2 token_debt=163
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=151 slot=1 request=b00000000002 occupancy=11 native_cut=83 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2024048442 observed_ns=621991346814082 clock_domain=1 record=79 ancestry_serial=2 token_debt=159
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=152 slot=1 request=b00000000002 occupancy=11 native_cut=87 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2072451021 observed_ns=621991395216661 clock_domain=1 record=79 ancestry_serial=2 token_debt=155
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=153 slot=1 request=b00000000002 occupancy=11 native_cut=91 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=11286009614 observed_ns=621991444472412 clock_domain=1 record=77 ancestry_serial=2 token_debt=159
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=154 slot=0 request=a00000000002 occupancy=8 native_cut=85 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2170022113 observed_ns=621991492787753 clock_domain=1 record=79 ancestry_serial=2 token_debt=151
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=155 slot=1 request=b00000000002 occupancy=11 native_cut=95 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2217826121 observed_ns=621991540591761 clock_domain=1 record=79 ancestry_serial=2 token_debt=147
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=156 slot=1 request=b00000000002 occupancy=11 native_cut=99 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2268283374 observed_ns=621991591049014 clock_domain=1 record=79 ancestry_serial=2 token_debt=143
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=157 slot=1 request=b00000000002 occupancy=11 native_cut=103 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2315898077 observed_ns=621991638663717 clock_domain=1 record=79 ancestry_serial=2 token_debt=139
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=158 slot=1 request=b00000000002 occupancy=11 native_cut=107 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=11529246178 observed_ns=621991687708976 clock_domain=1 record=77 ancestry_serial=2 token_debt=155
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=159 slot=0 request=a00000000002 occupancy=8 native_cut=89 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2414091070 observed_ns=621991736856710 clock_domain=1 record=79 ancestry_serial=2 token_debt=135
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=160 slot=1 request=b00000000002 occupancy=11 native_cut=111 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2466311076 observed_ns=621991789076716 clock_domain=1 record=79 ancestry_serial=2 token_debt=131
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=161 slot=1 request=b00000000002 occupancy=11 native_cut=115 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2515098022 observed_ns=621991837863662 clock_domain=1 record=79 ancestry_serial=2 token_debt=127
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=162 slot=1 request=b00000000002 occupancy=11 native_cut=119 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=11734520438 observed_ns=621991892983236 clock_domain=1 record=77 ancestry_serial=2 token_debt=151
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=163 slot=0 request=a00000000002 occupancy=8 native_cut=93 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2618095521 observed_ns=621991940861161 clock_domain=1 record=79 ancestry_serial=2 token_debt=123
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=164 slot=1 request=b00000000002 occupancy=11 native_cut=123 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=11833977880 observed_ns=621991992440678 clock_domain=1 record=77 ancestry_serial=2 token_debt=147
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=165 slot=0 request=a00000000002 occupancy=8 native_cut=97 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2718168203 observed_ns=621992040933843 clock_domain=1 record=79 ancestry_serial=2 token_debt=119
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=166 slot=1 request=b00000000002 occupancy=11 native_cut=127 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2769196868 observed_ns=621992091962508 clock_domain=1 record=79 ancestry_serial=2 token_debt=115
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=167 slot=1 request=b00000000002 occupancy=11 native_cut=131 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2822321935 observed_ns=621992145087575 clock_domain=1 record=79 ancestry_serial=2 token_debt=111
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=168 slot=1 request=b00000000002 occupancy=11 native_cut=135 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12039648917 observed_ns=621992198111715 clock_domain=1 record=77 ancestry_serial=2 token_debt=143
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=169 slot=0 request=a00000000002 occupancy=8 native_cut=101 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=2922839563 observed_ns=621992245605203 clock_domain=1 record=79 ancestry_serial=2 token_debt=107
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=170 slot=1 request=b00000000002 occupancy=11 native_cut=139 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12137912278 observed_ns=621992296375076 clock_domain=1 record=77 ancestry_serial=2 token_debt=139
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=171 slot=0 request=a00000000002 occupancy=8 native_cut=105 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3023057331 observed_ns=621992345822971 clock_domain=1 record=79 ancestry_serial=2 token_debt=103
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=172 slot=1 request=b00000000002 occupancy=11 native_cut=143 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12238834493 observed_ns=621992397297291 clock_domain=1 record=77 ancestry_serial=2 token_debt=135
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=173 slot=0 request=a00000000002 occupancy=8 native_cut=109 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3126581402 observed_ns=621992449347042 clock_domain=1 record=79 ancestry_serial=2 token_debt=99
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=174 slot=1 request=b00000000002 occupancy=11 native_cut=147 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3177941836 observed_ns=621992500707476 clock_domain=1 record=79 ancestry_serial=2 token_debt=95
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=175 slot=1 request=b00000000002 occupancy=11 native_cut=151 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3225828211 observed_ns=621992548593851 clock_domain=1 record=79 ancestry_serial=2 token_debt=91
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=176 slot=1 request=b00000000002 occupancy=11 native_cut=155 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12439544789 observed_ns=621992598007587 clock_domain=1 record=77 ancestry_serial=2 token_debt=131
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=177 slot=0 request=a00000000002 occupancy=8 native_cut=113 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3324037493 observed_ns=621992646803133 clock_domain=1 record=79 ancestry_serial=2 token_debt=87
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=178 slot=1 request=b00000000002 occupancy=11 native_cut=159 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3374104518 observed_ns=621992696870158 clock_domain=1 record=79 ancestry_serial=2 token_debt=83
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=179 slot=1 request=b00000000002 occupancy=11 native_cut=163 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12585617767 observed_ns=621992744080565 clock_domain=1 record=77 ancestry_serial=2 token_debt=127
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=180 slot=0 request=a00000000002 occupancy=8 native_cut=117 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12643135063 observed_ns=621992801597861 clock_domain=1 record=77 ancestry_serial=2 token_debt=123
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=181 slot=0 request=a00000000002 occupancy=8 native_cut=121 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12692552999 observed_ns=621992851015797 clock_domain=1 record=77 ancestry_serial=2 token_debt=119
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=182 slot=0 request=a00000000002 occupancy=8 native_cut=125 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12749759576 observed_ns=621992908222374 clock_domain=1 record=77 ancestry_serial=2 token_debt=115
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=183 slot=0 request=a00000000002 occupancy=8 native_cut=129 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12805466660 observed_ns=621992963929458 clock_domain=1 record=77 ancestry_serial=2 token_debt=111
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=184 slot=0 request=a00000000002 occupancy=8 native_cut=133 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12859206828 observed_ns=621993017669626 clock_domain=1 record=77 ancestry_serial=2 token_debt=107
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=185 slot=0 request=a00000000002 occupancy=8 native_cut=137 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=12910402456 observed_ns=621993068865254 clock_domain=1 record=77 ancestry_serial=2 token_debt=103
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=186 slot=0 request=a00000000002 occupancy=8 native_cut=141 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3797485167 observed_ns=621993120250807 clock_domain=1 record=79 ancestry_serial=2 token_debt=79
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=187 slot=1 request=b00000000002 occupancy=11 native_cut=167 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13010694152 observed_ns=621993169156950 clock_domain=1 record=77 ancestry_serial=2 token_debt=99
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=188 slot=0 request=a00000000002 occupancy=8 native_cut=145 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3895956921 observed_ns=621993218722561 clock_domain=1 record=79 ancestry_serial=2 token_debt=75
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=189 slot=1 request=b00000000002 occupancy=11 native_cut=171 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=3952081842 observed_ns=621993274847482 clock_domain=1 record=79 ancestry_serial=2 token_debt=71
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=190 slot=1 request=b00000000002 occupancy=11 native_cut=175 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13170575477 observed_ns=621993329038275 clock_domain=1 record=77 ancestry_serial=2 token_debt=95
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=191 slot=0 request=a00000000002 occupancy=8 native_cut=149 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4053888479 observed_ns=621993376654119 clock_domain=1 record=79 ancestry_serial=2 token_debt=67
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=192 slot=1 request=b00000000002 occupancy=11 native_cut=179 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13273814448 observed_ns=621993432277246 clock_domain=1 record=77 ancestry_serial=2 token_debt=91
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=193 slot=0 request=a00000000002 occupancy=8 native_cut=153 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13328602322 observed_ns=621993487065120 clock_domain=1 record=77 ancestry_serial=2 token_debt=87
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=194 slot=0 request=a00000000002 occupancy=8 native_cut=157 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4210899326 observed_ns=621993533664966 clock_domain=1 record=79 ancestry_serial=2 token_debt=63
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=195 slot=1 request=b00000000002 occupancy=11 native_cut=183 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13427062206 observed_ns=621993585525004 clock_domain=1 record=77 ancestry_serial=2 token_debt=83
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=196 slot=0 request=a00000000002 occupancy=8 native_cut=161 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13474067039 observed_ns=621993632529837 clock_domain=1 record=77 ancestry_serial=2 token_debt=79
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=197 slot=0 request=a00000000002 occupancy=8 native_cut=165 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13526151000 observed_ns=621993684613798 clock_domain=1 record=77 ancestry_serial=2 token_debt=75
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=198 slot=0 request=a00000000002 occupancy=8 native_cut=169 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4417372388 observed_ns=621993740138028 clock_domain=1 record=79 ancestry_serial=2 token_debt=59
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=199 slot=1 request=b00000000002 occupancy=11 native_cut=187 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13631658218 observed_ns=621993790121016 clock_domain=1 record=77 ancestry_serial=2 token_debt=71
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=200 slot=0 request=a00000000002 occupancy=8 native_cut=173 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4523753788 observed_ns=621993846519428 clock_domain=1 record=79 ancestry_serial=2 token_debt=55
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=201 slot=1 request=b00000000002 occupancy=11 native_cut=191 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4570588637 observed_ns=621993893354277 clock_domain=1 record=79 ancestry_serial=2 token_debt=51
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=202 slot=1 request=b00000000002 occupancy=11 native_cut=195 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13784063883 observed_ns=621993942526681 clock_domain=1 record=77 ancestry_serial=2 token_debt=67
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=203 slot=0 request=a00000000002 occupancy=8 native_cut=177 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=13840400727 observed_ns=621993998863525 clock_domain=1 record=77 ancestry_serial=2 token_debt=63
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=204 slot=0 request=a00000000002 occupancy=8 native_cut=181 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4728133937 observed_ns=621994050899577 clock_domain=1 record=79 ancestry_serial=2 token_debt=47
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=205 slot=1 request=b00000000002 occupancy=11 native_cut=199 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4778189353 observed_ns=621994100954993 clock_domain=1 record=79 ancestry_serial=2 token_debt=43
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=206 slot=1 request=b00000000002 occupancy=11 native_cut=203 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4826826763 observed_ns=621994149592403 clock_domain=1 record=79 ancestry_serial=2 token_debt=39
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=207 slot=1 request=b00000000002 occupancy=11 native_cut=207 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4876427804 observed_ns=621994199193444 clock_domain=1 record=79 ancestry_serial=2 token_debt=35
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=208 slot=1 request=b00000000002 occupancy=11 native_cut=211 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=4926540657 observed_ns=621994249306297 clock_domain=1 record=79 ancestry_serial=2 token_debt=31
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=209 slot=1 request=b00000000002 occupancy=11 native_cut=215 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14142719136 observed_ns=621994301181934 clock_domain=1 record=77 ancestry_serial=2 token_debt=59
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=210 slot=0 request=a00000000002 occupancy=8 native_cut=185 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=5026965528 observed_ns=621994349731168 clock_domain=1 record=79 ancestry_serial=2 token_debt=27
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=211 slot=1 request=b00000000002 occupancy=11 native_cut=219 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=5080047747 observed_ns=621994402813387 clock_domain=1 record=79 ancestry_serial=2 token_debt=23
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=212 slot=1 request=b00000000002 occupancy=11 native_cut=223 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14295525378 observed_ns=621994453988176 clock_domain=1 record=77 ancestry_serial=2 token_debt=55
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=213 slot=0 request=a00000000002 occupancy=8 native_cut=189 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14342421455 observed_ns=621994500884253 clock_domain=1 record=77 ancestry_serial=2 token_debt=51
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=214 slot=0 request=a00000000002 occupancy=8 native_cut=193 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14391543021 observed_ns=621994550005819 clock_domain=1 record=77 ancestry_serial=2 token_debt=47
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=215 slot=0 request=a00000000002 occupancy=8 native_cut=197 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=5276751172 observed_ns=621994599516812 clock_domain=1 record=79 ancestry_serial=2 token_debt=19
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=216 slot=1 request=b00000000002 occupancy=11 native_cut=227 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14491235785 observed_ns=621994649698583 clock_domain=1 record=77 ancestry_serial=2 token_debt=43
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=217 slot=0 request=a00000000002 occupancy=8 native_cut=201 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=5375562964 observed_ns=621994698328604 clock_domain=1 record=79 ancestry_serial=2 token_debt=15
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=218 slot=1 request=b00000000002 occupancy=11 native_cut=231 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14590120716 observed_ns=621994748583514 clock_domain=1 record=77 ancestry_serial=2 token_debt=39
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=219 slot=0 request=a00000000002 occupancy=8 native_cut=205 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14639476034 observed_ns=621994797938832 clock_domain=1 record=77 ancestry_serial=2 token_debt=35
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=220 slot=0 request=a00000000002 occupancy=8 native_cut=209 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=5525582606 observed_ns=621994848348246 clock_domain=1 record=79 ancestry_serial=2 token_debt=11
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=221 slot=1 request=b00000000002 occupancy=11 native_cut=235 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14744681401 observed_ns=621994903144199 clock_domain=1 record=77 ancestry_serial=2 token_debt=31
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=222 slot=0 request=a00000000002 occupancy=8 native_cut=213 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=5632004455 observed_ns=621994954770095 clock_domain=1 record=79 ancestry_serial=2 token_debt=7
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=223 slot=1 request=b00000000002 occupancy=11 native_cut=239 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14858193973 observed_ns=621995016656771 clock_domain=1 record=77 ancestry_serial=2 token_debt=27
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=224 slot=0 request=a00000000002 occupancy=8 native_cut=217 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=1 request=b00000000002 operation=8 result=4 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=5747361177 observed_ns=621995070126817 clock_domain=1 record=79 ancestry_serial=2 token_debt=3
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=225 slot=1 request=b00000000002 occupancy=11 native_cut=242 operation=8 result=4 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=14956125584 observed_ns=621995114588382 clock_domain=1 record=77 ancestry_serial=2 token_debt=23
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=226 slot=0 request=a00000000002 occupancy=8 native_cut=221 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=15006762701 observed_ns=621995165225499 clock_domain=1 record=77 ancestry_serial=2 token_debt=19
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=227 slot=0 request=a00000000002 occupancy=8 native_cut=225 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=15055925475 observed_ns=621995214388273 clock_domain=1 record=77 ancestry_serial=2 token_debt=15
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=228 slot=0 request=a00000000002 occupancy=8 native_cut=229 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=15106497034 observed_ns=621995264959832 clock_domain=1 record=77 ancestry_serial=2 token_debt=11
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=229 slot=0 request=a00000000002 occupancy=8 native_cut=233 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=15163398860 observed_ns=621995321861658 clock_domain=1 record=77 ancestry_serial=2 token_debt=7
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=230 slot=0 request=a00000000002 occupancy=8 native_cut=237 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+SCHED_REPAIR_SELECT v=1 engine=7134381075974763474 slot=0 request=a00000000002 operation=6 result=3 priority=0 class_weight=1 reason=admitted_idle age_known=1 age_ns=15222914352 observed_ns=621995381377150 clock_domain=1 record=77 ancestry_serial=2 token_debt=3
+SCHED_UNIT v=1 engine=7134381075974763474 admission_cut=231 slot=0 request=a00000000002 occupancy=8 native_cut=240 operation=6 result=3 priority=0 class_weight=1 accepted=1 source_accepted=1
+owned_slot_qualification_begin req=3 slot=0 occupancy=8 other_slot=1 other_occupancy=11 selected_cut=241 history=33e4ef68b0e0c5345b815d0fd6f779a170d120c233b3e0d3bfdcc01525414b1f forwarded=2859 accepted=2860 watermark=5 binary=c42df672220c5385d42253d612172be49334d34d11b46d1e75c39d1f01aa55d2 source=6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5
+owned_slot_bridge_binding req=3 source_cut=241 destination_cut=7 source_layout=f5e1811cfb52a047d95770bf7243ff6ce92a8a05fc103a9783d6bd4d3c7e1128 destination_layout=80562e275e3221af3595f76db7c247238666ae7092c6d15e048a069d06a4ef32 source_state=01886a6d2739a14d11593b99f259af3e9fc7331b3e73dd69a79f9934370ec75f destination_state=b60bf116ecc83dc3ec942d1cb6f1a33269e3a234baf21eb3ba7f824bc8ffca22 binary=c42df672220c5385d42253d612172be49334d34d11b46d1e75c39d1f01aa55d2 source=6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5
+suffix_repair_qualification req=3 phase=owned_slot_bridge repaired_cut=241 clean_cut=7 accepted=2860 forwarded=2859 exact_frontier=2859 watermark=5 history=33e4ef68b0e0c5345b815d0fd6f779a170d120c233b3e0d3bfdcc01525414b1f layout=f5e1811cfb52a047d95770bf7243ff6ce92a8a05fc103a9783d6bd4d3c7e1128 repaired=01886a6d2739a14d11593b99f259af3e9fc7331b3e73dd69a79f9934370ec75f clean=01886a6d2739a14d11593b99f259af3e9fc7331b3e73dd69a79f9934370ec75f binary=c42df672220c5385d42253d612172be49334d34d11b46d1e75c39d1f01aa55d2 source=6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5 stages=2 tensors=138 bytes=159066696 completed=1 equal=1 mismatches=0 oracle=physical_bridge emitted=0 logits_equal=1 picks_equal=1 logits_max_absolute_error=0
+suffix_repair_prefix_replay req=3 origin_req=3 boundary=2692 reached=2692 schedule=76a4f71365d0522973d2543f1e7b8620ddb15fef1157d0d531a16f6d87216609 events=3 batches=3 windows=0 ancestry=reset_from0 mapping_equal=1 completed=1 stages=2 policy=resolved_prefill_short64_v1 configured_max=1024 allocated_max=1024 auto_mode=0 auto_max=0 elapsed_ms=5558.942737 binary=c42df672220c5385d42253d612172be49334d34d11b46d1e75c39d1f01aa55d2 source=6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5
+suffix_repair_qualification req=3 phase=owned_slot_frontier repaired_cut=7 clean_cut=179 accepted=2860 forwarded=2859 exact_frontier=2859 watermark=5 history=33e4ef68b0e0c5345b815d0fd6f779a170d120c233b3e0d3bfdcc01525414b1f layout=80562e275e3221af3595f76db7c247238666ae7092c6d15e048a069d06a4ef32 repaired=b60bf116ecc83dc3ec942d1cb6f1a33269e3a234baf21eb3ba7f824bc8ffca22 clean=b60bf116ecc83dc3ec942d1cb6f1a33269e3a234baf21eb3ba7f824bc8ffca22 binary=c42df672220c5385d42253d612172be49334d34d11b46d1e75c39d1f01aa55d2 source=6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5 stages=2 tensors=138 bytes=159066696 completed=1 equal=1 mismatches=0 oracle=reset_replay emitted=0 logits_equal=1 picks_equal=1 logits_max_absolute_error=0
+suffix_restore_refusal v=1 site=serving_repaired_continuation status=2 source_cut=7 source_forwarded=2859 source_accepted=2860 source_exact=2859 source_watermark=5 destination_cut=180 destination_forwarded=2860 destination_accepted=2860 destination_exact=2860 destination_watermark=5 destination_phase=3 request_open=1 detail=aggregate suffix H exhausted
+suffix experiment terminal execution failure: serving repaired restore before continuation refused

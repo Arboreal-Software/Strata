@@ -1,0 +1,85 @@
+{
+  "status": "RELEASED",
+  "epoch": 1793572743.745882,
+  "runner_absent": true,
+  "matching_client_pids": [],
+  "checks": [
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "name=^/strata-managed-priority-input-envelope-cpu-20261101T222850Z-480dc96fe493$",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "label=strata.repair-attempt=480dc96fe493425686f11f9cfb096123",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "id=d2d555ecff9d05e2691717c26ce6218783764281bdf8ac1a98c7343115d9a455",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "inspect",
+        "1ae3605d33df66f2bb8dca5d495deb585d917f287b33b29c4f948235161c2fad"
+      ],
+      "stdout": "[private inspection omitted; only selected baseline facts retained]",
+      "stderr": "",
+      "exit": 0
+    },
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n",
+      "stderr": "",
+      "exit": 0
+    }
+  ],
+  "supplemental_read_only_audit": true,
+  "source_manifest_sha256": "6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5",
+  "input_manifest_sha256": "6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5",
+  "recorded_release_sha256": "0370b75d43c6c3d6bdf06e80d277df46380462c1eb49c1c9208d73aab990be49",
+  "result_sha256": "db86822bb243c55c813c34aa78260c149aba8256c002acf96a468ea25b1f2aed",
+  "attempt_record_sha256": "8bc725db3324a880f740ffb4e136a67b43aca0a4852a6c1b949a25415d3ad354"
+}

@@ -1,0 +1,15 @@
+{
+  "state": "RUNNING",
+  "epoch": 1793572803.954205,
+  "supervisor_pid": 3651507,
+  "pane": "%146",
+  "callback_pane": "%142",
+  "callback_pid": 3623544,
+  "config": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/root-supervisor.json",
+  "config_sha256": "ea3f32a1fc73cdfc21342b78718d8cbb3cfc333f618a6d6b35237eb12d1e66bb",
+  "output": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/output-strata-serve-suffix-repaired-20261101T223919Z",
+  "source_manifest_sha256": "6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5",
+  "binary_sha256": "c42df672220c5385d42253d612172be49334d34d11b46d1e75c39d1f01aa55d2",
+  "diagnostic_only": true,
+  "native_pass": false
+}

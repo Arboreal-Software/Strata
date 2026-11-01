@@ -1,0 +1,108 @@
+{
+  "original_manifest_sha256": "f983320af084b1f5544be03d0ff1b8c1c2ac7a4082a36e373064ca7735b1ed19",
+  "original_manifest_entries": 6918,
+  "selected_entries": {
+    "project/include/strata/prefill/owned_workspace.hpp": {
+      "bytes": 4219,
+      "sha256": "9441ad1dc9a19c43fbd3faa4a2dc567b16fcb6c6dc8d8412e2a2d0b7f4733995"
+    },
+    "project/src/core/conversation_state.cpp": {
+      "bytes": 30516,
+      "sha256": "10cff8145d25ca4f2ba0aa36de2317d1edf9dc2fe848f329cf05903cf05984ec"
+    },
+    "project/src/core/verify.cpp": {
+      "bytes": 299490,
+      "sha256": "9bc475bfa38b54d409da607943b58902c2572de6b545fb09e63847ae631dd2e9"
+    },
+    "project/src/prefill/prefill.cpp": {
+      "bytes": 352382,
+      "sha256": "43d633459c51554ee13eb87e40df8f8d270b3503d6035b1675629ab5185b5086"
+    },
+    "project/src/program/generate.cpp": {
+      "bytes": 1767491,
+      "sha256": "a0b422860c6a39c733128e3938975653a58a1085641bbf5b76f2ac69559a0084"
+    },
+    "project/src/program/resident_repair_compare.inc": {
+      "bytes": 10013,
+      "sha256": "8c159d6c3f921bbf04c46b75d3970316b1e167821ebb639701f53cfdf9e3f1a4"
+    },
+    "project/src/program/resident_repair_construction.inc": {
+      "bytes": 23547,
+      "sha256": "fbee92214f3c164a234fe35bb5c73e2c54cb065d87880f4e9b776f7af810160f"
+    },
+    "project/src/program/resident_repair_controller.inc": {
+      "bytes": 152914,
+      "sha256": "048d38e06ea16a29d47e0be6f965f86d8a65b2130bb4f5f96ff3318f13f8986f"
+    },
+    "project/src/program/resident_repair_dispatch.inc": {
+      "bytes": 26517,
+      "sha256": "c2b4ed67b53ec5d4c46fa7e06d26751b0bc5d22b02e6d966bad276d664441406"
+    },
+    "project/src/program/resident_repair_runtime.inc": {
+      "bytes": 15278,
+      "sha256": "5bc955b0856e53b5786b98debc1779608cc4b1ab9a7a59fc732cde0d386bcb6b"
+    },
+    "project/src/program/serving_output_capacity.hpp": {
+      "bytes": 7792,
+      "sha256": "eed14bf79fce609d7fbefe863b3d6e58dab447b64902b11e458a8c4729ac3e96"
+    },
+    "project/src/program/serving_prefix_replay.hpp": {
+      "bytes": 11482,
+      "sha256": "e6972461159b70f283c818e9521ec49b1d7a25cfda51e5a31b446df6bd82b45e"
+    },
+    "project/src/program/serving_repair_admission.hpp": {
+      "bytes": 20374,
+      "sha256": "2da6ea425d0d95faeb3a691aa27063b508ced96aec328213123eeaa87f9ccbd0"
+    },
+    "project/src/program/serving_repair_admission_test.cpp": {
+      "bytes": 40940,
+      "sha256": "a6583f7d4bfe8b74c4fef6979dc8ccdd3e7da4c65142f4cc2fa418c1a7728c55"
+    },
+    "project/src/program/serving_repair_age.hpp": {
+      "bytes": 2343,
+      "sha256": "24c4b05b4de0168a451f8250018978eb86fb6854069983ef7e6fc9c0ae2d8641"
+    },
+    "project/src/program/serving_repair_owners.hpp": {
+      "bytes": 148261,
+      "sha256": "234c9a8aab4805b7b432d231e1eed7a670087faf39441d3a534c330ed1b5da90"
+    },
+    "project/src/program/serving_repair_owners_test.cpp": {
+      "bytes": 195672,
+      "sha256": "e998bc30f633c2580b6d6ea74046100d82a5c60f90c1913383a371b95efebf96"
+    },
+    "project/src/program/serving_repair_scheduler.hpp": {
+      "bytes": 8336,
+      "sha256": "86c4c383487bc744e7f55f4cbd1e535bd1b0701613a2955495c860d2bd96dc18"
+    },
+    "project/src/program/serving_slot_qualification.inc": {
+      "bytes": 14452,
+      "sha256": "51b046a43253cbdc52bcc7c70fb07e892b338adeda85ec2e550aaf2dd4147390"
+    },
+    "project/src/program/serving_suffix_cancel_qualification.hpp": {
+      "bytes": 8186,
+      "sha256": "d96be859ea8aa889ee772762b2c57c12f18d8feb45a0b80ec90fde12fc95e938"
+    },
+    "project/src/program/serving_suffix_fault_qualification.hpp": {
+      "bytes": 3133,
+      "sha256": "7ea4915749315a2d9d33280177616d4d58a1c68d869c6ca6bcb041485f4e987a"
+    },
+    "project/src/program/serving_suffix_qualification.inc": {
+      "bytes": 70481,
+      "sha256": "e2c0def7656b0263aec555e1e18865251f3d1b887e94c6fca911e7291833a63b"
+    },
+    "project/src/program/serving_thread_bridge.hpp": {
+      "bytes": 34985,
+      "sha256": "3052b0d8117ea9dbabed38d6f3ebbf8b3bc35a4ab82798bfeec9c3424a43b939"
+    },
+    "project/src/program/suffix_raw_runtime.cpp": {
+      "bytes": 107996,
+      "sha256": "d8180396b55e480337ed10a1312be496129d9be6bff8ec2ba1e00352af889046"
+    },
+    "project/src/program/suffix_raw_runtime.hpp": {
+      "bytes": 25000,
+      "sha256": "4031240e042f4d8ebc5765bfbdecab0edc53a605b11b3f218bb4c19a67c1f9f9"
+    }
+  },
+  "source_commit": "c1aad1fda12c0c3924f7f8870cfbb008e7f7ebc0",
+  "qualification_claim": false
+}

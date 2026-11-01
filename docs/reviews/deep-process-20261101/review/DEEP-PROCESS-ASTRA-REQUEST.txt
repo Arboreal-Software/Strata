@@ -1,0 +1,24 @@
+tier: pro
+model: GPT-6 Astra Pro
+project: Arboreal-Software/Strata
+authority: owner_authorized
+key: strata-deep-process-research-20261101
+
+Owner explicitly requests an IN-DEPTH process failure analysis and external research, not a routine patch review. Implementation is PAUSED. Wait for END PACKET; numbered evidence replies follow.
+
+Owner verbatim: "I'd like you to send all of this to chatswarm Astra pro for review. it should perform an IN DEPTH analysis of the problems, research what other people are doing to counter problems like this, etc. I would not expect it's work to take less than 45 minutes, and I want it to be informed of that. it should not do a light pass and return the results - I want i to really work, and use subagents intelligently while it does so. So got 6 Astra pro"
+
+Treat this as at least 45 minutes of substantive investigation after the complete packet, not a quick response or artificial waiting. Acknowledge receipt/start, requested and actually served model/tier, and your ability to run long research and subagents. If duration, tools, context, browsing or subagents are unavailable, disclose that rather than pretending. Do not silently substitute a model or return a lightweight final review. Intermediate progress/questions welcome; preserve one durable job/thread.
+
+Use subagents intelligently for independent evidence audit, external engineering research, adversarial alternatives and synthesis. Do not merely multiply broad reviews. Research primary sources and concrete practice from AI coding agents, systems/GPU development, integration/contract testing, simulation, CI feedback latency, and evidence/reproducibility. Cite direct URLs, dates, applicability and limitations. Separate empirical evidence from vendor advice and hypotheses; include disconfirming evidence.
+
+Required output:
+1. Evidence-grounded causal analysis of repeated delays: integration feedback gaps, fixture/adapter defects, snapshot/build costs, review/documentation overhead, compaction/delegation/continuity, misleading progress signals, owner-driver responsibilities. Audit our own process diagnosis; do not simply agree.
+2. Reconstruct a representative attempt timeline, costs and uncertainty removed using available evidence. Mixed catalog rows are NOT comparable trials; no invented waste percentage or historical wall-time claims.
+3. Research what others concretely do, then map each useful practice to THIS C++/GPU/two-slot system with implementation cost and limits.
+4. Compare a small number of concrete strategies, using adversarial -> strongest defense -> adjudication. Identify necessary safeguards vs process-generated bureaucracy. Explain how to shorten diagnosis-to-real-runtime feedback without weakening correctness, resource cleanup or qualification.
+5. An extremely specific recommended operating plan for Codex root: next decisive experiment, production entry points, what to keep/reuse/stop/delete/defer, bounded decision rules for adding tests/reviews/abstractions, ownership, build/reuse strategy, stage gates and stop rules, measurable process effectiveness. Distinguish immediate changes from changes requiring owner approval; don't execute them.
+6. A full completion dependency path through 393216 context, TWO real concurrent slots, vision/current generation compatibility, incremental concurrent repair, exact actual-history validation, performance, and flag deployment/rollback. No scope reduction or smoke-test substitution. Be candid about infeasible/unproven steps.
+7. Open questions, evidence gaps and confidence; precise information requests if packet is insufficient. Source-sharing is authorized; local paths are references, not proof you can access files.
+
+This review is explicitly authorized for depth and subagent research. No implementation, deployment, service changes or new purchases are authorized. A final response before meaningful research is complete is not responsive. Report elapsed active investigation and subagent contributions honestly.

@@ -1,0 +1,15 @@
+{
+  "started": 1793570752.549654,
+  "jobs": [
+    {
+      "name": "managed-prefill-cold-fallback-longprefix-numerical",
+      "started": 1793570762.027644,
+      "exit": 125,
+      "release_exit": 0
+    }
+  ],
+  "restored": true,
+  "error": "RuntimeError('test failed or cleanup unproved; remaining tests skipped')",
+  "finished": 1793571033.130456,
+  "notification": "sent"
+}

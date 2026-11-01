@@ -1,0 +1,14 @@
+{
+  "state": "RUNNING",
+  "epoch": 1793570752.4982266,
+  "supervisor_pid": 3638842,
+  "pane": "%144",
+  "callback_pane": "%142",
+  "callback_pid": 3623544,
+  "config": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/managed-prefill-cold-fallback-native-root-20261101/root-supervisor.json",
+  "config_sha256": "86f4ddc96536f11c80fba9b7de77c4af65755175012506a58819ef3da8c655c3",
+  "output": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/managed-prefill-cold-fallback-native-root-20261101/output-strata-serve-suffix-repaired-20261101T220440Z",
+  "source_manifest_sha256": "f983320af084b1f5544be03d0ff1b8c1c2ac7a4082a36e373064ca7735b1ed19",
+  "binary_sha256": "c15173dfffc7c17f3c3be3f35b93b31d863fc2f27029aed0dd5270df3b697e91",
+  "native_pass": false
+}

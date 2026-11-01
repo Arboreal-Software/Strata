@@ -1,0 +1,968 @@
+NATIVE CORRECTNESS, CANCELLATION, SEMANTICS AND PERFORMANCE COMPLETION PLAN
+Planning-only handback, 2026-11-01. Product goal remains PAUSED.
+
+AUTHORITY AND STATUS
+This is a proposed execution runbook for Astra/root review, not permission to
+resume. Its preparation used read-only source, campaign, receipt and handoff
+inspection. No implementation, tests, staging, model reads, builds, containers,
+live Docker/tmux queries, service changes, grant changes or commits were executed
+for this plan. Only this planning document is new. No agent resource handles.
+Root owns resource exclusion, grant issuance, final configuration, launches,
+independent cleanup/restoration and adjudication. All commands below are FUTURE
+commands, usable only after explicit resume and the indicated review/edits.
+
+Recommendation: retain the current frozen engine, fix only missing qualification
+adapters, and finish the genuinely missing cells. Do not rebuild the engine for
+fixture, parser or evidence-binding changes. Do not rerun already passing cells
+merely because another case in their batch failed. Do not call this complete P07,
+P08, production scheduling-policy selection, installed-launch qualification or
+deployment rollback; the companion lifecycle-and-serving-plan.txt owns those
+additional requirements. Applicable lifecycle/dependency/priority and normal
+image/installed-launch gates still precede experimental deployment. This plan
+does not waive them by calling the build experimental.
+
+PATH DEFINITIONS (absolute paths; use a shell with set -euo pipefail on resume)
+W=LOCAL_WORKSPACE
+B=$W/.local/strata-implementation/suffix-first
+TOOLS=$B/repaired-campaign-tools
+BUILD=$B/incremental-repair/managed-priority-input-envelope-retry-build-root-20261101
+BA=$BUILD/managed-priority-input-envelope-cpu-20261101T070953Z
+SRC=$BUILD/input/project
+AUDIT=$B/build-release-audit-managed-input-envelope-20261101.json
+POLICY=$B/managed-qualification-inputs-root-20261101/EXPERIMENT-INPUTS.json
+NUM3=$B/managed-native-input-envelope-target3-root-20261101
+NUM4=$B/managed-native-input-envelope-target4-root-20261101
+BIND=$NUM4/ARTIFACT-BINDING.json
+RELEASE=$W/.local/handoffs/strata-successor-20261029/release_owned.py
+RETURN=$B/managed-return77d-driver-sol
+RETURN_REPORT=$B/managed-return77d-report-sol
+OCC=$B/owned-two-slot-occupied32k-managed77d-bounded-sol
+COMPACT=$B/native-admission-cancel-managed-compact-race-sol-20261101
+PERF=$B/managed-performance-on-proposal-sol-20261101
+SERIAL=$B/repaired-cancel-managed-source77d-proposal-sol-20261101
+
+Names FRESH_*, ACTUAL_*, NEW_* below are root-selected NEW absolute destinations
+or actual recorded identities, never literal strings to pass to a program.
+Never overwrite an existing output, ATTEMPT, frozen supervisor or receipt.
+
+1. EXACT IMMUTABLE ENGINE AND POLICY TO RETAIN
+
+Source-manifest SHA256:
+ 77d28f807c2814b36ce432bd78802365626c162e26df9df85844fd0d1d90caec
+Optional fault-OFF binary, $BA/strata-optional:
+ a83c647e1aa3f37c2b42112c6725476f51692c53a304b1b9dd6f0dc7ec1a4f5d
+ 81,440,792 bytes.
+Fault-ON binary, $BA/strata-fault:
+ a7ec9b2291be54ebdb269fa56688b410e8136ad7f05ad8553cfddced019899fe
+ 81,487,872 bytes.
+Default-OFF binary, $BA/strata-default:
+ 1f61cc3c114dafcfb57528f7808006cf57352a29fe0daaec6df1a062659c9f7f
+ 79,492,184 bytes.
+Actual build: 28 steps PASS, 25 CTests in each enabled variant, default-OFF
+linked. Build result/fixtures/metadata, $BUILD/ATTEMPT.json, normalized
+$BUILD/SUPERVISOR-RELEASE.json and genuine raw $AUDIT are required together.
+The source-specific old failed 6807 build/native attempt is historical evidence,
+not qualification of this successor. Neither fa nor source36/native proofs
+transfer. Canonical worktree identity is not a substitute for $SRC.
+
+The engine startup correction is already in this build: private verified-input
+loader is a separate opt-in P00 feature, not mandatory for managed scheduling.
+Ordinary signed/hash-pinned read-only qualification inputs receive the explicit
+selected-model metadata/input lifetime envelope; private-loader budget stays
+unchanged when opted in. Preserve both paid reservations and default-off path.
+Do not enable the private snapshot loader to work around an old harness guard.
+
+Pinned runtime for current native jobs:
+ sha256:8d1bf249c5a1ef82acb133ae04b339e3e0cf752c7581ff9ee811f4656ae15226
+Explicit qualification-only managed values from $POLICY:
+ limits_csv=-100,100,100,60000,16,8,64,128,256,1024,16,8388608
+ default_base="0"; controls low=-10, high=10, boost=25, TTL=250ms.
+Native environment has POLICY literal
+ strict-priority-tier-then-class-lottery-v1
+and the exact LIMITS CSV in STRATA_SERVING_THREAD_{POLICY,LIMITS}_V1.
+These are owner-selected experiment inputs, not production defaults or a
+fairness guarantee. Higher-tier continuous demand can starve lower tiers.
+The selected-repair cancellation case uses explicit diagnostic age=1ns, cap2,
+weights1/1; young performance configuration uses age=10^18ns. Preserve the
+complete existing repair-policy tuple. No guessed priority-to-weight mapping.
+HTTP-only state/default-base settings do not belong in native cfg.env.
+
+2. WHAT HAS ACTUALLY RUN; WHAT MAY BE REUSED
+
+Managed numerical targets3/4: ACTUAL PASS and independent release/restoration.
+ $NUM3 token strata-serve-suffix-repaired-20261101T072519Z
+ $NUM4 token strata-serve-suffix-repaired-20261101T072940Z
+Their ROOT-RELEASE.json status is PASSED_QUALIFICATION_RELEASED_RESTORED.
+Each actual serve/attempt-<token>/two-slot-repair/ contains report.json,
+parsed-numerical.json, managed-journal.json, managed-scheduler-report.json and
+complete stdout/stderr. Reuse these exact source/artifact/history/release proofs
+as prerequisites, with their hashes, not as permission to execute old grants.
+Their dated grants expired 08:25:20Z / 08:29:41Z; both are attempted and MUST
+never be renewed/re-executed. Target4's real ARTIFACT-BINDING is the downstream
+binding. This is 512-context exact-history numerical proof, not occupied32k,
+semantic task quality, returned occupancy or timed performance.
+
+Ordinary managed queued/prefill/stale cancellation: ACTUAL PASS in
+ $B/managed-ordinary-cancel-batch-preparation-sol-20261101/campaign-{queued,prefill,stale}
+with exit0/release0 in
+ $B/managed-ordinary-cancel-batch-final-root-20261101/output/RESULT.json.
+That batch stopped on accepted-race failure and restored the baseline. Preserve
+the three passing per-case reports/attempt identities and batch root release;
+batch error does not erase them and does not make the fourth pass. All their
+attempted campaigns/grants stay immutable. No need to redo them for a race-only
+fixture correction that changes neither their input nor engine/observer bytes.
+
+Accepted-race target272: ACTUAL honest failed fixture window, not a STOP PASS.
+ $B/managed-ordinary-cancel-batch-preparation-sol-20261101/campaign-accepted-race
+ token strata-serve-suffix-repaired-20261101T074038Z-accepted-race
+ Healthy request emitted initial sample+63 decode commits=64 budget before
+ target555's STOP. Target canceled with two actual outputs, but required future
+ healthy post-target-terminal commit could never happen. Root interrupted exact
+ driver; engine exit0; observer preserved FAIL/KeyboardInterrupt, runner125.
+Accepted-race target137: ACTUAL second honest failed window.
+ $B/managed-short-race-preparation-sol-20261101/campaign
+ token strata-serve-suffix-repaired-20261101T080819Z-short-race
+ $B/managed-next-batch-final-root-20261101/KNOWN-FAILED-SHORT-FIXTURE-INTERRUPTION.json
+ Actual target prefill16 boundaries saw healthy commit counts
+ 7,17,25,32,40,49,58,63,63; stderr: prompt read9parts, slots decoding6799ms
+ between them. Halving272 to137 retained the artificial128 minimum and was
+ insufficient. Root exact-child SIGINT preserved engineexit0, observerFAIL.
+Both failed historical campaigns are attempted: MUST fresh-stage, never renew,
+erase ATTEMPT, relabel as PASS, or use their target cancellation alone to waive
+the required future live-survivor observation.
+
+Selected managed repair-unit cancellation: ACTUAL PASS, independent cleanup and
+restoration, even though the subsequent retained-return job was paused.
+ Campaign $B/managed-selected-repair-cancel-root-20261101
+ token strata-serve-suffix-repaired-20261101T075146Z
+ actual two-slot-repair/report.json SHA
+  6f83fec94d7ff8c590118668a39c542da8d1f5112979f8d9447a4252f64e3fa1
+ selected-repair-cancellation-report.json SHA
+  a7fcc185b35579e09f4b28e80b2b69b96c2c01d41c9db771df1902764209b84c
+ Runner3480079, exact CID
+  2fe9e4b0289659cd344644477f3f7edabe9028d7c9ef64c99c539e258fbd5d6b
+ result exit0/186.237s, release_ready/container_absent/clientterminal true.
+ Independent receipt is B/managed-remaining-three-final-root-20261101/ROOT-RELEASE.json,
+ not a nonexistent per-campaign ROOT-RELEASE. It binds these hashes and runner/
+ exact container disappearance, daemon and healthy restored baseline facts.
+ Scope: five real request pairs on persistent thread; real aged selected repair
+ unit+same applied ACK; BSTOP exact A2 occupancy; future B2 decode; replacement
+ ordinary two-token quiet request in freed slot held by supported pending-oracle
+ condition; survivor target4 exact tensor/logit/history/pending/main/selected/
+ actual new-peer restore. Disposed canceled state gets no fabricated tensor
+ proof. This is not equivalence to the three serial cancellation hooks.
+
+Retained return: OWNER-INTERRUPTED, NOT QUALIFIED and not yet a numerical FAIL.
+ Campaign $B/managed-retained-return-root-20261101
+ token strata-serve-suffix-repaired-20261101T075723Z
+ Runner3481252. ATTEMPT started1793521380.6315; result exit124/57.921s.
+ report.json, managed-scheduler-report.json, parsed-numerical.json are MISSING.
+ OWNER-PAUSE.json in managed-remaining-three-final-root-20261101 records root
+ SIGTERM to supervisor3479966 at1793521438.416. Exact release exit0, restoretrue.
+ Root receipt records runner absent, name/label absence; retained CID is null
+ because before-data was missing. Do not invent a CID observation or a complete
+ report. MUST fresh-stage this attempted campaign for retry. Do not run
+ native_pass --write against the paused attempt to manufacture missing evidence.
+
+Occupied32k: UNATTEMPTED/SKIPPED, NOT QUALIFIED.
+ Campaign $B/managed-occupied32k-root-20261101
+ token strata-serve-suffix-repaired-20261101T074834Z
+ No ATTEMPT; skipped when pause stopped predecessor. Its old dated grant and
+ old frozen batch config are not a ready new launch. All three original next-
+ batch grants expire1793530388 (2026-11-01T10:53:08Z); they were only2326 seconds
+ from expiry at the10:14:22Z file audit, insufficient for a new full batch.
+ Treat every dated/expired old campaign as historical and fresh-stage new
+ campaign/token/grant rather than patch expiry behind frozen pins. Reuse the
+ reviewed immutable payload, not the old execution authority. Selected/return
+ attempted grants may never be renewed even before their old expiry.
+
+Batch restoration is ACTUAL in
+ $B/managed-remaining-three-final-root-20261101/output/RESULT.json
+ and ROOT-RELEASE.json (OWNER_PAUSED_RELEASED_RESTORED): selected exit0/release0,
+ retained supervisor-terminated/release0, occupied not started; restoredtrue.
+ Root independently verified no matching clients, exact owned absence and
+ original healthy context393216/PARALLEL2. This is test-baseline restoration,
+ not candidate deployment rollback or post-CUDA-fault recovery qualification.
+
+3. FRESH AUTHORIZATION, EXECUTION AND RELEASE PROCEDURE (ROOT ONLY, ON RESUME)
+
+Baseline captured by existing supervisor is exact CID
+ 1ae3605d33df66f2bb8dca5d495deb585d917f287b33b29c4f948235161c2fad
+with context393216 and PARALLEL2. freeze_config.py checks healthy actual name,
+CID prefix/context, actual callback pane PID, daemon, and actual runner preflight.
+If baseline/callback has legitimately changed, STOP: review an identity-only
+successor configuration; do not lie to old pins or remove identity checks.
+
+For any fresh standard current campaign (never an attempted path):
+ python3 -B "$TOOLS/stage.py" --build "$BUILD" --attempt "$BA" --campaign "$FRESH_CAM"
+This checks released producer/full frozen source, optional build metadata and
+source gates, creates new candidate/source/inputs/run.py/manifest and NEW token.
+Its initial scenario/profile/authority is not the injected scenario. After the
+specific injector below, merge the actual returned JSON before preflight:
+ - grant_additions exactly, including scenario flag and PLAN hash;
+ - returned runner_sha256 and input_manifest_sha256;
+ - full profile/profile_path and transcript bounds when occupied/performance;
+ - all returned supervisor_additional_pins, rejecting conflicting duplicate paths.
+No manual boolean makes a payload qualified. Retain injection stdout + actual
+exit. The root-generated final grant is bound to actual new runner/input hashes,
+source/artifact, model+pack hashes/read scope, two GPU UUIDs, runtime and limits.
+Ordinary resource limits remain4CPU,34359738368 RAM bytes and equal swap,
+22528MiB/GPU,1800s job,60s cleanup, networknone, exact pinned existing runc path.
+Fresh single-job authority: root issues expiry now+3600 immediately before
+preflight/freeze, preserving identities/limits. For a new two1800s-job batch use
+fresh grants now+6000 and require >=5400s remaining AFTER preparation; do not
+preissue them while another resource campaign runs. No automatic active renewal.
+
+Actual preflight and single-job freeze commands:
+ python3 -B "$FRESH_CAM/serve/run.py" --preflight --grant "$FRESH_CAM/serve/OWNER-AUTHORIZATION.json"
+ python3 -B "$TOOLS/freeze_config.py" --campaign "$FRESH_CAM" --notify-pane "$ACTUAL_NOTIFY_PANE" --config "$FRESH_CONFIG"
+Root reviews NEW config/hash, all pins and fresh grant. Then existing detached
+resource owner runs exactly:
+ python3 -B "$TOOLS/supervise.py" "$FRESH_CONFIG"
+Do not run run.py --execute beside the supervisor or launch two configs sharing
+one token. freeze_config is preparation with live read-only queries; it is NOT
+allowed during the current planning pause. Existing single config is job1800/
+campaign2700 with restore-health600. Supervisor performs preflights (120 each)
+before stopping baseline, then jobs serially, per-attempt exact release (180),
+stop-first-failure, restore only after cleanup proven, healthwait600.
+
+For two compatible fresh jobs, reuse existing supervisor's jobs array and pin
+merge (not a new launcher): freeze each as above; require identical preserved
+container_id/notify_pane/notify_pane_pid; each exact one job seconds1800; union
+pins with equality on collisions; keep both actual argv/preflight/release arrays;
+new merged campaign_seconds5400, fresh output path, jobs in reviewed order.
+Add injector supervisor_additional_pins and current prerequisite/review hashes;
+write new config with exclusive creation; root reviews before launch. Both grants
+must cover that entire window. Existing supervisor allows up to8 jobs and14400s;
+this is the already used batch mechanism. The old next-batch finalize.py is hard
+pinned to four now-attempted/old campaigns: DO NOT rerun or patch it to renew them.
+
+Always inspect actual output/RESULT.json, each serve/ATTEMPT.json and attempt
+result.json before adjudication. Canonical release invocation (only root):
+ python3 -B "$RELEASE" "$FRESH_CAM/serve/ATTEMPT.json" "$ACTUAL_DAEMON_ID"
+Root must independently bind runner PID+start/command, Docker client terminal,
+CID/name/label, daemon continuity and chronology to THAT attempt, plus exact
+absence filters and restored original health/context/PARALLEL. A RELEASED string
+or another attempt's absent runner is insufficient. If cleanup not proven: hold
+resource owner, do not start another model, do not kill foreign processes or
+restart baseline over unknown occupancy. Resolve using exact owned identities.
+When supervisor ended by owner pause, preserve its interruption/output and root
+release; do not turn timeout124 into success. A report PASS without release is
+only pass_payload, never final native/recovery/deployment qualification.
+
+4. COMPACT ACCEPTED-RACE RETRY: READY INPUTS, STILL NO NATIVE PASS
+
+Held source proposal/checkpoint:
+ $COMPACT/CHECKPOINT.json
+ 47835960e969cbab3c9b3edebb2bec5fd15ab5afdc32fcaabe7ddc2ae2e4caa6
+61 files,51 offline tests previously PASS and root independently reran/reviewed:
+ $B/managed-compact-race-root-review-20261101.json.
+Current fresh-but-inactive prepared closure:
+ $B/managed-compact-race-preparation-sol-20261101
+ PREPARED-CHECKPOINT SHA6491b272385241a697dd783d5efb682abacf056e861f93ef9fc21567fb6a3feb
+65 files; campaign token strata-serve-suffix-repaired-20261101T082156Z-compact-race.
+ OWNER expiry0; noATTEMPT, nofreeze, nolaunch. It is deliberately inactive,
+ not a once-active expired grant. Actual runner --preflight exit0 used only an
+ exact temporary validation grant copy with +300expiry; body/hash/argv/real exit
+ in PREFLIGHT-ONLY-GRANT-EVIDENCE.json and whole-runner-preflight.*; OWNER stayed0.
+ PLAN adc2822081d94abe154a6a1b63c57b0b939decd191b066ee65f15f9638a7d366
+ runner ab2c2cd301903965c505c8fc2f60e90641d03b09c0d0cc0dd0e45e626728202b
+ manifest d1fde0d28c9c140ee829e80f1cc922b6175ca6fc8ae5933e13d037cda22fe8f6.
+
+Exact tokenizer-backed input budgets (not character estimates): race50, healthy
+864, queued445, prefill1044, reused269; every native max_new64, context2048,
+prefill16. Only named race artificial generator+pre-model verifier lower bound
+changed128->2. Other names retain128, and assigning the50token input to queued
+is rejected. Native staging contract was already2..1984. Valid compact chat
+system/user/assistant prompt retains real accepted request and STOP semantics.
+Pinned Python3.12 tokenizer/pack/regex round-trip previously PASS. Source config,
+64-survivor budget, STOP observer/history/retirement and ACK bijection unchanged.
+50tokens requires4prefill16 parts; old curve suggests~32 peer commits before
+target acceptance, providing headroom. This is feasibility evidence, NOT a
+latency guarantee or executed compact PASS. Do not increase healthy budget,
+force/suppress EOS, pad tokens or skip live peer to make it pass.
+
+Root previously authorized activating only that exact fresh expiry0 closure at
+launch after review/noATTEMPT. Conservative recommendation for this resumed plan:
+fresh-stage a NEW sibling prep/token so all dated execution authority is fresh
+and no old pinned preparation is mutated. Existing prepare.py is path-relative
+and already does standardstage+managedstage+inject+receipt-scope seam correction:
+ mkdir "$FRESH_COMPACT_PREP"
+ cp "$B/managed-compact-race-preparation-sol-20261101/prepare.py" "$FRESH_COMPACT_PREP/prepare.py"
+ python3 -B "$FRESH_COMPACT_PREP/prepare.py"
+This existing script requires its NEW campaign path, checks exact COMPACT
+checkpoint, rebinds actual target4, stages CONFIG/PROMPTS/tokenizer dependencies,
+uses control timeout15 and driver420, applies the narrowly reviewed receipt_scope
+branch, captures actual preflight exit with temporary validation grant and leaves
+new OWNER expiry0. It does not freeze/launch. Capture/checkpoint/review fresh
+outputs before root expiry issuance. Do NOT rerun original prepare.py in-place;
+it rightly refuses campaign already exists. No new preparation framework needed.
+
+If root instead deliberately adopts the already-reviewed never-active expiry0
+closure: assert noATTEMPT/supervisor, reverify exact PREPARED-CHECKPOINT/hash/limits,
+then issue fresh now+3600 grant as HANDOFF.md specifies; this is fresh final
+authorization, not renewal of an attempted grant. Root/Astra must choose one path;
+never execute both. Dated expired grants always fresh-stage, attempted always
+fresh-stage. Existing inactive OWNER0 path has no current execution authority.
+
+Then section3 single-job freeze/supervisor (1800/2700, driver420) with actual
+callback and reviewed config. Keep this retry separate as root decided; previous
+independent three-job batch has now released/restored, so there is no need to
+rebuild another merged four-job batch merely to include this race.
+
+Acceptance: actual target BOWN_ACCEPT; authenticated captured occupancy BSTOP;
+cancel terminal paired correctly; exact complete accepted/pending histories and
+raced-output preservation; healthy native commit STRICTLY after target terminal;
+all occupancies terminal; every actual BOWN_COMMIT has exactly one matching
+SCHED_UNIT and vice versa on request/slot/occupancy/nativecut, correct foreground
+op/result, no duplicate nativecut even with different admission serial; actual
+joined-prefill ACK where present; engine0; complete strict reports; exact release
+and independently healthy restored baseline. No synthetic timings qualify it.
+Case outputs: attempt/admission-cancel/ raw logs, report and managed journal/
+scheduler report, actual result and release; inspect exact report keys from the
+copied entry/managed_cancel, not a nonexistent generic native_pass.py CLI.
+Failure: early EOS/window missed/STOP too late/missing history/ACK/oracle/peer
+progress remains FAIL. Preserve transcript. Use observed per-chunk counts to
+distinguish fixture window from product cancellation; do not blindly halve again
+or relax future-peer requirement. Product hang/incorrect history is source issue,
+requiring bounded fix, regression, one coherent source freeze/build and new
+artifact-bound downstream qualification. Compact timing failure alone does not
+invalidate unrelated three case PASS receipts.
+
+5. RETAINED RETURN RETRY: REUSE PAYLOAD, NEW CAMPAIGN/AUTHORITY
+
+Exact ready payload $RETURN/prepared-payload, PLAN
+ c32266f707eb63cbd2effc09501d1d6b29292c453c46fa0bffe27c9399ef8429.
+Source producer pins in $RETURN/REVIEWED-SOURCE-PINS.json. Former fa scenario/
+numerical report/readers retained; source pins and real managed Driver seam77d.
+Six real requests Aseed,Bseed,A2,B2,A3,B3; target5A3 must bind the NEW B3 peer,
+not retired B2. First pair natural max64, dynamic actual EOS, actual unaligned
+donor,1..3 real known-input prealignment rows; aggregate watermark unchanged by
+known rows. Both initial pair AND returned pair need genuine same-operation
+two-DECODE, matching per-member SCHED_UNIT/cohort and authentic occupancy/cuts.
+All tensor/logit/frontier/pending continuation/MAIN/selected/new-peer restores
+remain zero-tolerance. context512/pre16, inner1215(load240/work900 plus75 reserve),
+outer1800; ordinary4CPU/32GiB/two22528MiB GPUs. No context32k/performance transfer.
+
+Root executes on resume, fresh path only:
+ python3 -B "$TOOLS/stage.py" --build "$BUILD" --attempt "$BA" --campaign "$FRESH_RETURN"
+ python3 -B "$RETURN/inject.py" --campaign "$FRESH_RETURN" --payload "$RETURN/prepared-payload" > "$FRESH_RETURN/INJECTION.json"
+Merge its grant_additions + actual runner/manifest hashes per section3, issue
+fresh grant, preflight/freeze. Injection requires original fresh runner, cannot
+nest inside an already managed numerical injected runner. Reuse payload unchanged
+unless source/candidate identity changed. If payload must be reconstructed:
+ python3 -B "$RETURN/stage.py" --candidate "$FRESH_RETURN/candidate" --config "$RETURN/CONFIG-target5.json" --output "$NEW_RETURN_PAYLOAD" --source "$SRC" --reviewed-source-pins "$RETURN/REVIEWED-SOURCE-PINS.json" --binding "$BIND" --managed-policy "$POLICY"
+Existing prepared payload is preferred: no benefit to restaging identical bytes.
+
+After actual run AND independent exact release/root restoration:
+ python3 -B "$RETURN_REPORT/native_pass.py" --campaign "$FRESH_RETURN" --attempt "$ACTUAL_RETURN_ATTEMPT" --write
+ python3 -B "$RETURN_REPORT/native_pass.py" --campaign "$FRESH_RETURN" --attempt "$ACTUAL_RETURN_ATTEMPT"
+Expected separate two-slot-return-numerical-evidence.json; exact report rebuilt
+from complete raw logs, six bindings, first+returned-member ACKs, true B3 peer,
+candidate/source/grant/result/proc/manifest/container proof. It must not be
+consumed as ordinary target3/4 or32k mode. Missing reports/paused run refuse.
+Failure on natural EOS/unaligned donor/prealignment/return peer is an honest
+feasibility or product finding: inspect raw actual H/F/pending/StateCuts, do not
+substitute guessed token, old B2, floor-align, pad, raise tolerance, or claim64
+outputs if natural EOS stopped earlier. Preserve all histories for cold oracle.
+
+6. OCCUPIED32K: FIRST REAL EXECUTION STILL REQUIRED
+
+Exact payload $OCC/prepared-payload PLAN
+ 4a8c0fbf98c78966f8f412e09404cd61692599dbadab4bfd0ec8ad9f4af7794c.
+OFFLINE-PREFLIGHT.json/SOURCE-ORIGIN and TRANSCRIPT-BOUND-REVIEW.json document
+actual77d/a83c and target3/4 prerequisites; neither is native32k evidence.
+Full original expert profile196632B/SHA
+ 8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf
+is payload/expert-profile.bin (read-only mounted as /qualification-profile).
+cacheauto,pre16,batch2/group1,split24,INT8,reserves1536/2048; nominimal48profile.
+Both genuine seed endpoints F32700/A32701; repaired prompts32765, three outputs;
+both terminal F32767/A32768. True T+BT, real donor pending, same native2DECODE,
+full exact tensor/logit/pending/continuation/restoration mandatory. Allocation of
+32768 context alone is not occupied-context proof. No forced EOS/padding/history
+substitution. Existing max_new3 is insufficient for reliable occupied cancellation;
+this case explicitly does not qualify graceful occupied cancellation.
+
+One engine start/four requests;1800outer/1620inner/load300/work1200/75reserve;
+same4CPU/32GiB RAM=swap/two22528MiB GPUs. Actual resource fit/repair+oracle cost
+UNKNOWN. Do not launch multiple workers or enlarge budget automatically.
+Bounded unfiltered transcript32MiB combined,131072stdout lines,96MiB encoded JSON
+only for wrapper/escaping. Projection29,833,216B, margin3,721,216B: <=16640 selected
+units including256 reserve,4200prefill units,1536B/selected,768B/prefill,+1MiBfixed.
+These are fixed-profile format projections, not permission to truncate/deduplicate
+receipts. Existing Docker-client summary2MiB cap remains distinct. Real overflow
+fails; source growth/output enlargement requires new explicit review/grant.
+
+Resume recipe:
+ python3 -B "$TOOLS/stage.py" --build "$BUILD" --attempt "$BA" --campaign "$FRESH_OCC"
+ python3 -B "$OCC/inject.py" --campaign "$FRESH_OCC" --payload "$OCC/prepared-payload" > "$FRESH_OCC/INJECTION.json"
+Merge returned grant_additions (INCLUDING fullprofile/path/transcript limits) and
+runner/manifest, plus returned supervisor_additional_pins for BOTH actual target
+prerequisite sets; conflict refuses. It accepts ORIGINAL fresh runner only. The
+local validation does not save grant for root: root must actually merge it before
+preflight. Retaining standard minimal98520B grant is wrong even if injector ran.
+Grant profile_path must be this NEW campaign inputs/expert-profile.bin; not old
+campaign or minimal48 profile. Fresh freeze and existing supervisor, optionally
+as second job after fresh retainedreturn (section3 two-job5400/6000 envelope).
+
+Restaging CLI if required, not needed just to rerun identical payload:
+ python3 -B "$OCC/stage.py" --campaign "$ACTUAL_CURRENT_CAMPAIGN" --source "$SRC" --profile "$OCC/prepared-payload/expert-profile.bin" --prerequisite3 "$ACTUAL_TARGET3_PREREQUISITE_JSON" --prerequisite4 "$ACTUAL_TARGET4_PREREQUISITE_JSON" --binding "$BIND" --managed-policy "$POLICY" --output "$NEW_OCC_PAYLOAD"
+Use paths from actual prepared PLAN.native_prerequisites/OFFLINE-PREFLIGHT; do
+not invent a JSON by setting pass:true. The existing payload has all20 actual
+source-bound prerequisite records and is safer than reconstructing by hand.
+
+After actualPASS + independent exact release:
+ python3 -B "$OCC/native_pass.py" --campaign "$FRESH_OCC" --attempt "$ACTUAL_OCC_ATTEMPT" --write
+ python3 -B "$OCC/native_pass.py" --campaign "$FRESH_OCC" --attempt "$ACTUAL_OCC_ATTEMPT"
+Output two-slot-occupied32k-evidence.json, reparsed original occupied numerical
+and managed controls/journal, all identity/release and prior3/4 hash checks.
+On OOM/deadline/log overflow: preserve peak resource/time and raw output; root
+decides profile feasibility or a separately priced new bounded attempt. Do not
+quietly reduce actual F/A to small context and populate the32k gate. On incorrect
+same-history numerics or restoration: block feature and source-fix before retry.
+
+7. LEGACY SERIAL SEMANTIC/FATAL/THREE-SITE REGRESSIONS: HONEST SEPARATE MODE
+
+ROOT CORRECTION (actual receipt inspected): S/current77d-seven-arm-root-20261101/ROOT-PREPARATION.json already records PREPARED_NOT_RUN via the unchanged repaired-campaign-tools/stage.py --build BUILD --attempt BA --mode retained --fixture TOOLS/fixtures/edited-label-v3.json --campaign NEW. Root verified actual six-check audit and canonical seven-arm operations/configs; source77d and optionala83c are bound. PREFLIGHT.json exists; grant remains expired and no execution occurred. Thus the optional seven-arm job does NOT require rebuilding the obsolete wrapper described below. Its fault/control/score consumers still need current bindings and any actual audit-schema adaptations. Prefer the existing root preparation; do not redo solved optional staging merely to make old wrapper metadata green.
+
+Current source-only proposal $SERIAL has checkpoint66e628... (63 files,13 prior
+focused offline tests,72 source pins). ARTIFACT-IDENTITY.json is still
+PENDING_NEW_REVIEWED_BUILD, optional/fault hashes null. Old fa receipts remain
+HISTORICAL. Merely naming source77d did NOT make wrappers actual-artifact-bound.
+NEXT-JOBS.md inherited fa command examples are not current recipes to copy.
+
+Concrete stager blocker: frozen release_proof expects exactly FIVE raw build
+checks. Genuine current $AUDIT has SIX: daemoninfo, exactnameps, exactlabelps,
+exactCIDps, baselineinspect(selected/redacted facts), daemoninfo. Keep genuine raw
+audit bytes exactly. A normalized SUPERVISOR-RELEASE or a five-row projection is
+NOT a replacement. Minimal future edit: fresh isolated successor of these
+wrappers, bind actual77d/a83c/a7ec metadata and source closure, and accept the
+exact six-command schema with result/ATTEMPT/release SHA, exact name/label/CID/
+daemon, chronology, runner/client absence and baseline facts. Existing actual
+reference is managed-ordinary-cancel-batch-preparation-sol-20261101/prepare.py
+verify_actual_audit, already strict; copy only necessary consumer logic into a
+fresh reviewed successor, no shared-framework change or frozen-receipt mutation.
+Negative tests must reject other attempt/CID/name/label, stale audit before result,
+missing/duplicate check, wrong daemon/exit/stdout and metadata variant mismatch.
+Alternative is root genuinely capturing the exact old five-check audit after
+resources are released, under reviewed old producer schema; not rewriting six
+rows and not rerunning build. Recommendation: consume existing authentic six.
+
+Once source/artifact/audit consumer successor is actually reviewed/frozen, let
+NEXT be its absolute new path; current $SERIAL scripts still fail closed.
+Exact existing interfaces to retain:
+ python3 -B "$NEXT/next_jobs/stage_optional_native.py" --build "$BUILD" --attempt "$BA" --build-release-audit "$AUDIT" --campaign "$FRESH_SERIAL_NATIVE"
+Future root grant/preflight/freeze/supervisor per section3, one native campaign.
+Seven actual arms: cold_reference,repaired,repaired_repeat,repaired_unsupported,
+repaired_budget,repaired_cancel,repaired_sensitivity. This is native serial GEN,
+context512/pre16/minimal profile48/greedy/split24/INT8, NOT owned managed BGEN.
+Do not inject policy flags/BIND blindly: nativeguard requires owned verified
+two-slot mode; serial retained regression remains valid in its actual mode.
+Fixture edited-label-v3 SHA
+ 7c4aac10be3be05c86bc03e16044949027db967ae0a1da50ac571ae19ecf7fc5
+and actual native main49a7fa1023c85765a1352a882950877128b4a0cf6ad0cdaa10664c6ab71059b3
+must be bound by real source/producer proof; no old binary qualification reuse.
+
+After actual new optional native result + exact release/restoration:
+ python3 -B "$TOOLS/score_native.py" --results "$ACTUAL_SERIAL_ATTEMPT" --fixture "$TOOLS/fixtures/edited-label-v3.json" --tools "$SRC/tools" --pack LOCAL_WORKSPACE/data/Strata-data/packs/iq3_s --output "$FRESH_SERIAL_NATIVE/semantic-report.json"
+ python3 -B "$NEXT/next_jobs/score_approximation.py" --campaign "$FRESH_SERIAL_NATIVE" --attempt "$ACTUAL_SERIAL_ATTEMPT" --build "$BUILD" --build-attempt "$BA" --build-release-audit "$AUDIT" --output "$FRESH_SERIAL_NATIVE/approximation-report.json"
+Use the actual pinned materialized Python3.12/regex/tokenizer dependency ABI;
+host3.13 must not load cp312 extension or skip tokenization. Outputs must reflect
+four repaired positives and four independent cold answers, editedblue/edited2green/
+sensitivitygreen; first decoded answer word is the task criterion, NOT approximate
+token equality. Unsupported/budget/control rows remain negative controls.
+Root qualification-summary binds the eight actual files: native result/scenario/
+release, supervisorRESULT/config, approximation, semantic, grant. No author-set
+qualified=true. Historical fa reports under serving-retained-native-fa-root-
+20261101T0518 remain fa/f4b0 only, not current77d task quality.
+
+Same fault-ON artifact normal control must execute BEFORE injected faults:
+ python3 -B "$NEXT/next_jobs/stage_fault_control.py" --build "$BUILD" --attempt "$BA" --build-release-audit "$AUDIT" --template-campaign "$FRESH_SERIAL_NATIVE" --campaign "$FRESH_FAULT_CONTROL"
+Normalcontrol selector ABSENT (not value0), actual Popen env/argv pinned, seed+
+edited histories complete; control-report.json modecontrol/selector_absenttrue.
+It does not inject a CUDA fault, prove failstop, ordinary managedSTOP, candidate
+HTTP recovery or deployment rollback. Fault control uses a7ec, optional usesa83c;
+same source does not make binaries interchangeable.
+
+Then THREE fresh selected fatal campaigns, one site per attempt (no looping):
+ python3 -B "$NEXT/next_jobs/fault/stage.py" --mode private_replay --build "$BUILD" --attempt "$BA" --template-campaign "$FRESH_SERIAL_NATIVE" --control-campaign "$FRESH_FAULT_CONTROL" --control-attempt "$ACTUAL_CONTROL_ATTEMPT" --control-supervisor-result "$ACTUAL_CONTROL_SUPERVISOR_RESULT" --build-release-audit "$AUDIT" --campaign "$FRESH_FAULT_PRIVATE"
+Repeat exact interface with --mode second_partial_copy and NEW campaign, then
+--mode final_exact_copy and NEW campaign. No active source change/build needed.
+Each needs its own fresh grant and supervisor release; existing batch may place
+three1800s jobs in one reviewed7200s campaign with enough fresh authority (e.g.
+7800s AFTER all preparation), independently exact releasing each and final600s
+restore health; root must validate actual stager limits rather than extend
+canonical caps. Control prerequisite must already be actually completed/released,
+so do not pre-mint downstream grants before it finishes.
+
+Exact fatal obligations from fault/protocol.py:
+ - target actually admitted once; seed admitted/refused exactly matches completed
+   same-a7ec control, real seed full output, aligned edited donor + realpending;
+ - target one real T, no DONE, no cancellation, numeric engine exit1 (not signal,
+   timeout, ordinaryrefusal, code2 or forged EOF success);
+ - exact origin: private_replay=>resident actual all-stage completion refused;
+   second_partial_copy=>partial selected restore uncertain;
+   final_exact_copy=>final whole-state exact restore uncertain;
+ - durable fresh owner0600 single-link bounded regular receipt read only after
+   EOF, exact actual source/binary/request/publication/old/private/targetcuts/
+   acceptedH/receipt token bindings; clean device1/stream prerequisites;
+ - private chain binding,private_work_completed,prerequisite,armed,launch,
+   cudaStreamQuery,raw_failure; real query715or719, RAWflags poison/unhealthy/
+   cutunchanged/failureownerretained all1;
+ - copy chain binding,prerequisite,api_refusal,raw_failure; stage0 completed,
+   actual stage1/device1 cudaMemcpyAsync/copykind5,1..16MiB, status1or21;
+ - no target successful state/oracle after uncertain restore, no successful
+   final progress, no lost failure owner. fault-report.json pass_payload true
+   still native_fault_qualified false until independent lifecycle adjudication.
+Existing25buildCTests selectorrefusal optional/default are actual CPU/build
+coverage, not those GPU fatal site receipts. Current77d fatal/control/serial
+three-site executions have NOT happened. A functioning STOP is not fatal recovery.
+After each fatal, root independently proves exact cleanup+daemon, no lingering
+owned model/CUDA work and healthy restored original. Potential poisoned context
+must be released; do not assume killing process/supervisor exit restores a
+healthy candidate service. Actual candidate restart/health then ordinary clients
+is a separate recovery drill in companion plan, not current evidence.
+
+Serial three-site cancellation, if required for supported serial feature scope:
+ python3 -B "$NEXT/stage_cancel.py" --build "$BUILD" --attempt "$BA" --build-release-audit "$AUDIT" --native-campaign "$FRESH_SERIAL_NATIVE" --native-attempt "$ACTUAL_SERIAL_ATTEMPT" --control-campaign "$FRESH_FAULT_CONTROL" --control-attempt "$ACTUAL_CONTROL_ATTEMPT" --control-supervisor-result "$ACTUAL_CONTROL_SUPERVISOR_RESULT" --campaign "$FRESH_SERIAL_CANCEL"
+Preserve transport/WAIT-import, first_output, private_unit sites and accepted/
+pending/coldT1/state/retirement checks. Exact arguments and one-source proof do
+not convert this to owned managed cancellation: actual owned BGEN branches past
+serial hooks. Managed selected-repair result has different real boundary coverage.
+Astra/root must record which actual modes will be supported. No claim three
+serial sites are covered by one managed post-unitSTOP; no engine-hook expansion
+solely to satisfy an inapplicable serial harness. If serial retained feature ships,
+finish its existing gates separately. If experimental surface is owned managed
+only, explicitly unsupported serial surface still needs truthful default/refusal
+behavior; do not silently relabel required gates as managed equivalents.
+
+8. MANAGED TASK-QUALITY ADAPTER: NOT RUNNABLE; EXACT MISSING WORK
+
+Current WIP $B/managed-edited-label-semantic-sol/PAUSED-WIP.json says incomplete,
+unqualified, no stage/entry/grant/supervisor, tests NOT RUN. It copied real readers/
+managed transport and edited-label-v3, then drafted semantic.py; it is not ready
+to pass to the GPU owner. Old serial semantics cannot satisfy current managed
+task quality by setting managed metadata or copying answer tokens.
+
+Proposed minimal isolated completion after resume (no new engine/framework):
+A. Fix actual draft API mismatches before writing a launcher:
+ - semantic.validate_warm final read_two_slot.validate(records(...sealed=True))
+   currently expects exactly oneSTOP plus futurepeer through the inherited
+   cancellation reader, but this semantic script sends noSTOP. This is a real
+   draft mismatch. Reuse existing numerical report's fullLifecycle plus unsealed
+   exact-history reader pattern; explicitly require all FIVE actual occupancies
+   retired, no outstanding rows/late output, expected request counts/history.
+   Do not weaken shared cancellation reader's STOP obligation.
+ - final['accepted'] fallbackTrue hides wrong API name (reader uses admissions).
+   Reconcile exact admissions schema and independently bind BOWN_ACCEPT; missing
+   admitted repaired state must reject, not silently pass conditional fallback.
+ - fixture expected_answers uses edited/edited2/sensitivity; scorer CASES uses
+   blue/sensitivity_green/repeat_green. Add an explicit immutable mapping and
+   tests, not guessed expected dictionary keys.
+ - every true actual BOWN_COMMIT needs exactly one correct foreground op/result
+   SCHED_UNIT, converse/no duplicatecut, monotonic admission, actual epoch/reply
+   and JOINED_PREFILL exact fields; reuse reviewed current managed validation
+   seams rather than assuming metadata alone proves execution.
+B. Complete actual runtime/cleanup and independent fresh cold GEN1 controls using
+existing BoundedTransport/Driver and normal supervisor. One persistent managed
+thread, five exact pairs, successful OPEN/BIND before original BGEN, actual OS
+producer and SCHED_READY/reply/sequence journal. Cold must use the same exact
+constructed actual prompt, newly cold state/process, genuine native output and
+tokenizer decode; no copying repaired answer as cold answer.
+C. Pinned tokenizer metadata/source/regex + pack roundtrip loader and pre-model
+verification. Existing fixture seed226tokens,max_new7, aligned edit32:36,
+planned donorF232, first edited292 and repeat340; context512 leaves <=64budget
+margin. Real seed natural EOS may violate alignedF232: fail honestly or reuse
+reviewed actual prealignment protocol with exact real H/cut proof; do not assume
+seed emits7, pad donor or flooralign. Exact draft edited budget1 yields an answer
+token, but does not establish2DECODEoverlap. Task-quality and concurrency claims
+must stay separate: use separate genuine same-operation witness, or design a
+budget with real useful outputs without inventing same-token requirement.
+D. Finish fixed CONFIG/preflight/stage/inject adapters from current managed
+numerical/cancel seam, actual77d/a83c $BIND, $POLICY, bounded15scontrol,
+real source/input/profile/readscope and cleanup budgets. Add only fixed cases,
+not a generic framework. Source-only unresolved values remain UNBOUND and
+for_execution rejects until root review. No existing executable semantic-stage
+command is claimed ready here: this step is TO_IMPLEMENT, not a fake CLI.
+E. Focused offline regressions (future only): noSTOP complete5 accepted path;
+missing/forged actualdonor, wrongexpectedmapping, staleBIND/op/result/epoch,
+missingunit/duplicatecut, exactfallbackwronglyaccepted, wrongblue/green,
+freshcoldnotindependent, tokenizermutation/ABI mismatch, EOF/lateoutput/missing
+retirement. Real-file source/fixture identity tests + pipe driver ordering.
+Root/Astra review isolated change, freeze payload once, then standard fresh
+campaign/injection/grant/supervisor. No engine rebuild for Python adapter alone.
+
+Measured acceptance to require: known edited fact first decoded answer word blue,
+independent sensitivity green, repeat green, in each actual repaired and fresh
+exact cold answer; raw prompt uses genuine actual prior accepted H/pending and
+only intended edit+freshsuffix; actual approximate admission (not exactfallback);
+complete owned history/retirement and actualmanaged execution. Approximate warm
+tokens need NOT equal cold/OFFtokens. Zero-tolerance exact numerical oracles compare
+state/logits for the SAME ACTUAL HISTORY; task quality compares known fact.
+Short512semantic pass does not qualify32k full-profile performance semantics.
+For timing eligibility, prepare additional fixed near32k cases at EXACT PERF
+fullprofile/cacheauto/pre16/reserves/managed policy, actual semantic fixture and
+actual donor histories; bind workload arrays/expected seed history to those real
+receipts. No fabricated32765 semantic padding counts as task quality. If matched
+profile task budget/known fact fails, investigate/profile reject before timings.
+
+9. LEGACY ORIGINAL/CURRENT OFF NEUTRALITY: READY PREPARER, NO ACTUAL OBSERVATION
+
+Current source-only successor
+ $B/current-off-input-envelope-observation-sol-20261101
+ CHECKPOINT d0434ae0c274d897f534e804473eda4f12f657e1d95fac88d7ea047eeddc1164
+25files,12priorofflinePASS. Executor/wire/timing/proc/config/workload preserved;
+only current source identity rebound. Whole two-job preparer
+ $B/original-current-off-input-envelope-batch-preparation-sol-20261101
+ CHECKPOINT35476976ea9eccf1dca7641b49b8cce02e7f31de4147f91db21c89d53acc6125
+8files,9priorofflinePASS. Main preparation/run has NOT executed.
+Original preserved campaign $B/original-off-observation-root-20261101 is currently
+pristine/ungranted/unattempted. Original artifact SHA
+ ae49d5da81b9b65d50af1108c4b3f8b289ee198d9992d66268b7e885cf1a4776;
+runtime sha256:ec8ab65b49dd35478d8b77a15cf1d7fb05c07c0e42adac30932ac5982679a757.
+No actual exact source manifest for original: preserve source_unattested=true
+and exact separate legacy-original grant schema. Do not invent source proof.
+Original CUDA-library/runtime differs from current; commonruntime NOT proven.
+
+Both OFF: ordinary legacy2, noowned/suffixrepair/managed env, no http_request on
+wire, explicit neutral sampling tuple, two coding prompts98/99 tokens,max64.
+No hidden ON BIND attempted. Original --help actual bounded CPU probe verified
+binary/libraries/exit0 only, not generation. Explicit no managedpolicy is correct
+OFFscope because nativeguard requires ONowned verified2 for managed activation.
+length finish must actually deliver64 tokens; early naturalEOS stays honest and
+cannot be counted as full useful-output performance win. Settings attested=false
+without receipts; whole-backend neutrality, not isolated feature speedup.
+
+Resume exact preparer (already existing CLI; root only because live freezequeries):
+ python3 -B "$B/original-current-off-input-envelope-batch-preparation-sol-20261101/prepare.py" --planned-launch-epoch "$ACTUAL_NEAR_LAUNCH_UNIX" --output "$NEW_OFF_PREPARATION"
+planned epoch must be now..now+1800, output NEW absolute path. This verifies
+current28stepbuild/release and exact pristine originalclosure; standardstages
+current; stage_pair.py legacy-suffix-off/young-test-only CONFIG-CURRENT-OFF +
+WORKLOAD-COMMON; creates original exact-schema grant, realbothpreflights, live
+freeze. It hardcodes callback %114 and checks matching panePID viafreeze; root
+must verify that is still the intended actual callback. If obsolete, reviewed
+identity-only successor with explicit valid callback first; do not point it at a
+new unknown pane or alter frozen tool silently. Never overwrite an existing
+originalgrant: if any prior grant/ATTEMPT appears, STOP and freshstage original
+identity closure/campaign, retaining source-unattested schema.
+Output NEW_OFF_PREPARATION/supervisor.json jobs originalOFF,currentOFF1800each,
+campaign5400,expiryplanned+6000 and>=5400left afterprep,onebaselinecycle. Then:
+ python3 -B "$TOOLS/supervise.py" "$NEW_OFF_PREPARATION/supervisor.json"
+Expected per-attempt stdout/timing/proc/fullretirement reports, result/release,
+combinedoutputRESULT restoredhealthy and independent rootrelease. Actual wire or
+runtime incompatibility fails observation, not permission to silently remove
+sampler fields/changecurrentbaseline/pretendcommonruntime. Reuse oldbinaryhelp
+fact only. If first originaljob fails, second skipped; cleanup/restoration first,
+then minimal explicit adapter correction with source-unattested limits.
+
+These OFF configs use cache48/minimalprofile; planned managed performance uses
+cacheauto/full196632Bprofile/reserves. DO NOT pair these times as featureOFF/ON.
+They are original-v-current wholebackend observations. For actual feature timing,
+use PERF/OFF-fullprofile-32k-REFERENCE.json (dataonly, not a launched result),
+exactsamecurrenta83c/runtime/modelpack/profile/cacheauto/pre16/reserves/context/
+sampling/workload. It deliberately disables owned/repair/managed as the intended
+OFFfeature; otherwise no unexplained profile differences. Original baseline
+context393216/spec4/groups2 is not a measured matched32k baseline.
+
+10. MANAGED PERFORMANCE WRAPPER: EXISTING WORK, ACTIVATION DELIBERATELY BLOCKED
+
+Held WIP $PERF/PAUSE-HANDOFF.json SHA
+ ed8a550badbbc2878fd72b8e13950c53f10a9501c0b3b5e3ee56c98eae65d8ad
+contains full fileinventory and last actual47offlinePASS command/result.
+Not finalfrozen, not runnable, no nativeperformance evidence, no handles.
+Parent two-slot-performance-lineage-sol files preserved byte-for-byte. Derived
+managed_executor differs only2 prewritehooks: native transcript offset captured
+BEFORE any setup polling; actual OPEN foreground/live_repair and BIND before
+each original BGEN. Persistent CREATE during actual seedadmission, actual
+SCHEDREADY/replies and exact OS pipe/process proof; all rawstdout retained,
+only schedulerREADY/REPLY excluded from unchanged native timing parser. Do not
+drop actual T/BT emitted while controls are pumped (negative already tested).
+
+Every request's common start is BEFORE serialized setup/queue. Retain both:
+  native_only_measurement: BGEN actualwrite -> output/BDONE/fullretirement;
+  end_to_end_measurement: requeststart -> first useful/full useful output ->
+   actual fullretirement, INCLUDING queue+OPEN/BIND and any request setup.
+Explicit per-request setup requested/begin/end and one-time threadCREATE duration
+are retained. CREATE amortization requires actual durable reuse as already done;
+never assume free creation, never omit OPEN/BIND from net comparison. Mandatory
+SCHEDstderr overhead remains real timed cost. DiagnosticsOFF means qualification
+selectorsOFF, NOTlogfree; log_free=false must remain. No speedup claim based
+only native-only timing, BDONE alone or kernel latency.
+
+Current configs ON-fullprofile-{young,aged}-32k.json are fixed data: full196632B
+profile/cacheauto/pre16/context32768/batch2group1/split24/INT8/reserve1536+2048;
+only explicit age1e18 vs1ns testpolicies; actual POLICY/LIMITS from ownerinput.
+The -help-supported old/OFF and ON-young-32k olderconfigs are not silent substitutes.
+All qualifier/fault/debug/state/oracle/nativewitness selectors absent by presence,
+including0, in timed runs. /proc actualbinary/argv/environment, model/pack/profile
+and runtime pinning must continue. Parent900sinner+60cleanup and2MiBcombined
+UNFILTERED stdout/stderr bound retained; near32k mandatorySCHED may exceed it.
+That is unresolved feasibility, not a reason to suppress receipts. Budget
+adaptation needs explicit review + freshgrant; do not copy occupied32MiB cap
+without pricing performanceharness overhead/actual fixed workload.
+
+PREREQUISITES-PENDING.json currently has null actual_occupied_32k,
+matched_profile_semantics,same_profile_two_slot_witness,independent_release;
+stateUNBOUND/executablefalse. require_prerequisites unconditionally raises EVEN
+if a caller forges BOUND. inject_managed calls it before mutation; entry validates
+for_execution beforePopen. This is a real deliberate codeblock, not just a JSON
+toggle. Existing draft staging command below only creates BLOCKED payload:
+ python3 -B "$PERF/stage_managed.py" --candidate "$FRESH_PERF_CAM/candidate" --source-freeze "$BUILD" --config "$PERF/ON-fullprofile-young-32k.json" --workload "$ACTUAL_QUALIFIED_WORKLOAD_JSON" --profile "$OCC/prepared-payload/expert-profile.bin" --binding "$BIND" --managed-policy "$POLICY" --prerequisites "$PERF/PREREQUISITES-PENDING.json" --policy young-test-only --control-timeout-seconds 15 --output "$NEW_BLOCKED_PERF_PAYLOAD"
+This has NO executionauthority and injection MUST refuse. Current qualifier
+source/template references remain77d/a83c, actual controlclient bytes must match
+$SRC/serve/scheduler_control.py. Changing readinessboolean is not completion.
+
+Smallest missing implementation, after resume, in NEW reviewed successor:
+1. Complete real evidence binder consuming actual occupied32k-evidence, matched
+   fullprofile semantic receipts/score, actual untimed sameprofile native2DECODE
+   witness and exact independent release/chronology. Bind complete files/paths/
+   hashes + actualsource/artifact/runtime/profile/config/workload/policy. Reject
+   sourcefa/6807,512context substitutions, otherattemptrelease, missingfulloutput,
+   profile/context/cache/reserve drift and changedactualhistory. Remove the
+   unconditionalblock only in that reviewed successor, replace by realverification;
+   frozenWIP remains unchanged and cannot be activated by fakeBOUND.
+2. Add fixed untimed managed witness using existing managedDriver/historyreaders:
+   EXACT same profile/argv/seeds/requests/env as planned timing, except only
+   STRATA_HTTP_NATIVE_RECEIPTS and STRATA_HTTP_TWO_SLOT_RECEIPTS='1'. Actual two
+   independent eligible same-tier requestpairs and native operation with TWO
+   DECODE rows, both exact BOWN_COMMIT/BT and SCHED_UNIT per-member ACKs; GROUP2
+   alone can include KNOWN, and SCHEDcohort2 metadata alone is not nativeproof.
+   Compare with existing exact CLI:
+    python3 -B "$PERF/compare_witness.py" --measured-plan "$ACTUAL_TIMED_PAIR_PLAN" --witness-plan "$ACTUAL_WITNESS_PAIR_PLAN"
+   This compares settings only, not actualwitnesssuccess; additionally full
+   Lifecycle + exacthistory read_two_slot sealedFalse alloccupancyretired pattern
+   and actualraw sameoperation twoDECODE required. Current timed stager forbids
+   those selectors, so create separate fixed untimed adapter, not relax timed
+   diagnostic filter. Preserve actual journal/raw proof and independent release.
+3. Derive workload ONLY from real semanticallyqualified actualseed histories and
+   edited prompts, exact actualtokenizer. Fixed expectedseed tokens are a valid
+   within-ON actualdonor check, not evidence that approximate ON targettokens must
+   equal OFF/cold. Actual ON targethistories may differ; validate accepted/pending/
+   donorbase/cumulativewatermark and usefulknownfact independently. Fullrequested
+   usefuloutput criterion retains all requested outputs on lengthfinish; natural
+   EOS preserved but full_requested=false/performancefalse for budget comparison.
+4. Finish reviewed injection path/fullprofile mounts and root grants/preflights.
+   Existing draft inject_managed is onlyblocker, copied inject_pair/stage_pair
+   are legacyreferences. Do not use them to execute plainON by accident. Reuse
+   original runner exact seams/profilegrant changes as occupied injector does,
+   bind timingpayload ownactualhashes and performancegrantbindings; no newrunner/
+   supervisor framework. Add actualentry validation beforePopen. Rootindependent
+   review/checkpoint; regenerate freshstage not edit existingWIP/frozenreceipts.
+5. Future tests first: realOSpipeCREATE/OPEN/BINDordering and concurrentoutput
+   duringcontrolsetup; missingACK/reply/epoch refuses; fulloutput/lateBT/fullretire;
+   setup artificiallyslow demonstrably increases endtoend while native series
+   separate; forgedBOUND/otherprofile/otherrelease/context512 fail; failedpreflight
+   makes no resource call; actualprofilemount/grant/inputclosure consistent.
+   Last actual47 tests can be rerun only once these changes authorized. Their
+   existing exact command (cwdPERF) is:
+    python3 -B -m unittest -v test_managed_performance test_cumulative_timing test_pair_stage test_protocol_timing test_witness_settings
+   This plan did NOT run it. Prior47synthetic tests do not prove model speed.
+
+Expected actualtimed outputs from successor reuse originalexecute paths:
+ attempt/two-slot-performance/{pair-report.json,stderr.log,stdout.json,
+   stdout-raw.json,managed-setup-journal.json}, actualresult/proc/grant/release.
+pair-report statusOBSERVED alone performance_qualified=false; preserve native-only
+and endtoend subreports, useful_output_full_requested/natural_eos, mandatory
+schedulerreceiptsoverhead and rawcomplete stream. Add aggregate analysis using
+these actualfiles after releases, not fabricated speedupthreshold in runner.
+
+Proposed experiment acceptance (NOT yet an owner-approved numeric threshold):
+ - at least3 counterbalanced paired OFF/ON blocks with fixed exactworkload,
+   startup/warmup separate and all attempts/results included, same artifact/
+   runtime/profile/cache/reserves/context/sampler/resourceenvelope;
+ - exactsameinput useful-task contract and complete actualoutput/retirement,
+   raw per-request queuedsecondrequest TTFT, ITL/gaps, first/lastusefuloutput,
+   fullretirementwall, useful/fullretirethroughput and setup/CREATE cost;
+ - measured CPU/RAM/GPU peaks and loading/copy/repair/return overhead, no hidden
+   cost outsidecapture and no diagnosticONoracle timing substituted;
+ - report perblockpaired distribution/range and everyfailure/earlyEOS, no
+   cherry-pick or averaging failedfullbudgetruns into a speedup;
+ - owner chooses explicit useful speed/latency/resource margins and allowed
+   regression BEFORE accepting trials. No numericalpercentage adopted here.
+Run young and agedstress as distinct labelledmechanism trials if required; age1
+is not tuned productionpolicy. No boundedwait claim with stricttiers. Applicable
+real priority/activity/dependency/lifecycle proof belongs to companion plan.
+
+11. RUN ORDER, FAILURE BRANCHES, REUSE AND STOP CONDITIONS
+
+Recommended minimum after Astra review AND owner resume:
+ (i) retain77d/a83c/source/runtime and signed component; rootreverify exactrelease
+     and healthybaseline once. Complete adapter edits/review/hostchecks in a
+     coherent small set; no automaticenginebuild forPythonfixes.
+ (ii) compact50race singlejob freshauthority; retainedreturn+occupied32k fresh
+     twojobexistingbatch whenready (onebaselinecycle for thatpair). Selected
+     repair+ordinary3cases+native3/4 alreadypass withinstatedscope, reuse.
+ (iii) independently required HTTPpriority/dependency/lifecycle/image/installed
+     launch/refusal/restart/rollback work from companion plan; no overlapping
+     GPUcampaigns. Do not mistakenly promote nativebinary receipts to packaged
+     Pythonruntime/installedselector proof.
+ (iv) complete actualmanagedtaskquality including matching32kfullprofile; actual
+     sameprofiletwoDECODE witness+release; explicit performancebinder. Separately
+     finish legacyserialfeature optional/control/fatal/3sites if supported scope
+     requires them. Batch only jobs whose actualprereqs are alreadycomplete.
+ (v) original/currentOFF observation if desiredwholebackendneutrality; matched
+     currentfullprofileOFF/managedONcounterbalanced measurement aftergates.
+ (vi) root/ownerreview actualscopedmatrix, applicablefullrequirements and chosen
+     policy/margins; normalimmutableimage+installedlauncher+disable/rollback,
+     then bounded optinexperimentalrelease. No broadproductiondefaultpromotion.
+All future resourcejobs root-owned; no agents launch or send external messages.
+
+Failure handling / reuse rules:
+ - Offlineorpreflightrefusal: no baseline stop; fix exactpayload/identity in NEW
+   path, capture actualexit and review once. Do not call refusal a resourcePASS.
+ - Model startupnonzero: retain actualexit+boundedstderr, do not wait generic
+   deadline/pretendREADY. Compare exactargv/env/private-loader/guard/source pins.
+   Actual old6807managedstartupfailure alreadyfixed77d; do not reintroduce it.
+ - Windowmiss/EOS: preserve transcript/actualtokenizedbudgets, identify real
+   observationcurve; retry only freshcampaign after justified fixture review.
+   No automaticlongerhealthybudget/tolerance/STOPgate waiver.
+ - Numerical/history/restoration/blockedwork/ACK mismatch: productblocker; stop
+   downstreampromotion, smallest sourcefix+oldbugnegative+coherentfreezebuild,
+   bind newartifacts and rerun directlyaffected requiredcells. OldsourcePASS
+   remains historical and cannot populate newartifactmatrix. Unchangedreceipt
+   can only be source-correctness background with explicit scope.
+ - Deadline/OOM/transcriptoverflow: not numericalPASS. Exactcleanup/restoration
+   first; reportmeasuredcost and require explicitnewbounds/profiledecision. No
+   reuse of sameattempt/grant or unboundedretryloop. Pausedreturn wasinterrupted,
+   so firstfreshfullrun stillunknown.
+ - FatalCUDAuncertainty: failureowner/poison proof and exactprocess/container
+   release mandatory; no successfultargetstateclaim; restoreoriginal onlyafter
+   ownedoccupancyabsent+daemonhealthy. Candidate restart/drill stillseparate.
+ - Any unclearcleanup/foreignGPUoccupancy: no launch/restart/killforeignwork;
+   rootreconciles exactATTEMPT. Root baselinehealthfailure means hold even if
+   payloadPASS. Restoration does not prove deploymentrollback nor secureauth.
+ - Grant expiration before execute/freeze: freshstage datedgrant/campaign;
+   expiration whileattemptmaylive: NEVER renew; ownercleanup/release first.
+   DeliberatefreshOWNER0 only becomes authority via explicitrootfinalization
+   afterclosurecheck, never by executiontool. No mutationbehindfrozenconfigpins.
+ - Image/runtime-onlychange: explicit engine/runtime splitinventory/signature/
+   trustoverlay closure may repackage unchangedengine; no pretendingPythonmatches
+   oldenginesnapshot. Newimage needs its ownHTTP/normalimage proof. Root's
+   canonical/frozencomparison is not installed-launcher proof.
+ - Sameartifacts/payloadunchanged: reuse completedsource-specificnumerics+
+   independentrelease byhash, fullprofilefile and immutablepreparedpayloads;
+   freshcampaign/token/grant/config for execution; keep originalrawfailures.
+   A batchstopskips unstartedjobs; do not markthemfailedorpassed. A completed
+   earlierjobPASS staysvalid if independentlyreleased and scopesmatch.
+
+12. PROCESS COSTS TO AVOID; ASTRA REVIEW QUESTIONS
+
+Avoidable costs already visible: repeatedpackaging/rebinding/checkpointlayers
+before the firstcompleteendtoendcase; preparingmanydownstreamjobs whileactual
+prereqsUNBOUND; the137retrychosenwithoutremovingartificial128minimum after the
+firstactualprefill/peerbudgetcurve. The compact50case nowuses actual4chunk
+headroom and strongerunchangedgate. Do not repeat timingblindfixturechanges.
+Use one immutableengine/profile/runtime, narrowfixedadapters and the existing
+restoringbatchsupervisor; independentreview oncepercoherentclosure, thenreal
+execution. Preserve necessarysource/artifactidentity, samehistorynumerics,
+physicalretirement, resourcebound and independentrelease/restoration. Those
+gates are not overhead to delete. No newgeneralframework or duplicatePASSreruns.
+
+Astra must adversarially review these concrete decisions before execution:
+1. Does compact50actually preserve acceptedtargetSTOP+futurepeer and validchat,
+   with no otherfixturethreshold/budgetchange? Is4chunkheadroom a reasonable
+   bounded candidate, clearlynotmeasuredPASS? Prefer no thirdblindtimingguess.
+2. Are selectedPASS and pausedreturn/missingCID/unattemptedoccupied distinguished
+   exactly? Can anotherattemptrelease or batcherror falsely qualify a cell?
+3. Is freshsix-checkauditconsumer identicalinidentity/chronologystrength to the
+   genuineaudit, with no normalizedreceipt substitution? Are faultONnormalcontrol
+   and threeactualfatal1exits covered separately frommanagedSTOP/restoration?
+4. Is semanticdraft noSTOPreader/API/expectedmapping repaired in isolatedcode,
+   freshcold independent, actualdonor/approximateadmission and fullmanagedACK
+   coverage authentic? Are512quality and32kmatchedquality distinct?
+5. Is actualoccupied32k historytruly F32700->32767/A32768 with fullprofileand
+   sameoperation2DECODE, boundedrawlogs/actualresources, noallocationonlystandin?
+6. Do matchedwitness and timedplans differ only approvedwitnessselectors; can
+   GROUP2KNOWN/cohortmetadata sneak in as2DECODE? Is everyactualmemberACKbound?
+7. Are all OPEN/BINDqueue/setup and one-timeCREATE costs accountedfor and all
+   usefuloutputs/fullretirement complete, with no approximateON/OFFtokenequality
+   requirement or native-onlynetperformanceclaim? Do fullprofileandcachematch?
+8. Do all attempted/datedoldgrants requirefreshstage, OWNER0inactivefinalization
+   remainexplicit, and short-livedgrantissuance happenonlyatactualrootlaunch?
+   No code/testing/resources are authorized merely by this plan.
+
+Review output should name exact source/predicate/receipt, strongest defense,
+minimal required correction or unsupported scope, and rerun scope. If a step has
+no executable adapter yet, keep TO_IMPLEMENT/UNBOUND rather than invent a command
+or receipt. Applicable fullcompletion/deployment criteria require root/owner
+adjudication; this document is a runnable-path plan, not self-approval.
+
+QUICK EXECUTION-READINESS INDEX FOR THE ROOT PLAN
+This index is the short decision surface; earlier sections carry reproducibility.
+All execution remains forbidden while paused.
+
+EXISTING CLI, usable after fresh staging/authorization/review:
+ - Compact retry: existing path-relative prepare.py in section4, copied to NEW
+   sibling preparation; preserves50token fixture, target4 prerequisite and OWNER0.
+   Then existing freeze_config.py / supervise.py. Existing inactive closure can
+   instead receive fresh final authorization only by explicitroot adoption;
+   choose ONE, never both. No pending engine/source change.
+ - Retained return: standard stage.py + RETURN/inject.py with prepared-payload;
+   merge actual injection JSON and freshgrant. After actual run/release, existing
+   RETURN_REPORT/native_pass.py --write, then without--write. Paused attempt is
+   not an input to --write. No pending source/driver change.
+ - Occupied32k: standard stage.py + OCC/inject.py with prepared-payload and full
+   profile/transcript/prerequisite pins; after actual run/release existing
+   OCC/native_pass.py --write, then without--write. Existing old dated campaign
+   is NOT a ready launch. No pending source/driver change.
+ - Original/currentOFF: existing combined prepare.py --planned-launch-epoch
+   --output, ONLY after pristine originalgrant/attempt and callback%114 checks;
+   existing supervise.py. If those identities changed, a fresh identity-only
+   preparer/campaign successor is TO_IMPLEMENT before that CLI may execute.
+
+EXISTING INTERFACE, NOT YET A RUNNABLE CURRENT JOB:
+ - Serial optional7arm has a separate root-prepared/preflighted actual77d job (see ROOT CORRECTION in section7), not yet run; do not redo solved staging.
+ - Old serial wrapper/faultcontrol/fatal3site/cancel3site: staging CLI exists
+   exactly as section7, but actualartifacts are NULL and genuine6-check audit is
+   incompatible with frozen5-check consumer. Fresh exact binding+strictconsumer
+   successor/negative tests/rootreview are TO_IMPLEMENT. Do not try old CLI with
+   fa receipts or edit rawrelease to make it pass.
+ - Performance stage_managed.py exists, but only produces blockedUNBOUND draft.
+   Injection/runtime intentionally alwaysrefuse. The real evidencebinder,
+   untimedmatchedwitness adapter, matched32k semanticworkload, fullprofile grant/
+   mount injection and independentreview are TO_IMPLEMENT. No readyperformance
+   launchcommand is claimed; original plainON stage_pair is not a substitute.
+ - Managed edited-label semantics has NO stage/entry/grant/launchCLI. Concrete
+   draftreader/API fixes, independentcoldexecutor, tokenizer/preflight/staging,
+   boundedcleanup/tests/review are TO_IMPLEMENT (section8).
+
+MINIMAL FAULT / REFUSAL / RESTORATION MATRIX STILL TO CLOSE ON CURRENT ARTIFACT
+Cell                                  Existing evidence / required next result
+Optional/default faultselector refusal Actual same-build25CTests each enabled
+                                      variant includes selectorrefusal build
+                                      steps; preserve actualfixtures. Not live
+                                      GPU failstop or candidate recovery.
+FaultON selector-absent normalcontrol  NOTRUN77d; existing blockedstager needs
+                                      bindingfix; expect actualcomplete seed+
+                                      edited, engine0/control-report and release.
+FaultON private_replay                 NOTRUN77d; fresh site, engine1, actual
+                                      durable launch/query/RAWpoison chain,
+                                      no successfultargetDONE/state, release.
+FaultON second_partial_copy            NOTRUN77d; fresh site, engine1, stage0
+                                      completed/realstage1 APIrefusal+RAWpoison,
+                                      no successfultargetpublication, release.
+FaultON final_exact_copy               NOTRUN77d; distinct finalwhole-state
+                                      purpose/cuts, engine1, actualcopyrefusal/
+                                      failureownerretained, exactrelease.
+Malformed/stale/unsupported managed    Existing CPU/source/transport tests are
+control/BIND/dependency refusal        scoped implementation evidence. Required
+                                      actualHTTP/control refusal+healthyepoch/
+                                      physicalnonexecution is in companion
+                                      lifecycle plan, not serialfault receipts.
+Normalimage diagnostics/selector       Packaging/env tests are not installed
+presence refusal/defaultOFF            launcher or normalimage actualproof;
+                                      companion normalimage/installedlaunch
+                                      plan must close exact parent/childenv,
+                                      disablecompatibility and switch gates.
+Per-attempt owned release + original   ACTUAL for numerical3/4, ordinary3case,
+baseline restoration                  selectedrepair; failedrace/pause released
+                                      and restored honestly. Must be freshly
+                                      established for every futureattempt.
+Candidate restart after fatal failure NOTESTABLISHED by existing nativeSTOP/
+and real deployment rollback          baseline-restoration receipts; companion
+                                      recovery/rollback drills TO_IMPLEMENT.
+
+Do not add an unreviewed fault mode or engine hook just to expand this matrix.
+Preserve currently supported typed sites; root/Astra decide supportedserial vs
+managedsurface explicitly. None of these missing cells can be filled by historical
+faPASS, currentbuildCPUtests, a syntheticreceipt or a supervisorrestored boolean.

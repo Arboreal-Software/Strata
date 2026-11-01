@@ -1,0 +1,20 @@
+{
+  "scope": "native-two-donor-concurrent-repaired-numerical-observations",
+  "status": "FAIL",
+  "result": null,
+  "error": "ValueError: Native exited before same genuine native operation with two repaired decode rows",
+  "engine_exit": 70,
+  "artifact_sha256": "c42df672220c5385d42253d612172be49334d34d11b46d1e75c39d1f01aa55d2",
+  "source_manifest_sha256": "6fc1e89ebba9dfca5da608a06ad8e0d037742787bedeecc9e4a1e7dfe06aaaa5",
+  "numerical_pass": false,
+  "qualified": false,
+  "deployable": false,
+  "target_request": 3,
+  "managed_error": "ValueError: Original native numerical driver/oracle did not pass",
+  "managed_scheduler": {
+    "status": "FAIL",
+    "error": "ValueError: Original native numerical driver/oracle did not pass",
+    "qualified": false,
+    "deployable": false
+  }
+}

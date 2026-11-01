@@ -1,0 +1,645 @@
+{
+  "snapshot_utc": "2026-11-01T22:52:07.665664+00:00",
+  "implementation": "PAUSED",
+  "source_commit": "c1aad1fda12c0c3924f7f8870cfbb008e7f7ebc0",
+  "catalog_rows": 71,
+  "catalog_note": "Mixed campaign/preparation records, not comparable trials; latest diagnostic native is separately indexed in outcomes, not silently added to catalog denominator.",
+  "current_review_url": "https://clairesagentn-xnh7316.slack.com/archives/C0C2E4KL03X/p1793573375026029",
+  "packet_parts_url": "https://clairesagentn-xnh7316.slack.com/archives/C0C2E4KL03X/p1793573183318949",
+  "dispatch_correction": "Exact GPT-6 Astra Pro label rejected by router; corrected GPT-6 Pro thread, requested served identity must be confirmed by coordinator.",
+  "latest_release_correction": "Diagnostic native now independently released/restored, ROOT-RELEASE included. Packet earlier audit-not-yet-performed statement is historical. No full numerical/deployment PASS.",
+  "historical_push_rejection_reason": "UNKNOWN: persisted notes say public evidence push rejected; exact old review text unavailable. New explicit owner authorization and filtered export apply.",
+  "sanitization": "No key/model/binary/environment-file reads. Workspace/home paths made symbolic; emails/credential-shaped values and sensitive JSON fields redacted. Never treat sanitized derivatives as byte-identical originals.",
+  "records": [
+    {
+      "origin": ".local/handoffs/strata-resume-20261101/DEEP-PROCESS-ASTRA-REQUEST.txt",
+      "origin_bytes": 4011,
+      "origin_sha256": "65bfa0e078de9742f76060bf7ad09c1c5dabf2d53be82112ee5fa1bb8b45dda5",
+      "published": "review/DEEP-PROCESS-ASTRA-REQUEST.txt",
+      "published_bytes": 4011,
+      "published_sha256": "65bfa0e078de9742f76060bf7ad09c1c5dabf2d53be82112ee5fa1bb8b45dda5",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-resume-20261101/DEEP-PROCESS-ASTRA-PACKET.txt",
+      "origin_bytes": 67554,
+      "origin_sha256": "09197b9c0fa36956497e710cabe60096b100cf9d6e84607a2283676f791a7bf1",
+      "published": "review/DEEP-PROCESS-ASTRA-PACKET.txt",
+      "published_bytes": 67504,
+      "published_sha256": "9cd0105692efe4c56cfd41b55e6460f5be6778621b820735e5698a4122faec95",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-resume-20261101/DEEP-PROCESS-ASTRA-DISPATCH.json",
+      "origin_bytes": 1042,
+      "origin_sha256": "296161512f6693e10df3f0def02f96f32384d987c28350df00ec964fbaada048",
+      "published": "review/DEEP-PROCESS-ASTRA-DISPATCH.json",
+      "published_bytes": 1042,
+      "published_sha256": "296161512f6693e10df3f0def02f96f32384d987c28350df00ec964fbaada048",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-resume-20261101/CONTINUE-NOW-20261101.txt",
+      "origin_bytes": 8171,
+      "origin_sha256": "caea49e2e98661e363ee91d68e5d5b1d465f2f3d6f4e9d664cf968ca1ecea1f6",
+      "published": "review/CONTINUE-NOW-20261101.txt",
+      "published_bytes": 8151,
+      "published_sha256": "75ffcb46b4b9490f5c26820951f1bafe5f11fa96ee0c6adc9a106f289797fb90",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-completion-plan-20261101/PLAN.txt",
+      "origin_bytes": 29424,
+      "origin_sha256": "3d423495092194123f1a9cf3c93a3218ce5274cf89809b4efb63f5dae94d3b01",
+      "published": "plan/PLAN.txt",
+      "published_bytes": 29394,
+      "published_sha256": "3e473ea9f668c542057f93a4049b8b430f46588d9f16ae4cd3bd67c97259c168",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-completion-plan-20261101/DISPOSITION.txt",
+      "origin_bytes": 6133,
+      "origin_sha256": "c63f2dbab2f2a256f888108cf33e7b1f5e5d9fcd02bcdfc2db8b19b22cff2c96",
+      "published": "plan/DISPOSITION.txt",
+      "published_bytes": 6133,
+      "published_sha256": "c63f2dbab2f2a256f888108cf33e7b1f5e5d9fcd02bcdfc2db8b19b22cff2c96",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-completion-plan-20261101/full-scope-audit.txt",
+      "origin_bytes": 60298,
+      "origin_sha256": "e265be58ea671175d20738a42f8795c18d418c4b79adad496a0be7e7046e2f86",
+      "published": "plan/full-scope-audit.txt",
+      "published_bytes": 60278,
+      "published_sha256": "b94a2b94ab5a73622007699fcc9e426ef535a970edeb850bbbd6afb6e995968f",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-completion-plan-20261101/lifecycle-and-serving-plan.txt",
+      "origin_bytes": 20739,
+      "origin_sha256": "ed0e5503c83e4c5c412894fbf7deeab0d57bd12e2dac66d51eec8d749f08c118",
+      "published": "plan/lifecycle-and-serving-plan.txt",
+      "published_bytes": 20737,
+      "published_sha256": "3af6e8fd29a21459e22f48cf48cb8bd97780afb2215306b2275d2a7df546c1b9",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-completion-plan-20261101/native-and-performance-plan.txt",
+      "origin_bytes": 69383,
+      "origin_sha256": "15e9eb7841705f01db5b37e439836754edef6269b94e35e86341f5a003d4f6db",
+      "published": "plan/native-and-performance-plan.txt",
+      "published_bytes": 69343,
+      "published_sha256": "d63cb4a918704e79254aa1e18731c200af1e8b415dcb4c0e57b27ae861106e5b",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-completion-plan-20261101/fixture-catalog.json",
+      "origin_bytes": 555909,
+      "origin_sha256": "e7f2828ca1fe2668400a3617daab02e019abb38611bc37c0060516cd065da72f",
+      "published": "plan/fixture-catalog.json",
+      "published_bytes": 541821,
+      "published_sha256": "26090c692daa308ce813c4311f31c94198f36bf2060114c3786312c0ca9eb70b",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/strata-completion-plan-20261101/D2-EXECUTION-AMENDMENT-20261101.txt",
+      "origin_bytes": 3251,
+      "origin_sha256": "22129b9da156dd690aba137d2f06e60b1f912f036e2a0340a1bae3dd112a76c7",
+      "published": "plan/D2-EXECUTION-AMENDMENT-20261101.txt",
+      "published_bytes": 3251,
+      "published_sha256": "22129b9da156dd690aba137d2f06e60b1f912f036e2a0340a1bae3dd112a76c7",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/handoffs/HANDOFF-complete-strata-features-20261027.md",
+      "origin_bytes": 7230,
+      "origin_sha256": "dc657e023f783cce3631be9b2c85c9e2b998dbfad29340f902b6bbdc0541937d",
+      "published": "plan/original-ownership-handoff.md",
+      "published_bytes": 7190,
+      "published_sha256": "645166f92ef69bea6ee9c5b96859a2f903e01296461a1764276722083ccb29c6",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/01-foundations/p00/PLAN.md",
+      "origin_bytes": 20575,
+      "origin_sha256": "4f6048c950ca337c31652b18a6dd1c8f80f17dee907a2d8aa7c006139e2c0e5f",
+      "published": "requirements/01-foundations/p00/PLAN.md",
+      "published_bytes": 20575,
+      "published_sha256": "4f6048c950ca337c31652b18a6dd1c8f80f17dee907a2d8aa7c006139e2c0e5f",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/01-foundations/p01/PLAN.md",
+      "origin_bytes": 27733,
+      "origin_sha256": "4109e8d2703035c8e87664225939ffdbbf8616effed0fcc2e48cebd7799d32fb",
+      "published": "requirements/01-foundations/p01/PLAN.md",
+      "published_bytes": 27733,
+      "published_sha256": "4109e8d2703035c8e87664225939ffdbbf8616effed0fcc2e48cebd7799d32fb",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/01-foundations/p02/PLAN.md",
+      "origin_bytes": 60794,
+      "origin_sha256": "62d32bdd2ccc36cde24e1fc0affd82ee076237222c96d899b9fb8a09db8d80f1",
+      "published": "requirements/01-foundations/p02/PLAN.md",
+      "published_bytes": 60794,
+      "published_sha256": "62d32bdd2ccc36cde24e1fc0affd82ee076237222c96d899b9fb8a09db8d80f1",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/01-foundations/p02/elastic-retirement/PLAN.md",
+      "origin_bytes": 14474,
+      "origin_sha256": "a2f3960a4211e15482461a74aac9e620d765199c096bd32e360a5035e9c46578",
+      "published": "requirements/01-foundations/p02/elastic-retirement/PLAN.md",
+      "published_bytes": 14474,
+      "published_sha256": "a2f3960a4211e15482461a74aac9e620d765199c096bd32e360a5035e9c46578",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/01-foundations/p03/PLAN.md",
+      "origin_bytes": 81874,
+      "origin_sha256": "588f6944cd0c09b68fdade9f90a1bb3633b6ea9e7709ff70c5e0fe3c63d9c4ef",
+      "published": "requirements/01-foundations/p03/PLAN.md",
+      "published_bytes": 81874,
+      "published_sha256": "588f6944cd0c09b68fdade9f90a1bb3633b6ea9e7709ff70c5e0fe3c63d9c4ef",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/01-foundations/p04/PLAN.md",
+      "origin_bytes": 22394,
+      "origin_sha256": "0b4ea308717e2667c59346308ccfaec899933a2be9b6e438ef47c603102c8057",
+      "published": "requirements/01-foundations/p04/PLAN.md",
+      "published_bytes": 22394,
+      "published_sha256": "0b4ea308717e2667c59346308ccfaec899933a2be9b6e438ef47c603102c8057",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/01-foundations/p04/shared-document-prefix/PLAN.md",
+      "origin_bytes": 5622,
+      "origin_sha256": "48e74b2569e8625d9a95d337171faf674107c1208482ee142367cf643a1425b2",
+      "published": "requirements/01-foundations/p04/shared-document-prefix/PLAN.md",
+      "published_bytes": 5622,
+      "published_sha256": "48e74b2569e8625d9a95d337171faf674107c1208482ee142367cf643a1425b2",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/02-exact-parking/p05/PLAN.md",
+      "origin_bytes": 66520,
+      "origin_sha256": "7112aab972dfd023b937f3a6fa1b499f7cacd33820d110d4c327a90dcdbf6c8c",
+      "published": "requirements/02-exact-parking/p05/PLAN.md",
+      "published_bytes": 66520,
+      "published_sha256": "7112aab972dfd023b937f3a6fa1b499f7cacd33820d110d4c327a90dcdbf6c8c",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/02-exact-parking/p06/PLAN.md",
+      "origin_bytes": 25275,
+      "origin_sha256": "d3cff07df35e511e9562cef9390231e3b7dcd216165fa9eb8d5099926a3763a5",
+      "published": "requirements/02-exact-parking/p06/PLAN.md",
+      "published_bytes": 25275,
+      "published_sha256": "d3cff07df35e511e9562cef9390231e3b7dcd216165fa9eb8d5099926a3763a5",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/03-scheduling/p07/PLAN.md",
+      "origin_bytes": 23565,
+      "origin_sha256": "361105a30a96c4121c996d66714b3fee9a35cc9c54b84144f327d45cb1fc119d",
+      "published": "requirements/03-scheduling/p07/PLAN.md",
+      "published_bytes": 23565,
+      "published_sha256": "361105a30a96c4121c996d66714b3fee9a35cc9c54b84144f327d45cb1fc119d",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/03-scheduling/p08/PLAN.md",
+      "origin_bytes": 88252,
+      "origin_sha256": "9a9098e7218d6bc2cc27aa943acc0615689b77a96ef3d03b651da37bf0197b08",
+      "published": "requirements/03-scheduling/p08/PLAN.md",
+      "published_bytes": 88252,
+      "published_sha256": "9a9098e7218d6bc2cc27aa943acc0615689b77a96ef3d03b651da37bf0197b08",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/03-scheduling/p09/PLAN.md",
+      "origin_bytes": 83598,
+      "origin_sha256": "f9159be21c2e77bef357ef60546e60daf2c41d64b7bda482fd64d6b2e5dcbe58",
+      "published": "requirements/03-scheduling/p09/PLAN.md",
+      "published_bytes": 83598,
+      "published_sha256": "f9159be21c2e77bef357ef60546e60daf2c41d64b7bda482fd64d6b2e5dcbe58",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/03-scheduling/p10/PLAN.md",
+      "origin_bytes": 28987,
+      "origin_sha256": "978cb9ae13b727ad23c56dbd75952bb6ec5fd130e5a539b73fc79711fceee418",
+      "published": "requirements/03-scheduling/p10/PLAN.md",
+      "published_bytes": 28987,
+      "published_sha256": "978cb9ae13b727ad23c56dbd75952bb6ec5fd130e5a539b73fc79711fceee418",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/04-repair/p11/PLAN.md",
+      "origin_bytes": 29142,
+      "origin_sha256": "2a45197d3ce137645a8b56f5895d0248962cde2065b534f136d8d56195193a53",
+      "published": "requirements/04-repair/p11/PLAN.md",
+      "published_bytes": 29142,
+      "published_sha256": "2a45197d3ce137645a8b56f5895d0248962cde2065b534f136d8d56195193a53",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/04-repair/p11/weight-stream-screen/PLAN.md",
+      "origin_bytes": 5309,
+      "origin_sha256": "bd043e9ce123a5bed75ff1d555314e4b6c1c23020371f193a6ec69620cb31038",
+      "published": "requirements/04-repair/p11/weight-stream-screen/PLAN.md",
+      "published_bytes": 5309,
+      "published_sha256": "bd043e9ce123a5bed75ff1d555314e4b6c1c23020371f193a6ec69620cb31038",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/04-repair/p12/PLAN.md",
+      "origin_bytes": 35339,
+      "origin_sha256": "ea88fdfab5cc55eff76a99a2d1f310b56ca214aedc6d1bbb4da73dc86a08e910",
+      "published": "requirements/04-repair/p12/PLAN.md",
+      "published_bytes": 35339,
+      "published_sha256": "ea88fdfab5cc55eff76a99a2d1f310b56ca214aedc6d1bbb4da73dc86a08e910",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/04-repair/p13/PLAN.md",
+      "origin_bytes": 52505,
+      "origin_sha256": "f5e709bded559e5032a05e401888f3cf55915b7d71412172dc954613254f8440",
+      "published": "requirements/04-repair/p13/PLAN.md",
+      "published_bytes": 52505,
+      "published_sha256": "f5e709bded559e5032a05e401888f3cf55915b7d71412172dc954613254f8440",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/04-repair/p13/speculative-batch-interleaving/PLAN.md",
+      "origin_bytes": 16829,
+      "origin_sha256": "86eede0b905e5d303b7b60dfcb853b9712143740f22868825bfd3668e25cbfbd",
+      "published": "requirements/04-repair/p13/speculative-batch-interleaving/PLAN.md",
+      "published_bytes": 16829,
+      "published_sha256": "86eede0b905e5d303b7b60dfcb853b9712143740f22868825bfd3668e25cbfbd",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/04-repair/p14/PLAN.md",
+      "origin_bytes": 41774,
+      "origin_sha256": "38cae813bd911c4e43f9f4acaff831e88a1c79a9deb7cb202539b20aa25e17cb",
+      "published": "requirements/04-repair/p14/PLAN.md",
+      "published_bytes": 41774,
+      "published_sha256": "38cae813bd911c4e43f9f4acaff831e88a1c79a9deb7cb202539b20aa25e17cb",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/05-qualification/flash-next-512k-two-stream/PLAN.md",
+      "origin_bytes": 4245,
+      "origin_sha256": "1576a4497e7fd6c9d10ae423232d24dd352daad3da3eaf004c60d39afc1740a4",
+      "published": "requirements/05-qualification/flash-next-512k-two-stream/PLAN.md",
+      "published_bytes": 4245,
+      "published_sha256": "1576a4497e7fd6c9d10ae423232d24dd352daad3da3eaf004c60d39afc1740a4",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/05-qualification/p15/PLAN.md",
+      "origin_bytes": 103647,
+      "origin_sha256": "64907c66b0aa06651e58f83bc274a1be98505ff1f76d1de1847e280adc74f781",
+      "published": "requirements/05-qualification/p15/PLAN.md",
+      "published_bytes": 103647,
+      "published_sha256": "64907c66b0aa06651e58f83bc274a1be98505ff1f76d1de1847e280adc74f781",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "dev-baseline/work-items/06-voice-follow-up/flash-next-512k-two-stream/PLAN.md",
+      "origin_bytes": 209,
+      "origin_sha256": "4fa77e87ab7af9d2a944376259daa640131442e75d5ed09d4f444d15e2b51ef3",
+      "published": "requirements/06-voice-follow-up/flash-next-512k-two-stream/PLAN.md",
+      "published_bytes": 209,
+      "published_sha256": "4fa77e87ab7af9d2a944376259daa640131442e75d5ed09d4f444d15e2b51ef3",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "remote-policy-ownership/docs/qualification/owned-suffix-repair/README.md",
+      "origin_bytes": 2221,
+      "origin_sha256": "623d9e91bb890896fe6d5b862c16680eefb32afec40575137dcb9f0bfb72f86a",
+      "published": "worktree-snapshots/qualification-README.md",
+      "published_bytes": 2221,
+      "published_sha256": "623d9e91bb890896fe6d5b862c16680eefb32afec40575137dcb9f0bfb72f86a",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": "remote-policy-ownership/docs/qualification/owned-suffix-repair/evidence-index.json",
+      "origin_bytes": 11099,
+      "origin_sha256": "e190d5644fa32ca8b95321f2ba3b7e2ed4a9318eebd9536b3949da29c49546b3",
+      "published": "worktree-snapshots/qualification-evidence-index.json",
+      "published_bytes": 11099,
+      "published_sha256": "e190d5644fa32ca8b95321f2ba3b7e2ed4a9318eebd9536b3949da29c49546b3",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-build-root-20261101/ATTEMPT.json",
+      "origin_bytes": 398,
+      "origin_sha256": "2ed3e06e187cf3100aead9b9ad2102d107e757f21ba9dff2cdf0af570988079d",
+      "published": "outcomes/managed-prefill-cold-fallback-build-root-20261101/ATTEMPT.json",
+      "published_bytes": 370,
+      "published_sha256": "bc2e5b0f14aed3fde6926dc5579b175daa1a2e4180eac4d209a987cc358c3070",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-build-root-20261101/SUPERVISOR-RELEASE.json",
+      "origin_bytes": 1056,
+      "origin_sha256": "c1c0dada7866324f460133e19f72ce8988bc4a9a41a717fdde7b4973bf788b73",
+      "published": "outcomes/managed-prefill-cold-fallback-build-root-20261101/SUPERVISOR-RELEASE.json",
+      "published_bytes": 1056,
+      "published_sha256": "c1c0dada7866324f460133e19f72ce8988bc4a9a41a717fdde7b4973bf788b73",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-build-root-20261101/ROOT-SIX-CHECK-AUDIT.json",
+      "origin_bytes": 2117,
+      "origin_sha256": "b330e99c34c5284187dd951c03c13a881edaace9b317ffff46e208d4205dd541",
+      "published": "outcomes/managed-prefill-cold-fallback-build-root-20261101/ROOT-SIX-CHECK-AUDIT.json",
+      "published_bytes": 2117,
+      "published_sha256": "b330e99c34c5284187dd951c03c13a881edaace9b317ffff46e208d4205dd541",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-build-root-20261101/managed-priority-input-envelope-cpu-20261101T214902Z/result.json",
+      "origin_bytes": 2999,
+      "origin_sha256": "5fbb6aa4083c0eb78a7bbf6477ccf56b979f77d794698aa40829574268df020b",
+      "published": "outcomes/managed-prefill-cold-fallback-build-root-20261101/build-result.json",
+      "published_bytes": 2971,
+      "published_sha256": "6dac41d844c3c36a5172155486a82ebb8e05c2d682cae71a3c476789650822c9",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-build-root-20261101/ATTEMPT.json",
+      "origin_bytes": 397,
+      "origin_sha256": "8bc725db3324a880f740ffb4e136a67b43aca0a4852a6c1b949a25415d3ad354",
+      "published": "outcomes/restore-refusal-diagnostic-build-root-20261101/ATTEMPT.json",
+      "published_bytes": 369,
+      "published_sha256": "17d944b3f199786868241f188aa1ef91eac5b8e09eb01080e5a18be3f010e043",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-build-root-20261101/SUPERVISOR-RELEASE.json",
+      "origin_bytes": 1113,
+      "origin_sha256": "0370b75d43c6c3d6bdf06e80d277df46380462c1eb49c1c9208d73aab990be49",
+      "published": "outcomes/restore-refusal-diagnostic-build-root-20261101/SUPERVISOR-RELEASE.json",
+      "published_bytes": 1113,
+      "published_sha256": "0370b75d43c6c3d6bdf06e80d277df46380462c1eb49c1c9208d73aab990be49",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-build-root-20261101/ROOT-SIX-CHECK-AUDIT.json",
+      "origin_bytes": 2116,
+      "origin_sha256": "9f568a31dd67c7dda63ef12680aab1f8e928b20e74c5727baf356bbf43e6b4b7",
+      "published": "outcomes/restore-refusal-diagnostic-build-root-20261101/ROOT-SIX-CHECK-AUDIT.json",
+      "published_bytes": 2116,
+      "published_sha256": "9f568a31dd67c7dda63ef12680aab1f8e928b20e74c5727baf356bbf43e6b4b7",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-build-root-20261101/managed-priority-input-envelope-cpu-20261101T222850Z/result.json",
+      "origin_bytes": 2999,
+      "origin_sha256": "db86822bb243c55c813c34aa78260c149aba8256c002acf96a468ea25b1f2aed",
+      "published": "outcomes/restore-refusal-diagnostic-build-root-20261101/build-result.json",
+      "published_bytes": 2971,
+      "published_sha256": "4079251b5e68a5679a4d358e20cd44fea6cd6873a7db2cf3eb8e1eabbfb82ab2",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-native-root-20261101/ROOT-LAUNCH.json",
+      "origin_bytes": 813,
+      "origin_sha256": "e0d05c5e8889cc9dcd19da3b9ab4c744ef98bf6c4cd81ee23486f18e2eade7c0",
+      "published": "outcomes/managed-prefill-cold-fallback-native-root-20261101/ROOT-LAUNCH.json",
+      "published_bytes": 773,
+      "published_sha256": "63b891502e54c72684d8e82c06864a78d677761ebad5349e73f10cb91212d303",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-native-root-20261101/ROOT-RELEASE.json",
+      "origin_bytes": 1916,
+      "origin_sha256": "b14593af4aae7ea8571ab2a2d2d5a8606da1564621885f58226dd106e4b9b833",
+      "published": "outcomes/managed-prefill-cold-fallback-native-root-20261101/ROOT-RELEASE.json",
+      "published_bytes": 1896,
+      "published_sha256": "e03e1ce022daabcdfdfa0191b480f93c03b022a57f56af4b5e8607b0ea27a4df",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-native-root-20261101/output-strata-serve-suffix-repaired-20261101T220440Z/RESULT.json",
+      "origin_bytes": 377,
+      "origin_sha256": "b749796f3c5a1ecaf23b575cbea9162a91897a86caabe0694d6314def7b5dd91",
+      "published": "outcomes/managed-prefill-cold-fallback-native-root-20261101/supervisor-result.json",
+      "published_bytes": 377,
+      "published_sha256": "b749796f3c5a1ecaf23b575cbea9162a91897a86caabe0694d6314def7b5dd91",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T220440Z/result.json",
+      "origin_bytes": 8493,
+      "origin_sha256": "53e77381a797d043f06a39630d107aabd9f8dfc2365f11b0f2d7c79486001c10",
+      "published": "outcomes/managed-prefill-cold-fallback-native-root-20261101/runner-result.json",
+      "published_bytes": 8312,
+      "published_sha256": "54d7ff56f0a3c92415a1431b8ad2893cc1cc12548988edf789eaa8bae125ce24",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-cold-fallback-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T220440Z/two-slot-repair/stderr.log",
+      "origin_bytes": 36862,
+      "origin_sha256": "eeade86c4bd0c76c7ae8c6b621719d7979760e1ce7d61d86d39bb182af3439d7",
+      "published": "outcomes/managed-prefill-cold-fallback-native-root-20261101/stderr.log",
+      "published_bytes": 36862,
+      "published_sha256": "eeade86c4bd0c76c7ae8c6b621719d7979760e1ce7d61d86d39bb182af3439d7",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/ROOT-LAUNCH.json",
+      "origin_bytes": 809,
+      "origin_sha256": "a260055fd87b664f21390f676d1c9644753cbd0a668c60cc9ebaa6b0b13d4f22",
+      "published": "outcomes/managed-prefill-reserve4096-native-root-20261101/ROOT-LAUNCH.json",
+      "published_bytes": 769,
+      "published_sha256": "8a3bb8dd9012f9353c6037449caef77d0cee5dadad451c997e2f12879b84f810",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/ROOT-RELEASE.json",
+      "origin_bytes": 1950,
+      "origin_sha256": "eb373552d78e2d089b0a5ab5b013560da489744c3ecc9369056473187c12ac1c",
+      "published": "outcomes/managed-prefill-reserve4096-native-root-20261101/ROOT-RELEASE.json",
+      "published_bytes": 1930,
+      "published_sha256": "16ff1cb3f8111cee683ac976e6216b0a40f394082402146d172a4eab53277154",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/output-strata-serve-suffix-repaired-20261101T221708Z/RESULT.json",
+      "origin_bytes": 378,
+      "origin_sha256": "501622ccfb64e528ecd01499d02219e71240418b8bfa69d544cbc4279153b5a7",
+      "published": "outcomes/managed-prefill-reserve4096-native-root-20261101/supervisor-result.json",
+      "published_bytes": 378,
+      "published_sha256": "501622ccfb64e528ecd01499d02219e71240418b8bfa69d544cbc4279153b5a7",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T221708Z/result.json",
+      "origin_bytes": 8486,
+      "origin_sha256": "376631d7d4039cd5ae50ef6329961336282f14a67fddf02ce494891a550ad3a6",
+      "published": "outcomes/managed-prefill-reserve4096-native-root-20261101/runner-result.json",
+      "published_bytes": 8305,
+      "published_sha256": "14d76dd6bced3444ccbd9b8821e083a741e332f521b916a7e3ae42f0cd919b74",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T221708Z/two-slot-repair/report.json",
+      "origin_bytes": 133158,
+      "origin_sha256": "38c363b2c4d5e8f01ac0dcb608593941fc424e0e2fb3e4110fa9b190a198e6f3",
+      "published": "outcomes/managed-prefill-reserve4096-native-root-20261101/report-summary.json",
+      "published_bytes": 791,
+      "published_sha256": "85fe5d658499679ad22da82443bba10bebb87906ce009627fe88274911b9dc41",
+      "derivation": "sanitized selected-field summary; full original not published",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T221708Z/two-slot-repair/stdout.log",
+      "origin_bytes": 53789,
+      "origin_sha256": "2dbd7c1e66783a9daf310ee3c76d5ff5b9d7564624f273f5f02520f5dfdb52ca",
+      "published": "outcomes/managed-prefill-reserve4096-native-root-20261101/stdout.log",
+      "published_bytes": 53789,
+      "published_sha256": "2dbd7c1e66783a9daf310ee3c76d5ff5b9d7564624f273f5f02520f5dfdb52ca",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T221708Z/two-slot-repair/stderr.log",
+      "origin_bytes": 96393,
+      "origin_sha256": "c64ae7c284956d0daa31e0e685d7d74383cde478a664476bb69de61d3d8edc4e",
+      "published": "outcomes/managed-prefill-reserve4096-native-root-20261101/stderr.log",
+      "published_bytes": 96393,
+      "published_sha256": "c64ae7c284956d0daa31e0e685d7d74383cde478a664476bb69de61d3d8edc4e",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/ROOT-LAUNCH.json",
+      "origin_bytes": 833,
+      "origin_sha256": "2a37cb92e3302195ca1d9eb520f37f884cc49c6d9d84806dcd535f04525ebda9",
+      "published": "outcomes/restore-refusal-diagnostic-native-root-20261101/ROOT-LAUNCH.json",
+      "published_bytes": 793,
+      "published_sha256": "4aa06f6718e5f12fcb239e35c8901c0cca8e9cbeaf8681d80677146e110b01b8",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/ROOT-RELEASE.json",
+      "origin_bytes": 1963,
+      "origin_sha256": "710d18e0cf923a6aae92f3098d4fc63e5d4d6d1e603c6ea9f54f9bfd5898a573",
+      "published": "outcomes/restore-refusal-diagnostic-native-root-20261101/ROOT-RELEASE.json",
+      "published_bytes": 1943,
+      "published_sha256": "7f23b9dec0f2eceeda32c89a00a0c15b27530522b9d27c5ff95e9687bb2e4ed3",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/output-strata-serve-suffix-repaired-20261101T223919Z/RESULT.json",
+      "origin_bytes": 368,
+      "origin_sha256": "f976708abd1bebc2b23ad3442bc5cedce22e8f0214ef00a5790235be7830a527",
+      "published": "outcomes/restore-refusal-diagnostic-native-root-20261101/supervisor-result.json",
+      "published_bytes": 368,
+      "published_sha256": "f976708abd1bebc2b23ad3442bc5cedce22e8f0214ef00a5790235be7830a527",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T223919Z/result.json",
+      "origin_bytes": 8478,
+      "origin_sha256": "2f7e11dad80ae77d9fda7c1e539ce67c44777119c8661174038749b4ea2fa140",
+      "published": "outcomes/restore-refusal-diagnostic-native-root-20261101/runner-result.json",
+      "published_bytes": 8297,
+      "published_sha256": "78b09d1278b9b308e9620b0d7a7d175207c3090cf640da82bc1623edde951148",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T223919Z/two-slot-repair/report.json",
+      "origin_bytes": 133158,
+      "origin_sha256": "b44d9aa8b4bf30181136452d580d1d3d60631f46939e59731f773f124621df1f",
+      "published": "outcomes/restore-refusal-diagnostic-native-root-20261101/report-summary.json",
+      "published_bytes": 791,
+      "published_sha256": "1710b340ee1811561815495c0dad8be7180e07e47e7ebb11ebc142c87f039428",
+      "derivation": "sanitized selected-field summary; full original not published",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T223919Z/two-slot-repair/stdout.log",
+      "origin_bytes": 53774,
+      "origin_sha256": "25af02ca1e0577e1cf8b9e4386dce3a7b7772e9d3f95f1db19454692e2cd96df",
+      "published": "outcomes/restore-refusal-diagnostic-native-root-20261101/stdout.log",
+      "published_bytes": 53774,
+      "published_sha256": "25af02ca1e0577e1cf8b9e4386dce3a7b7772e9d3f95f1db19454692e2cd96df",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    },
+    {
+      "origin": ".local/strata-implementation/suffix-first/restore-refusal-diagnostic-native-root-20261101/serve/attempt-strata-serve-suffix-repaired-20261101T223919Z/two-slot-repair/stderr.log",
+      "origin_bytes": 96289,
+      "origin_sha256": "05cb9651a96fc07441563f841d0a97e08892f36953cc5ef761539f300addb6fd",
+      "published": "outcomes/restore-refusal-diagnostic-native-root-20261101/stderr.log",
+      "published_bytes": 96289,
+      "published_sha256": "05cb9651a96fc07441563f841d0a97e08892f36953cc5ef761539f300addb6fd",
+      "derivation": "sanitized full text/JSON; original hash retained",
+      "local_only_origin_is_not_retrievable": true
+    }
+  ]
+}

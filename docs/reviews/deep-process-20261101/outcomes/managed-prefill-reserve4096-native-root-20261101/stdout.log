@@ -1,0 +1,339 @@
+INFO logit_bias=1 context=32768 kv=int8 kv_resident=0 expert_slots=17063 expert_cache_mib=33126 expert_slots_primary=9132 expert_cache_primary_mib=16845 spec=0 mtp_max=0 lookup=0 vram_free_mib=3056 cvec=0 arena_mib=0 pool_workers=2 pcie_frac=0.37 spec_min_p=0.00 conversation_cache_mib=2048 conversation_cache_slots=2 conversation_cache_min_free_mib=2560 conversation_cache_min_tokens=0 tail_role_token=-1 vram_elastic=0 prefill_cap=1024 prefill_stages=2 stream_all_min=1024 prefill_pipe=0 batch_slots=2 slot_cache=0 batch_groups=1 engine=0.1.51
+READY 32768 stop
+SCHED_READY {"schema":1,"engine_epoch":17103267312848182944,"policy":"strict-priority-tier-then-class-lottery-v1","limits":{"min_base":-100,"max_base":100,"max_activity_boost":100,"max_activity_ttl_ms":60000,"max_threads":16,"max_activity_leases":8,"max_id_bytes":64,"max_operations":128,"max_edges":256,"max_frame_bytes":1024,"max_control_lines":16,"metadata_bytes":8388608},"max_reply_bytes":2048,"capabilities":["managed_threads","managed_activity","dependencies","request_bindings","accepted_applied","idle_expiry","strict_tier_class_lottery"]}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":1,"status":"ok","graph_revision":0,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":1,"effective_priority":0,"activity_boost":0,"accepted_revision":1,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":0,"result_revision":0,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":2,"status":"ok","graph_revision":1,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":1,"result_revision":1,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":3,"status":"ok","graph_revision":2,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":2,"result_revision":1,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":4,"status":"ok","graph_revision":2,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":0,"result_revision":0,"next_expiry_ms":null}
+HTTP_ACCEPT {"schema":1,"request":1,"input_count":2790,"input_sha256":"690c03b81418741b568367ebe16b7e87516fc62da443363943a8f416eee88367","max_new":1,"supported_serial_profile":false,"temperature":0,"top_p":1,"top_k":1,"min_p":0,"penalty_last_n":0,"penalty_repeat":1,"penalty_freq":0,"penalty_present":0,"seed":0,"bias":false,"cvec_loaded":false}
+RESUME 0
+PP 1024 2790 12300 83.2
+PP 2048 2790 14899 137.5
+PP 2789 2790 16096 173.3
+REUSED 0
+T 2
+DONE 1 2790 16095.8 26.1 length 0 0 0 466 480 0 0 27.7 2790 0 chunk=1024 experts_streamed=18182
+BOWN_ACCEPT {"request":"a00000000001","leg":1,"slot":0,"occupancy":6,"full_budget":3,"input_count":2790,"input_sha256":"690c03b81418741b568367ebe16b7e87516fc62da443363943a8f416eee88367","cut":2,"forwarded":2790,"accepted":2791,"watermark":0,"history":"0332c9bcaa88b5f00368e7193687edef315d1edbc47c0cab646b3cb1af515c5e"}
+BADM 0 1
+BOWN_GROUP {"op":1,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":6,"position":2790}]}
+BT 0 2438
+BOWN_COMMIT {"request":"a00000000001","slot":0,"occupancy":6,"op":1,"cut":3,"forwarded":2791,"accepted":2792,"watermark":1,"history":"110610b5aac813719ec3f0c46661e203f4b72fbdd3f30b942272283ba94fc018","sample":2438}
+BOWN_GROUP {"op":2,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":6,"position":2791}]}
+BT 0 2438
+BOWN_COMMIT {"request":"a00000000001","slot":0,"occupancy":6,"op":2,"cut":4,"forwarded":2792,"accepted":2793,"watermark":2,"history":"10e53ea7890484ee8a76105ed84ef0e1b78c4099f3fce5d20690dac165bba416","sample":2438}
+BDONE 0 3 length 27.7
+BOWN_DONE {"request":"a00000000001","slot":0,"occupancy":6,"reason":"length","watermark":2,"history":"10e53ea7890484ee8a76105ed84ef0e1b78c4099f3fce5d20690dac165bba416"}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":5,"status":"ok","graph_revision":12,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":3,"result_revision":2,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":6,"status":"ok","graph_revision":13,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":4,"result_revision":2,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":7,"status":"ok","graph_revision":13,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":0,"result_revision":0,"next_expiry_ms":null}
+HTTP_ACCEPT {"schema":1,"request":2,"input_count":2791,"input_sha256":"a9db4951af2c28822407a6e0e3c38ca1c615d8fdca8d71c608a4a3631b2a8aa1","max_new":1,"supported_serial_profile":false,"temperature":0,"top_p":1,"top_k":1,"min_p":0,"penalty_last_n":0,"penalty_repeat":1,"penalty_freq":0,"penalty_present":0,"seed":0,"bias":false,"cvec_loaded":false}
+RESUME 0
+PP 1024 2791 2288 447.5
+PP 2048 2791 4543 450.8
+PP 2790 2791 5688 490.5
+REUSED 0
+T 2
+DONE 1 2791 5688.3 12.4 length 0 0 0 464 480 0 0 31.8 2791 0 chunk=1024 experts_streamed=18135
+BOWN_ACCEPT {"request":"b00000000001","leg":2,"slot":1,"occupancy":7,"full_budget":2,"input_count":2791,"input_sha256":"a9db4951af2c28822407a6e0e3c38ca1c615d8fdca8d71c608a4a3631b2a8aa1","cut":2,"forwarded":2791,"accepted":2792,"watermark":0,"history":"3e2d44b69bbe4a8cce140659f16c919b0785a1708bde3ad5ce1d35901283e29f"}
+BADM 1 1
+BOWN_GROUP {"op":3,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":7,"position":2791}]}
+BT 1 5983
+BOWN_COMMIT {"request":"b00000000001","slot":1,"occupancy":7,"op":3,"cut":3,"forwarded":2792,"accepted":2793,"watermark":1,"history":"05b785cbaea23f1d3aa17da67c583404841d819d4f23701c06c3ab89e7c0a20f","sample":5983}
+BDONE 1 2 length 12.8
+BOWN_DONE {"request":"b00000000001","slot":1,"occupancy":7,"reason":"length","watermark":1,"history":"05b785cbaea23f1d3aa17da67c583404841d819d4f23701c06c3ab89e7c0a20f"}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":8,"status":"ok","graph_revision":22,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":5,"result_revision":3,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":9,"status":"ok","graph_revision":23,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":6,"result_revision":3,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":10,"status":"ok","graph_revision":23,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":0,"result_revision":0,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":11,"status":"ok","graph_revision":24,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":7,"result_revision":4,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":12,"status":"ok","graph_revision":25,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":8,"result_revision":4,"next_expiry_ms":null}
+SCHED_REPLY {"schema":1,"engine_epoch":17103267312848182944,"sequence":13,"status":"ok","graph_revision":25,"thread_id":"qual-persistent","thread_generation":1,"base":0,"base_version":0,"effective_priority":0,"activity_boost":0,"accepted_revision":0,"applied_revision":0,"applied_cut":0,"actor_id":"","actor_incarnation":0,"lease_version":0,"operation_serial":0,"result_revision":0,"next_expiry_ms":null}
+HTTP_ACCEPT {"schema":1,"request":3,"input_count":2857,"input_sha256":"49a78c93323c6d313f05d5cd0962df164ef0303444c2cc8fb272581cf25fd155","max_new":1,"supported_serial_profile":false,"temperature":0,"top_p":1,"top_k":1,"min_p":0,"penalty_last_n":0,"penalty_repeat":1,"penalty_freq":0,"penalty_present":0,"seed":0,"bias":false,"cvec_loaded":false}
+RESUME 0
+PP 1024 2857 2597 394.2
+PP 2048 2857 4856 421.7
+PP 2692 2857 5935 453.6
+BOWN_ACCEPT {"request":"a00000000002","leg":3,"slot":0,"occupancy":8,"full_budget":64,"input_count":2857,"input_sha256":"49a78c93323c6d313f05d5cd0962df164ef0303444c2cc8fb272581cf25fd155","cut":10,"forwarded":2792,"accepted":2793,"watermark":2,"history":"25886928d4945172c51d635f4b14b0a8e98ebacb76a5819ec37121805227e497"}
+BADM 0 1
+HTTP_ACCEPT {"schema":1,"request":4,"input_count":2857,"input_sha256":"fd6fcb8e42c9f388067215a725f301fd46de5b3b3034763c4157e96190222f8e","max_new":1,"supported_serial_profile":false,"temperature":0,"top_p":1,"top_k":1,"min_p":0,"penalty_last_n":0,"penalty_repeat":1,"penalty_freq":0,"penalty_present":0,"seed":0,"bias":false,"cvec_loaded":false}
+RESUME 0
+BOWN_GROUP {"op":4,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2792}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":4,"cut":11,"forwarded":2793,"accepted":2794,"watermark":2,"history":"557d68b54c291a2754477aff6342efe27d13b8d31798712c803ffa43ca744e4e","next_known":248046}
+BOWN_GROUP {"op":5,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2793}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":5,"cut":12,"forwarded":2794,"accepted":2795,"watermark":2,"history":"70c965dcb756c99de2f02312f1f14f56389ea7f8437720a8c895662d9d827808","next_known":198}
+BOWN_GROUP {"op":6,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2794}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":6,"cut":13,"forwarded":2795,"accepted":2796,"watermark":2,"history":"1c8510c05072238902b4b954a63c69cb97b4eff6e036fe0d7a399927d419b1da","next_known":248045}
+BOWN_GROUP {"op":7,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2795}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":7,"cut":14,"forwarded":2796,"accepted":2797,"watermark":2,"history":"3fb8df9afd4c68265a437e2f6b3a7e03bf0dce195694963dcf1e1907c3754f4f","next_known":846}
+BOWN_GROUP {"op":8,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2796}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":8,"cut":15,"forwarded":2797,"accepted":2798,"watermark":2,"history":"bce16aa5665b5d66019b68bc26db2e0f84bff0b28da58ca00174be1a9b3cd774","next_known":198}
+PP 1024 2857 2341 437.4
+BOWN_GROUP {"op":9,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2797}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":9,"cut":16,"forwarded":2798,"accepted":2799,"watermark":2,"history":"01b1d0fe960b2a0d5e88a02f3e7bd8e507c68588de14c46bafc51f4e707bd2c0","next_known":9947}
+BOWN_GROUP {"op":10,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2798}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":10,"cut":17,"forwarded":2799,"accepted":2800,"watermark":2,"history":"907cb517786af2d891c7857763753d4c4fdd83086f4e5ddc6b14b455ed7dd1c6","next_known":279}
+BOWN_GROUP {"op":11,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2799}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":11,"cut":18,"forwarded":2800,"accepted":2801,"watermark":2,"history":"81f724c0a3b6339abc92bb54e784b59dbbc44e3db0235be11d52fc7e64b6fa5e","next_known":41685}
+BOWN_GROUP {"op":12,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2800}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":12,"cut":19,"forwarded":2801,"accepted":2802,"watermark":2,"history":"ed87ac4dbc7856a0a48281c34a7198e63ff6e786a242ad6bd3c38efc14f5ddca","next_known":1785}
+BOWN_GROUP {"op":13,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2801}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":13,"cut":20,"forwarded":2802,"accepted":2803,"watermark":2,"history":"c2ccd7aa96aaa3eeed1fe11d1a722b7ac83b46abf271f32ca170f83b1258070c","next_known":2306}
+BOWN_GROUP {"op":14,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2802}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":14,"cut":21,"forwarded":2803,"accepted":2804,"watermark":2,"history":"fe4b944b2bebe506fdff8a1372cefa77a3d3653bdd6b1a97f8ee6f352f600c22","next_known":11}
+BOWN_GROUP {"op":15,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2803}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":15,"cut":22,"forwarded":2804,"accepted":2805,"watermark":2,"history":"a51a42cecd5b885b1ba3276cf88a9aa7a685367f15dc0d0431a643b8950ac489","next_known":524}
+BOWN_GROUP {"op":16,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2804}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":16,"cut":23,"forwarded":2805,"accepted":2806,"watermark":2,"history":"1e5aa7dcf92cb7e7efaca55f393db34aa34139e5021dd4d76c5e2fddc579732a","next_known":866}
+BOWN_GROUP {"op":17,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2805}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":17,"cut":24,"forwarded":2806,"accepted":2807,"watermark":2,"history":"b6e3dc204a7c06ccda75ab19f08e90fb7fd5519a15dd9de02d417de2325c60fb","next_known":6575}
+BOWN_GROUP {"op":18,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2806}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":18,"cut":25,"forwarded":2807,"accepted":2808,"watermark":2,"history":"d9ad588dbd8c6d871a79f58cb8509573f3723b9f0793f9970b6e7e0d6f39d23f","next_known":4087}
+BOWN_GROUP {"op":19,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2807}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":19,"cut":26,"forwarded":2808,"accepted":2809,"watermark":2,"history":"72d3b1c8965383de72693f2fdfbd56336f93855c6cf7c9ab46cf417370e09b46","next_known":13}
+BOWN_GROUP {"op":20,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2808}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":20,"cut":27,"forwarded":2809,"accepted":2810,"watermark":2,"history":"a5bc128fe1eef9bbc6d4bf18ada1dec1f451e856f08f734c7ff0eddfbebb3fd5","next_known":9357}
+BOWN_GROUP {"op":21,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2809}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":21,"cut":28,"forwarded":2810,"accepted":2811,"watermark":2,"history":"6632fb765d2db752a3620831023e89de7c7ab707bc2c68a81596c1a0f607f37b","next_known":264}
+BOWN_GROUP {"op":22,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2810}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":22,"cut":29,"forwarded":2811,"accepted":2812,"watermark":2,"history":"ee0ed5b25e260a5a2138ab92e554c982111386bc25fe879b310972bc2b12e8fc","next_known":47193}
+BOWN_GROUP {"op":23,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2811}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":23,"cut":30,"forwarded":2812,"accepted":2813,"watermark":2,"history":"ed64bbc520e3af29038ae62d40bde3a6a76e65ba7cd002a4e73fc929703272e3","next_known":1103}
+BOWN_GROUP {"op":24,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2812}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":24,"cut":31,"forwarded":2813,"accepted":2814,"watermark":2,"history":"4fce31dbc524e1eb5006e5f6393efbd04b4241fb9ebf307546eded0b5eb6404b","next_known":314}
+BOWN_GROUP {"op":25,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2813}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":25,"cut":32,"forwarded":2814,"accepted":2815,"watermark":2,"history":"61a11a1e631717fa51dcdbe4beab2434640e1f7d3e7afece7a4013a592c8c904","next_known":220}
+BOWN_GROUP {"op":26,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2814}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":26,"cut":33,"forwarded":2815,"accepted":2816,"watermark":2,"history":"ec869fe80b9faf1c8d9badf8da377e93f31ffacc3ded477a041b566bb8091789","next_known":21}
+BOWN_GROUP {"op":27,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2815}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":27,"cut":34,"forwarded":2816,"accepted":2817,"watermark":2,"history":"914e29eee59c2897a2c9a1662948befa3741b2b843388099e21f51e8a75d6855","next_known":15}
+BOWN_GROUP {"op":28,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2816}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":28,"cut":35,"forwarded":2817,"accepted":2818,"watermark":2,"history":"4fc921d68915ecc24cbd49bae3820a902d54daab36c88722d7f0aaf19da5f182","next_known":1228}
+BOWN_GROUP {"op":29,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2817}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":29,"cut":36,"forwarded":2818,"accepted":2819,"watermark":2,"history":"ae0ff8997ca19e135161a10375cb1bcc319edc826cb7819ee0da8142ccb9fa98","next_known":7189}
+BOWN_GROUP {"op":30,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2818}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":30,"cut":37,"forwarded":2819,"accepted":2820,"watermark":2,"history":"5653ae334f4ff77300518ddfd83dce65ea332923a6e841a2c92ea33015a46133","next_known":364}
+BOWN_GROUP {"op":31,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2819}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":31,"cut":38,"forwarded":2820,"accepted":2821,"watermark":2,"history":"029fc7ef1d736e386d17032f33ef824fba2efd35b8c828e4cd3b9abc697b472a","next_known":279}
+BOWN_GROUP {"op":32,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2820}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":32,"cut":39,"forwarded":2821,"accepted":2822,"watermark":2,"history":"1d37586ab928bd21f1ac877db51e3226687482ae4036aa65134e584bd4ccfee5","next_known":7873}
+BOWN_GROUP {"op":33,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2821}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":33,"cut":40,"forwarded":2822,"accepted":2823,"watermark":2,"history":"6a9b421ac11dea690474ddca2991269daa12a03d8d9decfed6e307decaef719c","next_known":13}
+BOWN_GROUP {"op":34,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2822}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":34,"cut":41,"forwarded":2823,"accepted":2824,"watermark":2,"history":"28ac39131ce8c59d41843c5bb790bd8f7981f3c5569c7cb75981ef8c308ba532","next_known":8618}
+BOWN_GROUP {"op":35,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2823}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":35,"cut":42,"forwarded":2824,"accepted":2825,"watermark":2,"history":"3bd3e948f75461c5f63f9bb551fa12a37abbff9f7407d9abc44a71e9b4bc161e","next_known":2713}
+BOWN_GROUP {"op":36,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2824}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":36,"cut":43,"forwarded":2825,"accepted":2826,"watermark":2,"history":"cfbec82411ca80c38744c1e45b8bc155e1e7c43081ead3caaee60ea5a3d240ae","next_known":3749}
+BOWN_GROUP {"op":37,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2825}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":37,"cut":44,"forwarded":2826,"accepted":2827,"watermark":2,"history":"2f5ca4c368ee692c0acb5c4369ae500de8a60e1e62d508734e3eefb7df336ac3","next_known":279}
+BOWN_GROUP {"op":38,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2826}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":38,"cut":45,"forwarded":2827,"accepted":2828,"watermark":2,"history":"c1ae59540682770be41e1f2966f88a29aee428f3a6fcb91d35b1c2d9d5e4598f","next_known":2306}
+BOWN_GROUP {"op":39,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2827}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":39,"cut":46,"forwarded":2828,"accepted":2829,"watermark":2,"history":"025c4127b457e9deb443862042b9345b3f7385aaeaa4195047635fe466a31806","next_known":11}
+BOWN_GROUP {"op":40,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2828}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":40,"cut":47,"forwarded":2829,"accepted":2830,"watermark":2,"history":"66e59aae4e36487d0387301aeeaa4eb75adbf3c1bf26b370bf7cc2fb4411cb18","next_known":449}
+BOWN_GROUP {"op":41,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2829}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":41,"cut":48,"forwarded":2830,"accepted":2831,"watermark":2,"history":"5f76e616fb0749ce9a0b119cba58d5b661c2fd90b2c491943fadd87c18400db4","next_known":1879}
+BOWN_GROUP {"op":42,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2830}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":42,"cut":49,"forwarded":2831,"accepted":2832,"watermark":2,"history":"8ba460b1cb810fe393c3bfac522488561e605956d1cd0b1e8b95eeac35387704","next_known":1105}
+BOWN_GROUP {"op":43,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2831}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":43,"cut":50,"forwarded":2832,"accepted":2833,"watermark":2,"history":"7294c773ca14cc4724cad0f3ea6f3b925f4309a2d6429cdcbb8df1b731564fa3","next_known":11}
+BOWN_GROUP {"op":44,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2832}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":44,"cut":51,"forwarded":2833,"accepted":2834,"watermark":2,"history":"4a830b337d02cf68e6099520e005b245eb245a332ac69dee332a9a3619cf0bc6","next_known":1141}
+BOWN_GROUP {"op":45,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2833}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":45,"cut":52,"forwarded":2834,"accepted":2835,"watermark":2,"history":"1d84e389738451f8501610f33cebe99d4414cb66a943d706b61d35b5771f1b3b","next_known":3481}
+BOWN_GROUP {"op":46,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2834}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":46,"cut":53,"forwarded":2835,"accepted":2836,"watermark":2,"history":"05a8fa4943f19296300fe5636536f63cda51ecae96be4a84cd181cccd5b77c5d","next_known":1067}
+BOWN_GROUP {"op":47,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2835}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":47,"cut":54,"forwarded":2836,"accepted":2837,"watermark":2,"history":"cf421a828d43a1550b359829d94b8ddf1697f11406320c4a1dab4d227c0e7e2c","next_known":11}
+BOWN_GROUP {"op":48,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2836}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":48,"cut":55,"forwarded":2837,"accepted":2838,"watermark":2,"history":"f33668668db3bf79ece70efe5ba7a0bcdb9253b948e71ba49304df5f5e2250e9","next_known":321}
+BOWN_GROUP {"op":49,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2837}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":49,"cut":56,"forwarded":2838,"accepted":2839,"watermark":2,"history":"d603b68448fa1559d91cbf2e0893a69c19319790f902dc6c9c8d80d3c074b9a9","next_known":264}
+BOWN_GROUP {"op":50,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2838}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":50,"cut":57,"forwarded":2839,"accepted":2840,"watermark":2,"history":"815fd2b96aa59fd311aed8d14c0516bee2f331e0605dfcf5eca6e8ad01eb6e4c","next_known":2781}
+BOWN_GROUP {"op":51,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2839}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":51,"cut":58,"forwarded":2840,"accepted":2841,"watermark":2,"history":"cfa0a7f9c27f667e33b47fc2a0bbe92d133f69048b9985961746b05b8f72564f","next_known":13}
+BOWN_GROUP {"op":52,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2840}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":52,"cut":59,"forwarded":2841,"accepted":2842,"watermark":2,"history":"e5df44c7494a28131cd089fdfe108243db934c39b6a96c4ca6b981bc6ff6cb86","next_known":38256}
+BOWN_GROUP {"op":53,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2841}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":53,"cut":60,"forwarded":2842,"accepted":2843,"watermark":2,"history":"6c462b8e4d55d46d77a14190f0dd897020fb9a695666f9710a82000df37a32a7","next_known":660}
+BOWN_GROUP {"op":54,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2842}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":54,"cut":61,"forwarded":2843,"accepted":2844,"watermark":2,"history":"daf3bfdb2b121055c459f68cb0c67ad08f8359e892a9794d7074cf82f3d29621","next_known":220}
+BOWN_GROUP {"op":55,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2843}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":55,"cut":62,"forwarded":2844,"accepted":2845,"watermark":2,"history":"caed7d4d29cf8b22c6e92e5ddb686901cadac51c8978a8eaa09ba5ca8bf1b201","next_known":21}
+BOWN_GROUP {"op":56,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2844}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":56,"cut":63,"forwarded":2845,"accepted":2846,"watermark":2,"history":"d77c2a5c137b7bc818a6b93a4aaf02e4b637d43f077c2b65d27bb78b5747b40d","next_known":15}
+BOWN_GROUP {"op":57,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2845}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":57,"cut":64,"forwarded":2846,"accepted":2847,"watermark":2,"history":"7cf75386036f378dda513f3e6fe0c999d2cc077ab403dcc297cc81a56dc12e20","next_known":7189}
+BOWN_GROUP {"op":58,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2846}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":58,"cut":65,"forwarded":2847,"accepted":2848,"watermark":2,"history":"fb591b93758d33a41f5f96e22fd6a645ce51ed276f3f6fc440f2007633b85671","next_known":13}
+BOWN_GROUP {"op":59,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2847}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":59,"cut":66,"forwarded":2848,"accepted":2849,"watermark":2,"history":"beed5449f1096bb0b60f9cf33747e128baccaab3c72412960d32f65cbe5525e9","next_known":248046}
+BOWN_GROUP {"op":60,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2848}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":60,"cut":67,"forwarded":2849,"accepted":2850,"watermark":2,"history":"5b32da552c1435deb39afda49d0d7b525e04ba775d8a691b95dccf6b0bd482ce","next_known":198}
+BOWN_GROUP {"op":61,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2849}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":61,"cut":68,"forwarded":2850,"accepted":2851,"watermark":2,"history":"029f80f7c619c92f19470ab1c13ab14a64f19957d2845171aa558b3f425e315b","next_known":248045}
+BOWN_GROUP {"op":62,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2850}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":62,"cut":69,"forwarded":2851,"accepted":2852,"watermark":2,"history":"8a2aabeccced2179ab05783c48d56fdf9621547d448a38e6409363a315d870ac","next_known":74455}
+BOWN_GROUP {"op":63,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2851}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":63,"cut":70,"forwarded":2852,"accepted":2853,"watermark":2,"history":"f9ae6f49995c3448474afe483762d87f91272fd3bc9f4660ca6c09a79d23c282","next_known":198}
+BOWN_GROUP {"op":64,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2852}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":64,"cut":71,"forwarded":2853,"accepted":2854,"watermark":2,"history":"b68cfc0111c195a52907ab40617c8d0b5f16cb337096c50f369ddab4862276c7","next_known":248068}
+BOWN_GROUP {"op":65,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2853}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":65,"cut":72,"forwarded":2854,"accepted":2855,"watermark":2,"history":"4a897d4692c0db68c51c1fce7c2cb9b3157ad45cf01d9482cee2789696b68daf","next_known":271}
+BOWN_GROUP {"op":66,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2854}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":66,"cut":73,"forwarded":2855,"accepted":2856,"watermark":2,"history":"e9c6f2d918be1998367d5de28085b0e22e44372d4036fb2ca1b9efccfb2e7b69","next_known":248069}
+BOWN_GROUP {"op":67,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2855}]}
+BOWN_KNOWN {"request":"a00000000002","slot":0,"occupancy":8,"op":67,"cut":74,"forwarded":2856,"accepted":2857,"watermark":2,"history":"49a78c93323c6d313f05d5cd0962df164ef0303444c2cc8fb272581cf25fd155","next_known":271}
+BOWN_GROUP {"op":68,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2856}]}
+BT 0 2
+BOWN_COMMIT {"request":"a00000000002","slot":0,"occupancy":8,"op":68,"cut":75,"forwarded":2857,"accepted":2858,"watermark":3,"history":"2f4317bc2964bfc967c9a4ff9da3582e511ab8dda0f8c6bdb7ec51decdcd12de","sample":2}
+BOWN_GROUP {"op":69,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2857}]}
+BT 0 2438
+BOWN_COMMIT {"request":"a00000000002","slot":0,"occupancy":8,"op":69,"cut":76,"forwarded":2858,"accepted":2859,"watermark":4,"history":"d33412859f9782f0f76d141cac37c538163567b60bc09d8ab082f9c8ec5b8e36","sample":2438}
+BOWN_GROUP {"op":70,"stages":2,"active_rows":1,"rows":[{"slot":0,"occupancy":8,"position":2858}]}
+BT 0 248046
+BOWN_COMMIT {"request":"a00000000002","slot":0,"occupancy":8,"op":70,"cut":77,"forwarded":2859,"accepted":2860,"watermark":5,"history":"33e4ef68b0e0c5345b815d0fd6f779a170d120c233b3e0d3bfdcc01525414b1f","sample":248046}
+BDONE 0 3 stop 3134.5
+PP 2048 2857 5780 354.3
+PP 2692 2857 7993 336.8
+BOWN_ACCEPT {"request":"b00000000002","leg":4,"slot":1,"occupancy":11,"full_budget":64,"input_count":2857,"input_sha256":"fd6fcb8e42c9f388067215a725f301fd46de5b3b3034763c4157e96190222f8e","cut":12,"forwarded":2792,"accepted":2793,"watermark":1,"history":"bdcb7daf2d2da052542623617eddc45264b6736849e80ee20581af3222990555"}
+BADM 1 1
+BOWN_GROUP {"op":71,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2792}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":71,"cut":13,"forwarded":2793,"accepted":2794,"watermark":1,"history":"48b1947851190eb6f74293bcfc6da1ec2ee0345b5d6863d4b5b961b80d3dda22","next_known":248046}
+BOWN_GROUP {"op":72,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2793}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":72,"cut":14,"forwarded":2794,"accepted":2795,"watermark":1,"history":"203178e0dd4207db35bd6a22fdef50bddf3efb7a2336419f78f0093510e8be2b","next_known":198}
+BOWN_GROUP {"op":73,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2794}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":73,"cut":15,"forwarded":2795,"accepted":2796,"watermark":1,"history":"5c5ae65034328036f42b931bbb12666a0e61cea7af78aded0d1bea1426b47ce3","next_known":248045}
+BOWN_GROUP {"op":74,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2795}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":74,"cut":16,"forwarded":2796,"accepted":2797,"watermark":1,"history":"8e381b2cdb16baa5fea65161394b6aeb1544e0aa758fb2737f49b6864dfeb200","next_known":846}
+BOWN_GROUP {"op":75,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2796}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":75,"cut":17,"forwarded":2797,"accepted":2798,"watermark":1,"history":"95b1910ffb8873dcd11bb9ff0e04bd0c118a450c2c52063584301dc0a406f1c4","next_known":198}
+BOWN_GROUP {"op":76,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2797}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":76,"cut":18,"forwarded":2798,"accepted":2799,"watermark":1,"history":"9dafd94b5a015063f1c185e76f17d94a949fb7e54f09d5bb1ae36177113e3024","next_known":9947}
+BOWN_GROUP {"op":77,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2798}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":77,"cut":19,"forwarded":2799,"accepted":2800,"watermark":1,"history":"670073237a76183d933923b45e249767779e4e4e4e18cd449c146eba92373e4e","next_known":279}
+BOWN_GROUP {"op":78,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2799}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":78,"cut":20,"forwarded":2800,"accepted":2801,"watermark":1,"history":"fda79e63469d1894195e14a159191aec079ecf63b7b8027993fa1508cb3ea8e4","next_known":41685}
+BOWN_GROUP {"op":79,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2800}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":79,"cut":21,"forwarded":2801,"accepted":2802,"watermark":1,"history":"0357458190552f759d48004f84baa46d49f89f75791df579293a6ee5e9749e64","next_known":1785}
+BOWN_GROUP {"op":80,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2801}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":80,"cut":22,"forwarded":2802,"accepted":2803,"watermark":1,"history":"142c6419a63adeab56227ba9524bf4baa813873182dfc71174a737f06ddeaff5","next_known":2306}
+BOWN_GROUP {"op":81,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2802}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":81,"cut":23,"forwarded":2803,"accepted":2804,"watermark":1,"history":"19b9ff33ecd979af482292f215bf648022c2fff6466cd90c4ebeca57dc2aa97f","next_known":11}
+BOWN_GROUP {"op":82,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2803}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":82,"cut":24,"forwarded":2804,"accepted":2805,"watermark":1,"history":"6c4dc915951e9f1248911ed61caefc81006553ffd170e73547f4b97126cadb65","next_known":524}
+BOWN_GROUP {"op":83,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2804}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":83,"cut":25,"forwarded":2805,"accepted":2806,"watermark":1,"history":"1dcd17af4a305ceccfe7b155645b0479d2d9a22de22f981cd7ba642b256b07fd","next_known":866}
+BOWN_GROUP {"op":84,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2805}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":84,"cut":26,"forwarded":2806,"accepted":2807,"watermark":1,"history":"092a88f853f37b3a398739c524b57881ec648bca645171a612ecd8bcebe9799e","next_known":6575}
+BOWN_GROUP {"op":85,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2806}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":85,"cut":27,"forwarded":2807,"accepted":2808,"watermark":1,"history":"ec9e1daa165f5f3a9e37696dc772308cb2f6030dba8f697f1253b5578d53adb2","next_known":4087}
+BOWN_GROUP {"op":86,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2807}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":86,"cut":28,"forwarded":2808,"accepted":2809,"watermark":1,"history":"4725191d07f73764e7adbb51de581770b994005f2ccb61295304c8246d6becec","next_known":13}
+BOWN_GROUP {"op":87,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2808}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":87,"cut":29,"forwarded":2809,"accepted":2810,"watermark":1,"history":"836498a823b3f8a4f8ff204881a5abff1dca7f8df303b899c7d404ebc57e79d4","next_known":9357}
+BOWN_GROUP {"op":88,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2809}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":88,"cut":30,"forwarded":2810,"accepted":2811,"watermark":1,"history":"1ed43d73194662a9bfe93a59452f46139e5396aea60edd981d830eece284fe6e","next_known":264}
+BOWN_GROUP {"op":89,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2810}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":89,"cut":31,"forwarded":2811,"accepted":2812,"watermark":1,"history":"0119ed9cec3ee16cdf612d8cdfda8eb8e3d456b110dacf0edc85bcb904aefad1","next_known":47193}
+BOWN_GROUP {"op":90,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2811}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":90,"cut":32,"forwarded":2812,"accepted":2813,"watermark":1,"history":"46c96b011cec1d9dfd7fc03111d379b65a025163ecda511bc9f8df91c5542a82","next_known":1103}
+BOWN_GROUP {"op":91,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2812}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":91,"cut":33,"forwarded":2813,"accepted":2814,"watermark":1,"history":"9f79b51713fb8acdf6648bfc75a819d18943cda6f01c6a81a273f8720c3d0d9b","next_known":314}
+BOWN_GROUP {"op":92,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2813}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":92,"cut":34,"forwarded":2814,"accepted":2815,"watermark":1,"history":"7d392b6d21d7a57b9e39577d52968b1c4efb5484621b0320f5da1dc092415778","next_known":220}
+BOWN_GROUP {"op":93,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2814}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":93,"cut":35,"forwarded":2815,"accepted":2816,"watermark":1,"history":"83ac030fc32b112156d18353798043142f358f761e2e6dcaf24f1b067d86bfdf","next_known":21}
+BOWN_GROUP {"op":94,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2815}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":94,"cut":36,"forwarded":2816,"accepted":2817,"watermark":1,"history":"3912477488df1d723a168c07318585f889526c60e73323fed24b49df204bdd43","next_known":15}
+BOWN_GROUP {"op":95,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2816}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":95,"cut":37,"forwarded":2817,"accepted":2818,"watermark":1,"history":"48adfef2e1277b0e965e3e5585a243885b914865a3e4d220e7fbe3d03f454d6a","next_known":1228}
+BOWN_GROUP {"op":96,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2817}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":96,"cut":38,"forwarded":2818,"accepted":2819,"watermark":1,"history":"9a63f8d4c541d015607e4fee2f392ae577ca2967750a2dd884ac249d6ca93386","next_known":7189}
+BOWN_GROUP {"op":97,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2818}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":97,"cut":39,"forwarded":2819,"accepted":2820,"watermark":1,"history":"4e04abe2c84e7c5b7adbbe95656d38a294990576f3c7b0a8511ba384f4de8ffd","next_known":364}
+BOWN_GROUP {"op":98,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2819}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":98,"cut":40,"forwarded":2820,"accepted":2821,"watermark":1,"history":"6539d2558cbb7d5c7cf00a972e471fa38ed43d1c7b131545af4e7cc52252746b","next_known":279}
+BOWN_GROUP {"op":99,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2820}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":99,"cut":41,"forwarded":2821,"accepted":2822,"watermark":1,"history":"7af8dc7d4d9310d5bdfc050cd37bf40ef2b4769a03617f77be13188d3046e797","next_known":7873}
+BOWN_GROUP {"op":100,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2821}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":100,"cut":42,"forwarded":2822,"accepted":2823,"watermark":1,"history":"0ef07b16d12653e1ddfed08513c6e46b6be521c5db5e85d723add630b71fd2db","next_known":13}
+BOWN_GROUP {"op":101,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2822}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":101,"cut":43,"forwarded":2823,"accepted":2824,"watermark":1,"history":"710d680679051a94b151f265d53845719a34d7f13002e66e413712880f0c3b4f","next_known":8618}
+BOWN_GROUP {"op":102,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2823}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":102,"cut":44,"forwarded":2824,"accepted":2825,"watermark":1,"history":"c75964aadb82989e451773c4404ad364e008aabd426f31f1ffe93d7423593b12","next_known":2713}
+BOWN_GROUP {"op":103,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2824}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":103,"cut":45,"forwarded":2825,"accepted":2826,"watermark":1,"history":"4338ec130e0087ef2cd1374d20c678da3c822e83c08cd3b1a13ad0fb01025de0","next_known":3749}
+BOWN_GROUP {"op":104,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2825}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":104,"cut":46,"forwarded":2826,"accepted":2827,"watermark":1,"history":"5520311a0b22a21b8de3c2c16cf762d31e8c78ba590138292436e281e143fb34","next_known":279}
+BOWN_GROUP {"op":105,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2826}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":105,"cut":47,"forwarded":2827,"accepted":2828,"watermark":1,"history":"d6c5f852ea5bc0237a26ba7876c131adec4277df4b8b489ac91b66004a98d1e0","next_known":2306}
+BOWN_GROUP {"op":106,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2827}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":106,"cut":48,"forwarded":2828,"accepted":2829,"watermark":1,"history":"eb7bedbea5425a73892c4fa1b4acab592cf9d285c63c6514c3644815371bd0ee","next_known":11}
+BOWN_GROUP {"op":107,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2828}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":107,"cut":49,"forwarded":2829,"accepted":2830,"watermark":1,"history":"c8ccfbfe73fc580d7c078eb82b8b7286744046b3eafacd59ac2f10108a47101d","next_known":449}
+BOWN_GROUP {"op":108,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2829}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":108,"cut":50,"forwarded":2830,"accepted":2831,"watermark":1,"history":"8d3890ac6f7df470361cf3619630ad769ba6c55dccf5df1c52b2523366c7b57d","next_known":1879}
+BOWN_GROUP {"op":109,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2830}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":109,"cut":51,"forwarded":2831,"accepted":2832,"watermark":1,"history":"14bcad5550c89111a37c17afbca183ac405ede813ef27b37d733bb106f39c660","next_known":1105}
+BOWN_GROUP {"op":110,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2831}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":110,"cut":52,"forwarded":2832,"accepted":2833,"watermark":1,"history":"38b0067e3a1af1dcaf21b322f28757ade043fe4a7a1764f11e93e1693ee0b622","next_known":11}
+BOWN_GROUP {"op":111,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2832}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":111,"cut":53,"forwarded":2833,"accepted":2834,"watermark":1,"history":"bd9b7db58fe4464fe5c4c7e57e84fda419dd4bb85aa0a60de7322ce7cfb38850","next_known":1141}
+BOWN_GROUP {"op":112,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2833}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":112,"cut":54,"forwarded":2834,"accepted":2835,"watermark":1,"history":"cf31e3abe5e347be9a245d4cd900a97fe8c95ae6bd87dde54fe74cb533c97593","next_known":3481}
+BOWN_GROUP {"op":113,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2834}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":113,"cut":55,"forwarded":2835,"accepted":2836,"watermark":1,"history":"dd546a9fc07298c5ef8cd4fde642344a0988930eb90b264ab7e4d7d37e0b8a63","next_known":1067}
+BOWN_GROUP {"op":114,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2835}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":114,"cut":56,"forwarded":2836,"accepted":2837,"watermark":1,"history":"6da70e546cbf6059f17865e4087a82a5a07914bd9e59eb17898c960b4fa452d9","next_known":11}
+BOWN_GROUP {"op":115,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2836}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":115,"cut":57,"forwarded":2837,"accepted":2838,"watermark":1,"history":"5b1cf46cf9495324a35bf5683df231fe784b06dabc31704cbbe354f4dbb5427e","next_known":321}
+BOWN_GROUP {"op":116,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2837}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":116,"cut":58,"forwarded":2838,"accepted":2839,"watermark":1,"history":"f0483aa2b4a78f6d32d4f086d0d96cd41cd0b3ea65d4a015b1c9b8e0e2416da1","next_known":264}
+BOWN_GROUP {"op":117,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2838}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":117,"cut":59,"forwarded":2839,"accepted":2840,"watermark":1,"history":"a574481d93d6a91878b3e8a180c35854111c6b491c20ea7accf47490bb8f47a5","next_known":2781}
+BOWN_GROUP {"op":118,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2839}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":118,"cut":60,"forwarded":2840,"accepted":2841,"watermark":1,"history":"082d4d953975cdc7f3b944069801ef3efece088e6fa3202c9c84e689774997b4","next_known":13}
+BOWN_GROUP {"op":119,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2840}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":119,"cut":61,"forwarded":2841,"accepted":2842,"watermark":1,"history":"ec9c56052eca4a2d0e6dc5dd241ac267092b00f446efc0f33d738818c9cec15d","next_known":38256}
+BOWN_GROUP {"op":120,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2841}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":120,"cut":62,"forwarded":2842,"accepted":2843,"watermark":1,"history":"1933f32ece180b8ed312892f792396f0eaa102df3b27a31f75be8d05d3aa8c5c","next_known":660}
+BOWN_GROUP {"op":121,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2842}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":121,"cut":63,"forwarded":2843,"accepted":2844,"watermark":1,"history":"851747156aac362a6db4d326aaef3a0eca904700f4a3f9a7aab9741c208064e3","next_known":220}
+BOWN_GROUP {"op":122,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2843}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":122,"cut":64,"forwarded":2844,"accepted":2845,"watermark":1,"history":"e9033661d97b60233243b290ab03501a5660c204b9d1aa8dc7928e693dcf2ff4","next_known":21}
+BOWN_GROUP {"op":123,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2844}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":123,"cut":65,"forwarded":2845,"accepted":2846,"watermark":1,"history":"6113fa681e44637d649766aa9a41af0c6b18e0ffaa7dd336abab73626edb43d6","next_known":15}
+BOWN_GROUP {"op":124,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2845}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":124,"cut":66,"forwarded":2846,"accepted":2847,"watermark":1,"history":"d3034796452965151e373d73116c9298c3d7321982ab2f501a7174b0dc222881","next_known":7189}
+BOWN_GROUP {"op":125,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2846}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":125,"cut":67,"forwarded":2847,"accepted":2848,"watermark":1,"history":"3e3429849ff5b2490a06c5a44692d3dfef91355015e3bda220894b334d84fae0","next_known":13}
+BOWN_GROUP {"op":126,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2847}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":126,"cut":68,"forwarded":2848,"accepted":2849,"watermark":1,"history":"c6b99980d488d937bf7dacafb194ebac264424dcec03c55e3f9523b6785b60de","next_known":248046}
+BOWN_GROUP {"op":127,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2848}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":127,"cut":69,"forwarded":2849,"accepted":2850,"watermark":1,"history":"e9cae236a3708fa6f1675756e2eeb802ba757785b801083c6e323d52c991dcb4","next_known":198}
+BOWN_GROUP {"op":128,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2849}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":128,"cut":70,"forwarded":2850,"accepted":2851,"watermark":1,"history":"613d09eaf11536f4e1be94d385f3422823093319e861c83b707d769cb8b5a0d3","next_known":248045}
+BOWN_GROUP {"op":129,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2850}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":129,"cut":71,"forwarded":2851,"accepted":2852,"watermark":1,"history":"70299e0b49cf9da3e73c448386b2f86e821982c7f2a7ab6331b6927a46f6480e","next_known":74455}
+BOWN_GROUP {"op":130,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2851}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":130,"cut":72,"forwarded":2852,"accepted":2853,"watermark":1,"history":"b1e471a952ca4ebf632becd88639b447583173609ce501fbdc941c1a1e198d93","next_known":198}
+BOWN_GROUP {"op":131,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2852}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":131,"cut":73,"forwarded":2853,"accepted":2854,"watermark":1,"history":"c190c70fd727fa33665d563b8412def15d66385bd399c19ed11fb28a3b6d5b75","next_known":248068}
+BOWN_GROUP {"op":132,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2853}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":132,"cut":74,"forwarded":2854,"accepted":2855,"watermark":1,"history":"d8cb0b076d8b902d73d7b7ef79007120b11f3c838574ef1a355e7b7f31c96cc9","next_known":271}
+BOWN_GROUP {"op":133,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2854}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":133,"cut":75,"forwarded":2855,"accepted":2856,"watermark":1,"history":"d569e66126bbdf03718844e49f3d044e2f79d0ef0f135ccb65355b19a4874b46","next_known":248069}
+BOWN_GROUP {"op":134,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2855}]}
+BOWN_KNOWN {"request":"b00000000002","slot":1,"occupancy":11,"op":134,"cut":76,"forwarded":2856,"accepted":2857,"watermark":1,"history":"fd6fcb8e42c9f388067215a725f301fd46de5b3b3034763c4157e96190222f8e","next_known":271}
+BOWN_GROUP {"op":135,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2856}]}
+BT 1 2
+BOWN_COMMIT {"request":"b00000000002","slot":1,"occupancy":11,"op":135,"cut":77,"forwarded":2857,"accepted":2858,"watermark":2,"history":"9a18b94b3fbc78788597d67afaf131e3d0b8e3c0a97f0d0152c82eb8d2b9249b","sample":2}
+BOWN_GROUP {"op":136,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2857}]}
+BT 1 5983
+BOWN_COMMIT {"request":"b00000000002","slot":1,"occupancy":11,"op":136,"cut":78,"forwarded":2858,"accepted":2859,"watermark":3,"history":"7a83f16187cfd3fed22ad519310e96f2c35b9dc7b40e4945772f421a658b5b58","sample":5983}
+BOWN_GROUP {"op":137,"stages":2,"active_rows":1,"rows":[{"slot":1,"occupancy":11,"position":2858}]}
+BT 1 248046
+BOWN_COMMIT {"request":"b00000000002","slot":1,"occupancy":11,"op":137,"cut":79,"forwarded":2859,"accepted":2860,"watermark":4,"history":"4c0df42f0945656682cf5bb81c4779f845b71ad5d8a0e289545d4eea571a3b6a","sample":248046}
+BDONE 1 3 stop 875.0

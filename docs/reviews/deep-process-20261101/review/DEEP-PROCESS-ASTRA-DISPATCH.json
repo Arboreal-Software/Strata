@@ -1,0 +1,22 @@
+{
+  "status": "CORRECTED_ROUTING_AWAITING_ACK",
+  "requested_model": "GPT-6 Astra Pro",
+  "tier": "pro",
+  "channel": "C0C2E4KL03X",
+  "thread_ts": "1793573375.026029",
+  "url": "https://clairesagentn-xnh7316.slack.com/archives/C0C2E4KL03X/p1793573375026029",
+  "parts_sent": 17,
+  "minimum_substantive_minutes_requested": 45,
+  "implementation": "PAUSED",
+  "source_push_agent": "sol_lifecycle_review",
+  "evidence_push_agent": "sol_scope_audit",
+  "end_packet_epoch": 1793573329.8779924,
+  "files": {
+    "DEEP-PROCESS-ASTRA-REQUEST.txt": "65bfa0e078de9742f76060bf7ad09c1c5dabf2d53be82112ee5fa1bb8b45dda5",
+    "DEEP-PROCESS-ASTRA-PACKET.txt": "09197b9c0fa36956497e710cabe60096b100cf9d6e84607a2283676f791a7bf1"
+  },
+  "routing_model": "GPT-6 Pro",
+  "evidence_thread_ts": "1793573183.318949",
+  "evidence_url": "https://clairesagentn-xnh7316.slack.com/archives/C0C2E4KL03X/p1793573183318949",
+  "initial_rejection": "Unsupported Pro model label. Use model: GPT-5.6 Sol Pro or model: GPT-6 Pro; unlabeled Pro defaults to GPT-5.6 Sol Pro."
+}

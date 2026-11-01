@@ -1,0 +1,46 @@
+D2 EXECUTION AMENDMENT — CONDITIONAL ONE-ATTEMPT CORRECTION
+Root adjudication after GPT6 Astra Pro ChatSwarm review and owner Slack notification.
+Review: https://clairesagentn-xnh7316.slack.com/archives/C0C2E4KL03X/p1793558366569839
+Owner DM: https://clairesagentn-xnh7316.slack.com/archives/D0BS8DFARUL/p1793558392225919
+Full review and request: ../strata-resume-20261101/RESERVE-AMENDMENT-*.
+
+Supersedes only the occupied32k execution configuration/deadlines in PLAN.txt D2:
+explicit primary/later GPU expert-cache reserves3072/3072 MiB; inner1500s,
+load300s, aggregate work1100s, close75s. Original outer1800s remains.
+No scope, cap, numerical tolerance, fixture token boundary, two-slot requirement,
+engine source/binary identity, full routing profile, or release criterion changes.
+No deployment-profile or reduced-context decision is implied.
+
+Why: original primary1536 exceeded GPU0 cap; primary2560/later2048 reached
+READY but exceeded GPU1 cap at first request (22546 versus22528MiB).
+The later GPU has an independent reserve. Primary-only changes cannot free it.
+Original inner1620 also refused after outer-budget preflight consumption.
+All failures remain in fixture-catalog.json. Their results are not reused as PASS.
+
+Root accepts Astra's recommendation conditionally, with these launch prerequisites:
+1. Fresh immutable prepared successor; both reserves and deadlines verified from
+   actual argv/plan, old or partially updated tuples rejected. Same196632B profile.
+2. Explicit phase/deadline ledger: existing entry requires remaining SCENARIO
+   budget>=1510; do not reset the outer expiry. Work must have aggregate1100+75
+   available at entry or refuse; no per-request timeout reset or token reduction.
+   Account setup/identity/reporting separately;25s nominal spare is not proof.
+3. Root reviews changed source and offline positive/negative tests. No engine rebuild.
+4. One bounded retry using original4CPU/32GiB RAM=swap/22528MiB perGPU,
+   raw32MiB/131072lines/encoded96MiB limits and exact GPU identities/cadence.
+   Capture effective cache sizes, phase timing and available allocation evidence.
+5. PASS requires both F32767/A32768 real slots, complete shared-operation and
+   actual-history numerical/restoration evidence, independent cleanup and
+   authenticated393216/two-slot baseline restoration. READY is not qualification.
+6. Cap/timeout/overflow/missing witness/semantic failure stops promotion. Preserve
+   measurements and diagnose allocation category or phase before another change.
+   No automatic second retry, cap increase, smaller workload or changed tolerance.
+7. Matching semantic/witness/performance consumers require fresh3072/3072 binding;
+   no relabeling2560/2048 or other old receipts. Small-label semantics remains scoped.
+
+Predicted916/1006MiB margins cover only the previous observed phase; full-context,
+private repair and oracle peaks remain unknown. Smaller expert residency can change
+transfers, transient allocation and timing despite the unchanged routing profile.
+Independent D3/D4 work continues after verified resource release.
+
+Reviewer reports GPT6 Astra Pro/pro; independent provider-profile attestation was
+unavailable. Reviewer inspected supplied evidence, not local files or execution.

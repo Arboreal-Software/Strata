@@ -1,0 +1,14 @@
+{
+  "state": "RUNNING",
+  "epoch": 1793571499.3687925,
+  "supervisor_pid": 3642992,
+  "pane": "%145",
+  "callback_pane": "%142",
+  "callback_pid": 3623544,
+  "config": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/root-supervisor.json",
+  "config_sha256": "911cd9555d3113b7b8f48ca7cb7e149062d22f47f2854a0bb8e8ec7db697fe0c",
+  "output": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/managed-prefill-reserve4096-native-root-20261101/output-strata-serve-suffix-repaired-20261101T221708Z",
+  "source_manifest_sha256": "f983320af084b1f5544be03d0ff1b8c1c2ac7a4082a36e373064ca7735b1ed19",
+  "binary_sha256": "c15173dfffc7c17f3c3be3f35b93b31d863fc2f27029aed0dd5270df3b697e91",
+  "native_pass": false
+}

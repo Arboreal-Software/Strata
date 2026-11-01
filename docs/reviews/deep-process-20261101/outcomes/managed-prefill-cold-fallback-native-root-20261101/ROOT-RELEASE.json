@@ -1,0 +1,68 @@
+{
+  "status": "PRODUCT_FAIL_INDEPENDENTLY_RELEASED_BASELINE_RESTORED",
+  "failure": "GPU resource envelope exceeded; no numerical verdict",
+  "epoch": 1793571137.489941,
+  "campaign": "LOCAL_WORKSPACE/.local/strata-implementation/suffix-first/managed-prefill-cold-fallback-native-root-20261101",
+  "cid": "5cc8a3c79d3d44d0801240cc872fb37bb9fa31fdf61592cfd2654e28ee83907e",
+  "attempt_label": "7ae8554d7c8a47d59485419f30a0e9ce",
+  "runner_absent": true,
+  "supervisor_absent": true,
+  "matching_client_pids": [],
+  "checks": [
+    {
+      "args": [
+        "info",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": "be76a944-ad6a-4ad6-983d-af0294b670e7\n"
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "name=^/strata-serve-suffix-repaired-e689f76ee1bc4fc6ba03fbc097805d1c$",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "label=strata.resident-repair-attempt=7ae8554d7c8a47d59485419f30a0e9ce",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    },
+    {
+      "args": [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "id=5cc8a3c79d3d44d0801240cc872fb37bb9fa31fdf61592cfd2654e28ee83907e",
+        "--format",
+        "{{.ID}}"
+      ],
+      "stdout": ""
+    }
+  ],
+  "baseline": {
+    "id": "1ae3605d33df66f2bb8dca5d495deb585d917f287b33b29c4f948235161c2fad",
+    "image": "sha256:ec8ab65b49dd35478d8b77a15cf1d7fb05c07c0e42adac30932ac5982679a757",
+    "healthy": true,
+    "context": 393216,
+    "parallel": 2
+  },
+  "supervisor_result_sha256": "b749796f3c5a1ecaf23b575cbea9162a91897a86caabe0694d6314def7b5dd91",
+  "result_sha256": "53e77381a797d043f06a39630d107aabd9f8dfc2365f11b0f2d7c79486001c10",
+  "native_pass": false,
+  "qualified": false
+}

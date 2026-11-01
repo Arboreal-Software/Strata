@@ -1,0 +1,35 @@
+ASTRA COMPLETION-PLAN REVIEW — ROOT ADJUDICATION
+2026-11-01. Planning changes only. Implementation goal remains PAUSED.
+Canonical: https://clairesagentn-xnh7316.slack.com/archives/C0C2E4KL03X/p1793529260038189
+Request slack-C0C2E4KL03X-81ba10e977ba94df60ac; attempt attempt_71d11304-0f3d-4dc3-8d87-d2268b238a3e.
+Coordinator issued inactivity intervention, then delivered the complete late result in two messages containing sections1/3,2/3,3/3 and final index. Late completion supersedes the warning for review availability; no retry or new dispatch. Reviewer reports GPT-6 Astra Pro/relay pro; independent provider-profile attestation unavailable. Reviewer read53/53 parts and prior review; did not inspect omitted repository source or execute anything.
+
+1. ACCEPT — move target/capability decision before final-profile preparation.
+Current helper lacks393216 and fixes text-only/non-spec restrictions. Existing owner-selected baseline remains the working target, not a new reduced-context default. Added D-TARGET. Small diagnostic jobs may retain their scoped value; they cannot populate target release gates. Reduced capability/context still needs owner choice. No re-litigation of required two slots.
+
+2. ACCEPT — distinguish healthy refusal from fatal device poisoning.
+Original D6 incorrectly required surviving-peer continuation at every fault boundary. Existing fault contracts instead require engine1/no successful target DONE and retained poisoned ownership. Revised D6: healthy refusal preserves state/peer continuation; fatal failure proves failstop/ownership/release, then separate candidate restart/recovery. No new engine fault hooks requested merely to expand the matrix.
+
+3. ACCEPT WITH SOURCE CHECK — age eligibility and burst caps do not prove bounded waiting.
+Re-read serving_thread_bridge.hpp select: eligible operations are filtered to maximum effective_priority before class-weight selection. Re-read serving_repair_scheduler.hpp max-consecutive gate. These constrain eligibility/bursts, not a hard maximum service delay under sustained higher tiers. Added explicit guarantee boundary and a conditional implementation task if hard staleness is required. No unilateral new policy/threshold adopted.
+
+4. ACCEPT CONDITIONALLY — same-profile observer evidence derivation, never relabeling.
+Current exact target tuple checks stay. TO_IMPLEMENT derivation preserves actual witness tuple/raw hash, validates selector-only delta and noninterference, normal corroboration, chronology and independent release. Added target-profile actual-history/pending/restoration, occupied/returned concurrency and normal quality/cancel/lifecycle/timing/rollback minimums. Three-output occupancy is not occupied cancellation. Negative cases include wrong tuple/history, missing ACK/raw, another attempt release and selector presence even0. No manifest/compiler implemented or gate promoted.
+
+5. ACCEPT WITH SOURCE CHECK — explicit rollback bootstrap identities.
+Re-read suffix_cache_launch.py activate/preflight/validate. rollback_drill is already propagated through internal preflight, so that specific cycle is not a confirmed current code defect. Ordinary CLI preflight is strict; installed integration must not accidentally put it before bootstrap. Added candidate C, actual drilled manifest R0 and attestation-only final R1 extension; exact immutable candidate remains unchanged. R1 must not falsely claim it was drilled or hash itself through its receipt. Compiler/verifier semantics and negatives remain TO_IMPLEMENT.
+
+6. ACCEPT — actual installed selector, one lock order, detached owner.
+Source already supplied proves old selector/schema, shell SUPPORTED=(), obsolete proposed activate and current activate-transaction CLI. Added parent/child lock reacquisition deadlock prevention, under-lock revalidation and actual installed routing acceptance. No installed files changed.
+
+7. ACCEPT — finish real adapters and use truthful measurements.
+Retain native appendix's concrete semantic no-STOP/reader, admissions and answer-key blockers; performance draft intentionally refuses and needs actual binder/witness/injector. Settings comparison alone is not a concurrency witness. Native clocks omit HTTP ingress/queue. Proposed balanced16-arm campaign is a design proposal subject to feasibility/bounds and owner margins, not a command to run blindly or a statistical guarantee. No margins=>OBSERVED; straddling=>INCONCLUSIVE. No fabricated p99, hard wait bound or ETA.
+
+8. ACCEPT — reuse already prepared work and all observed outcomes.
+Retain current target3/4 and cancellation passes at actual scope; current seven-arm staging already solved. Never-active compact closure can be reverified/adopted once under fresh authority; no ceremonial duplicate preparation. Attempted/owner-interrupted return gets a fresh attempt. Independent occupied/compact work need not be suppressed by unrelated fixture failure after verified cleanup. Existing caps/strict readers remain authoritative; reviewer prose is not a grant or replacement config.
+
+9. ACCEPT — corrected full-scope dependency order.
+P00–P04 lifetime/accounting/exact-state prerequisites precede generic P05/P06; protected return precedes active parking/maintenance. P09/P10/both P11 vendors/P12/P13 and all child plans remain.512k/vision/output-reserve/hardware requirements are unresolved actual qualification, not waived by32k experiment. Revised D8 ordering accordingly; no whole-goal completion claim.
+
+FINAL PLAN STATE
+PLAN.txt revision2 is root-adjudicated. PLAN-AS-REVIEWED.txt preserves exactly the earlier draft; transport files/readback and packet hashes continue to describe that original submission, not revision2. Appendices are source-specific supporting detail; revision2 overrides conflicting order or blanket claims. Remaining decisions: explicit resumption, any context/capability reduction, production policy/performance margins, and genuinely missing external hardware/durable-storage access. All product/build/test/resource/git/deployment work remains paused. No further review is required solely to re-review these planning edits.
