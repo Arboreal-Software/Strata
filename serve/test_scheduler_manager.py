@@ -28,7 +28,7 @@ class Native:
     def wait_ready(self, timeout):
         return {'engine_epoch':self.epoch,'limits':{'max_threads':128}}
     def close(self, reason): self.closed=reason
-    def command(self, verb, *args):
+    def command(self, verb, *args, timeout=5.0):
         if self.closed: raise SchedulerProtocolError(self.closed)
         self.calls.append((verb,*args)); self.seq+=1
         if verb=='CREATE':
@@ -43,7 +43,7 @@ class Native:
         if verb=='ACTOR': row['accepted_revision']+=1
         self.graph+=1
         return {**row,'engine_epoch':self.epoch,'thread_id':thread,'graph_revision':self.graph,
-            'status':'ok','operation_serial':self.seq,'result_revision':args[2] if verb=='OPEN' else 0,
+            'status':'ok','operation_serial':args[1] if verb in ('CANCEL','EDGE','RETIRE') else self.seq,'result_revision':args[2] if verb in ('OPEN','CANCEL','EDGE','RETIRE') else 0,
             'actor_incarnation':self.seq,'lease_version':self.seq}
 
 
@@ -173,7 +173,7 @@ class ManagerTests(unittest.TestCase):
         self.m.action({'action':'edge','consumer':fg,'prerequisite':pf,'add':True})
         prerequisite_done=threading.Event();consumer_waiting=threading.Event();commands=[];errors=[];outputs={}
         command=self.n.command
-        def native(verb,*args):
+        def native(verb,*args,timeout=5.0):
             result=command(verb,*args)
             if verb=='BIND' and args[1]=='aaaaaaaaaaaa' and not prerequisite_done.is_set():
                 result['status']='not_ready'
@@ -222,7 +222,7 @@ class ManagerTests(unittest.TestCase):
         handle=self.m.action({'action':'actor','thread':self.t})['actor']
         incarnation=self.m.actors[handle]['reply']['actor_incarnation'];observed=[]
         native=self.n.command
-        def changed(verb,*args):
+        def changed(verb,*args,timeout=5.0):
             out=native(verb,*args)
             if verb=='ACTOR_SNAPSHOT':
                 out.update(actor_incarnation=incarnation,lease_version=91)
@@ -268,7 +268,7 @@ class ManagerTests(unittest.TestCase):
         self.m.action({'action':'edge','consumer':pairs[0][0],'prerequisite':pairs[1][0],'add':True})
         ready=threading.Event();binds=[];frames=[];errors=[];outputs=[]
         native=self.n.command
-        def command(verb,*args):
+        def command(verb,*args,timeout=5.0):
             if verb=='BIND':
                 binds.append(args[1])
                 if e.ctl.owner!=threading.get_ident():
@@ -351,7 +351,7 @@ class ManagerTests(unittest.TestCase):
 
     def test_foreign_reply_generation_poisoned_not_published(self):
         native=self.n.command
-        def foreign(verb,*args):
+        def foreign(verb,*args,timeout=5.0):
             out=native(verb,*args)
             if verb=='SNAPSHOT':out['thread_generation']+=1
             return out
@@ -368,7 +368,7 @@ class ManagerTests(unittest.TestCase):
         rp=self.m.action({'action':'open','thread':self.t,'class':'live_repair'})['operation']
         paused=threading.Event();release=threading.Event();ready_to_bind=threading.Event();errors=[]
         native=self.n.command
-        def blocked(verb,*args):
+        def blocked(verb,*args,timeout=5.0):
             out=native(verb,*args)
             if verb=='BIND' and not ready_to_bind.is_set():out['status']='not_ready'
             return out
@@ -414,7 +414,7 @@ class ManagerTests(unittest.TestCase):
         rp=self.m.action({'action':'open','thread':self.t,'class':'live_repair'})['operation']
         serial=self.m.operations[fg]['reply']['operation_serial'];terminal=[False]
         native=self.n.command
-        def blocked(verb,*args):
+        def blocked(verb,*args,timeout=5.0):
             out=native(verb,*args)
             if verb=='CANCEL' and args[1]==serial:
                 if terminal[0]:out['status']='terminal'
@@ -439,7 +439,7 @@ class ManagerTests(unittest.TestCase):
 
     def test_cancellation_burst_beyond_four_retains_every_pending_pair(self):
         native=self.n.command;delay=[False];entered=threading.Event();release=threading.Event()
-        def blocked(verb,*args):
+        def blocked(verb,*args,timeout=5.0):
             if delay[0] and verb=='SNAPSHOT':entered.set();release.wait(1)
             out=native(verb,*args)
             if verb=='BIND':out['status']='not_ready'

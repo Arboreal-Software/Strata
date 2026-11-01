@@ -202,7 +202,11 @@ class SchedulerControl:
     def command(self, verb, *arguments, timeout=5.0):
         """Internal typed command; caller owns authentication and handle mapping."""
         _need(type(timeout) in (int, float) and 0 < timeout <= 60, 'Invalid scheduler deadline')
-        with self._serial:
+        deadline = time.monotonic() + timeout
+        if not self._serial.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            self.close('Scheduler command serialization timed out; reconcile engine epoch')
+            raise SchedulerProtocolError('Scheduler command serialization timed out')
+        try:
             with self._condition:
                 self._healthy()
                 _need(self._ready is not None, 'Scheduler startup not received')
@@ -216,9 +220,12 @@ class SchedulerControl:
                 self._sequence = seq
                 self._pending = seq
                 self._reply = None
-            deadline = time.monotonic() + timeout
             try:
+                if time.monotonic() >= deadline:
+                    raise SchedulerProtocolError('Scheduler deadline exhausted before write')
                 self._write(frame + '\n')
+                if time.monotonic() >= deadline:
+                    raise SchedulerProtocolError('Scheduler mutation outcome uncertain after write deadline')
                 with self._condition:
                     while self._reply is None:
                         self._healthy()
@@ -233,3 +240,5 @@ class SchedulerControl:
             except BaseException:
                 self.close('Scheduler mutation outcome uncertain; reconcile engine epoch')
                 raise
+        finally:
+            self._serial.release()

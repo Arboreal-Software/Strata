@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import secrets
 import threading
+import time
 
 from .scheduler_control import SchedulerProtocolError
 
@@ -20,6 +21,12 @@ U64 = (1 << 64) - 1
 
 class SchedulerManagerError(ValueError):
     pass
+
+
+class SchedulerGraphConflict(SchedulerManagerError):
+    """Two authenticated pre-effect CAS refusals; no accepted mutation."""
+    status = 'stale_version'
+    attempts = 2
 
 
 class SchedulerRequestCancelled(SchedulerManagerError):
@@ -162,6 +169,43 @@ class SchedulerManager:
                 raise SchedulerProtocolError('Scheduler managed thread reply mismatch')
         return reply
 
+    def _graph_mutation(self, verb, thread, generation, intent):
+        """Caller holds lock, also used by attach: two pre-effect CAS attempts only."""
+        client = self.client
+        need(client is not None, 'Scheduler engine unavailable')
+        deadline = time.monotonic() + 10.0
+        epoch = self._thread(thread)['engine_epoch']
+
+        def wire(command, *arguments):
+            need(self.client is client, 'Scheduler engine epoch changed')
+            remaining = deadline - time.monotonic()
+            need(remaining > 0, 'Scheduler graph action deadline exhausted')
+            # Real transport owns timeout quarantine/late-reply rejection.
+            reply = client.command(command, *arguments, timeout=min(5.0, remaining))
+            need(self.client is client, 'Scheduler engine epoch changed')
+            if reply['engine_epoch'] != epoch:
+                client.close('Scheduler graph reply changed engine epoch')
+                raise SchedulerProtocolError('Scheduler graph reply epoch mismatch')
+            return reply
+
+        for attempt in range(2):
+            snapshot = wire('SNAPSHOT', thread, generation)
+            need(snapshot['status'] == 'ok', 'Native scheduler refused: '+snapshot['status'])
+            if snapshot['thread_id'] != thread or snapshot['thread_generation'] != generation:
+                client.close('Scheduler graph snapshot names another managed generation')
+                raise SchedulerProtocolError('Scheduler managed thread reply mismatch')
+            result = wire(verb, snapshot['graph_revision'], *intent)
+            if (result['operation_serial'], result['result_revision']) != intent[:2]:
+                client.close('Scheduler graph reply names another operation')
+                raise SchedulerProtocolError('Scheduler graph operation reply mismatch')
+            if result['status'] == 'stale_version':
+                if attempt == 0:
+                    continue
+                raise SchedulerGraphConflict('Native scheduler refused: stale_version (two attempts)')
+            need(result['status'] == 'ok', 'Native scheduler refused: '+result['status'])
+            self.native[thread] = snapshot
+            return result
+
     def _thread(self, handle):
         need(type(handle) is str and handle in self.native, 'Unknown thread handle')
         return self.native[handle]
@@ -278,25 +322,21 @@ class SchedulerManager:
                 if action == 'retire_actor':
                     del self.actors[handle]
             else:
-                # Query graph revision from an authentic thread snapshot before every CAS.
                 key = body['consumer'] if action == 'edge' else body['operation']
                 operation = self._operation(key)
                 thread = operation['thread']
-                current = self._thread(thread)
-                snapshot = self._command('SNAPSHOT', thread, current['thread_generation'])
-                self.native[thread] = snapshot
+                generation = self._thread(thread)['thread_generation']
                 record = operation['reply']
+                intent = (record['operation_serial'], record['result_revision'])
                 if action == 'edge':
                     prerequisite = self._operation(body['prerequisite'])['reply']
                     need(type(body['add']) is bool, 'Dependency add must be boolean')
-                    result = self._command('EDGE', snapshot['graph_revision'], record['operation_serial'],
-                                           record['result_revision'], prerequisite['operation_serial'],
-                                           prerequisite['result_revision'], int(body['add']))
-                else:
-                    result = self._command(action.upper(), snapshot['graph_revision'],
-                                           record['operation_serial'], record['result_revision'])
-                    if action == 'retire':
-                        del self.operations[key]
+                    # EDGE is declarative: preserve exact endpoints/add, renew only CAS.
+                    intent += (prerequisite['operation_serial'],
+                               prerequisite['result_revision'], int(body['add']))
+                result = self._graph_mutation(action.upper(), thread, generation, intent)
+                if action == 'retire':
+                    del self.operations[key]
             response = {'manager_revision': self.revision, 'native': result}
             if action == 'create':
                 response['thread'] = thread
