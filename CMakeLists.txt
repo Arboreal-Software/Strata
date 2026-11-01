@@ -346,6 +346,27 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   target_link_libraries(serving_thread_startup_test PRIVATE Threads::Threads)
   add_test(NAME serving_thread_startup_test COMMAND serving_thread_startup_test)
   set_tests_properties(serving_thread_startup_test PROPERTIES TIMEOUT 120)
+  add_executable(serving_output_capacity_test tests/core/serving_raw_contracts/test_serving_output_capacity.cpp
+    src/core/window_budget.cpp)
+  target_include_directories(serving_output_capacity_test PRIVATE include src/program)
+  target_link_libraries(serving_output_capacity_test PRIVATE Threads::Threads)
+  add_test(NAME serving_output_capacity_test COMMAND serving_output_capacity_test)
+  set_tests_properties(serving_output_capacity_test PROPERTIES TIMEOUT 120)
+  set(_output_capacity_fixture ${CMAKE_CURRENT_BINARY_DIR}/serving_output_capacity/actual.cpp)
+  add_custom_command(OUTPUT ${_output_capacity_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/generate_serving_output_capacity_test.py
+      --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_output_capacity_fixture}
+    DEPENDS src/program/generate.cpp tests/core/serving_raw_contracts/generate_serving_output_capacity_test.py
+      tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+    VERBATIM)
+  add_executable(serving_output_admission_test ${_output_capacity_fixture} src/core/window_budget.cpp)
+  target_include_directories(serving_output_admission_test PRIVATE include src/program)
+  target_link_libraries(serving_output_admission_test PRIVATE Threads::Threads)
+  add_test(NAME serving_output_admission_test COMMAND serving_output_admission_test)
+  set_tests_properties(serving_output_admission_test PROPERTIES TIMEOUT 120)
+  add_test(NAME serving_output_capacity_source_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_output_capacity_source.py)
+  set_tests_properties(serving_output_capacity_source_test PROPERTIES TIMEOUT 30)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME serving_thread_bridge_nonce_test COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_bridge_nonce.py

@@ -3334,7 +3334,7 @@ public:
         if (facts.accepted.empty() || facts.frontiers.empty() || !facts.cut_id ||
             facts.cut_id == std::numeric_limits<uint64_t>::max() || facts.accepted.size() > session.max_tokens())
             return refuse("suffix repair needs an accepted run, request frontiers and a fresh cut");
-        if (facts.retain_foreground && (facts.frontiers.size()!=1 || facts.max_generated==0 || facts.max_generated>64 ||
+        if (facts.retain_foreground && (facts.frontiers.size()!=1 || facts.max_generated==0 ||
             facts.request_tokens.size()<facts.accepted.size() || facts.request_tokens.size()>session.max_tokens() ||
             facts.max_generated>session.max_tokens()-facts.request_tokens.size() ||
             !std::equal(facts.accepted.begin(),facts.accepted.end(),facts.request_tokens.begin())))
@@ -3342,14 +3342,26 @@ public:
         // The operation's own host scratch (metadata, roots, receipt observers), admitted through the transaction's
         // real ledger and retained by the credit it returns: a credit is budget, never completion.
         uint64_t control = (1ULL << 20);
-        if (std::max(facts.accepted.size(),facts.request_tokens.size()) >
-            (std::numeric_limits<uint64_t>::max()-control)/128ULL)
-            return refuse("suffix repair control quote overflow");
-        control += std::max(facts.accepted.size(),facts.request_tokens.size()) * 128ULL;
+        if(facts.retain_foreground){
+            if(!serving_output_history_quote(facts.request_tokens.size(),facts.max_generated,control))
+                return refuse("suffix repair output/history quote overflow");
+        }else{
+            const auto metadata_tokens=std::max(facts.accepted.size(),facts.request_tokens.size());
+            if(metadata_tokens>(UINT64_MAX-control)/128ULL)return refuse("suffix repair control quote overflow");
+            control+=metadata_tokens*128ULL;
+        }
         if (auto admitted = session.admit_host(control, out.operation_credit); !admitted) return admitted;
+        rrd::ResidentRepairController::ReceiptHistory initial_receipts;
+        rrd::ResidentRepairController::ReceiptHistory::Prepared receipt_growth;
         if (facts.retain_foreground) {
-            // The existing control quote (1MiB +128/request token) covers both metadata-only outer snapshots,
-            // immutable request, and clone/reserve transients. It does not admit context-sized outer vectors.
+            // Pay finite generated history as well as short-input/long-output requests.
+            // Receipt growth is independent, stable-address storage, prepared BEFORE restore.
+            uint64_t required=0;
+            const uint64_t comparison_headroom=SuffixExperimentDriver::serving_qualification_enabled()?1:0;
+            if(!serving_receipt_requirement(0,facts.max_generated,comparison_headroom,required)||
+               !initial_receipts.prepare(required,[&](uint64_t bytes,std::shared_ptr<const void>& credit){
+                   return bool(session.admit_host(bytes,credit));},receipt_growth))
+                return refuse("suffix repair cumulative receipt admission refused");
             out.cohort_capacity_bound=uint64_t(facts.request_tokens.size())+facts.max_generated;
             out.request_tokens.reserve(facts.request_tokens.size());
             for(auto token:facts.request_tokens)out.request_tokens.push_back(int32_t(token));
@@ -3452,6 +3464,8 @@ public:
                                             session.slot_occupancy_incarnation()?&session:nullptr))
             return post_error("resident binding refused after install: ", error);
         preconstructed.reset(); // controller now owns the initialized private gang; guard must not retire it
+        if(facts.retain_foreground&&!repair->receipts_.commit(receipt_growth))
+            failstop(session,"prepared receipt capacity changed before controller adoption");
         // Copies and restores are complete: the old operand payloads are no longer consumers, so free their
         // charges before the controller works (the driver releases them at the same point).
         roots.reset();donor={};prefix={};out.splice={};out.splice_credit.reset();
@@ -3862,6 +3876,9 @@ public:
         // Credit precedes the payload: old/new request vectors die before their own reservation.
         std::shared_ptr<const void> credit;
         std::vector<int32_t> tokens;
+        core::SnapshotDescriptor publication,cohort_publication;
+        resident_repair_detail::ResidentRepairController::ReceiptHistory::Prepared receipts;
+        uint64_t history_bound=0;
         uint64_t max_generated=0;
     };
     static bool prepare_continuation_request(ServingRawSession& session,const Outcome& owner,
@@ -3869,7 +3886,7 @@ public:
         if(!session.request_open()||!owner.controller||owner.retired||!owner.yielded||prepared.credit||
            !prepared.tokens.empty()){error="continuation request requires an open retained admission";return false;}
         const auto& c=*owner.controller;const auto& h=c.published_->metadata;
-        if(c.receipt_count_>c.receipts_.size()||!budget||budget>c.receipts_.size()-c.receipt_count_||
+        if(c.receipt_count_>c.receipts_.size()||!budget||
            h.cut.accepted!=h.cut.forwarded+1||h.accepted_tokens.size()!=h.cut.accepted||
            h.pending_tokens.size()!=1||h.pending_tokens.front()!=h.accepted_tokens.back()||
            incoming.size()<h.accepted_tokens.size()||incoming.size()>session.max_tokens()||
@@ -3892,18 +3909,35 @@ public:
         for(auto token:incoming)if(token<0||token>=vocabulary||token>INT32_MAX){
             error="continuation token outside actual model vocabulary";return false;
         }
-        if(incoming.size()>(UINT64_MAX-sizeof(PreparedContinuationRequest))/sizeof(int32_t)){
-            error="continuation immutable request host quote overflow";return false;
-        }
-        const auto admitted=session.admit_host(sizeof(PreparedContinuationRequest)+incoming.size()*sizeof(int32_t),prepared.credit);
+        uint64_t bytes=0,required=0;
+        const uint64_t comparison_headroom=SuffixExperimentDriver::serving_qualification_enabled()?1:0;
+        if(!serving_output_history_quote(incoming.size(),budget,bytes)||bytes>UINT64_MAX-sizeof(PreparedContinuationRequest)||
+           !serving_receipt_requirement(c.receipt_count_,budget,comparison_headroom,required)){
+            error="continuation output/history/receipt quote overflow";return false;}
+        if(!c.receipts_.prepare(required,[&](uint64_t quote,std::shared_ptr<const void>& credit){
+            return bool(session.admit_host(quote,credit));},prepared.receipts)){
+            error="continuation cumulative receipt allocation refused before displacement";return false;}
+        const auto admitted=session.admit_host(bytes+sizeof(PreparedContinuationRequest),prepared.credit);
         if(!admitted){error=admitted.detail;return false;}
-        try{prepared.tokens.reserve(incoming.size());for(auto token:incoming)prepared.tokens.push_back(int32_t(token));}
+        try{prepared.tokens.reserve(incoming.size());for(auto token:incoming)prepared.tokens.push_back(int32_t(token));
+            prepared.history_bound=uint64_t(incoming.size())+budget;
+            prepared.publication=owner.published;prepared.cohort_publication=owner.cohort_publication;
+            prepared.publication.accepted_tokens.reserve(size_t(prepared.history_bound));
+            prepared.cohort_publication.accepted_tokens.reserve(size_t(prepared.history_bound));}
         catch(...){error="continuation immutable request allocation refused before displacement";return false;}
         prepared.max_generated=budget;return true;
     }
     static void adopt_continuation_request(Outcome& owner,PreparedContinuationRequest& prepared) noexcept {
         auto& c=*owner.controller;
+        if(prepared.publication.key!=owner.published.key||prepared.publication.cut!=owner.published.cut||
+           prepared.publication.accepted_tokens!=owner.published.accepted_tokens||
+           prepared.publication.pending_tokens!=owner.published.pending_tokens)
+            strata::core::retirement_failed("prepared continuation publication changed during activation");
+        if(!c.receipts_.commit(prepared.receipts))strata::core::retirement_failed("prepared continuation receipt capacity changed");
         owner.request_tokens.swap(prepared.tokens);owner.request_credit.swap(prepared.credit);
+        static_assert(std::is_nothrow_swappable_v<core::SnapshotDescriptor>);
+        std::swap(owner.published,prepared.publication);std::swap(owner.cohort_publication,prepared.cohort_publication);
+        owner.cohort_capacity_bound=prepared.history_bound;
         owner.max_generated=prepared.max_generated;
         owner.request_receipt_base=c.receipt_count_;owner.request_known_base=c.known_count_;
         owner.request_watermark_base=c.published_->metadata.cut.output_watermark;
@@ -16074,7 +16108,8 @@ int main(int argc, char** argv) {
                 const strata::kernels::SamplerParams& sampling,std::string_view request_key,uint64_t request_leg,
                 std::string& error) -> bool {
             if(serving_repair_idle_unit==0){error="owned repaired admission requires explicit bounded repair units";return false;}
-            if(!owned_batch_allocation||budget<1||budget>64||!fresh_owned_slot(index,error))return false;
+            if(!owned_batch_allocation||budget<1||!strata::program::serving_output_fits(
+                validated_request.size(),uint64_t(budget),uint64_t(o.max_context))||!fresh_owned_slot(index,error))return false;
             auto& slot=bs.at(index);auto& actor=*slot.owned_raw;
             slot.http_request=request_key;slot.http_leg=request_leg;
             slot.alignment_observed=false;slot.alignment_last_operation=0;slot.alignment_phase="donor";
@@ -17856,7 +17891,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
 #if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
-                if(owned_batch_allocation&&(bimg||mn>64||bs[size_t(b)].repair_finishing)){
+                if(owned_batch_allocation&&(bimg||bs[size_t(b)].repair_finishing)){
                     std::printf("ERR BGEN: unsupported owned request or pinned repair slot\n");std::fflush(stdout);continue;
                 }
 #endif
@@ -18295,6 +18330,14 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // The admission phase is GEN1, but physical slot output has the full
+            // BGEN budget. Refuse that full request before any input/state mutation.
+            if(owned_batch_allocation&&(admit_max_new<1||!strata::program::serving_output_fits(
+                ids.size(),uint64_t(admit_max_new),uint64_t(o.max_context)))){
+                std::printf("ERR owned BGEN prompt/output exceeds context\n");std::fflush(stdout);continue;
+            }
+#endif
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -19090,12 +19133,12 @@ int main(int argc, char** argv) {
                 if (!strata::program::ServingSuffixRepairOperation::exact_first() && strata::kernels::cvec().loaded())
                     donor_refusal="retained suffix repair requires an owner-bound steering identity before loaded cvec is supported";
                 else if (!strata::program::ServingSuffixRepairOperation::exact_first() &&
-                    (max_new<1 || max_new>64 || req_temperature>0 || req_penalty_last_n>0 ||
+                    (max_new<1 || req_temperature>0 || req_penalty_last_n>0 ||
                      !req_bias.empty() || o.prefill_head_alias || o.adapt_every || o.adapt_async ||
                      o.pipeline_windows || pipe ||
                      uint64_t(ids.size())>serving_raw_session->max_tokens() ||
                      uint64_t(max_new)>serving_raw_session->max_tokens()-uint64_t(ids.size())))
-                    donor_refusal="retained suffix repair requires neutral greedy output, 1..64 outputs and admitted prompt/output capacity";
+                    donor_refusal="retained suffix repair requires neutral greedy output and admitted finite prompt/output capacity";
                 else if (repaired_donor_pending < 0)
                     donor_refusal = "no certified pending token for the session's endpoint";
                 else if (uint64_t(ids.size()) <= donor_forwarded || ids[size_t(donor_forwarded)] != repaired_donor_pending)

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdio>
+#include "serving_output_capacity.hpp"
 #include "suffix_experiment_metrics.hpp"
 #if defined(STRATA_WINDOW_STATE_AVAILABLE)
 // The retained-repair evidence value and the shared owner gates. They live in a CUDA-free header because the CPU
@@ -54,6 +55,7 @@ class ResidentRepairController final {
         // Fixed retained acknowledgement: retry same operation returns this
         // historical receipt without forwarding/emitting again.
     };
+    using ReceiptHistory=::strata::program::ServingReceiptHistory<Receipt>;
     struct KnownReceipt {
         uint64_t operation=0,publication=0,cut=0;
         int32_t consumed=-1,next=-1;
@@ -1315,6 +1317,7 @@ class ResidentRepairController final {
     // Exact bounded observations, no GPU/resource query or fake completion.
     // Published history/root objects are immutable while reachable here.
     struct Observation {
+        ReceiptHistory::Snapshot receipt_snapshot; // separately paid; payload before credit
         std::shared_ptr<Published> selected;
         core::WindowKey key,private_key;
         Receipt last;
@@ -1326,7 +1329,6 @@ class ResidentRepairController final {
         std::vector<int32_t> accepted,pending,private_history;
         std::array<int64_t,maximum_stages> private_windows{},live_windows{};
         std::array<std::array<int32_t,3>,maximum_stages> private_ple{},live_ple{};
-        std::array<Receipt,64> receipts{};
         std::array<core::RepairCausalRoot,core::RepairAncestry::capacity> roots{};
         size_t root_count=0,receipt_count=0;
         uint64_t next_cut=0,service_operation=0,private_operation=0,last_completed=0,foreground=0;
@@ -1340,7 +1342,10 @@ class ResidentRepairController final {
         Observation o;o.selected=published_;o.key=published_->metadata.key;o.private_key=private_key_;o.last=last_;o.live=live_.cut_;o.private_cut=private_->cut_;
         o.runtime_cut=runtime_->cut_;o.selected_cut=published_->metadata.cut;
         o.accepted=published_->metadata.accepted_tokens;o.pending=published_->metadata.pending_tokens;
-        o.private_history=private_history_;o.receipts=receipts_;o.receipt_count=receipt_count_;
+        o.private_history=private_history_;o.receipt_count=receipt_count_;
+        if(!receipts_.snapshot(receipt_count_,[&](uint64_t bytes,std::shared_ptr<const void>& credit){
+            return bool(live_.admit_controller_host(bytes,credit));},o.receipt_snapshot))
+            fatal("receipt observation host admission/allocation refused");
         if(published_->data){o.ancestry_data=published_->data;o.coverage_begin=published_->data->coverage.begin();o.coverage_end=published_->data->coverage.end();
             o.region_count=published_->data->region_roots.size();if(o.region_count>o.region_roots.size())fatal("observer root map bound");
             std::copy(published_->data->region_roots.begin(),published_->data->region_roots.end(),o.region_roots.begin());
@@ -1375,7 +1380,7 @@ class ResidentRepairController final {
            before.exact_receipt!=after.exact_receipt||before.binding_receipt!=after.binding_receipt)return false;
         for(size_t i=0;i<before.region_count;++i)if(before.region_roots[i].region!=after.region_roots[i].region||before.region_roots[i].root!=after.region_roots[i].root)return false;
         for(size_t i=0;i<before.root_count;++i)if(before.roots[i]!=after.roots[i])return false;
-        for(size_t i=0;i<before.receipt_count;++i)if(!receipt_equal(before.receipts[i],after.receipts[i]))return false;
+        for(size_t i=0;i<before.receipt_count;++i)if(!receipt_equal(before.receipt_snapshot.entries[i],after.receipt_snapshot.entries[i]))return false;
         return !busy_;
     }
     bool check_stale_serial(std::string& error){
@@ -1860,7 +1865,7 @@ class ResidentRepairController final {
     bool comparison_done_=false,comparison_pass_=false;
     Receipt last_{};
     KnownReceipt last_known_{};
-    std::array<Receipt,64> receipts_{};
+    ReceiptHistory receipts_;
     size_t receipt_count_=0;
     uint64_t next_cut_=1,foreground_count_=0,foreground_at_attachment_=0,known_count_=0;
     unsigned partial_count_=0;
