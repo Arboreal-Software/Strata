@@ -16,11 +16,19 @@ class OutputCapacitySource(unittest.TestCase):
 
     def test_full_bgen_budget_checked_before_media_or_native_work(self):
         begin = self.source.index('const int64_t n = (int64_t) ids.size();', self.source.index('ERR bad request:'))
-        check = self.source.index('ids.size(),uint64_t(admit_max_new),uint64_t(o.max_context)', begin)
+        check = self.source.index('ids.size(),uint64_t(admit_max_new),uint64_t(o.max_context),0)', begin)
         self.assertLess(check, self.source.index('req_imgs.clear();', begin))
         owned = body(self.source, 'auto admit_owned_repair_slot =')
         self.assertIn('serving_output_fits(', owned)
         self.assertLess(owned.index('serving_output_fits('), owned.index('fresh_owned_slot('))
+
+    def test_owned_boundary_does_not_change_legacy_context_slack(self):
+        start = self.source.index('bool request_over_context=false;')
+        end = self.source.index('bool bad = false;', start)
+        guard = self.source[start:end]
+        self.assertIn('if(owned_batch_allocation&&admit_slot>=0)', guard)
+        self.assertIn('uint64_t(n),uint64_t(admit_max_new),uint64_t(o.max_context),0)', guard)
+        self.assertIn('request_over_context=n+max_new+8>o.max_context;', guard)
 
     def test_initial_storage_prepared_before_state_install(self):
         start = self.source.index('rrd::ResidentRepairController::ReceiptHistory initial_receipts;')

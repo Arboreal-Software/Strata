@@ -16,6 +16,14 @@ def generate(root):
     adopt = actual('static void adopt_continuation_request(')
     start = source.index('const int64_t n = (int64_t) ids.size();', source.index('ERR bad request:'))
     bgen = source[start:source.index('req_imgs.clear();', start)]
+    later = source.index('sp.embd_rows = geni ? row_ptr.data() : nullptr;', start)
+    later = source.index('\n', later) + 1
+    generic_context = source[later:source.index('bool bad = false;', later)]
+    command_guard = actual('if(owned_batch_allocation&&(admit_slot<0||req_temperature!=0||req_penalty_last_n!=0||req_bias_present||')
+    receipt_source = (root / 'src/program/http_two_slot_receipt.hpp').read_text()
+    key_start = receipt_source.index('inline bool http2_request_key(')
+    key_body = body(receipt_source, 'inline bool http2_request_key(')
+    request_key = receipt_source[key_start:receipt_source.index(key_body, key_start)] + key_body
     return r'''
 #include "serving_output_capacity.hpp"
 #include "strata/core/window_budget.hpp"
@@ -26,9 +34,11 @@ def generate(root):
 #include <cstdlib>
 #include <span>
 #include <string>
+#include <string_view>
 static void require(bool b,const char* why){if(!b){std::fprintf(stderr,"FAIL: %s\n",why);std::abort();}}
 namespace strata::core { [[noreturn]] inline void retirement_failed(const char* why){require(false,why);std::abort();} }
 namespace strata::program {
+''' + request_key + r'''
 struct SuffixExperimentDriver {static bool serving_qualification_enabled(){return false;}};
 namespace resident_repair_detail {
 struct ResidentRepairController {
@@ -69,11 +79,28 @@ struct Actual {
 ''' + prepared + '\n' + prepare + '\n' + adopt + r'''
 };
 struct Options{int64_t max_context=512;};
-static bool actual_bgen(bool owned_batch_allocation,const std::vector<int64_t>& ids,int64_t admit_max_new){
-    Options o;
+static bool actual_bgen(bool owned_batch_allocation,const std::vector<int64_t>& ids,int64_t admit_max_new,int64_t context=512,int admit_slot=0){
+    Options o;o.max_context=context;
     for(int once=0;once<1;++once){
 #define STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE 1
 ''' + bgen + r'''
+        return true;
+    }
+    return false;
+}
+static bool actual_generic_context(bool owned_batch_allocation,int64_t n,int64_t max_new,int64_t admit_max_new,int64_t context,int admit_slot=0){
+    Options o;o.max_context=context;
+    for(int once=0;once<1;++once){
+''' + generic_context + r'''
+        return true;
+    }
+    return false;
+}
+static bool actual_owned_command(bool owned_batch_allocation,int admit_slot){
+    const double req_temperature=0;const int req_penalty_last_n=0;const bool req_bias_present=false;
+    const std::string req_http_request="000000000001";
+    for(int once=0;once<1;++once){
+''' + command_guard + r'''
         return true;
     }
     return false;
@@ -90,10 +117,31 @@ static void setup(Outcome& owner){
 static void bgen_tests(){
     std::vector<int64_t> ids(40,3);
     require(actual_bgen(true,ids,65),"actual owned BGEN allows admitted65 output");
-    require(actual_bgen(true,ids,464),"actual owned BGEN full budget fits context slack");
-    require(!actual_bgen(true,ids,465),"actual owned BGEN rejects full budget, not merely GEN1 phase");
+    require(actual_bgen(true,ids,472),"actual owned BGEN full budget fits exact logical context");
+    require(!actual_bgen(true,ids,473),"actual owned BGEN rejects full budget, not merely GEN1 phase");
     require(!actual_bgen(true,ids,0)&&!actual_bgen(true,ids,INT64_MAX),"actual owned BGEN rejects unresolved or oversized budget");
     require(actual_bgen(false,ids,INT64_MAX),"default-off native admission fragment unchanged");
+}
+static void boundary_tests(){
+    const std::vector<int64_t> ids(32765,3);
+    require(actual_bgen(true,ids,3,32768),"actual early owned full-budget boundary32765/3 fits32768");
+    require(actual_generic_context(true,32765,1,3,32768),"actual later owned GEN1 guard preserves full-budget boundary");
+    require(!actual_bgen(true,ids,4,32768)&&!actual_generic_context(true,32765,1,4,32768),
+        "both actual owned guards reject logical capacity+1");
+    require(!actual_generic_context(false,32765,1,3,32768),"ordinary legacy counterexample retains8 slack");
+    require(actual_generic_context(false,32759,1,3,32768)&&!actual_generic_context(false,32760,1,3,32768),
+        "actual legacy GEN1 boundary unchanged");
+}
+static void plain_gen_tests(bool stale_only=false){
+    const std::vector<int64_t> ordinary(40,3);
+    for(int64_t previous:{int64_t(0),int64_t(1),int64_t(470),INT64_MAX}){
+        if(stale_only&&previous!=470)continue;
+        require(actual_bgen(true,ordinary,previous,512,-1),"plainGEN never consults absent/stale BGEN full budget");
+        require(actual_generic_context(true,40,64,previous,512,-1)&&
+            !actual_generic_context(true,40,480,previous,512,-1),"plainGEN context uses its current budget and legacy8");
+        require(!actual_owned_command(true,-1),"actual earlier owned command guard retains pre-existing GEN refusal");
+    }
+    require(actual_owned_command(true,0)&&actual_owned_command(false,-1),"actual command guard preserves BGEN and ordinary legacy routes");
 }
 static void continuation_tests(){
     ServingRawSession session;Outcome owner;setup(owner);std::string error;
@@ -134,6 +182,9 @@ static void continuation_tests(){
 int main(int argc,char** argv){
     const std::string which=argc>1?argv[1]:"all";
     if(which=="all"||which=="bgen")strata::program::bgen_tests();
+    if(which=="all"||which=="boundary")strata::program::boundary_tests();
+    if(which=="all"||which=="plain-gen")strata::program::plain_gen_tests();
+    if(which=="plain-gen-stale")strata::program::plain_gen_tests(true);
     if(which=="all"||which=="continuation")strata::program::continuation_tests();
     std::puts("PASS extracted production full-BGEN and retained-continuation admission/adoption");
 }

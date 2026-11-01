@@ -357,7 +357,7 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/generate_serving_output_capacity_test.py
       --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_output_capacity_fixture}
     DEPENDS src/program/generate.cpp tests/core/serving_raw_contracts/generate_serving_output_capacity_test.py
-      tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+      tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py src/program/http_two_slot_receipt.hpp
     VERBATIM)
   add_executable(serving_output_admission_test ${_output_capacity_fixture} src/core/window_budget.cpp)
   target_include_directories(serving_output_admission_test PRIVATE include src/program)

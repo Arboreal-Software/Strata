@@ -16109,7 +16109,7 @@ int main(int argc, char** argv) {
                 std::string& error) -> bool {
             if(serving_repair_idle_unit==0){error="owned repaired admission requires explicit bounded repair units";return false;}
             if(!owned_batch_allocation||budget<1||!strata::program::serving_output_fits(
-                validated_request.size(),uint64_t(budget),uint64_t(o.max_context))||!fresh_owned_slot(index,error))return false;
+                validated_request.size(),uint64_t(budget),uint64_t(o.max_context),0)||!fresh_owned_slot(index,error))return false;
             auto& slot=bs.at(index);auto& actor=*slot.owned_raw;
             slot.http_request=request_key;slot.http_leg=request_leg;
             slot.alignment_observed=false;slot.alignment_last_operation=0;slot.alignment_phase="donor";
@@ -18333,8 +18333,8 @@ int main(int argc, char** argv) {
 #if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
             // The admission phase is GEN1, but physical slot output has the full
             // BGEN budget. Refuse that full request before any input/state mutation.
-            if(owned_batch_allocation&&(admit_max_new<1||!strata::program::serving_output_fits(
-                ids.size(),uint64_t(admit_max_new),uint64_t(o.max_context)))){
+            if(owned_batch_allocation&&admit_slot>=0&&(admit_max_new<1||!strata::program::serving_output_fits(
+                ids.size(),uint64_t(admit_max_new),uint64_t(o.max_context),0))){
                 std::printf("ERR owned BGEN prompt/output exceeds context\n");std::fflush(stdout);continue;
             }
 #endif
@@ -18433,7 +18433,16 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
+            bool request_over_context=false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // Only the resolved owned non-spec profile uses its exact logical
+            // full request capacity; legacy windows retain their eight-row slack.
+            if(owned_batch_allocation&&admit_slot>=0)request_over_context=admit_max_new<1||!strata::program::serving_output_fits(
+                uint64_t(n),uint64_t(admit_max_new),uint64_t(o.max_context),0);
+            else
+#endif
+                request_over_context=n+max_new+8>o.max_context;
+            if (request_over_context) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
                 continue;
