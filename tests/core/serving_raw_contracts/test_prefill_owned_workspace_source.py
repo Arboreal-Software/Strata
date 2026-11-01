@@ -50,6 +50,38 @@ class PaidPrefillWiring(unittest.TestCase):
                       'chunk!=workspace_chunk_', 'bool(borrow)!=workspace_borrowed_', 'bool(next_)!=workspace_successor_']:
             self.assertIn(field, init[:init.index('retirement_init_started_ = true')])
 
+    def test_paid_init_resolves_policy_without_observer_side_effects(self):
+        init = body(self.cpp, 'bool Prefill::init(')
+        resolved = init.index('if(workspace_credit_&&cpu_share_env()!=0.0)')
+        self.assertLess(resolved, init.index('retirement_init_started_ = true'))
+        observer = body(self.cpp, 'core::PrefillCpuShareObservation Prefill::cpu_share_policy() const noexcept')
+        self.assertNotIn('cpu_share_env()', observer)
+        self.assertNotIn('cpu_share_explicit()', observer)
+        self.assertIn('r.explicit_resolved = g_share_explicit_observed', observer)
+
+    def test_preinstall_refusals_keep_same_request_running_for_exact_tail(self):
+        helper = body(self.driver, 'auto sfx_resume_exact =')
+        self.assertIn('serving_raw_session.get()!=main.get()', helper)
+        self.assertIn('main->cut()!=prefix_cut', helper)
+        self.assertIn('!main->request_open()', helper)
+        self.assertLess(helper.index('main->begin_work('), helper.index('serving_ordinary_fence=true'))
+        self.assertNotIn('close_request(', helper)
+        self.assertIn('serving_raw_fence_running||serving_ordinary_fence||serving_suffix_active', helper)
+        self.assertEqual(self.driver.count('sfx_resume_exact(prefix_main,prefix_cut)'), 3)
+        section = self.driver[self.driver.index('if (to == sfx_repair_at && serving_raw_fence_running)'):]
+        self.assertLess(section.index('const auto prefix_main=serving_raw_session'), section.index('drain_work('))
+        for refusal in ['prefix schedule refused before install', 'prefix capture refused',
+                        'prefix base refused before install']:
+            branch = section[section.index(refusal):]
+            self.assertIn('sfx_resume_exact(prefix_main,prefix_cut)', branch[:2400])
+        legacy = section[section.index('refused before the "'):]
+        self.assertLess(legacy.index('sfx_release_donor()'), legacy.index('sfx_failstop_if_running()'))
+        owned = section.index('if(owned_batch_allocation&&admit_slot>=0)')
+        exit_owned = section.index('goto owned_batch_request_done', owned)
+        legacy_run = section.index('const auto result = strata::program::ServingSuffixRepairOperation::run(')
+        self.assertLess(owned, exit_owned)
+        self.assertLess(exit_owned, legacy_run)
+
     def test_real_cleanup_precedes_credit_release(self):
         release = body(self.cpp, 'void Prefill::release()')
         last = release.rindex('workspace_credit_.reset()')

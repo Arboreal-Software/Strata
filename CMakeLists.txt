@@ -409,6 +409,22 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_safe_turn.py
     --binary $<TARGET_FILE:prefill_safe_turn_test>)
   set_tests_properties(prefill_safe_turn_test PROPERTIES TIMEOUT 120)
+  if(UNIX)
+    set(_prefill_refusal_fixture ${CMAKE_CURRENT_BINARY_DIR}/prefill_refusal/actual.cpp)
+    add_custom_command(OUTPUT ${_prefill_refusal_fixture}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_refusal.py
+        --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_prefill_refusal_fixture}
+      DEPENDS src/program/generate.cpp src/prefill/prefill.cpp
+        tests/core/serving_raw_contracts/test_prefill_refusal.py
+        tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+      VERBATIM)
+    add_executable(prefill_refusal_test ${_prefill_refusal_fixture})
+    target_include_directories(prefill_refusal_test PRIVATE include)
+    add_test(NAME prefill_refusal_test COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_refusal.py
+      --binary $<TARGET_FILE:prefill_refusal_test>)
+    set_tests_properties(prefill_refusal_test PROPERTIES TIMEOUT 120)
+  endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME serving_thread_bridge_nonce_test COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_bridge_nonce.py

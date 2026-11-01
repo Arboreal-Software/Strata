@@ -21365,6 +21365,25 @@ int main(int argc, char** argv) {
                     serving_donor_cut = {};
                 }
             };
+            auto sfx_resume_exact = [&](const std::shared_ptr<strata::program::ServingRawSession>& main,
+                                        const strata::core::StateCut& prefix_cut) {
+                if(!serving_threads){sfx_release_donor();return;}
+                // Refusal did not install a suffix. Continue the SAME admitted
+                // request from its genuinely joined exact prefix, without closing
+                // its request fence or bypassing managed prefill admission.
+                if(!main||serving_raw_session.get()!=main.get()||!main->healthy()||
+                   !main->request_open()||main->phase()!=strata::program::ServingRawSession::Phase::drained||
+                   main->cut()!=prefix_cut||prefix_cut.forwarded!=prefix_cut.accepted||
+                   prefix_cut.exact_frontier!=prefix_cut.forwarded||serving_raw_cut!=prefix_cut.id||
+                   serving_raw_fence_running||serving_ordinary_fence||serving_suffix_active)
+                    strata::core::retirement_failed("exact prefix refusal lost its admitted RAW owner/cut");
+                std::string begin_error;
+                if(!main->begin_work(begin_error))
+                    strata::core::retirement_failed("exact prefix refusal could not resume actual RAW work");
+                serving_ordinary_fence=true;
+                serving_start_certified_exact=true;
+                serving_donor=strata::core::BundleHandle{};serving_donor_cut={};
+            };
             // Only after the synchronous prefill producer has returned. Discard
             // the interrupted MAIN gang, never either independent occupied slot.
             auto settle_owned_admission_cancel = [&]() -> bool {
@@ -21577,6 +21596,7 @@ int main(int argc, char** argv) {
                     const strata::core::StateCut prefix_cut{
                         serving_raw_cut + 1, boundary, boundary, boundary, 0,
                         strata::core::window_history_digest(prefix_ids)};
+                    const auto prefix_main=serving_raw_session;
                     strata::core::BundleHandle prefix;
                     if (!serving_raw_session->drain_work(true, prefix_cut, fence_error)) {
                         sfx_failstop_if_running();
@@ -21606,7 +21626,7 @@ int main(int argc, char** argv) {
                                 plan.reject("long activation origin requires actual recorded batched prefix");
                             if(!plan.seal(prefix_ids)){
                                 std::fprintf(stderr,"strata serve: suffix cache (repaired): prefix schedule refused before install (%s); reading exactly\n",plan.reason?plan.reason:"unsealed prefix transcript");
-                                sfx_repair_at=-1;serving_suffix_boundary=-1;sfx_release_donor();continue;
+                                sfx_repair_at=-1;serving_suffix_boundary=-1;sfx_resume_exact(prefix_main,prefix_cut);continue;
                             }
                         }
                         const auto prefix_metadata = strata::program::ServingRawSession::endpoint_metadata(
@@ -21616,7 +21636,7 @@ int main(int argc, char** argv) {
                                          "(%s): reading the prompt exactly\n", got.detail.c_str());
                             sfx_repair_at = -1;
                             serving_suffix_boundary = -1;
-                            sfx_release_donor();
+                            sfx_resume_exact(prefix_main,prefix_cut);
                         } else {
                             strata::program::ServingSuffixRepairOperation::Facts facts;
                             facts.accepted = serving_suffix_accepted;
@@ -21638,7 +21658,7 @@ int main(int argc, char** argv) {
                             }
                             if(sfx_prefix_plan.active&&!sfx_prefix_base(sfx_prefix_plan,err)){
                                 std::fprintf(stderr,"strata serve: suffix cache (repaired): prefix base refused before install (%s); reading exactly\n",err.c_str());
-                                sfx_repair_at=-1;serving_suffix_boundary=-1;sfx_release_donor();continue;
+                                sfx_repair_at=-1;serving_suffix_boundary=-1;sfx_resume_exact(prefix_main,prefix_cut);continue;
                             }
                             if(owned_batch_allocation&&admit_slot>=0){
                                 const size_t target=size_t(admit_slot);

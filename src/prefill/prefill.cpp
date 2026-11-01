@@ -1479,6 +1479,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
        cpu_pool_||helper_||impl_->pp||impl_->help_pp||embd_rows||on_routes||on_taps)){
         err="prefill workspace admission does not match actual init owners/shape";return false;
     }
+    // Paid owned initialization is the real policy consumer even when its
+    // contract intentionally creates no CPU pool. Observers stay side-effect free.
+    if(workspace_credit_&&cpu_share_env()!=0.0){
+        err="owned prefill workspace requires the resolved disabled CPU policy";return false;
+    }
     retirement_init_started_ = true;
     if (strict_retirement_) core::retirement_check(true, cudaGetDevice(&impl_->device), "Prefill init device");
     Impl& m = *impl_;
