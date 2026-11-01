@@ -1,0 +1,234 @@
+{
+  "schema": 1,
+  "source_checkpoint": "75ef2747f615ea7c30b66818812c6e02dfd86079",
+  "tested_source_manifest_sha256": "77d28f807c2814b36ce432bd78802365626c162e26df9df85844fd0d1d90caec",
+  "optional_binary_sha256": "a83c647e1aa3f37c2b42112c6725476f51692c53a304b1b9dd6f0dc7ec1a4f5d",
+  "release_qualified": false,
+  "rows": [
+    {
+      "name": "Native repaired target3",
+      "campaign_directory": "managed-native-input-envelope-target3-root-20261101",
+      "outcome_at_review": "PASS",
+      "scope": "Same-history exact numerical continuation; context512/minimal48 only",
+      "receipt_files": [
+        {
+          "relative_path": "output-strata-serve-suffix-repaired-20261101T072519Z/RESULT.json",
+          "bytes": 285,
+          "sha256": "7097406a61975c7d180e9a3d8335a31ae03d25d971a9a42dc89ce59f4daefe2e"
+        },
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T072519Z/result.json",
+          "bytes": 8526,
+          "sha256": "1fffe49416ed17f86e466812b344e9f232e9da68a98603e7981560a3f5ebf2cd"
+        },
+        {
+          "relative_path": "ROOT-RELEASE.json",
+          "bytes": 1246,
+          "sha256": "edda02367ca0cc0bf923e30a3e9965c9da2735fbdb8b93be95f530586cc33953"
+        },
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T072519Z/two-slot-repair/report.json",
+          "bytes": 11921,
+          "sha256": "4f7618f5dd4eff6f2d578e9bfef0ece3a1d5d3f5979bd0c82c6a45f36ba83cde"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Native repaired target4",
+      "campaign_directory": "managed-native-input-envelope-target4-root-20261101",
+      "outcome_at_review": "PASS",
+      "scope": "Same-history exact numerical continuation; context512/minimal48 only",
+      "receipt_files": [
+        {
+          "relative_path": "output-strata-serve-suffix-repaired-20261101T072940Z/RESULT.json",
+          "bytes": 286,
+          "sha256": "8c91a3b41e1041cfe9f7e48d5d8ad9f44ae0059a20d68df18dd8299615487c4c"
+        },
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T072940Z/result.json",
+          "bytes": 8525,
+          "sha256": "b966977f89fa2c065c364bb68ef8c0a9127d9d7aece93b4ed111810f8a5b98a0"
+        },
+        {
+          "relative_path": "ROOT-RELEASE.json",
+          "bytes": 1246,
+          "sha256": "319973eeb837b821691dc484062f147f896b84893343e3d4387670dbd2723ff2"
+        },
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T072940Z/two-slot-repair/report.json",
+          "bytes": 11921,
+          "sha256": "d5d8d5d090d652942bdcbffc66db46e0ab3227473aa57a11c9132499c4984055"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Ordinary authenticated HTTP",
+      "campaign_directory": "http-execution",
+      "outcome_at_review": "PASS",
+      "scope": "Fresh admissions/default policy and concurrent decode, no suffix repair",
+      "receipt_files": [
+        {
+          "relative_path": "RESULT.json",
+          "bytes": 1233,
+          "sha256": "6d0ab25dd05f3b20dd4061a47d3a9d9df24b642b3d488aa8b3b4f585ca379fd5"
+        },
+        {
+          "relative_path": "ROOT-RELEASE.json",
+          "bytes": 1770,
+          "sha256": "c5d0c924e4bcf1aed1b6c2872340c8301a8cb75acfb03d8c7885712cff2b1807"
+        },
+        {
+          "relative_path": "two-slot-http-evidence/report.json",
+          "bytes": 36675,
+          "sha256": "34c038800be926ff2de456ee54e52f0f58dcd398ff547ad168ed9945135d95e9"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "First cancellation batch",
+      "campaign_directory": "managed-ordinary-cancel-batch-final-root-20261101",
+      "outcome_at_review": "MIXED",
+      "scope": "Queued/prefill/stale pass;272-token race fixture exhausted peer",
+      "receipt_files": [
+        {
+          "relative_path": "RESULT.json",
+          "bytes": 410,
+          "sha256": "ce0c56aef74d19ca7790da75b4d9648a1d38c3993cd6922351c21e182c9fbd05"
+        },
+        {
+          "relative_path": "output/RESULT.json",
+          "bytes": 782,
+          "sha256": "61a29f6ad6b87151059f14b3d1a7a82402bf87599788df7fe54a4b17df3cd02d"
+        },
+        {
+          "relative_path": "ROOT-RELEASE.json",
+          "bytes": 6081,
+          "sha256": "ba83c9580a5e447a06949987062e34212bb29bb264d7048678fac5d1bf1e564e"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Second acceptance race",
+      "campaign_directory": "campaign",
+      "outcome_at_review": "FIXTURE_INVALID_WITH_PROOF",
+      "scope": "137-token target; healthy64 exhausted before acceptance; SIGINT flush separately failed",
+      "receipt_files": [
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T080819Z-short-race/result.json",
+          "bytes": 8616,
+          "sha256": "f3dac5ff57728d648b95d9a98347e3f12df1dbc88c6ae390a254f6f42f56c92d"
+        },
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T080819Z-short-race/admission-cancel/report.json",
+          "bytes": 21734,
+          "sha256": "009d8648370d8d5f9f35ce5a0101f1a583d4240d6dae022c163e2e584cf83362"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Selected repair cancellation",
+      "campaign_directory": "managed-selected-repair-cancel-root-20261101",
+      "outcome_at_review": "PASS",
+      "scope": "Aged repair cancellation/replacement and exact survivor; not all fault sites",
+      "receipt_files": [
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T075146Z/result.json",
+          "bytes": 8469,
+          "sha256": "e4c9d5e41b5d4c38334724685da5f491d8e2005471fa32f7eeb543b72700753c"
+        },
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T075146Z/two-slot-repair/report.json",
+          "bytes": 12835,
+          "sha256": "6f83fec94d7ff8c590118668a39c542da8d1f5112979f8d9447a4252f64e3fa1"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Retained return",
+      "campaign_directory": "managed-retained-return-root-20261101",
+      "outcome_at_review": "OWNER_INTERRUPTED",
+      "scope": "Interrupted before container creation; no native evidence",
+      "receipt_files": [
+        {
+          "relative_path": "serve/attempt-strata-serve-suffix-repaired-20261101T075723Z/result.json",
+          "bytes": 994,
+          "sha256": "01ec0eb6a075d41cbe9717910436b3cf000ef9de96e89894feb46565e6057904"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Occupied32k",
+      "campaign_directory": "managed-occupied32k-root-20261101",
+      "outcome_at_review": "NOT_RUN",
+      "scope": "Both occupied slots and same-history numeric continuation remain unproved",
+      "receipt_files": [],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Compact acceptance race",
+      "campaign_directory": "campaign",
+      "outcome_at_review": "NOT_RUN",
+      "scope": "50-token/four-chunk fixture feasible hypothesis; owner grant expiry0",
+      "receipt_files": [],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Legacy seven-arm semantics",
+      "campaign_directory": "current77d-seven-arm-root-20261101",
+      "outcome_at_review": "NOT_RUN",
+      "scope": "Staged/preflight only, not managed semantics",
+      "receipt_files": [],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Lifecycle HTTP",
+      "campaign_directory": "qualification",
+      "outcome_at_review": "NOT_RUN",
+      "scope": "Image built, dependency/controls staged only",
+      "receipt_files": [],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Managed edited-label semantics",
+      "campaign_directory": "managed-edited-label-semantic-sol",
+      "outcome_at_review": "INCOMPLETE_TOOLING",
+      "scope": "No complete execution/cold reference/stager",
+      "receipt_files": [
+        {
+          "relative_path": "PAUSED-WIP.json",
+          "bytes": 2759,
+          "sha256": "e2cb33859567fe72ce79e54be169f09b770ec6dc1df88c7f7ae588b477e3cde6"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    },
+    {
+      "name": "Managed performance",
+      "campaign_directory": "managed-performance-on-proposal-sol-20261101",
+      "outcome_at_review": "INCOMPLETE_TOOLING",
+      "scope": "Input/binding/final execution review pending",
+      "receipt_files": [
+        {
+          "relative_path": "PAUSE-HANDOFF.json",
+          "bytes": 7636,
+          "sha256": "ed8a550badbbc2878fd72b8e13950c53f10a9501c0b3b5e3ee56c98eae65d8ad"
+        }
+      ],
+      "storage": "LOCAL_ONLY; hashes are an index, not a remote evidence archive"
+    }
+  ],
+  "new_attempts": [
+    {
+      "name": "Retained return after review",
+      "campaign_directory": "managed-retained-return-resume-root-20261101",
+      "status": "RUNNING_NO_RESULT_YET"
+    }
+  ]
+}
