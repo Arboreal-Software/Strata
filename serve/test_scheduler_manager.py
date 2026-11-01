@@ -235,6 +235,109 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(observed,[91,91])
         self.assertEqual(sum(call[0]=='ACTOR_SNAPSHOT'for call in self.n.calls),2)
 
+    def _retry_bind_while_peer_has_control(self, ending):
+        """Actual admission generator and lock wait, simulated native boundary.
+
+        not_ready yields with no control. A peer then occupies control during
+        prefill while another physical slot is free. The retry must reacquire,
+        rather than issuing a synchronous BIND behind that peer's native work.
+        Events distinguish the first real lock attempt from an unlocked BIND;
+        there is no CUDA, timeout enlargement or sleep-based race assertion.
+        """
+        from serve.two_slot_receipts import OwnedSlotObservations
+        e=batch_engine();del e._take_control  # Exercise the real cancellation/deadline-aware method.
+        probe=threading.Event();observation=[]
+        class Control:
+            def __init__(lock):lock.raw=threading.Lock();lock.owner=None
+            def acquire(lock,*args,**kwargs):
+                if lock.raw.locked() and lock.owner!=threading.get_ident() and not probe.is_set():
+                    observation.append('waiting_for_peer_control');probe.set()
+                ok=lock.raw.acquire(*args,**kwargs)
+                if ok:lock.owner=threading.get_ident()
+                return ok
+            def release(lock):
+                if lock.owner!=threading.get_ident():raise AssertionError('Released another request control')
+                lock.owner=None;lock.raw.release()
+            def locked(lock):return lock.raw.locked()
+        e.ctl=Control();e.slot_busy=[False,False]
+        epoch=dataclasses.replace(e._capture_epoch(),scheduler=self.n,strict_owned=True)
+        epoch.slots.owned_observations=OwnedSlotObservations();e._epoch=epoch;e.scheduler_manager=self.m
+        pairs=[]
+        for _ in range(2):
+            pairs.append(tuple(self.m.action({'action':'open','thread':self.t,'class':kind})['operation'] for kind in ('foreground','live_repair')))
+        self.m.action({'action':'edge','consumer':pairs[0][0],'prerequisite':pairs[1][0],'add':True})
+        ready=threading.Event();binds=[];frames=[];errors=[];outputs=[]
+        native=self.n.command
+        def command(verb,*args):
+            if verb=='BIND':
+                binds.append(args[1])
+                if e.ctl.owner!=threading.get_ident():
+                    if not probe.is_set():observation.append('bind_without_control');probe.set()
+                    raise AssertionError('BIND without owning admission control')
+            result=native(verb,*args)
+            if verb=='BIND' and args[1]=='aaaaaaaaaaaa' and not ready.is_set():result['status']='not_ready'
+            return result
+        self.n.command=command
+        original=e._send;peer_slot=[]
+        def send(frame,**kwargs):
+            frames.append(frame)
+            if frame.startswith('BGEN '):
+                slot=int(frame.split()[1])
+                if 'http_request=bbbbbbbbbbbb' in frame:
+                    peer_slot.append(slot);e.lines.put('PP 1 2 0 1.0')
+                else:
+                    e.lines.put('BADM %d 1'%slot);e.slot_q[slot].put('BT %d 7'%slot);e.slot_q[slot].put('BDONE %d 1 length 0'%slot)
+            original(frame,**kwargs)
+        e._send=send
+        def cancel_for(key,pair):
+            cancel=threading.Event();cancel._strata_request_id=key;cancel._strata_scheduler_thread=self.t
+            cancel._strata_scheduler_manager=self.m;cancel._strata_scheduler_operations=pair;return cancel
+        cancel=cancel_for('aaaaaaaaaaaa',pairs[0]);peer_cancel=cancel_for('bbbbbbbbbbbb',pairs[1])
+        consumer=e.generate_batched([1,2],1,{},cancel);peer=e.generate_batched([3,4],1,{},peer_cancel)
+        self.assertIsNone(next(consumer));self.assertEqual(binds,['aaaaaaaaaaaa']);self.assertFalse(e.ctl.locked());self.assertFalse(any(e.slot_busy))
+        self.assertIsNone(next(peer));self.assertEqual(len(peer_slot),1);self.assertTrue(e.ctl.locked());self.assertEqual(e.ctl.owner,threading.get_ident())
+        def resume():
+            try:outputs.extend(consumer)
+            except BaseException as error:errors.append(error)
+        worker=threading.Thread(target=resume);worker.start();peer_finished=False
+        try:
+            self.assertTrue(probe.wait(1),'Retry reached neither lock acquisition nor BIND')
+            self.assertEqual(observation,['waiting_for_peer_control'])
+            self.assertEqual(binds,['aaaaaaaaaaaa','bbbbbbbbbbbb'])
+            if ending=='cancel':cancel.set()
+            elif ending=='deadline':cancel._strata_queue_deadline=server.time.monotonic()-1
+            if ending!='continue':
+                worker.join(2);self.assertFalse(worker.is_alive(),'Canceled/expired retry did not leave control wait')
+                self.assertEqual(e.ctl.owner,threading.get_ident());self.assertTrue(e.slot_busy[peer_slot[0]])
+            ready.set();slot=peer_slot[0]
+            e.lines.put('BADM %d 1'%slot);e.slot_q[slot].put('BT %d 9'%slot);e.slot_q[slot].put('BDONE %d 1 length 0'%slot)
+            self.assertEqual(list(peer),[9]);peer_finished=True
+            worker.join(2);self.assertFalse(worker.is_alive())
+            if ending=='continue':self.assertEqual(errors,[]);self.assertEqual(outputs,[7]);self.assertEqual(binds,['aaaaaaaaaaaa','bbbbbbbbbbbb','aaaaaaaaaaaa'])
+            elif ending=='cancel':self.assertEqual(errors,[]);self.assertEqual(outputs,[])
+            else:self.assertEqual(len(errors),1);self.assertIsInstance(errors[0],server.QueueWaitExpired);self.assertEqual(outputs,[])
+            self.assertFalse(any(frame.startswith(('BCANCEL','BSTOP')) for frame in frames))
+            self.assertEqual(sum('http_request=aaaaaaaaaaaa' in frame for frame in frames),1 if ending=='continue' else 0)
+            self.assertFalse(e.ctl.locked());self.assertFalse(any(e.slot_busy));self.assertIsNone(self.n.closed)
+        finally:
+            ready.set();cancel.set()
+            if not peer_finished:
+                slot=peer_slot[0];e.lines.put('BADM %d 1'%slot);e.slot_q[slot].put('BT %d 9'%slot);e.slot_q[slot].put('BDONE %d 1 length 0'%slot)
+                list(peer)
+            worker.join(2)
+            if not worker.is_alive():consumer.close()
+            with self.m._cancel_condition:cleanup=self.m._cancel_worker
+            if cleanup is not None:cleanup.join(1)
+
+    def test_not_ready_free_slot_retry_waits_for_peer_control_then_progresses(self):
+        self._retry_bind_while_peer_has_control('continue')
+
+    def test_not_ready_retry_cancel_does_not_bind_or_release_peer_control(self):
+        self._retry_bind_while_peer_has_control('cancel')
+
+    def test_not_ready_retry_queue_expiry_does_not_bind_or_release_peer_control(self):
+        self._retry_bind_while_peer_has_control('deadline')
+
     def test_close_releases_actor_handles_without_forging_bound_retirement(self):
         thread=self.m.action({'action':'create','base':2,'expected_revision':1})['thread']
         actor=self.m.action({'action':'actor','thread':thread})['actor']

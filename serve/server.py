@@ -2200,6 +2200,14 @@ class StrataEngine:
                                                             # the held prefix: prompt_read 1) and BDONE replace them
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
+                    # A managed not_ready retry continues this inner loop after
+                    # releasing control. Reacquire even when a slot is already
+                    # free; the slot-wait path below is not always entered.
+                    if not holding:
+                        ok = yield from self._take_control(cancel, len(prompt))
+                        if not ok:
+                            return
+                        acquired_control()
                     if slot is None:
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
                         # the start of this prompt (its conversation's last turn), else the one used longest ago.
