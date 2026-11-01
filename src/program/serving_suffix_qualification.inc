@@ -657,7 +657,25 @@ static bool qualify_serving_frontier(Context& c,SerialUnit& serial,ServingRawSes
                     core::BundleHandle cold_continuation;
                     const auto cold_meta=ServingRawSession::endpoint_metadata(original.key,cold_next.cut,buffers.history);
                     if(!raw_call([&]{return session.capture(cold_meta,cold_continuation);}))failstop("serving cold continuation capture refused");
-                    if(!raw_call([&]{return session.restore(repaired,original.key);}))failstop("serving repaired restore before continuation refused");
+                    const auto restore_source_cut=original.cut,restore_destination_cut=session.cut();
+                    const auto restore_phase=session.phase();
+                    const bool restore_request_open=session.request_open();
+                    const auto restored=raw_call([&]{
+                        auto result=session.restore(repaired,original.key);
+                        if(!result){
+                            std::fprintf(stderr,"suffix_restore_refusal v=1 site=serving_repaired_continuation status=%u source_cut=%llu source_forwarded=%llu source_accepted=%llu source_exact=%llu source_watermark=%llu destination_cut=%llu destination_forwarded=%llu destination_accepted=%llu destination_exact=%llu destination_watermark=%llu destination_phase=%u request_open=%u detail=%s\n",
+                                unsigned(result.status),(unsigned long long)restore_source_cut.id,
+                                (unsigned long long)restore_source_cut.forwarded,(unsigned long long)restore_source_cut.accepted,
+                                (unsigned long long)restore_source_cut.exact_frontier,(unsigned long long)restore_source_cut.output_watermark,
+                                (unsigned long long)restore_destination_cut.id,(unsigned long long)restore_destination_cut.forwarded,
+                                (unsigned long long)restore_destination_cut.accepted,(unsigned long long)restore_destination_cut.exact_frontier,
+                                (unsigned long long)restore_destination_cut.output_watermark,unsigned(restore_phase),
+                                unsigned(restore_request_open),result.detail.c_str());
+                            std::fflush(stderr);
+                        }
+                        return result;
+                    });
+                    if(!restored)failstop("serving repaired restore before continuation refused");
                     const auto repaired_next=forward(c,serial,tx,next_cut,pending,forwarded,accepted,
                         original.cut.history,accepted,buffers.approximate_logits);
                     core::BundleHandle repaired_continuation;
