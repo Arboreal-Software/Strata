@@ -2,6 +2,24 @@
 
 Status snapshot: 27 October 2026. This report covers the requested engine improvements, including conversation switching, context edits, reuse, repair, scheduling, and compression. It describes development progress; it is not a release announcement.
 
+Follow-on backlog additions were recorded on 3 November 2026 below. The older progress sections remain a historical snapshot, not a current qualification report.
+
+## Follow-on backlog — added 3 November 2026
+
+### Typed next-block generation
+
+**Requested:** generate the next assistant block of a caller-selected type, such as reasoning or text, stop at its boundary, and let the caller resume from that exact point instead of completing the entire assistant turn.
+
+**Acceptance:** preserve exact tokens, delimiters, parser state, and generation settings across stop/resume. Handle empty blocks, end of turn, output limits, cancellation, and tokens generated beyond the boundary without loss or duplication. A deliberate reasoning stop must not automatically continue into an answer. Selecting a block type does not guarantee meaningful or nonempty reasoning.
+
+**Status:** requested, not implemented or scheduled. Supported model formats and an initial implementation scope remain to be decided. This follow-on item does not replace the existing engine completion commitments.
+
+### Public and private fork development
+
+Maintain a public fork for shared improvements and community contributions, alongside a private fork where future development begins. Publish selected, self-contained improvements with public tests and documentation; retain proprietary features privately. Continue integrating upstream updates and community contributions into both forks, keeping downstream changes focused to limit merge conflicts.
+
+All work developed so far is approved for the public fork. Future public/private placement will be decided explicitly. Keep internal execution plans, session records, and handoffs outside source control; retain actionable feature documentation and appropriate reproducible evidence. Repository migration and visibility changes are not scheduled by this backlog entry.
+
 ## Overall state
 
 The goal is to make Strata spend less time rebuilding conversations: preserve complete conversation state, switch between sessions, restore parked state, reuse work after edits, and repair approximations while keeping interactive requests responsive.
