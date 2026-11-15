@@ -1,6 +1,7 @@
 """Model discovery, on-demand loading and safe unloading over the actual HTTP API."""
 import json
 import io
+import itertools
 import os
 import subprocess
 import time
@@ -57,8 +58,11 @@ class Lifecycle(unittest.TestCase):
                 stdin.write("pending")                  # buffered: flush() and close() will hit the broken pipe
                 proc = mock.Mock(stdin=stdin, stdout=io.StringIO())
                 self.addCleanup(proc.stdout.close)
-                proc.poll.side_effect = [None if running else 0, 0]
-                engine.proc, engine.pump, engine.log = proc, mock.Mock(), io.StringIO()
+                proc.poll.side_effect = itertools.chain([None if running else 0], itertools.repeat(0))
+                reader = mock.Mock(ident=1)
+                reader.is_alive.return_value = True
+                reader.join.side_effect = lambda **kwargs: setattr(reader.is_alive, "return_value", False)
+                engine.proc, engine.pump, engine.log = proc, reader, io.StringIO()
                 self.addCleanup(engine.log.close)
                 engine.ended, engine.progress, engine.last = False, (1, 2), {"generated": 1}
 
@@ -85,7 +89,7 @@ class Lifecycle(unittest.TestCase):
         engine = StrataEngine("missing-executable", [], lazy=True)
         proc = mock.Mock()
         proc.stdin, proc.stdout = io.StringIO(), io.StringIO()
-        proc.poll.side_effect = [None, 0]
+        proc.poll.side_effect = itertools.chain([None], itertools.repeat(0))
         proc.wait.side_effect = lambda **kwargs: self.assertTrue(proc.stdin.closed)
         engine.proc = proc
         engine.close()
@@ -110,7 +114,7 @@ class Lifecycle(unittest.TestCase):
         engine = StrataEngine("missing-executable", [], lazy=True)
         proc = mock.Mock()
         proc.stdin, proc.stdout = io.StringIO(), io.StringIO()
-        proc.poll.side_effect = [None, 0]
+        proc.poll.side_effect = itertools.chain([None], itertools.repeat(0))
         proc.wait.side_effect = [subprocess.TimeoutExpired("engine", 20), 0]
         engine.proc = proc
         engine.close()

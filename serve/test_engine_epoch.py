@@ -39,6 +39,64 @@ def replace(e):
 
 
 class EngineEpochTests(unittest.TestCase):
+    def test_never_started_ordinary_reap_does_not_invent_channels(self):
+        e = server.StrataEngine("missing-executable", [], lazy=True)
+        epoch = e._capture_epoch()
+        self.assertIsNone(epoch.proc)
+        self.assertIsNone(epoch.slots.slot_q)
+        e._reap_owned_image_transports(epoch)
+        self.assertIsNone(epoch.slots.slot_q)
+        self.assertIsNone(e.proc)
+
+    def test_missing_strict_or_live_channels_remain_fenced(self):
+        import dataclasses
+        e = server.StrataEngine("missing-executable", [], lazy=True)
+        ordinary = e._capture_epoch()
+        for epoch in (dataclasses.replace(ordinary, strict_owned=True),
+                      dataclasses.replace(ordinary, proc=Process()),
+                      dataclasses.replace(ordinary, receipt_env=(("STRATA_HTTP_TWO_SLOT_RECEIPTS", "1"),))):
+            with self.subTest(strict=epoch.strict_owned, live=epoch.proc is not None):
+                with self.assertRaises(server.EngineStuck):
+                    e._reap_owned_image_transports(epoch)
+                self.assertIsNone(epoch.slots.slot_q)
+
+    def test_populated_uncertain_transport_retains_fd_until_original_exit(self):
+        e = batch_engine()
+        epoch = e._capture_epoch()
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        channel = epoch.slots.slot_q[0]
+        channel._owned_image_proof_lost = True
+        channel._owned_image_transport_fd = read_fd
+        try:
+            with self.assertRaises(server.EngineStuck):
+                e._reap_owned_image_transports(epoch)
+            os.fstat(read_fd)
+            epoch.proc.code = 0
+            e._reap_owned_image_transports(epoch)
+            self.assertIsNone(channel._owned_image_transport_fd)
+            self.assertFalse(channel._owned_image_proof_lost)
+            with self.assertRaises(OSError):
+                os.fstat(read_fd)
+        finally:
+            if getattr(channel, "_owned_image_transport_fd", None) is not None:
+                os.close(read_fd)
+
+    def test_close_exited_between_polls_closes_captured_pipe_before_wait(self):
+        import itertools
+        e = engine()
+        old = e.proc
+        old.poll = mock.Mock(side_effect=itertools.chain([None], itertools.repeat(0)))
+        def wait(timeout=None):
+            self.assertTrue(old.stdin.closed)
+            self.assertIs(e.proc, old)
+            return 0
+        old.wait = mock.Mock(side_effect=wait)
+        e.close()
+        self.assertIsNone(e.proc)
+        self.assertTrue(old.stdin.closed)
+        old.wait.assert_called_once()
+
     def test_strict_admin_single_frame_acquire_borrow_busy_and_errors(self):
         import dataclasses
         from serve.test_batch_control_guard import CountLock

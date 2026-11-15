@@ -1576,6 +1576,11 @@ class StrataEngine:
                     except OSError:
                         pass
                     break
+            # Observe each raw arrival once before dedicated owner consumption.
+            if two_receipt is not None:
+                two_receipt.observe(line)
+            if native_receipt is not None:
+                native_receipt.observe(line)
             if epoch.strict_owned:
                 try:
                     paired = owned_terminals.observe(line)
@@ -1584,10 +1589,13 @@ class StrataEngine:
                     if paired is not None:
                         retired_slot, terminal_line = paired
                         slot_q[retired_slot].put(terminal_line)
-                    if line.startswith("BDONE "):
-                        if two_receipt is not None:
-                            two_receipt.observe(line)
-                        continue  # no routing until BOTH real terminal and retirement arrive
+                    if line.startswith(("BDONE ", "BOWN_ACCEPT ", "BOWN_DONE ",
+                                        "BOWN_COMMIT ", "BOWN_KNOWN ", "BOWN_GROUP ",
+                                        "BOWN_STOP ", "BOWN_ADMISSION_CANCEL ")):
+                        # Pairing/nonce checks above retain their exact authority.
+                        # GROUP/STOP/ADMISSION_CANCEL are informational records,
+                        # not schema-authenticated capabilities or image replies.
+                        continue  # BDONE still requires BOTH real terminal halves
                 except (ValueError, KeyError, IndexError, TypeError) as error:
                     # Fail the captured epoch, wake all consumers below, and retire
                     # this exact process. Never synthesize a successful BDONE.
@@ -1606,10 +1614,6 @@ class StrataEngine:
                     except OSError:
                         pass
                     break
-            if two_receipt is not None:
-                two_receipt.observe(line)
-            if native_receipt is not None:
-                native_receipt.observe(line)  # exact received native line, before routing/consumer filtering
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -2588,6 +2592,11 @@ class StrataEngine:
         """Only these two captured-epoch private FD holds; no payload export.
         A live/uncertain child blocks replacement. No signal, retry or healing.
         """
+        if epoch.slots.slot_q is None:
+            if (epoch.proc is None and epoch.strict_owned is False and
+                    not epoch.receipt_env and epoch.scheduler is None):
+                return  # Never-started ordinary epoch: no channels or private FD.
+            raise EngineStuck("Captured image channels are unavailable; retirement is fenced")
         for channel in epoch.slots.slot_q:
             if not getattr(channel, "_owned_image_proof_lost", False):
                 continue
@@ -4003,8 +4012,13 @@ class StrataEngine:
                         # after a failed earlier write acquired the lock first.
                         with self._state_lock():
                             valid = self.proc is proc and not getattr(self, "_stdin_failed", False)
-                        if valid and proc.poll() is None:
-                            self._write_locked(proc, "STOP\nQUIT", close_stdin=True)
+                        if valid:
+                            if proc.poll() is None:
+                                self._write_locked(proc, "STOP\nQUIT", close_stdin=True)
+                            else:
+                                # The captured child exited between polls. EOF still
+                                # precedes wait/reader join, on this bounded worker.
+                                proc.stdin.close()
                 except (OSError, AttributeError, ValueError) as error:
                     errors.append(error)
                 finally:

@@ -5,6 +5,7 @@ real StrataEngine and Service, so the server's side is tested without a GPU: req
 wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
 goes back to the slot that holds it."""
 import json
+import queue
 import sys
 import tempfile
 import threading
@@ -321,6 +322,13 @@ class PickSlot(unittest.TestCase):
         e.slot_used = [0.0] * n
         e.slot_live = [None] * n
         e.slot_group = [0] * n
+        # A ready ordinary batch has real per-slot channels and group metadata.
+        e.slot_q = [queue.Queue() for _ in range(n)]
+        e.slot_gs, e.slot_groups = 0, 1
+        e.slot_cv, e.ctl = threading.Condition(), threading.Lock()
+        e.slot_claims, e.slot_releasing, e._orphan_seen = set(), set(), {}
+        e.waiting, e.admitting, e.ctl_epoch = 0, 0, 0
+        e.wait_lens, e.rid_q = [], {}
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -332,9 +340,9 @@ class PickSlot(unittest.TestCase):
         self.assertEqual(e.pick_slot([7, 8]), 1)                    # no match: the empty slot first
         e.slot_busy[1] = True
         self.assertEqual(e.pick_slot([7, 8]), 0)                    # then the one used longest ago
-        e.slot_busy = [True] * 3
+        e.slot_busy[:] = [True] * 3
         self.assertIsNone(e.pick_slot([7, 8]))
-        e.slot_busy = [False] * 3
+        e.slot_busy[:] = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
 
     def test_a_rewritten_next_turn_goes_to_the_slot_of_its_chat(self):
@@ -362,7 +370,7 @@ class PickSlot(unittest.TestCase):
         e.slot_held[0] = []                                             # an empty slot still comes before evicting one
         self.assertEqual(e.pick_slot(list(range(5000, 5200))), 0)
         # the whole held stream continued is still the longer match
-        e.slot_held = [held_a, held_b + [T, 1, 2]]
+        e.slot_held[:] = [held_a, held_b + [T, 1, 2]]
         self.assertEqual(e.pick_slot(held_b + [T, 1, 2, 3, 4]), 1)
 
     # ---- #2518: a branching follow-up (same history, the last question replaced) belongs to the slot of its chat
@@ -405,7 +413,7 @@ class PickSlot(unittest.TestCase):
         e.slot_used = [1.0, 2.0, 3.0]
         e.slot_busy[1] = True                                           # the owner is still working
         self.assertEqual(e.pick_slot(self.branch_of(hists[1], [61, 62])), 0)    # the old order: the least recent free slot
-        e.slot_busy = [True, False, True]
+        e.slot_busy[:] = [True, False, True]
         self.assertEqual(e.pick_slot(self.branch_of(hists[1], [61, 62])), 1)
 
     def test_a_boundary_every_chat_shares_is_no_owner(self):
@@ -482,6 +490,9 @@ class PickSlot(unittest.TestCase):
         self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 2)
         e.slot_held[1] = list(range(1, 601))                       # a long prefix is worth the unbalanced group
         self.assertEqual(e.pick_slot(list(range(1, 700))), 1)
+        # Separate READY configuration, before this fixture's first capture.
+        e = self.engine(4)
+        e.slot_busy[0] = True
         e.slot_groups, e.slot_group = 1, [0] * 4                   # without groups: any held prefix, as before
         e.slot_held[1] = [1, 2, 3]
         self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 1)
