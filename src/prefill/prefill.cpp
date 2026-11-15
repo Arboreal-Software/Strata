@@ -1,6 +1,9 @@
+#include "strata/core/strict_retirement.hpp"
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "../program/owned_vision_position_banks.hpp"
+#include "../program/owned_image_request_operation.hpp"
 #include "strata/prefill/copy_events.hpp"
 #include "strata/prefill/timer_marks.hpp"
 #include "strata/prefill/mmq_ids_margin.hpp"
@@ -290,12 +293,23 @@ inline int64_t stream_all_min() {
 // STRATA_PREFILL_CPU_SHARE=0 turns it off: the output is then the 0.1.40.3 bytes.  g_share_default is set by
 // Prefill::arm_cpu_share(.., true) from the paths that qualify; the layer split and batch slots stay off, and HIP except a single gfx12 card (AMD-Q, arm_cpu_share).
 bool g_share_default = false;
+// Written only when the original lazy consumer resolves its value. Observation
+// must never force that resolution or change the environment-consumption order.
+bool g_share_explicit_observed = false, g_share_max_observed = false, g_share_max_presence_observed = false;
+double g_share_explicit_value = 0;
+int64_t g_share_max_value = 0;
+bool g_share_max_explicit = false;
 inline double cpu_share_explicit() {   // -2: the variable is not set; -1: measured
     static const double v = [] {
+        const double resolved = [] {
         const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE");
         if (e == nullptr) return -2.0;
         if (std::strcmp(e, "auto") == 0) return -1.0;
         return std::clamp(std::atof(e), 0.0, 1.0);
+        }();
+        g_share_explicit_value = resolved;
+        g_share_explicit_observed = true;
+        return resolved;
     }();
     return v;
 }
@@ -321,9 +335,17 @@ int64_t g_share_limit_arch = 0;   // AMD-Q: the default limit of a gfx12 card (s
 inline int64_t cpu_share_max() {
     static const int64_t v = [] {
         const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX");
-        return e ? std::max<int64_t>(kStreamAllMinDefault, (int64_t) std::atoll(e)) : (int64_t) 3072;
+        const int64_t resolved = e ? std::max<int64_t>(kStreamAllMinDefault, (int64_t) std::atoll(e)) : (int64_t) 3072;
+        g_share_max_value = resolved;
+        g_share_max_observed = true;
+        return resolved;
     }();
-    static const bool explicit_max = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
+    static const bool explicit_max = [] {
+        const bool resolved = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
+        g_share_max_explicit = resolved;
+        g_share_max_presence_observed = true;
+        return resolved;
+    }();
     // its measured range; STRATA_PF_PEER_CPU's is 3072 (see pf_peer_cpu)
     if (g_share_default && cpu_share_explicit() == -2.0 && !explicit_max && !pf_peer_cpu())   // the default-armed share: share_rules::default_share_limit (STRATA_PREFILL_CPU_SHARE_MAX=1024 restores the old 1,024)
         return g_share_limit_arch > 0 ? g_share_limit_arch : strata::prefill::share_rules::default_share_limit();
@@ -768,14 +790,16 @@ struct Stager {
             });
         return true;
     }
+    bool strict_retirement = false;
     ~Stager() {
         finish();
         { std::lock_guard<std::mutex> lk(mu); quit = true; }
         cv.notify_all();
         for (auto& t : threads) t.join();
+        core::StrictRetirementDevice retirement(strict_retirement, device);
         for (int i = 0; i < kRing; ++i) {
-            if (dma_done[i]) cudaEventDestroy(dma_done[i]);
-            if (buf[i] && pinned[i]) cudaFreeHost(buf[i]);
+            if (dma_done[i]) core::retirement_check(strict_retirement, cudaEventDestroy(dma_done[i]), "prefill stager cleanup");
+            if (buf[i] && pinned[i]) core::retirement_check(strict_retirement, cudaFreeHost(buf[i]), "prefill stager cleanup");
         }
     }
     void work() {
@@ -995,7 +1019,45 @@ struct PeerPrefill {
     std::vector<const float*> had_sh;
     std::vector<void*> owned;
     int64_t layers = 0, experts = 0, rows = 0, over_cap = 0;   // stats
+    void retire_strict(int primary_device) {
+        if (dev < 0) return;
+        core::StrictRetirementDevice peer(true, dev);
+        if (s) core::retirement_check(true, cudaStreamSynchronize(s), "prefill peer cleanup");
+        ctx.reset();
+        core::retirement_check(true, cudaSetDevice(dev), "peer device after MMQ retirement");
+        up_ring.retire_strict();
+        for (void* p : owned) core::retirement_check(true, cudaFree(p), "prefill peer cleanup");
+        if (ev_done) core::retirement_check(true, cudaEventDestroy(ev_done), "prefill peer cleanup");
+        if (s_out) core::retirement_check(true, cudaStreamSynchronize(s_out), "prefill peer cleanup");
+        for (cudaEvent_t e : ev_grp) if (e) core::retirement_check(true, cudaEventDestroy(e), "prefill peer cleanup");
+        for (cudaEvent_t e : ev_dm) if (e) core::retirement_check(true, cudaEventDestroy(e), "prefill peer cleanup");
+        if (s_cp) core::retirement_check(true, cudaStreamSynchronize(s_cp), "prefill peer cleanup");
+        for (cudaEvent_t e : pcopied) if (e) core::retirement_check(true, cudaEventDestroy(e), "prefill peer cleanup");
+        for (cudaEvent_t e : pused) if (e) core::retirement_check(true, cudaEventDestroy(e), "prefill peer cleanup");
+        if (s_cp) core::retirement_check(true, cudaStreamDestroy(s_cp), "prefill peer cleanup");
+        if (s_out) core::retirement_check(true, cudaStreamDestroy(s_out), "prefill peer cleanup");
+        if (s) core::retirement_check(true, cudaStreamDestroy(s), "prefill peer cleanup");
+        peer.finish();
+        core::StrictRetirementDevice primary(true, primary_device);
+        if (ev_in) core::retirement_check(true, cudaEventDestroy(ev_in), "prefill peer cleanup");
+        if (x_stream) { core::retirement_check(true, cudaStreamSynchronize(x_stream), "prefill peer cleanup"); core::retirement_check(true, cudaStreamDestroy(x_stream), "prefill peer cleanup"); }
+        if (ev_x) core::retirement_check(true, cudaEventDestroy(ev_x), "prefill peer cleanup");
+        if (host_x) core::retirement_check(true, cudaFreeHost(host_x), "prefill peer cleanup");
+        if (host_rows) core::retirement_check(true, cudaFreeHost(host_rows), "prefill peer cleanup");
+        if (host_src) core::retirement_check(true, cudaFreeHost(host_src), "prefill peer cleanup");
+        if (host_bounds) core::retirement_check(true, cudaFreeHost(host_bounds), "prefill peer cleanup");
+        if (host_w) core::retirement_check(true, cudaFreeHost(host_w), "prefill peer cleanup");
+        if (host_sum) core::retirement_check(true, cudaFreeHost(host_sum), "prefill peer cleanup");
+        if (host_pair) core::retirement_check(true, cudaFreeHost(host_pair), "prefill peer cleanup");
+        if (host_x16) core::retirement_check(true, cudaFreeHost(host_x16), "prefill peer cleanup");
+        if (host_sum16) core::retirement_check(true, cudaFreeHost(host_sum16), "prefill peer cleanup");
+        if (host_adds) core::retirement_check(true, cudaFreeHost(host_adds), "prefill peer cleanup");
+        dev = -1; // suppress the legacy destructor after successful checked retirement
+    }
+    bool strict_retirement = false;
+    int primary_device = -1;
     ~PeerPrefill() {
+        if (strict_retirement) { retire_strict(primary_device); return; }
         if (dev < 0) return;
         int prev = 0;
         cudaGetDevice(&prev);
@@ -1036,6 +1098,7 @@ struct PeerPrefill {
 // step records that way.  The event holds the next upload back until the last one has left the buffer.  No pinned RAM:
 // the copy is made from the caller's memory, as before.
 struct PinnedUpload {
+    bool strict_retirement = false;
     int32_t* p = nullptr;
     size_t n = 0;
     cudaEvent_t ev = nullptr;
@@ -1049,7 +1112,7 @@ struct PinnedUpload {
         n = count;
         if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
             cudaGetLastError();
-            cudaFreeHost(p);
+            core::retirement_check(strict_retirement, cudaFreeHost(p), "prefill upload initialization cleanup");
             p = nullptr;
             n = 0;
             ev = nullptr;
@@ -1061,6 +1124,11 @@ struct PinnedUpload {
         if (cudaEventSynchronize(ev) != cudaSuccess) return false;   // the previous upload is out of the buffer
         std::memcpy(p, src, bytes);
         return cudaMemcpyAsync(dst, p, bytes, cudaMemcpyHostToDevice, s) == cudaSuccess && cudaEventRecord(ev, s) == cudaSuccess;
+    }
+    void retire_strict() {
+        if (ev) core::retirement_check(true, cudaEventDestroy(ev), "prefill upload event");
+        if (p) core::retirement_check(true, cudaFreeHost(p), "prefill upload memory");
+        p = nullptr; ev = nullptr; n = 0;
     }
     void release() {
         if (ev) cudaEventDestroy(ev);
@@ -1353,7 +1421,45 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 }  // namespace
 
 Prefill::Prefill() : impl_(new Impl) {}
+bool Prefill::set_strict_retirement(bool enabled, std::string& error) {
+    if (retirement_init_started_) { error = "strict retirement must be configured before init"; return false; }
+#if defined(STRATA_GPU_METAL)
+    if (enabled) { error = "strict retirement is unsupported by Metal"; return false; }
+#endif
+    strict_retirement_ = enabled;
+    return true;
+}
+
+uint64_t Prefill::owned_position_fixed_growth_bound()noexcept {
+    return sizeof(position_banks_)+sizeof(image_operation_)+sizeof(image_generation_)+2*alignof(Prefill);
+}
+bool Prefill::owned_image_rows_present(int64_t begin,int64_t end)const noexcept {
+    if(!image_operation_||!image_operation_->request_||begin<0||end<begin)return false;
+    const auto rows=image_operation_->request_->row_pointers();
+    if(uint64_t(end)>rows.size())return true; // invalid spans must not take the token-only route
+    for(int64_t i=begin;i<end;++i)if(rows[size_t(i)])return true;
+    return false;
+}
+bool Prefill::owned_image_retirement_ready(const program::OwnedImageRequestOperation* context)noexcept {
+    if(!context||image_operation_.get()!=context||!impl_||next_run_.valid())return false;
+    core::WindowDeviceScope device(impl_->device);
+    return device.ok()&&impl_->up_ring.drain_owned()&&
+        cudaStreamSynchronize(impl_->cs)==cudaSuccess&&device.finish();
+}
+bool Prefill::owned_image_target(const core::ModelGeometry* g,const core::SessionState* ss,int device)const noexcept {
+    return position_banks_&&!image_operation_&&strict_retirement_&&workspace_credit_&&impl_&&
+        impl_->g==g&&impl_->ss==ss&&impl_->device==device&&
+        workspace_geometry_==g&&workspace_session_==ss&&
+        !next_run_.valid()&&!cpu_pool_&&!helper_&&!impl_->pp&&!impl_->help_pp&&
+        !embd_rows&&!on_routes&&!on_taps&&impl_->up_ring.owned_ready()&&impl_->up_ring.reserve(0);
+}
+bool Prefill::owned_position_bank_target(const core::ModelGeometry* g,const core::SessionState* ss,int device)const noexcept {
+    return !position_banks_&&strict_retirement_&&workspace_credit_&&impl_&&impl_->g==g&&impl_->ss==ss&&
+        impl_->device==device&&!cpu_pool_&&!helper_&&!impl_->pp&&!impl_->help_pp&&!embd_rows&&!on_routes&&!on_taps;
+}
+
 Prefill::~Prefill() {
+    if (strict_retirement_) { release(); return; }
     clear_taps();
     release();
 }
@@ -1382,7 +1488,8 @@ bool Prefill::reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int
 
 void Prefill::clear_taps() {
     if (tap_dev_ != nullptr) {
-        cudaFree(tap_dev_);
+        core::StrictRetirementDevice retirement(strict_retirement_, impl_ ? impl_->device : -1);
+        core::retirement_check(strict_retirement_, cudaFree(tap_dev_), "prefill taps");
         tap_dev_ = nullptr;
     }
     tap_layers_.clear();
@@ -1396,50 +1503,71 @@ void Prefill::reset() {
 }
 
 void Prefill::release() {
-    if (!impl_) return;
+    if (!impl_) {workspace_credit_.reset();return;}
+    if (strict_retirement_ && !retirement_init_started_) { impl_.reset();workspace_credit_.reset();return; }
+    core::StrictRetirementDevice retirement(strict_retirement_ && impl_->device >= 0, impl_->device);
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
-    if (impl_->cs) cudaStreamSynchronize(impl_->cs);
-    if (impl_->copy) cudaStreamSynchronize(impl_->copy);
-    if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
-    if (impl_->ple_copy) (void) cudaStreamSynchronize(impl_->ple_copy);
+    if (strict_retirement_) {
+        // No nested consumer may outlive the memory it borrows from Impl.
+        if (impl_->device >= 0) core::retirement_check(true, cudaDeviceSynchronize(), "prefill issuer drain");
+        if (impl_->stager) { impl_->stager->strict_retirement = true; impl_->stager.reset(); }
+        if (impl_->pp) { impl_->pp->retire_strict(impl_->device); impl_->pp.reset(); }
+        if (impl_->help_pp) { impl_->help_pp->retire_strict(impl_->device); impl_->help_pp.reset(); }
+        impl_->mmq_ctx.reset(); // pinned ggml dependency fatal-checks every device destructor
+        if (impl_->device >= 0) core::retirement_check(true, cudaSetDevice(impl_->device), "prefill device after MMQ retirement");
+#if !defined(STRATA_GPU_METAL)
+        impl_->gemm.retire_strict();
+#endif
+        impl_->steps_up.retire_strict();
+        impl_->tok_up.retire_strict();
+        impl_->up_ring.retire_strict();
+        if (tap_dev_) { core::retirement_check(true, cudaFree(tap_dev_), "prefill tap buffer"); tap_dev_ = nullptr; }
+    }
+    if (impl_->cs) core::retirement_check(strict_retirement_, cudaStreamSynchronize(impl_->cs), "prefill cleanup");
+    if (impl_->copy) core::retirement_check(strict_retirement_, cudaStreamSynchronize(impl_->copy), "prefill cleanup");
+    if (impl_->kv_copy) core::retirement_check(strict_retirement_, cudaStreamSynchronize(impl_->kv_copy), "prefill cleanup");
+    if (impl_->ple_copy) core::retirement_check(strict_retirement_, cudaStreamSynchronize(impl_->ple_copy), "prefill PLE drain");
     for (int i = 0; i < RING_MAX; ++i) {
-        if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
-        if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
+        if (impl_->copied[i]) core::retirement_check(strict_retirement_, cudaEventDestroy(impl_->copied[i]), "prefill cleanup");
+        if (impl_->used[i]) core::retirement_check(strict_retirement_, cudaEventDestroy(impl_->used[i]), "prefill cleanup");
     }
     for (int b = 0; b < 2; ++b) {
-        if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
-        if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
+        if (impl_->hand[b]) core::retirement_check(strict_retirement_, cudaFreeHost(impl_->hand[b]), "prefill cleanup");
+        if (impl_->hand_done[b]) core::retirement_check(strict_retirement_, cudaEventDestroy(impl_->hand_done[b]), "prefill cleanup");
         for (cudaEvent_t& e : impl_->hand_ev[b])
-            if (e) cudaEventDestroy(e);
-        if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
-        if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
-        if (b == 0 && impl_->ple_raw_dev) { (void) cudaFree(impl_->ple_raw_dev); impl_->ple_raw_dev = nullptr; }
+            if (e) core::retirement_check(strict_retirement_, cudaEventDestroy(e), "prefill cleanup");
+        if (impl_->ple_copied[b]) core::retirement_check(strict_retirement_, cudaEventDestroy(impl_->ple_copied[b]), "prefill cleanup");
+        if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) core::retirement_check(strict_retirement_, cudaFreeHost(impl_->ple_emb_host[b]), "prefill cleanup");
+        if (b == 0 && impl_->ple_raw_dev) { core::retirement_check(strict_retirement_, cudaFree(impl_->ple_raw_dev), "prefill cleanup"); impl_->ple_raw_dev = nullptr; }
     }
-    if (impl_->copy) cudaStreamDestroy(impl_->copy);
-    if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
-    if (impl_->ple_copy) (void) cudaStreamDestroy(impl_->ple_copy);
-    if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
-    if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
-    if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
-    if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
-    if (impl_->lm.dev) cudaFree(impl_->lm.dev);
-    if (impl_->lm.R_host) cudaFreeHost(impl_->lm.R_host);
-    if (impl_->lm.tab_host) cudaFreeHost(impl_->lm.tab_host);
-    if (impl_->lm.idsw_host) cudaFreeHost(impl_->lm.idsw_host);
+    if (impl_->copy) core::retirement_check(strict_retirement_, cudaStreamDestroy(impl_->copy), "prefill cleanup");
+    if (impl_->kv_copy) core::retirement_check(strict_retirement_, cudaStreamDestroy(impl_->kv_copy), "prefill cleanup");
+    if (impl_->ple_copy) core::retirement_check(strict_retirement_, cudaStreamDestroy(impl_->ple_copy), "prefill cleanup");
+    if (impl_->ple_raw_free) core::retirement_check(strict_retirement_, cudaEventDestroy(impl_->ple_raw_free), "prefill cleanup");
+    if (impl_->kv_released) core::retirement_check(strict_retirement_, cudaEventDestroy(impl_->kv_released), "prefill cleanup");
+    if (impl_->kv_ready) core::retirement_check(strict_retirement_, cudaEventDestroy(impl_->kv_ready), "prefill cleanup");
+    if (impl_->grp_host) core::retirement_check(strict_retirement_, cudaFreeHost(impl_->grp_host), "prefill cleanup");
+    if (impl_->lm.dev) core::retirement_check(strict_retirement_, cudaFree(impl_->lm.dev), "prefill cleanup");
+    if (impl_->lm.R_host) core::retirement_check(strict_retirement_, cudaFreeHost(impl_->lm.R_host), "prefill cleanup");
+    if (impl_->lm.tab_host) core::retirement_check(strict_retirement_, cudaFreeHost(impl_->lm.tab_host), "prefill cleanup");
+    if (impl_->lm.idsw_host) core::retirement_check(strict_retirement_, cudaFreeHost(impl_->lm.idsw_host), "prefill cleanup");
     for (int b = 0; b < 2; ++b)
         for (cudaEvent_t e : {impl_->lm.ev_in[b], impl_->lm.ev_done[b], impl_->lm.ev_out[b]})
-            if (e) cudaEventDestroy(e);
+            if (e) core::retirement_check(strict_retirement_, cudaEventDestroy(e), "prefill cleanup");
     impl_->steps_up.release();
     impl_->tok_up.release();
     impl_->up_ring.release();
     for (float* p : {impl_->cpu_x, impl_->cpu_rows, impl_->cpu_ones})
-        if (p) cudaFreeHost(p);
+        if (p) core::retirement_check(strict_retirement_, cudaFreeHost(p), "prefill cleanup");
     for (cudaEvent_t e : impl_->cpu_ev)
-        if (e) cudaEventDestroy(e);
+        if (e) core::retirement_check(strict_retirement_, cudaEventDestroy(e), "prefill cleanup");
     for (cudaEvent_t e : impl_->cpu_wall)
-        if (e) cudaEventDestroy(e);
-    for (void* p : impl_->owned) cudaFree(p);
+        if (e) core::retirement_check(strict_retirement_, cudaEventDestroy(e), "prefill cleanup");
+    for (void* p : impl_->owned) core::retirement_check(strict_retirement_, cudaFree(p), "prefill cleanup");
+    if (strict_retirement_) impl_.reset(); // all GPU-owning members are now empty, still on the owning device
+    workspace_credit_.reset(); // every buffer, host worker and upload consumer is now retired
 }
+
 
 namespace {
 constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
@@ -1804,10 +1932,47 @@ void warm_gemm_libraries(int device) {
 #endif
 }
 
+static bool prepare_paid_uploads(core::PinnedRing& ring,uint64_t chunk,uint64_t experts,
+    cudaStream_t stream,std::string& error) {
+    OwnedUploadRingBytes bytes;
+    if(!owned_upload_ring_quote(chunk,N,K,experts,bytes)) {
+        error="owned prefill upload quote overflow";return false;
+    }
+    if(!ring.prepare_owned(size_t(bytes.slot),stream)) {
+        error=std::string("owned prefill upload preparation failed: ")+cudaGetErrorString(ring.owned_error());return false;
+    }
+    return true;
+}
+
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes, bool borrow_spill) {
+    if(workspace_credit_&&(&g!=workspace_geometry_||&ss!=workspace_session_||src!=workspace_source_||
+       chunk!=workspace_chunk_||bool(borrow)!=workspace_borrowed_||bool(next_)!=workspace_successor_||borrow_spill||
+       cpu_pool_||helper_||impl_->pp||impl_->help_pp||embd_rows||on_routes||on_taps)){
+        err="prefill workspace admission does not match actual init owners/shape";return false;
+    }
+    // Paid owned initialization is the real policy consumer even when its
+    // contract intentionally creates no CPU pool. Observers stay side-effect free.
+    if(workspace_credit_&&cpu_share_env()!=0.0){
+        err="owned prefill workspace requires the resolved disabled CPU policy";return false;
+    }
+    if(workspace_credit_){
+        int current=-1;
+        if(cudaGetDevice(&current)!=cudaSuccess||current!=impl_->device){
+            err="owned prefill init device differs from paid stage";return false;
+        }
+    }
+    if (workspace_credit_ && (ple_compact_on() || ple_copy_stream_on() || gemm_dequant_side())) {
+        err="owned prefill workspace does not admit compact PLE or side dequant resources";return false;
+    }
+    if (workspace_credit_) impl_->gemm.freeze_weight_cache();
+    retirement_init_started_ = true;
+    if (strict_retirement_) core::retirement_check(true, cudaGetDevice(&impl_->device), "Prefill init device");
     Impl& m = *impl_;
+    m.steps_up.strict_retirement = strict_retirement_;
+    m.tok_up.strict_retirement = strict_retirement_;
+    m.up_ring.set_strict_retirement(strict_retirement_);
     int64_t tr_last = pf_alloc_trace() ? pf_free_mib() : 0;
     pf_mark("init: start (chunk, then the sign tables)", tr_last);
 #if defined(STRATA_GPU_METAL)
@@ -1886,6 +2051,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
+        m.stager->strict_retirement = strict_retirement_;
+        m.stager->device = m.device;
         const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
         // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are page faults on the
@@ -1906,7 +2073,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
             }
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, kMaxStagerThreads) : files ? kMaxStagerThreads : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
@@ -2038,6 +2205,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                      (unsigned long long) o.tr_n, (long long) (o.tr_asked >> 20), (long long) o.tr_drop,
                      (long long) (Prefill::bytes_needed(g, ss, chunk, src != nullptr) >> 20), (long long) (o.used >> 20));
     { int wd = 0; if (cudaGetDevice(&wd) == cudaSuccess) warm_gemm_libraries(wd); else (void) cudaGetLastError(); }
+    if(workspace_credit_&&!prepare_paid_uploads(m.up_ring,uint64_t(chunk),uint64_t(g.n_expert),m.cs,err))return false;
     pf_mark("init: warm_gemm_libraries (BLAS handles, workspaces)", tr_last);
     return true;
 }
@@ -2480,11 +2648,16 @@ void peer_had_signs(PeerPrefill& P) {
 
 bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     Impl& m = *impl_;
+    core::StrictRetirementDevice retirement(strict_retirement_ && m.device >= 0, m.device);
     m.help_pp.reset();
     if (helper == nullptr || helper == this || !split_help_env()) return true;
     const Impl& h = *helper->impl_;
     if (m.device < 0 || h.device < 0 || h.device == m.device || !mmq_plan().any) return true;
     auto pp = std::make_unique<PeerPrefill>();
+    pp->strict_retirement = strict_retirement_;
+    pp->up_ring.set_strict_retirement(strict_retirement_);
+    pp->primary_device = m.device;
+    pp->dev = h.device;
     pp->peer = nullptr;   // stream-only: it holds no experts, it streams a share of this stage's
     pp->compact = true;
     pp->p2p = false;      // the mapped host route, whether or not the cards could reach each other (measured there)
@@ -2495,9 +2668,9 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
         ok = cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) == cudaSuccess;
     }
     int prev = 0;
-    cudaGetDevice(&prev);
+    core::retirement_check(strict_retirement_, cudaGetDevice(&prev), "prefill peer setup device");
     pp->dev = h.device;
-    cudaSetDevice(pp->dev);
+    core::retirement_check(strict_retirement_, cudaSetDevice(pp->dev), "prefill peer setup device");
     ok = ok && cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
          cudaStreamCreateWithFlags(&pp->s_out, cudaStreamNonBlocking) == cudaSuccess &&
          cudaStreamCreateWithFlags(&pp->s_cp, cudaStreamNonBlocking) == cudaSuccess &&
@@ -2512,7 +2685,7 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
         ok = cudaEventCreateWithFlags(&pp->pcopied[(size_t) i], cudaEventDisableTiming) == cudaSuccess &&
              cudaEventCreateWithFlags(&pp->pused[(size_t) i], cudaEventDisableTiming) == cudaSuccess;
     if (ok) peer_had_signs(*pp);   // APR: on the helper's device
-    cudaSetDevice(prev);
+    core::retirement_check(strict_retirement_, cudaSetDevice(prev), "prefill peer setup device");
     if (!ok) { err = "prefill: the layer split's prompt help (streams and events)"; return false; }
     helper_ = helper;
     m.help_pp = std::move(pp);
@@ -2586,6 +2759,7 @@ bool Prefill::bind_stage_helper(int64_t T) {
 
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
     Impl& m = *impl_;
+    core::StrictRetirementDevice retirement(strict_retirement_ && m.device >= 0, m.device);
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // Without P2P the activations and the result rows take the mapped host route of the layer split's helper
     // (STRATA_PF_PEER_HOST=0: refuse as before, the prompt path then stays on the primary)
@@ -2603,6 +2777,10 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         return true;
     }
     auto pp = std::make_unique<PeerPrefill>();
+    pp->strict_retirement = strict_retirement_;
+    pp->up_ring.set_strict_retirement(strict_retirement_);
+    pp->primary_device = m.device;
+    pp->dev = peer->device();
     pp->peer = peer;
     pp->p2p = peer->p2p();
     pp->T_max = m.T_max;
@@ -2620,9 +2798,9 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         }
     }
     int prev = 0;
-    cudaGetDevice(&prev);
+    core::retirement_check(strict_retirement_, cudaGetDevice(&prev), "prefill peer setup device");
     pp->dev = peer->device();
-    cudaSetDevice(pp->dev);
+    core::retirement_check(strict_retirement_, cudaSetDevice(pp->dev), "prefill peer setup device");
     bool ok = cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
               cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
     {
@@ -2742,7 +2920,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         if (ok) host(pp->host_src, pp->host_src_cap, (size_t) pp->cap_rows);
         if (ok) host(pp->host_bounds, bounds_cap, PeerPrefill::kHostBounds);
         if (!ok) {
-            cudaSetDevice(prev);
+            core::retirement_check(strict_retirement_, cudaSetDevice(prev), "prefill peer setup device");
             err = "prefill peer: the host route's pinned buffers (" +
                   std::to_string(((size_t) pp->cap_rows * N * 4 + (size_t) m.T_max * N * 4) >> 20) + " MiB) do not fit in RAM";
             return false;
@@ -2750,7 +2928,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     }
     size_t fb = 0, tb = 0;
     cudaMemGetInfo(&fb, &tb);
-    cudaSetDevice(prev);
+    core::retirement_check(strict_retirement_, cudaSetDevice(prev), "prefill peer setup device");
     if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
     std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk (up to %lld rows per "
                          "layer%s%s); %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
@@ -2957,6 +3135,55 @@ uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core:
     return bytes_needed(g, ss, chunk, src) - (uint64_t) stage_slots((size_t) chunk) * (uint64_t) MAXBLOB();
 }
 
+WorkspaceAdmission Prefill::admit_owned_workspace(const core::ModelGeometry& g,const core::SessionState& ss,core::ExpertSource* source,
+                                   int64_t chunk,bool borrowed,const WorkspaceAdmitter& admit,std::string& error) {
+    // This first paid producer covers the same strict text/no-CPU/helper/peer
+    // profile as owned serving. It is not an envelope for optional writers.
+    if(!strict_retirement_||!impl_||impl_->g||workspace_credit_||!admit||chunk<=0||chunk>32768||
+       g.n_embd!=N||g.hc!=HC||g.hc_lr!=LR||ss.k!=K||g.n_expert<=0||g.n_layers<=0||
+       cpu_pool_||helper_||impl_->pp||impl_->help_pp||embd_rows||on_routes||on_taps){
+        error="owned prefill workspace needs fresh strict text/no-helper consumers";return WorkspaceAdmission::invalid;
+    }
+    int quoted_device=-1;
+    if(cudaGetDevice(&quoted_device)!=cudaSuccess||quoted_device<0){
+        error="owned prefill workspace has no current stage device";return WorkspaceAdmission::invalid;
+    }
+    // init's stager may use its file-backed profile. Bound that existing branch
+    // without repeating cached_share() (which could change between quote/init).
+    uint64_t stager_slots=16;
+    if(const char* configured=std::getenv("STRATA_STAGER_RING"))stager_slots=uint64_t(std::clamp(std::atoi(configured),2,256));
+    else {
+        bool transient=false;
+        for(int64_t layer=0;source&&!transient&&layer<g.n_layers;++layer)
+            for(int64_t expert=0;!transient&&expert<g.n_expert;++expert)transient=source->transient(layer,expert);
+        if(transient)stager_slots=std::max<uint64_t>(16,4*kMaxStagerThreads);
+    }
+    OwnedWorkspaceShape shape;
+    shape.chunk=uint64_t(chunk);shape.embedding=N;shape.handoff_width=D;shape.routes=K;
+    shape.experts=uint64_t(g.n_expert);shape.layers=uint64_t(g.n_layers);
+    shape.step_count=strata::kernels::kStepCount;shape.ple_heads=strata::kernels::PLE_N_HEADS;
+    shape.stager_slots=stager_slots;shape.max_blob=uint64_t(MAXBLOB());
+    static_assert(core::PinnedRing::kSlots==kOwnedUploadSlots&&core::PinnedRing::minimum_slot_bytes()==kOwnedUploadMinimum);
+    shape.object_bytes=sizeof(Impl)+core::PinnedRing::owned_transient_bytes()+sizeof(OwnedUploadRingBytes)+
+        sizeof(OwnedUploadRingScratch)+sizeof(core::OnDevice)+sizeof(core::WatchedStream)+3*sizeof(int)+sizeof(bool)+
+        sizeof(Stager)+stager_slots*(sizeof(uint8_t*)+sizeof(char)+
+        sizeof(std::vector<uint8_t>)+sizeof(cudaEvent_t))+2*kMaxStagerThreads*sizeof(std::thread);
+    shape.stager_job_bytes=sizeof(Stager::Job);shape.atomic_bytes=sizeof(std::atomic<int>);
+    shape.upload_slots=core::PinnedRing::kSlots;shape.upload_min_bytes=core::PinnedRing::minimum_slot_bytes();
+    shape.borrowed=borrowed;shape.successor=next_!=nullptr;
+    shape.arena_device_bytes=borrowed?bytes_needed(g,ss,chunk,source!=nullptr):bytes_needed_owned(g,ss,chunk,source!=nullptr);
+    OwnedWorkspaceBytes quote;
+    if(!owned_workspace_quote(shape,quote)){error="owned prefill workspace quote overflow/unsupported shape";return WorkspaceAdmission::invalid;}
+    std::shared_ptr<const void> credit;
+    const auto admitted=admit(quote,credit);
+    if(admitted!=WorkspaceAdmission::ready){error="owned prefill workspace reservation refused before allocation";return admitted;}
+    if(!credit){error="owned prefill workspace admission returned no retained credit";return WorkspaceAdmission::invalid;}
+    workspace_geometry_=&g;workspace_session_=&ss;workspace_source_=source;workspace_chunk_=chunk;
+    workspace_borrowed_=borrowed;workspace_successor_=next_!=nullptr;workspace_credit_=std::move(credit);
+    impl_->device=quoted_device;
+    return WorkspaceAdmission::ready;
+}
+
 int64_t Prefill::ring_default_slots() {
     const int r = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
     return (int64_t) std::min(r, ring_cap());
@@ -2977,6 +3204,40 @@ int64_t Prefill::ring_max_slots() {
 }
 
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
+core::PrefillCpuShareObservation Prefill::cpu_share_policy() const noexcept {
+    core::PrefillCpuShareObservation r;
+    r.explicit_resolved = g_share_explicit_observed;
+    r.cached_explicit = g_share_explicit_value;
+    r.default_armed = g_share_default;
+    r.maximum_resolved = g_share_max_observed && g_share_max_presence_observed && g_share_explicit_observed;
+    r.explicit_maximum = g_share_max_explicit;
+    r.cached_maximum = g_share_max_value;
+    if (r.maximum_resolved) r.effective_maximum = g_share_default && g_share_explicit_value == -2 &&
+        !g_share_max_explicit ? kStreamAllMinDefault : g_share_max_value;
+    r.armed_stream_limit = g_stream_min_share;
+    r.pool_present = cpu_pool_ != nullptr;
+    r.instance_present = bool(impl_);
+    if (impl_) {
+        r.source_present = impl_->src != nullptr;
+        r.peer_present = bool(impl_->pp);
+        r.allocation_disabled = impl_->cpu_dead;
+        r.measured_fraction = impl_->cpu_share_now;
+        r.measured_gate = impl_->cpu_gate;
+        r.measured_ratios = impl_->cpu_nratio;
+        r.measurement_pending = impl_->cpu_pend || impl_->pend_wall != 0;
+    }
+    return core::classify_cpu_share(r);
+}
+Prefill::ReplayActivity Prefill::replay_activity() const noexcept {
+    ReplayActivity r;r.next=next_;r.begin=stage_lb_;r.end=stage_le_;
+    r.workspace_paid=bool(workspace_credit_);
+    r.taps=!tap_layers_.empty()||bool(on_taps);r.pending_force=force_chunk_!=0;
+    if(impl_){const auto& m=*impl_;r.initialized=true;r.session=m.ss;r.source=m.src;
+        r.allocated_chunk=m.T_max;r.chunk=m.T;r.ring_slots=m.ring;
+        r.cache=m.cache;r.residency=m.host_res;r.device=m.device;r.helper=bool(m.help_pp);
+        r.peer=bool(m.pp);r.borrow_spill=m.borrow_spill;}
+    return r;
+}
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
@@ -3317,9 +3578,43 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
-    const core::OnDevice on_device(m.device);
-    // the stall report asks this stream (the one the waits below block on) whether its work is done (#5718 follow-up)
-    const core::WatchedStream watched("the prompt's GPU work", (void*) m.cs, m.device);
+    const core::OnDevice on_device(m.device,bool(workspace_credit_));
+    if(workspace_credit_&&(!m.up_ring.owned_ready()||!m.up_ring.reserve(0)||embd_rows||
+       cpu_pool_||helper_||m.pp||m.help_pp||on_routes||on_taps)){
+        err="owned prefill run requires the paid frozen text ring";return false;
+    }
+    const float* const* request_rows=embd_rows;
+    if(image_operation_){
+        const auto& operation=*image_operation_;
+        if(!position_banks_||!operation.request_||!operation.captured_||!operation.producer_closed_||
+           operation.phase_.load(std::memory_order_acquire)!=program::OwnedImageRequestOperation::Phase::unsealed||
+           position_banks_->owner_->content_generations_[0]!=image_generation_||
+           position_banks_->owner_->image_contexts_[0].lock()!=image_operation_||embd_rows||
+           operation.runtime_==nullptr||pos0<0||n<0||uint64_t(pos0)>operation.request_->tokens().size()||
+           uint64_t(n)>operation.request_->tokens().size()-uint64_t(pos0)){
+            err="owned image prefill context/generation/span changed";return false;
+        }
+        const auto immutable=operation.request_->tokens();
+        for(int64_t i=0;i<n;++i)if(tokens[i]!=immutable[size_t(pos0+i)]){
+            err="owned image prefill token source differs";return false;
+        }
+        // Submission reads the sealed token source too, never a caller vector
+        // that a callback could rewrite after the validation above.
+        tokens=immutable.data()+pos0;
+        request_rows=operation.request_->row_pointers().data();
+    }
+    const int32_t* owned_main_positions=nullptr;
+    if(position_banks_){
+        const auto& b=*position_banks_;const auto& owner=*b.owner_;
+        if(b.epoch_!=owner.epoch_||b.stage_>=owner.stages_||!owner.allocation_.healthy()||
+           owner.allocation_.stages()[b.stage_].session!=m.ss||owner.allocation_.stages()[b.stage_].device!=m.device||
+           !b.table(0)||owner.cells_<64||m.ss->max_cells!=int64_t(owner.cells_-64)||
+           pos0<0||n<0||uint64_t(pos0)>owner.cells_-64||uint64_t(n)>owner.cells_-64-uint64_t(pos0)){
+            err="owned prefill main position binding/extent changed";return false;
+        }
+        owned_main_positions=b.table(0);
+    }
+    const core::WatchedStream watched("the prompt GPU work", (void*) m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
@@ -3557,7 +3852,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             batched = false;
         for (int64_t t = 0; batched && t < T; ++t) {
             const int64_t tok = tokens[c0 + t];
-            if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+            if ((request_rows && request_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
             else m.tok_host[(size_t) t] = (int32_t) tok;
         }
         if (batched) {
@@ -3579,22 +3874,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
         }
         for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T;) {
-            const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
+            const float* row = request_rows ? request_rows[p0 + t] : nullptr;
             if (row) {
                 // #1996: the picture's rows live in the caller's (pageable) memory.  A run of consecutive rows is
                 // gathered into one pinned slot and goes up as one copy; the slot is guarded by its event.
                 const int64_t row_bytes = N * 4, run_max = std::max<int64_t>(1, (4 << 20) / row_bytes);
                 int64_t t1 = t + 1;
-                while (t1 < T && t1 - t < run_max && embd_rows[p0 + t1]) ++t1;
+                while (t1 < T && t1 - t < run_max && request_rows[p0 + t1]) ++t1;
                 void* stage = m.up_ring.acquire((size_t) ((t1 - t) * row_bytes));
                 cudaError_t e = cudaSuccess;
                 if (stage != nullptr) {
                     for (int64_t r = t; r < t1; ++r)
-                        std::memcpy((char*) stage + (size_t) ((r - t) * row_bytes), embd_rows[p0 + r], (size_t) row_bytes);
+                        std::memcpy((char*) stage + (size_t) ((r - t) * row_bytes), request_rows[p0 + r], (size_t) row_bytes);
                     e = m.up_ring.submit(m.emb + t * N, stage, (size_t) ((t1 - t) * row_bytes), m.cs);
                 } else {   // no pinned RAM: row by row from the caller's memory, each waited for
+                    if(m.up_ring.owned_mode()){
+                        err="owned prefill image upload cannot use direct fallback";return false;
+                    }
                     for (int64_t r = t; r < t1 && e == cudaSuccess; ++r)
-                        e = core::PinnedRing::direct(m.emb + r * N, embd_rows[p0 + r], (size_t) row_bytes, m.cs);
+                        e = core::PinnedRing::direct(m.emb + r * N, request_rows[p0 + r], (size_t) row_bytes, m.cs);
                 }
                 if (e != cudaSuccess) {
                     err = "prefill: the image embedding upload failed";
@@ -4298,11 +4596,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     pt.mark(kPfQsaPrep, cs);
-                    if (qsa_fuse_nr()) {
+                    if (!owned_main_positions && qsa_fuse_nr()) {
                         rms_rope_rows(m.Kc, kKvW, kHeadDim, m.Kc, kKvW, (const float*) wkn->data, T, kNKv, kHeadDim, EPS, p0, strata::kernels::rope_scaling(), m.cs);
                     } else {
                         rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
-                        rope(m.Kc, T, kNKv, kHeadDim, kKvW, p0, strata::kernels::rope_scaling(), m.cs);
+                        if (owned_main_positions) rope_owned(m.Kc, T, kNKv, kHeadDim, kKvW, p0, strata::kernels::rope_scaling(), m.cs, owned_main_positions);
+                        else rope(m.Kc, T, kNKv, kHeadDim, kKvW, p0, strata::kernels::rope_scaling(), m.cs);
                     }
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
@@ -4364,19 +4663,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
                     if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
-                    if (qsa_fuse_nr()) {
+                    if (!owned_main_positions && qsa_fuse_nr()) {
                         rms_rope_rows(m.Qf, kNHead * 2 * kHeadDim, 2 * kHeadDim, m.q, kQW, (const float*) wqn->data, T, kNHead, kHeadDim, EPS, p0, strata::kernels::rope_scaling(), m.cs);
                     } else {
                         split_q(m.Qf, m.q, T, m.cs);
                         rms_rows(m.q, (const float*) wqn->data, T * kNHead, kHeadDim, kHeadDim, EPS, m.cs);
-                        rope(m.q, T, kNHead, kHeadDim, kQW, p0, strata::kernels::rope_scaling(), m.cs);
+                        if (owned_main_positions) rope_owned(m.q, T, kNHead, kHeadDim, kQW, p0, strata::kernels::rope_scaling(), m.cs, owned_main_positions);
+                        else rope(m.q, T, kNHead, kHeadDim, kQW, p0, strata::kernels::rope_scaling(), m.cs);
                     }
                     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * kNHead, m.cs);
-                    if (qsa_fuse_nr()) {
+                    if (!owned_main_positions && qsa_fuse_nr()) {
                         rms_rope_rows(m.q_idx, kIdxQW, kIdxK, m.q_idx, kIdxQW, (const float*) wiqn->data, T, kIdxQHeads, kIdxK, EPS, p0, strata::kernels::rope_scaling(), m.cs);
                     } else {
                         rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
-                        rope(m.q_idx, T, kIdxQHeads, kIdxK, kIdxQW, p0, strata::kernels::rope_scaling(), m.cs);
+                        if (owned_main_positions) rope_owned(m.q_idx, T, kIdxQHeads, kIdxK, kIdxQW, p0, strata::kernels::rope_scaling(), m.cs, owned_main_positions);
+                        else rope(m.q_idx, T, kIdxQHeads, kIdxK, kIdxQW, p0, strata::kernels::rope_scaling(), m.cs);
                     }
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
@@ -4387,15 +4688,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     try {
                         static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
                         if (!per_token) {
-                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                            {if(owned_main_positions){strata::kernels::native_qsa_indexer_append_batch_owned(m.idx_raw, T, p0, 0, (const float*) wikn->data,
                                                                              EPS, ib, s, st.max_cells,
-                                                                             strata::kernels::rope_scaling(), m.cs);
+                                                                             strata::kernels::rope_scaling(), m.cs, owned_main_positions);}else{strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                             EPS, ib, s, st.max_cells,
+                                                                             strata::kernels::rope_scaling(), m.cs);}}
                         }
                         for (int64_t t = 0; per_token && t < T; ++t) {
                             const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                            strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
+                            {if(owned_main_positions){strata::kernels::native_qsa_indexer_append_owned(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
                                                                        (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                       strata::kernels::rope_scaling(), m.cs);
+                                                                       strata::kernels::rope_scaling(), m.cs, owned_main_positions);}else{strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
+                                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                                       strata::kernels::rope_scaling(), m.cs);}}
                         }
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     // KVA: the KV pages and the indexer's keys/pool are complete for this chunk.  Nothing that
@@ -7926,13 +8231,26 @@ bool Prefill::reserve_uploads(int64_t T) {
     bool ok = true;
     if (impl_ != nullptr && T > 0) {
         Impl& m = *impl_;
-        const core::OnDevice on_device(m.device);   // (the ring is the device's that is current at its first use)
-        // a text chunk's largest pageable uploads through the ring: the routing tables (and their ids down, T x K
-        // each); the PLE rows when they could not be pinned (T x N).  A picture's rows are not covered.
-        size_t bytes = (size_t) (T * K) * sizeof(int32_t);
-        if (!m.ple_pageable[0].empty() || !m.ple_pageable[1].empty())
-            bytes = std::max(bytes, (size_t) (T * N) * sizeof(float));
-        ok = m.up_ring.reserve(bytes);
+        const core::OnDevice on_device(m.device,bool(workspace_credit_));
+        if(workspace_credit_){
+            OwnedUploadRingBytes quote;
+            if(T>workspace_chunk_||!m.g||!owned_upload_ring_quote(uint64_t(T),N,K,uint64_t(m.g->n_expert),quote)){
+                m.up_ring.reject_owned();return false;
+            }
+            ok=m.up_ring.reserve(size_t(quote.slot));
+        }else{
+            // a text chunk's largest pageable uploads through the ring: the routing tables (and their ids down, T x K
+            // each); the PLE rows when they could not be pinned (T x N).  A picture's rows are not covered.
+            size_t bytes = (size_t) (T * K) * sizeof(int32_t);
+            if (!m.ple_pageable[0].empty() || !m.ple_pageable[1].empty())
+                bytes = std::max(bytes, (size_t) (T * N) * sizeof(float));
+            ok = m.up_ring.reserve(bytes);
+        }
+    }
+    if(workspace_credit_&&(!impl_||T<0))return false;
+    if(workspace_credit_&&T==0){
+        const core::OnDevice on_device(impl_->device,true);
+        ok=impl_->up_ring.reserve(0);
     }
     if (next_ != nullptr) ok = next_->reserve_uploads(T) && ok;
     return ok;
@@ -8008,6 +8326,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
+
+    cudaError_t ring_error=cudaSuccess;
+    for(Prefill* stage=this;stage;stage=stage->next_)if(stage->workspace_credit_&&stage->impl_){
+        const core::OnDevice device(stage->impl_->device,true);
+        if(!stage->impl_->up_ring.drain_owned())core::retirement_failed("owned prefill upload drain");
+        if(ring_error==cudaSuccess)ring_error=stage->impl_->up_ring.owned_error();
+    }
+    if(ring_error!=cudaSuccess){err=std::string("owned prefill first upload error: ")+cudaGetErrorString(ring_error);return false;}
 
     if (!body_ok) return false;
     if (!drain_ok) {

@@ -63,6 +63,14 @@
 #endif
 
 namespace strata::core {
+// Unsupported producer, deliberately no environment or inferred runtime state.
+// Do not use this unresolved record to enable SYCL managed numerical identity.
+RouteTailPolicyObservation observe_tail_skip_policy() noexcept {
+    RouteTailPolicyObservation r;
+    r.applicability = PolicyApplicability::unknown;
+    return r;
+}
+
 
 namespace detail {
 
@@ -415,10 +423,19 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 
 // ================================ THE FILE-BACKED SOURCE ================================
 
+bool FileExpertSource::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if (retirement_open_started_) { error = "strict retirement must be configured before open"; return false; }
+    if (enabled) { error = "strict expert retirement is unsupported by SYCL"; return false; }
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
+    return true;
+}
+
 FileExpertSource::~FileExpertSource() { close(); }
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
+    retirement_open_started_ = true;
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
     const auto& layout = strata::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
@@ -1430,6 +1447,19 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
 #endif
 }
 
+bool RouterLookahead::residency_snapshot_bytes(size_t layers, int64_t experts, uint64_t& out) noexcept {
+    if (experts < 0 || experts > std::numeric_limits<int>::max() ||
+        layers > uint64_t(std::numeric_limits<int64_t>::max()) || (layers && !experts)) return false;
+    const uint64_t n = uint64_t(experts);
+    if (n && uint64_t(layers) > std::numeric_limits<uint64_t>::max() / n) return false;
+    const uint64_t cells = uint64_t(layers) * n;
+    if (cells > std::numeric_limits<uint64_t>::max() / sizeof(int32_t) ||
+        cells > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
+        cells > std::vector<int32_t>().max_size()) return false;
+    out = cells * sizeof(int32_t);
+    return true;
+}
+
 RouterLookahead::~RouterLookahead() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1441,29 +1471,54 @@ RouterLookahead::~RouterLookahead() {
 
 bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k,
                             ExpertSource* src, std::string& err) {
+    // Configuration/start/destruction remain externally serialized, as in the
+    // existing SYCL lifecycle; this is not concurrent lifecycle authorization.
+    if (thread_.joinable()) { err = "RouterLookahead: already started"; return false; }
     if (src == nullptr || !src->warms()) { err = "RouterLookahead: the expert source does not warm"; return false; }
-    if (n_embd % 8 != 0) { err = "RouterLookahead: n_embd is not a multiple of 8"; return false; }
+    uint64_t snapshot_bytes = 0;
+    if (n_embd < 0 || n_embd > std::numeric_limits<int>::max() || n_embd % 8 != 0 ||
+        (!routers.empty() && !n_embd) ||
+        !residency_snapshot_bytes(routers.size(), n_expert, snapshot_bytes) ||
+        uint64_t(n_expert) > std::numeric_limits<size_t>::max() / (8 * sizeof(float)) ||
+        uint64_t(n_embd) > std::numeric_limits<size_t>::max() / (8 * sizeof(float)) ||
+        (n_expert && uint64_t(n_embd) > std::numeric_limits<size_t>::max() / uint64_t(n_expert))) {
+        err = "RouterLookahead: invalid or overflowing dimensions"; return false;
+    }
     for (const auto& r : routers)
-        if (r.size() != (size_t) (n_embd * n_expert)) { err = "RouterLookahead: a router of another shape"; return false; }
+        if (r.size() != size_t(n_embd) * size_t(n_expert)) {
+            err = "RouterLookahead: a router of another shape"; return false;
+        }
+    std::vector<int32_t> snapshot;
+    std::vector<float> activations;
+    try {
+        snapshot = std::vector<int32_t>(size_t(snapshot_bytes / sizeof(int32_t)));
+        if (snapshot.capacity() != snapshot.size()) {
+            err = "RouterLookahead: snapshot capacity exceeds quote"; return false;
+        }
+        activations = std::vector<float>(size_t(8 * n_embd), 0.f);
+    } catch (const std::bad_alloc&) { err.clear(); return false; }
     routers_ = std::move(routers);
+    residency_snapshot_ = std::move(snapshot);
+    x_ = std::move(activations);
     n_embd_ = n_embd;
     n_expert_ = n_expert;
     k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
     src_ = src;
-    x_.assign((size_t) (8 * n_embd), 0.f);
     thread_ = std::thread([this] { run(); });
     return true;
 }
 
 void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res) {
-    if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
+    if (layer < 0 || routers_.size() < 2 || uint64_t(layer) >= routers_.size() - 1 || n_tok <= 0 || x == nullptr) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
         n_tok_ = std::min<int64_t>(n_tok, 8);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
-        host_res_ = host_res;
+        has_residency_ = host_res != nullptr;
+        if (host_res) std::memcpy(residency_snapshot_.data(), host_res,
+                                  residency_snapshot_.size() * sizeof(int32_t));
         pending_ = true;
     }
     cv_.notify_one();
@@ -1484,7 +1539,7 @@ void RouterLookahead::run() {
             busy_ = true;
             layer = layer_;
             nt = n_tok_;
-            host_res = host_res_;
+            host_res = has_residency_ ? residency_snapshot_.data() : nullptr;
         }
         const auto t0 = std::chrono::steady_clock::now();
         want.clear();
@@ -2419,6 +2474,12 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;   // a previous layer already failed; do not make it worse
+    if (d.host_execution_observer != nullptr) {
+        d.failed = true;
+        d.fail = "SYCL expert host execution observation is unsupported";
+        d.fail_layer = d.layers;
+        return;
+    }
 
     using namespace strata::kernels::cpu;
     // Clause 3: the blob's internal offsets are compile-time constants, so a mismatched geometry does not
@@ -2548,6 +2609,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
+    if (d.host_execution_observer != nullptr) {
+        d.failed = true;
+        d.fail = "SYCL expert host execution observation is unsupported";
+        d.fail_layer = d.layers;
+        return;
+    }
     if (n_tok < 1 || n_tok > MAXT) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
@@ -3306,12 +3373,21 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     return st;
 }
 
+bool ArenaExpertSource::set_strict_retirement(bool enabled, const std::vector<int>& devices, std::string& error) {
+    if (retirement_open_started_) { error = "strict retirement must be configured before open"; return false; }
+    if (enabled) { error = "strict expert retirement is unsupported by SYCL"; return false; }
+    retirement_consumers_ = devices;
+    strict_retirement_ = enabled;
+    return true;
+}
+
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err, uint64_t max_pinned_bytes,
                              const std::string& shared_arena_file) {
     close();
+    retirement_open_started_ = true;
     const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();

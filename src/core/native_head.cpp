@@ -8,35 +8,116 @@
 
 #include <cuda_runtime.h>
 #include <climits>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <mutex>
 
 namespace strata::core {
 
-NativeHead::~NativeHead() {
-    unload();
+namespace {
+std::atomic<HeadEmbedLoadInventory*> failed_head_embed_inventory{nullptr};
+void retain_failed(std::unique_ptr<HeadEmbedLoadInventory>& inventory) noexcept {
+    if(auto* p=inventory.release()) {
+        auto* head=failed_head_embed_inventory.load();
+        do {p->quarantined_next=head;} while(!failed_head_embed_inventory.compare_exchange_weak(head,p));
+        std::fprintf(stderr,"head/embed inventory retained after uncertain retirement\n");
+    }
+}
+bool prepare_inventory(std::unique_ptr<HeadEmbedLoadInventory>& out,const NativeInventoryLimits& limits,
+ std::shared_ptr<const ReservationLease> reservation,std::shared_ptr<const void> inputs,std::string& error) {
+    uint64_t required=0;
+    if(!head_embed_inventory_host_bound(limits,required,error))return false;
+    if(!reservation||reservation->purpose()!=ReservationPurpose::foreground||reservation->resources().host_bytes<required||!inputs) {
+        error="head/embed inventory requires host reservation and retained inputs";return false;
+    }
+    try {
+        auto next=std::make_unique<HeadEmbedLoadInventory>();
+        next->metadata_reservation=std::move(reservation);next->retained_input_bindings=std::move(inputs);next->limits=limits;
+        next->sources.reserve(size_t(limits.max_sources));next->tensor.source_shape.reserve(size_t(limits.max_rank));
+        next->tensor.name.reserve(size_t(limits.max_string_bytes));out=std::move(next);return true;
+    }catch(const std::bad_alloc&){error="head/embed inventory allocation failed";return false;}
+}
+bool inventory_sources(HeadEmbedLoadInventory* p,const std::vector<std::string>& paths,std::string& error) {
+    if(!p)return true;
+    if(paths.size()>p->limits.max_sources){error="head/embed inventory source count exceeded";return false;}
+    for(const auto& path:paths)if(path.size()>p->limits.max_string_bytes){error="head/embed inventory source string exceeded";return false;}
+    p->sources=paths;return true;
+}
+bool inventory_tensor(HeadEmbedLoadInventory* p,const strata::TensorInfo& t,size_t ordinal,uint64_t start,uint64_t bytes,std::string& error) {
+    if(!p)return true;
+    if(t.name.size()>p->limits.max_string_bytes||t.shape.size()>p->limits.max_rank||t.offset>UINT64_MAX-start){error="head/embed inventory tensor bounds exceeded";return false;}
+    p->tensor.name=t.name;p->tensor.source_ordinal=ordinal;p->tensor.source_offset=start+t.offset;
+    p->tensor.source_bytes=bytes;p->tensor.source_type=t.type;p->tensor.source_shape=t.shape;p->tensor.runtime_bytes=bytes;return true;
+}
+}
+NativeHead::~NativeHead() { unload(); if(release_failed_||weights_||scratch_)retain_failed(inventory_); }
+
+
+uint64_t NativeHead::allocated_bytes() const {
+    return (weights_ ? allocated_weight_bytes_ : 0) + (scratch_ ? scratch_bytes_ : 0) +
+           (weights_ ? strata::kernels::native_head_packed_allocation_bytes(weights_) : 0);
+}
+
+bool NativeHead::release_checked(std::string& err) {
+    release_started_ = true; load_complete_ = false;
+    if (release_failed_) { err = "native head release previously failed"; return false; }
+    if (!weights_ && !scratch_) return true;
+    int d = -1;
+    if (cudaGetDevice(&d) != cudaSuccess || d != device_) {
+        err = "native head release requires owning device"; return false;
+    }
+    if (weights_ && !strata::kernels::native_head_packed_release_checked(weights_)) {
+        release_failed_ = true; err = "native head packed release failed"; return false;
+    }
+    if (scratch_) {
+        if (cudaFree(scratch_) != cudaSuccess) { release_failed_ = true; err = "native head scratch release failed"; return false; }
+        scratch_ = nullptr;
+    }
+    if (host_) {
+        if (cudaFreeHost(host_) != cudaSuccess) { release_failed_ = true; err = "native head mapped release failed"; return false; }
+        host_ = nullptr; weights_ = nullptr;
+    } else if (weights_) {
+        if (cudaFree(weights_) != cudaSuccess) { release_failed_ = true; err = "native head weight release failed"; return false; }
+        weights_ = nullptr;
+    }
+    return true;
 }
 
 void NativeHead::unload() {
-    if (weights_) strata::kernels::native_q6_k_unpack(weights_);
-    if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
-    if (scratch_) cudaFree(scratch_);
-    if (host_) cudaFreeHost(host_);   // the mapped-host fallback (weights_ is its device alias)
-    else if (weights_) cudaFree(weights_);
-    scratch_ = nullptr;
-    weights_ = nullptr;
-    host_ = nullptr;
+    if (release_failed_) return;
+    if (!weights_ && !scratch_) { if(inventory_) {release_started_=true;load_complete_=false;} return; }
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess ||
+        (previous != device_ && cudaSetDevice(device_) != cudaSuccess)) { release_failed_ = true; return; }
+    try {
+        std::string err;
+        if (cudaDeviceSynchronize() != cudaSuccess) release_failed_ = true;
+        else release_checked(err);
+    } catch (...) { release_failed_ = true; }
+    if (previous != device_ && cudaSetDevice(previous) != cudaSuccess) release_failed_ = true;
 }
 
+bool NativeHead::enable_inventory_capture(const NativeInventoryLimits& limits,
+ std::shared_ptr<const ReservationLease> reservation,std::shared_ptr<const void> inputs,std::string& error) {
+    if(weights_||scratch_||release_failed_||(inventory_&&!release_started_)) {error="head/embed inventory must be armed before load or after checked retirement";return false;}
+    if(inventory_generation_==UINT64_MAX) {error="head/embed inventory generation exhausted";return false;}
+    if(!prepare_inventory(inventory_,limits,std::move(reservation),std::move(inputs),error))return false;
+    inventory_required_=true;inventory_attempted_=false;return true;
+}
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
-    if (loaded()) { err = "native head is already loaded"; return false; }
+    if (weights_ || scratch_ || release_failed_) { err = "native head is loaded or has retained failed resources"; return false; }
+    if(inventory_required_&&(!inventory_||inventory_attempted_)) {err="head/embed inventory requires fresh capture admission";return false;}
+    inventory_attempted_=true;
+    load_complete_ = false; release_started_ = false;
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";
         return false;
     }
     try {
+        if(!inventory_sources(inventory_.get(),shards,err))return false;
         // The architecture is the metadata shard's; output.weight comes from whichever shard holds it (shard 2
         // of Unsloth's UD-Q4_K_XL, whose shard 1 holds no tensor).  GgufModel refuses a duplicate across shards.
         const strata::GgufModel model(shards);
@@ -56,6 +137,23 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             err = "native head: truncated output.weight payload";
             return false;
         }
+        if (inventory_) {
+        if(!inventory_tensor(inventory_.get(),*tensor,at,gguf.data_start(),bytes,err))return false;
+        scratch_bytes_ = strata::kernels::native_q8_1_bytes((int) n_in, 1);
+        if (!bytes || scratch_bytes_ > UINT64_MAX - bytes || cudaGetDevice(&device_) != cudaSuccess) {
+            err = "native head size or owning device invalid"; return false;
+        }
+        bytes_ = bytes; allocated_weight_bytes_ = bytes;
+        cudaError_t status = cudaMalloc(&weights_, bytes_);
+        if (status == cudaSuccess) status = cudaMalloc(&scratch_, scratch_bytes_);
+        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes_);
+        if (status == cudaSuccess)
+            status = cudaMemcpy(weights_, gguf.tensor_data(*tensor), bytes_, cudaMemcpyHostToDevice);
+        if (status != cudaSuccess) {
+            err = std::string("native head upload: ") + cudaGetErrorString(status);
+            return false;
+        }
+        } else {
         void* weights = nullptr;
         void* scratch = nullptr;
         void* host = nullptr;
@@ -97,17 +195,27 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             return false;
         }
         weights_ = weights;
+        allocated_weight_bytes_ = host ? 0 : bytes;
+        scratch_bytes_ = strata::kernels::native_q8_1_bytes((int)n_in, 1);
         host_ = host;
         { int d = -1; if (cudaGetDevice(&d) == cudaSuccess) device_ = d; }
         scratch_ = scratch;
         bytes_ = bytes;
+        }
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
-            strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
+            { const bool packed=strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
+              if(inventory_&&packed)inventory_->packed=HeadPackedForm::q6_planes_256; }
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
-            strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
+            { const bool packed=strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
+              if(inventory_&&packed)inventory_->packed=HeadPackedForm::q8_sm60_qs_d; }
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = "native head load drain failed"; return false; }
+        if(inventory_) {inventory_->generation=++inventory_generation_;inventory_->device=device_;
+            inventory_->main_bytes=bytes_;inventory_->scratch_bytes=scratch_bytes_;
+            inventory_->helper_bytes=strata::kernels::native_head_packed_allocation_bytes(weights_);inventory_->row_bytes=bytes_/n_out_;}
+        load_complete_ = true;
         if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: what the head holds and where
             namespace mf = strata::core::manifest;
             mf::instance().tensors("head", strata::ggml_type_name((uint32_t) type_), 1, bytes);
@@ -124,26 +232,110 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
     }
 }
 
+namespace {
+struct NativeHeadSpillFrame {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    HeadSpillCharge charge;
+#endif
+    cudaDeviceProp properties{};
+    void* host = nullptr;
+    void* alias = nullptr;
+    int current = -1;
+    cudaError_t status = cudaSuccess;
+};
+}
+uint64_t NativeHead::spill_control_bytes() noexcept {
+    // Actual fixed objects, not a guessed allocator/stack/RSS allowance. No new
+    // heap object, vector, lease or shared control is constructed by this chain.
+    // Native frame + ledger subframe + native formal/return storage + owning
+    // stage wrapper formal/return storage; references are represented by pointers.
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    return sizeof(NativeHeadSpillFrame) + WindowBudget::head_spill_control_bytes() +
+        sizeof(NativeHead*) + sizeof(WindowBudget*) +
+        sizeof(const std::shared_ptr<const ReservationLease>*) + sizeof(std::string*) + sizeof(bool) +
+        sizeof(const OwnedModelStage*) + sizeof(WindowBudget*) + sizeof(std::string*) + sizeof(bool) +
+        // Existing healthy() is also invoked by the new owning-stage wrapper.
+        sizeof(std::lock_guard<std::recursive_mutex>) + sizeof(const OwnedModelStage*) + sizeof(bool) +
+        // Typed implicit construction/destruction forwarding for the new frame
+        // and its phase token; no compiler-frame/ABI stack size is asserted.
+        2*sizeof(NativeHeadSpillFrame*) + 2*sizeof(HeadSpillCharge*);
+#else
+    // The default engine has no window ledger TU and no owned transition.
+    return 0;
+#endif
+}
 bool NativeHead::to_host(std::string& err) {
-    if (weights_ == nullptr || host_ != nullptr || (type_ == 14 && strata::kernels::native_q6_k_packed_enabled()) || (type_ == 8 && std::getenv("STRATA_Q8_SM60") != nullptr)) return false;   // (repacked in place: those stay in VRAM)
-    { int d = 0; cudaDeviceProp pr{}; if (cudaGetDevice(&d) != cudaSuccess || cudaGetDeviceProperties(&pr, d) != cudaSuccess || !strata::spill_allowed(strata::kSpillMetalBuild, pr.integrated != 0)) { (void) cudaGetLastError(); return false; } }   // (Q6_K / Q8_0 may be repacked in place: those stay)
-    void* hp = nullptr;
-    void* dp = nullptr;
-    if (cudaHostAlloc(&hp, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-        (void) cudaGetLastError();
-        err = "native head: no pinned host memory for the head";
-        return false;
+    // A captured loader may move only via the actual adopted stage/ledger path.
+    return to_host_checked(nullptr,nullptr,err);
+}
+bool NativeHead::to_host_checked(WindowBudget* budget,
+                                const std::shared_ptr<const ReservationLease>* reservation,
+                                std::string& err) {
+    err.clear(); // no new error-string allocation inside the paid transition
+    if (!ready_for_adoption() || host_ || !bytes_ ||
+        (type_==14 && strata::kernels::native_q6_k_packed_enabled()) ||
+        (type_==8 && std::getenv("STRATA_Q8_SM60")!=nullptr) ||
+        strata::kernels::native_head_packed_allocation_bytes(weights_)) return false;
+    if (inventory_ && (!budget || !reservation || inventory_generation_==UINT64_MAX ||
+        inventory_->generation==UINT64_MAX || inventory_->generation!=inventory_generation_)) return false;
+    if ((budget==nullptr)!=(reservation==nullptr)) return false;
+    // The wrapper retains the actual stage and its unchanged control block.
+    // This check precedes construction of ANY new fixed transition control.
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if (budget && (!*reservation || (*reservation)->resources().host_bytes<spill_control_bytes())) return false;
+#else
+    if (budget || reservation) return false;
+#endif
+    NativeHeadSpillFrame frame;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if (budget && !budget->admit_head_spill(*reservation,device_,bytes_,spill_control_bytes(),frame.charge)) return false;
+#endif
+    if (cudaGetDevice(&frame.current)!=cudaSuccess || frame.current!=device_ ||
+        cudaGetDeviceProperties(&frame.properties,device_)!=cudaSuccess ||
+        !strata::spill_allowed(strata::kSpillMetalBuild,frame.properties.integrated!=0)) goto rollback;
+    // Startup caller excludes submissions, other loader mutation and retirement.
+    // Fence borrowed readiness until success or a fully proven rollback.
+    load_complete_=false;
+    if (cudaDeviceSynchronize()!=cudaSuccess) goto uncertain;
+    frame.status=cudaHostAlloc(&frame.host,bytes_,cudaHostAllocMapped|cudaHostAllocPortable);
+    if (frame.status!=cudaSuccess) {
+        // A non-null/error allocation or an asynchronous error is ambiguous.
+        if (frame.host || frame.status!=cudaErrorMemoryAllocation) goto uncertain;
+        (void)cudaGetLastError();goto rollback;
     }
-    if (cudaHostGetDevicePointer(&dp, hp, 0) != cudaSuccess || cudaMemcpy(hp, weights_, bytes_, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        (void) cudaGetLastError();
-        cudaFreeHost(hp);
-        err = "native head: the head could not be moved to host memory";
-        return false;
+    if (!frame.host) goto uncertain;
+    if (cudaHostGetDevicePointer(&frame.alias,frame.host,0)!=cudaSuccess || !frame.alias) goto rollback;
+    if (cudaMemcpy(frame.host,weights_,bytes_,cudaMemcpyDeviceToHost)!=cudaSuccess) goto rollback;
+    if (cudaDeviceSynchronize()!=cudaSuccess) goto uncertain;
+    if (cudaFree(weights_)!=cudaSuccess) goto uncertain;
+    // Device credit is reduced only AFTER the old allocation was checked free.
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if (budget && !budget->settle_head_spill(*reservation,frame.charge,true)) goto uncertain;
+#endif
+    weights_=frame.alias;host_=frame.host;allocated_weight_bytes_=0;
+    if (inventory_) {
+        inventory_->placement=EmbedPlacement::mapped_portable;
+        inventory_->generation=++inventory_generation_;
     }
-    cudaFree(weights_);
-    weights_ = dp;
-    host_ = hp;
+    load_complete_=true;
     return true;
+rollback:
+    if (frame.host) {
+        if (cudaDeviceSynchronize()!=cudaSuccess || cudaFreeHost(frame.host)!=cudaSuccess) goto uncertain;
+        frame.host=nullptr;
+    }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if (budget && !budget->settle_head_spill(*reservation,frame.charge,false)) goto uncertain;
+#endif
+    load_complete_=true;
+    (void)cudaGetLastError();
+    return false;
+uncertain:
+    release_failed_=true;load_complete_=false;
+    // Do not unwind the frame, either pointer, stage/input owner or reservation.
+    // Process teardown owns uncertain backend work; no retry or false success.
+    std::fputs("strata: native head spill uncertain; worker restart required\n",stderr);
+    std::_Exit(86);
 }
 
 bool NativeHead::run(const float* mixed, float* logits, void* stream, std::string& err) const {
@@ -178,13 +370,69 @@ const NativeEmbed* g_embed = nullptr;
 void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
-NativeEmbed::~NativeEmbed() {
-    if (host_) cudaFreeHost(host_);
-    else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
+bool NativeEmbed::release_checked(std::string& err) {
+    release_started_ = true; load_complete_ = false;
+    if (g_embed == this) g_embed = nullptr;
+    if (release_failed_) { err = "native embedding release previously failed"; return false; }
+    if (!host_ && !dev_) return true;
+    int d = -1;
+    if (cudaGetDevice(&d) != cudaSuccess || d != device_) {
+        err = "native embedding release requires owning device"; return false;
+    }
+    if (device_owned_ && dev_) {
+        if (cudaFree(const_cast<void*>(dev_)) != cudaSuccess) { release_failed_ = true; err = "native embedding device release failed"; return false; }
+        dev_ = nullptr; device_owned_ = false;
+    }
+    if (host_) {
+        if (cudaFreeHost(host_) != cudaSuccess) { release_failed_ = true; err = "native embedding pinned release failed"; return false; }
+        host_ = nullptr; dev_ = nullptr;
+    }
+    return true;
 }
 
-bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
+NativeEmbed::~NativeEmbed() {
+    if (g_embed == this) g_embed = nullptr;
+    if(inventory_) {
+        if(!release_failed_&&(host_||dev_)) {
+            int previous=-1;
+            if(cudaGetDevice(&previous)!=cudaSuccess||(previous!=device_&&cudaSetDevice(device_)!=cudaSuccess))release_failed_=true;
+            else {
+                try {std::string error;if(cudaDeviceSynchronize()!=cudaSuccess||!release_checked(error))release_failed_=true;}
+                catch(...) {release_failed_=true;}
+                if(previous!=device_&&cudaSetDevice(previous)!=cudaSuccess)release_failed_=true;
+            }
+        }
+        if(release_failed_||host_||dev_)retain_failed(inventory_);
+        return;
+    }
+    if (release_failed_ || (!host_ && !dev_)) return;
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess ||
+        (previous != device_ && cudaSetDevice(device_) != cudaSuccess)) return;
     try {
+        std::string err;
+        if (cudaDeviceSynchronize() == cudaSuccess) release_checked(err);
+    } catch (...) {}
+    if (previous != device_) cudaSetDevice(previous);
+}
+
+bool NativeEmbed::enable_inventory_capture(const NativeInventoryLimits& limits,
+ std::shared_ptr<const ReservationLease> reservation,std::shared_ptr<const void> inputs,std::string& error) {
+    if(host_||dev_||release_failed_||(inventory_&&!release_started_)) {error="head/embed inventory must be armed before load or after checked retirement";return false;}
+    if(inventory_generation_==UINT64_MAX) {error="head/embed inventory generation exhausted";return false;}
+    if(!prepare_inventory(inventory_,limits,std::move(reservation),std::move(inputs),error))return false;
+    inventory_required_=true;inventory_attempted_=false;return true;
+}
+bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
+    if (host_ || dev_ || release_failed_) { err = "native embedding is loaded or has retained failed resources"; return false; }
+    if(inventory_required_&&(!inventory_||inventory_attempted_)) {err="head/embed inventory requires fresh capture admission";return false;}
+    inventory_attempted_=true;
+    load_complete_ = false; release_started_ = false;
+    if (n_embd <= 0 || n_vocab <= 0 || n_embd > INT_MAX || n_vocab > INT_MAX || n_embd % 256) {
+        err = "native embedding requires positive int32 dimensions and whole 256-value rows"; return false;
+    }
+    try {
+        if(!inventory_sources(inventory_.get(),shards,err))return false;
         const strata::GgufModel model(shards);
         // --embd-gguf's one-tensor file (tools/embd_bf16_pack.py) says "strata-embd": only its tensor is checked
         const strata::MetaValue* arch = model.meta().get("general.architecture");
@@ -200,6 +448,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             return false;
         }
         row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
+        if (!row_ || uint64_t(n_vocab) > UINT64_MAX / row_) { err = "native embedding size overflow"; return false; }
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
         // the table is copied out of the mapping below: a truncated shard must be an error, not a read past EOF
         if (!model.in_bounds(*t, at) || strata::tensor_payload_bytes(*t) != bytes_) {
@@ -208,13 +457,16 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             bytes_ = 0;
             return false;
         }
+        if(!inventory_tensor(inventory_.get(),*t,at,gguf.data_start(),bytes_,err))return false;
+        if(inventory_) {inventory_->role=HeadEmbedRole::embedding;inventory_->embedding_override=arch&&arch->s=="strata-embd";}
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
+        if (cudaGetDevice(&device_) != cudaSuccess) { err = "native embedding owning device unavailable"; return false; }
         // STRATA_EMBED_VRAM=1: the table in the current device's VRAM instead of mapped host memory. The same
         // bytes, read by the same gather kernels through dev_ (bitwise the same rows); what changes is where a
         // prompt's scattered row reads go: over a PCIe Gen2 x4 link they cost more than the table's size in VRAM
         // is worth. Taken only with the table plus 512 MiB free; otherwise, or when the upload fails, the mapped
         // placement below is used as before (and the fallback is said).
-        if (const char* ev = std::getenv("STRATA_EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
+        if (!inventory_) if (const char* ev = std::getenv("STRATA_EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
             size_t free_b = 0, total_b = 0;
             const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
             void* d = nullptr;
@@ -224,10 +476,12 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                     std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
                                          "(%llu MiB were free)\n",
                                  (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
-                    dev_ = d;   // host_ stays null: the destructor frees dev_
+                    dev_ = d; device_owned_ = true;   // retain through checked free
                     type_ = (int) t->type;
                     n_embd_ = n_embd;
                     n_vocab_ = n_vocab;
+                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "native embedding VRAM drain failed"; release_failed_ = true; return false; }
+                    load_complete_ = true;
                     return true;
                 }
                 (void) cudaFree(d);
@@ -239,15 +493,17 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         }
         cudaError_t host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
         if (host_err != cudaSuccess) {
+            if(inventory_)inventory_->placement=EmbedPlacement::device_pin_fallback;
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM
             // instead: it costs its size there and reads faster than over PCIe.
             cudaGetLastError();
             host_ = nullptr;
             void* d = nullptr;
-            if (cudaMalloc(&d, bytes_) != cudaSuccess ||
+            const auto alloc_status = cudaMalloc(&d, bytes_);
+            if (d) { dev_ = d; device_owned_ = true; }
+            if (alloc_status != cudaSuccess ||
                 cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
-                if (d) cudaFree(d);
                 cudaGetLastError();
                 err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB: " +
                       cudaGetErrorString(host_err) + ", nor place it in VRAM";
@@ -257,6 +513,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                          (unsigned long long) (bytes_ >> 20));
             dev_ = d;
         } else {
+            if(inventory_)inventory_->placement=EmbedPlacement::mapped_portable;
             std::memcpy(host_, gguf.tensor_data(*t), bytes_);
             void* d = nullptr;
 #if defined(STRATA_USE_HIP)
@@ -265,21 +522,25 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             // device-to-device copy into it does not land: tests/hip/mapped_alias). The table is only gathered from,
             // so without an alias it goes into VRAM like the unpinnable case above, instead of failing the start.
             if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess || d == nullptr) {
+                if(inventory_)inventory_->placement=EmbedPlacement::device_alias_fallback;
                 cudaGetLastError();
                 d = nullptr;
-                if (cudaMalloc(&d, bytes_) != cudaSuccess ||
+                const auto alloc_status = cudaMalloc(&d, bytes_);
+                if (d) { dev_ = d; device_owned_ = true; }
+                if (alloc_status != cudaSuccess ||
                     cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
-                    if (d) cudaFree(d);
                     cudaGetLastError();
                     err = "native embedding: no device alias for the mapped table, and no VRAM to copy it into";
                     return false;
                 }
-                cudaFreeHost(host_);   // the destructor frees dev_ when host_ is null
+                if (cudaFreeHost(host_) != cudaSuccess) {
+                    release_failed_ = true; err = "native embedding fallback pinned release failed"; return false;
+                }
                 host_ = nullptr;
                 std::fprintf(stderr, "strata: native embedding: no device alias for the mapped table, kept in VRAM\n");
             }
 #else
-            if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess) {
+            if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess || d == nullptr) {
                 err = "native embedding: no device alias for the mapped table";
                 return false;
             }
@@ -289,6 +550,9 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         type_ = (int) t->type;
         n_embd_ = n_embd;
         n_vocab_ = n_vocab;
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = "native embedding load drain failed"; return false; }
+        if(inventory_) {inventory_->generation=++inventory_generation_;inventory_->device=device_;inventory_->main_bytes=bytes_;inventory_->row_bytes=row_;}
+        load_complete_ = true;
         return true;
     } catch (const std::exception& e) {
         err = std::string("native embedding: ") + e.what();

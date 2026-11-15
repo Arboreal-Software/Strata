@@ -78,7 +78,7 @@ bool checkpoint_targets(const SessionState& ss, const ModelGeometry& g, size_t t
 }
 
 bool view_validate(const ConversationView& view, const SessionState& ss,
-                   const ModelGeometry& g, std::string& error) {
+                   const ModelGeometry& g, std::string& error, bool metadata_only = false) {
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, view.ids.size(), z, error)) return false;
     if (view.ids.empty() || !image_keys(view.images, view.ids.size()) ||
@@ -88,7 +88,8 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
         if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > view.ids.size() ||
             !std::equal(c.ids.begin(), c.ids.end(), view.ids.begin()))
             return fail(error, "checkpoint is not a live token prefix");
-        if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
+        if (!(metadata_only ? conversation_checkpoint_metadata_validate(c, ss, g, error)
+                            : conversation_checkpoint_validate(c, ss, g, error))) return false;
         size_t image = 0;
         for (const auto& key : view.images) {
             if ((uint64_t) key.start >= c.ids.size()) break;
@@ -104,6 +105,7 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
     size_t ids = 0, images = 0;
     if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
+    if (c.pending && !add(total,ConversationPending::allocation_bytes())) return false;
     for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
         if (!add(total, n)) return false;
     return true;
@@ -146,7 +148,7 @@ bool conversation_session_sizes(const ModelGeometry& g, const SessionState& ss, 
     return true;
 }
 
-bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss,
+bool conversation_checkpoint_metadata_validate(const ConversationCheckpoint& c, const SessionState& ss,
                                       const ModelGeometry& g, std::string& error) {
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
@@ -156,6 +158,12 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
         c.block_pos.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
         return fail(error, "invalid checkpoint running-state payload");
     return true;
+}
+
+bool conversation_checkpoint_validate(const ConversationCheckpoint& c,const SessionState& ss,
+                                      const ModelGeometry& g,std::string& error){
+    c.wait_pending();
+    return conversation_checkpoint_metadata_validate(c,ss,g,error);
 }
 
 #if defined(STRATA_GPU_METAL)
@@ -170,8 +178,15 @@ namespace strata::core {
 
 namespace {
 struct CkptAsync {
+    // Covers the prior join through all stage/slot/free/copy/control/future
+    // publication. The background worker never takes this lifecycle lock.
+    std::recursive_mutex lifecycle;
     std::mutex mu;
     std::future<cudaError_t> pending;
+    std::atomic<int> failure{0}; // persistent first async error; never healed by a later sync
+    void record_failure(int code) noexcept {
+        if(code){int expected=0;failure.compare_exchange_strong(expected,code,std::memory_order_acq_rel);}
+    }
     const void* dst = nullptr;   // the checkpoint bytes the copy in flight writes
     void* stage = nullptr;
     void* host = nullptr;   // pinned: the DMA lands here, then a plain memcpy (no driver staging beside the decode)
@@ -183,7 +198,7 @@ CkptAsync& ckpt_async() { static CkptAsync a; return a; }
 // STRATA_CKPT_VRAM_SLOTS=N (with STRATA_CKPT_ASYNC): the last N saved GDN states stay in VRAM (allocated only while
 // more than 1.5 GB stays free); a restore of a checkpoint whose tag a slot holds copies device to device.
 struct VramSlot { void* p = nullptr; size_t n = 0; uint64_t tag = 0, used = 0; int dev = -1; };
-struct VramSlots { std::vector<VramSlot> s; uint64_t clock = 0, next_tag = 0; };
+struct VramSlots { std::recursive_mutex mu; std::vector<VramSlot> s; uint64_t clock = 0, next_tag = 0; };
 VramSlots& vram_slots() { static VramSlots v; return v; }
 int vram_slots_n() {
     static const int n = [] { const char* v = std::getenv("STRATA_CKPT_VRAM_SLOTS"); return v ? std::max(0, std::min(16, std::atoi(v))) : 0; }();
@@ -269,23 +284,62 @@ int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const C
 }
 }  // namespace
 
-void conversation_checkpoint_join(const void* only) {
+bool conversation_checkpoint_slot_ready(const ConversationCheckpoint& c){
+    if(!c.dev_tag||!c.pending||c.pending->tag!=c.dev_tag||!c.pending->slot_ready())return false;
+    std::lock_guard<std::recursive_mutex> slots(vram_slots().mu);
+    if(vram_slots().s.empty())return false;
+    int dev=0;if(cudaGetDevice(&dev)!=cudaSuccess)return false;
+    for(const auto& slot:vram_slots().s)
+        if(slot.tag==c.dev_tag&&slot.dev==dev&&slot.n==c.gdn.size())return true;
+    return false;
+}
+bool conversation_checkpoint_probe_checked(const void*) noexcept {
+    auto& a=ckpt_async();
+    try{
+        if(a.failure.load(std::memory_order_acquire))return false;
+        std::unique_lock<std::mutex> lock(a.mu,std::try_to_lock);
+        if(lock&&a.pending.valid()&&a.pending.wait_for(std::chrono::seconds(0))==std::future_status::ready){
+            try{a.record_failure(int(a.pending.get()));}catch(...){a.record_failure(-1);}
+        }
+        return a.failure.load(std::memory_order_acquire)==0;
+    }catch(...){std::_Exit(1);}
+}
+
+bool conversation_checkpoint_join_checked(const void* only) noexcept {
     CkptAsync& a = ckpt_async();
-    std::lock_guard<std::mutex> lk(a.mu);
-    if (a.pending.valid() && (only == nullptr || only == a.dst)) {
-        const cudaError_t e = a.pending.get();
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(e));
-    }
+    try {
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (a.failure) return false;
+        if (a.pending.valid() && (only == nullptr || only == a.dst)) {
+            try { a.record_failure(int(a.pending.get())); }
+            catch (...) { a.record_failure(-1); }
+            if (a.failure) std::fprintf(stderr,"strata: async checkpoint failed, ownership retained (%d)\n",a.failure.load());
+        }
+        return a.failure == 0;
+    } catch (...) { std::_Exit(1); }
+}
+void conversation_checkpoint_join(const void* only) {
+    if (!conversation_checkpoint_join_checked(only)) std::_Exit(1);
 }
 
 namespace {
 // conversation_checkpoint_save; `staged` (STRATA_CKPT_ASYNC): the GDN bytes land in `c.gdn` on the background thread
 // after this returns (conversation_checkpoint_join waits for them)
 bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const ModelGeometry& g, std::string& error,
-                     bool& staged) {
+                     bool& staged, bool allow_async = true) {
     staged = false;
+    std::lock_guard<std::recursive_mutex> lifecycle(ckpt_async().lifecycle);
+    c.wait_pending();
+    c.pending.reset();c.dev_tag=0; // a reused synchronous/private checkpoint cannot inherit an old slot proof
+    bool complete = false;
+    struct DrainFailedCheckpoint {
+        ConversationCheckpoint& checkpoint; bool& complete;
+        ~DrainFailedCheckpoint() { if (!complete) checkpoint.wait_pending(); }
+    } drain_failed{c,complete};
     const auto j0 = std::chrono::steady_clock::now();
     conversation_checkpoint_join(nullptr);   // (the staging buffer is reused)
+    // Slot readers do not take lifecycle while another save waits for host D2H.
+    std::lock_guard<std::recursive_mutex> slots(vram_slots().mu);
     if (std::getenv("STRATA_PARK_TRACE")) std::fprintf(stderr, "strata parktrace: save join %.2f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - j0).count());
 #if defined(STRATA_GPU_METAL)
@@ -295,6 +349,12 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
+    // Portable control is quoted by the public peak and allocated before any
+    // payload resize/native allocation/copy. Private capture creates none.
+    ConversationPendingRef control;
+    if(allow_async&&ckpt_async_on()&&z.gdn>=((size_t)1<<20))
+        control=conversation_pending(&conversation_checkpoint_join_checked,nullptr,nullptr,0,
+                                     &conversation_checkpoint_probe_checked);
     static const bool atr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     const bool ready = c.gdn.size() == z.gdn;   // (a pooled checkpoint's pages are in; a fresh vector faults them all)
     const auto r0 = std::chrono::steady_clock::now();
@@ -302,7 +362,7 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
     if (atr) std::fprintf(stderr, "strata parktrace: save vectors %s, resize %.2f ms\n", ready ? "ready" : "fresh",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count());
-    if (ckpt_async_on() && c.gdn.size() >= ((size_t) 1 << 20)) {
+    if (control) {
         CkptAsync& a = ckpt_async();
         int dev = 0;
         (void) cudaGetDevice(&dev);
@@ -319,14 +379,18 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
         }
         (void) cudaGetLastError();
         const auto q0 = std::chrono::steady_clock::now();
-        VramSlot* slot = vram_slots_n() > 0 ? vram_slot_for(c.gdn.size(), dev) : nullptr;
+        VramSlot* slot = a.stage&&a.host&&a.stream&&vram_slots_n()>0 ? vram_slot_for(c.gdn.size(),dev) : nullptr;
         if (slot != nullptr) slot->tag = 0;   // (being rewritten)
         void* dsrc = slot != nullptr ? slot->p : a.stage;
         c.dev_tag = 0;
-        if (dsrc != nullptr && copy(dsrc, ss.gdn_state, c.gdn.size(), error)) {   // device to device: fast
+        if(dsrc&&a.host&&a.stream&&!copy(dsrc,ss.gdn_state,c.gdn.size(),error)){
+            a.record_failure(-1);std::_Exit(1); // submitted D2D uncertainty cannot release/reuse its stage
+        }
+        if (dsrc != nullptr&&a.host&&a.stream) {   // device to device: fast
             const auto q1 = std::chrono::steady_clock::now();
             if (slot != nullptr) {
                 VramSlots& v = vram_slots();
+                if(v.next_tag==UINT64_MAX)std::_Exit(1);
                 slot->tag = c.dev_tag = ++v.next_tag;
                 slot->used = ++v.clock;
             }
@@ -341,11 +405,14 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
             // the DMA in 4 MiB pieces, one in flight: a D2H copy queues behind the one before it on the copy engine, and
             // the decode's own small reads would otherwise wait for the whole 100+ MB at the link's ~1.6 GB/s
             a.dst = dst;
+            control->key=dst;control->tag=c.dev_tag;
+            c.pending=std::move(control);
+            try {
             a.pending = std::async(std::launch::async, [dst, host, stage, n, st, dev] {
                 conversation_detail::background_thread_placement();
-                (void) cudaSetDevice(dev);
+                cudaError_t e = cudaSetDevice(dev);
                 cudaEvent_t done = nullptr;
-                cudaError_t e = cudaEventCreateWithFlags(&done, cudaEventDisableTiming | cudaEventBlockingSync);
+                if (e == cudaSuccess) e = cudaEventCreateWithFlags(&done, cudaEventDisableTiming | cudaEventBlockingSync);
                 constexpr size_t PIECE = (size_t) 4 << 20;
                 for (size_t o = 0; e == cudaSuccess && o < n; o += PIECE) {
                     const size_t k = std::min(PIECE, n - o);
@@ -354,9 +421,12 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
                     if (e == cudaSuccess) e = cudaEventSynchronize(done);
                     if (e == cudaSuccess) std::memcpy(dst + o, (const uint8_t*) host + o, k);
                 }
-                if (done) (void) cudaEventDestroy(done);
+                const auto drained = cudaStreamSynchronize(st);
+                if (e == cudaSuccess) e = drained;
+                if (done) { const auto destroyed = cudaEventDestroy(done); if (e == cudaSuccess) e = destroyed; }
                 return e;
             });
+            } catch (...) { a.record_failure(-1); std::_Exit(1); }
             staged = true;
         }
     }
@@ -379,6 +449,8 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
     }();
     if (atr) std::fprintf(stderr, "strata parktrace: save small copies %.2f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count());
+    complete = ok;
+    if(ok&&staged&&c.dev_tag&&c.pending)c.pending->publish_slot_ready();
     return ok;
 }
 }  // namespace
@@ -391,14 +463,18 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
+    std::lock_guard<std::recursive_mutex> slots(vram_slots().mu);
+#if !defined(STRATA_GPU_METAL)
+    if(!conversation_checkpoint_metadata_validate(c,ss,g,error))return false;
+#endif
     const VramSlot* hit = nullptr;
-    if (c.dev_tag != 0) {
+    if (conversation_checkpoint_slot_ready(c)) {
         int dev = 0;
         (void) cudaGetDevice(&dev);
         for (VramSlot& x : vram_slots().s)
             if (x.tag == c.dev_tag && x.dev == dev && x.n == c.gdn.size()) { x.used = ++vram_slots().clock; hit = &x; }
     }
-    if (hit == nullptr) conversation_checkpoint_join(c.gdn.data());
+    if (hit == nullptr) {c.wait_pending();conversation_checkpoint_join(c.gdn.data());}
 #if defined(STRATA_GPU_METAL)
     (void) g;
     if (!strata::metal_engine::window_checkpoint_restore(c, &ss, error)) return false;
@@ -406,7 +482,6 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ss.ple_prev[1] = c.ids.size() >= 1 ? c.ids[c.ids.size() - 1] : -1;
     return true;
 #endif
-    if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
@@ -473,6 +548,13 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
         !product(layers, {qsa + (draft ? 1 : 0), sizeof(ConversationKv)}) ||
         !product(tails, {qsa, z.tail}) || !product(dead, {qsa, z.dead}) ||
         !product(positions, {qsa, z.block_pos})) return fail(error, "snapshot metadata byte count overflow");
+    // Maximum live-checkpoint control + image control + one per K/V layer.
+    // Private paid capture creates none; the conservative public peak still
+    // covers ordinary async control allocation before any worker can launch.
+    size_t pending_bytes = 0;
+    if (!product(pending_bytes, {qsa + (draft ? 1u : 0u) + 2u,
+                                 ConversationPending::allocation_bytes()}) || !add(bytes,pending_bytes))
+        return fail(error,"snapshot async control byte count overflow");
     for (size_t n : {ids, images, checkpoints, layers, tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
         if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
     for (const auto& c : view.checkpoints)
@@ -511,15 +593,16 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
     return true;
 }
 
-// (conversation_snapshot.cpp) STRATA_PARK_TRACE: conversation_kv_save's time since the park's begin, by part (ms)
+// Snapshot trace helper shared by ordinary and private capture.
 void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms);
 
-bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+static bool snapshot_fill_private(SavedConversation& captured, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* storage,
-                                std::vector<ConversationCheckpoint>* moved) {
+                                std::vector<ConversationCheckpoint>* moved, bool private_capture) {
+    std::lock_guard<std::recursive_mutex> park_builder(conversation_park_capture_mutex());
     static const bool ptr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -527,11 +610,14 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const auto pj = now();
     conversation_checkpoint_join(nullptr);   // the last turn checkpoint's DMA (STRATA_CKPT_ASYNC)
     conversation_park_join();                // the previous park's K/V DMA
+    captured.wait_pending();captured.pending.reset();captured.live_pending.reset();
     const auto p0 = now();
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
-    // Build into a new object so a failure cannot publish a partial snapshot.
-    SavedConversation captured;
+    ConversationPendingRef park_control;
+    if(!private_capture&&conversation_park_async_enabled())
+        park_control=conversation_pending(&conversation_park_join_checked,nullptr,nullptr,0,
+                                          &conversation_park_probe_checked);
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     if (storage != nullptr && !storage->empty()) {   // the running state into a dropped checkpoint's vectors
@@ -544,7 +630,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, storage);
     if (moved != nullptr)
         for (auto& c : *moved) {
-            conversation_checkpoint_join(c.gdn.data());
+            c.wait_pending();
             captured.checkpoints.push_back(std::move(c));
         }
     const auto p2 = now();
@@ -556,15 +642,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     // their replacement would join the copy just launched
     for (auto& k : captured.kv) k.pending.reset();
     bool live_staged = false;
-    const bool live_saved = checkpoint_save(captured.live, ss, g, error, live_staged);
+    const bool live_saved = checkpoint_save(captured.live, ss, g, error, live_staged, !private_capture);
     // STRATA_CKPT_ASYNC: the running state lands in live.gdn after the save returns; the image waits for that copy
     // before the vector is freed (an eviction within the copy's ~70 ms), as `pending` does for the K/V.  The join is
     // selective: a no-op once the copy has landed or another checkpoint's is in flight.
-    if (live_staged)
-        captured.live_pending = std::shared_ptr<void>(new char, [dst = (const void*) captured.live.gdn.data()](void* p) {
-            conversation_checkpoint_join(dst);
-            delete (char*) p;
-        });
+    if (live_staged) captured.live_pending = captured.live.pending;
     if (!live_saved) return false;
     const auto p3 = now();
     const int64_t upto = (int64_t) view.ids.size();
@@ -572,9 +654,15 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     size_t kv_need = 0;
     for (size_t j = 0; j < layers; ++j) kv_need += conversation_kv_bytes(owned(ss, j), g, upto, true);
     if (draft) kv_need += conversation_kv_bytes(*draft, g, upto, false);
-    const bool staged = conversation_park_async_begin(kv_need);
+    const bool staged = !private_capture && conversation_park_async_begin(kv_need);
     const auto p4 = now();
     struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};
+    if(staged){
+        // One shared intrusive owner keeps the complete slot until the image
+        // AND every retained layer are gone; payload destructors wait separately.
+        park_control->release=&conversation_park_slot_release;
+        park_control->tag=conversation_park_slot_tag();
+    }
     double kv_max = 0, kv_sum = 0;   // (STRATA_PARK_TRACE: the per-layer save time)
     for (size_t j = 0; j < layers; ++j) {
         const auto k0 = now();
@@ -597,26 +685,32 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
                                        std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
-    abandon.on = false;
-    if (staged && !conversation_park_async_launch(error)) return false;
-    if (staged) {
-        // STRATA_PARK_VRAM_MIB: the image's slot goes with the image, after the copy that reads it; each K/V layer
-        // carries a token of its own too (the layers outlive the image when they are retained for the next park, and
-        // the copy fills their buffers).  Without a slot: the image's join as before, no layer tokens.
-        const uint64_t slot = conversation_park_slot_tag();
-        auto token = [slot] {
-            return std::shared_ptr<void>(new char, [slot](void* p) {
-                conversation_park_join();
-                conversation_park_slot_release(slot);
-                delete (char*) p;
-            });
-        };
-        captured.pending = token();
-        if (slot != 0)
-            for (auto& k : captured.kv) k.pending = token();
+    if(staged){
+        captured.pending=std::move(park_control);
+        for(auto& k:captured.kv)k.pending=captured.pending;
+        if(!conversation_park_async_launch(error))return false;
+        if(captured.pending->tag)captured.pending->publish_slot_ready();
     }
+    abandon.on = false;
+    return true;
+}
+
+bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+                                const SessionState& ss, const ModelGeometry& g,
+                                const QsaState* draft, std::string& error,
+                                ConversationKvReuse reuse, size_t* reused_bytes,
+                                std::vector<ConversationCheckpoint>* storage,
+                                std::vector<ConversationCheckpoint>* moved) {
+    SavedConversation captured;
+    if (!snapshot_fill_private(captured,view,ss,g,draft,error,std::move(reuse),reused_bytes,storage,moved,false)) return false;
     image = std::move(captured);
     return true;
+}
+
+bool conversation_snapshot_save_private(SavedConversation& captured, const ConversationView& view,
+                                        const SessionState& ss, const ModelGeometry& g,
+                                        std::string& error) {
+    return snapshot_fill_private(captured,view,ss,g,nullptr,error,{},nullptr,nullptr,nullptr,true);
 }
 
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
@@ -673,8 +767,8 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     return true;
 }
 
-bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
-                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
+static bool snapshot_metadata_validate(const SavedConversation& image,const SessionState& ss,
+                                    const ModelGeometry& g,const QsaState* draft,std::string& error) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
@@ -682,23 +776,37 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
         return fail(error, "snapshot from another session layer range");
     const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
-    if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(image.live, ss, g, error)) return false;
+    if (!view_validate(view, ss, g, error,true) || !conversation_checkpoint_metadata_validate(image.live, ss, g, error)) return false;
     const size_t layers = owned_qsa(ss);
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < layers; ++j)
-        if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
-    return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
+        if (!conversation_kv_metadata_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
+    return !draft || conversation_kv_metadata_validate(image.kv.back(), *draft, g, upto, false, error);
+}
+
+bool conversation_snapshot_validate(const SavedConversation& image,const SessionState& ss,
+                                    const ModelGeometry& g,const QsaState* draft,std::string& error){
+    image.wait_pending(); // serializers/host validators never consume a slot-ready shortcut
+    return snapshot_metadata_validate(image,ss,g,draft,error);
 }
 
 bool conversation_copy_stream_ready(int device) { return conversation_detail::copy_stream_ready(device); }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
-    conversation_checkpoint_join(image.live.gdn.data());
-    for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
-    conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
-    if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+    // Validate ALL metadata without a native query or destination write first.
+    if(!snapshot_metadata_validate(image,ss,g,draft,error))return ConversationRestore::invalid;
+    if(!conversation_checkpoint_slot_ready(image.live)){
+        image.live.wait_pending();conversation_checkpoint_join(image.live.gdn.data());
+        if(image.live_pending&&image.live_pending!=image.live.pending)image.live_pending->wait();
+    }
+    // Only this carve's live state and K/V are consumed. History and later
+    // stage images retain their own pending owners; their host bytes are not read.
+    // The aggregate join is needed only when there is K/V to consume. Each
+    // layer restore also rechecks its exact slot and checks host fallback.
+    if(!image.kv.empty())conversation_park_join_for(image);
+
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < owned_qsa(ss); ++j)
@@ -732,31 +840,29 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 }
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {
-    conversation_checkpoint_join(image.live.gdn.data());
-    for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
-    conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
+    // Match the whole-session validator before delegating to the slot-aware route.
+    if (!image.stage_images.empty()) {
+        fail(error, "a layer split's image restored as a single session");
+        return ConversationRestore::invalid;
+    }
     return conversation_snapshot_restore(image, ss, g, &draft, error);
 }
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& ss, const ModelGeometry& g,
                                                           const QsaState& draft, std::string& error) {
-    conversation_checkpoint_join(image.live.gdn.data());
-    for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
-    conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
     return conversation_snapshot_restore_prefix(image, upto, ss, g, &draft, error);
 }
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& ss, const ModelGeometry& g,
                                                           const QsaState* draft, std::string& error) {
-    conversation_checkpoint_join(image.live.gdn.data());
-    for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
-    conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
     // a layer split's image (stage images) is restored stage by stage, never in part
     if (!image.stage_images.empty()) {
         fail(error, "a layer split's image restored as a single session");
         return ConversationRestore::invalid;
     }
-    if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+    // Prefix helpers consume only their own K/V and perform the checked host
+    // wait themselves when the exact runtime slot is unavailable.
+    if (!snapshot_metadata_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     const int64_t captured = (int64_t) image.live.ids.size();
     if (upto < 1 || upto > captured) {
         fail(error, "the borrowed prefix is not inside the parked conversation");
@@ -771,3 +877,37 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
     return ConversationRestore::restored;
 }
 } // namespace strata::core
+
+// Diagnostic-only empty-image primitives. Ordinary nonempty snapshot validation
+// above remains unchanged. Empty native endpoint tensors are copied/restored,
+// never replaced by an assumed zero metadata descriptor.
+namespace strata::core {
+bool conversation_snapshot_empty_save(SavedConversation& image,const SessionState& ss,const ModelGeometry& g,std::string& error){
+    ConversationStateSizes sizes;
+    if(!conversation_session_sizes(g,ss,sizes,error)||!sync(error))return false;
+    SavedConversation captured;captured.cvec=false;captured.geometry=geometry_key(g);captured.layer_lo=ss.layer_lo;captured.layer_hi=ss.layer_hi;
+    conversation_park_join();
+    bool staged=false;
+    if(!checkpoint_save(captured.live,ss,g,error,staged,false))return false;
+    captured.kv.resize(owned_qsa(ss));
+    for(size_t i=0;i<captured.kv.size();++i)if(!conversation_kv_save(captured.kv[i],owned(ss,i),g,0,true,error))return false;
+    // The RAW layer preallocates child-stage storage before native capture.
+    // Preserve it when replacing the root stage, without allocating after copies.
+    captured.stage_images.swap(image.stage_images);
+    image=std::move(captured);return true;
+}
+bool conversation_snapshot_empty_validate(const SavedConversation& image,const SessionState& ss,const ModelGeometry& g,const QsaState* draft,std::string& error){
+    if(draft||image.geometry!=geometry_key(g)||image.layer_lo!=ss.layer_lo||image.layer_hi!=ss.layer_hi||
+       image.cvec||!image.live.ids.empty()||!image.live.imgs.empty()||!image.live.stage_parts.empty()||!image.checkpoints.empty()||
+       image.kv.size()!=owned_qsa(ss)||!conversation_checkpoint_validate(image.live,ss,g,error))return false;
+    for(size_t i=0;i<image.kv.size();++i)if(!conversation_kv_validate(image.kv[i],owned(ss,i),g,0,true,error))return false;
+    return true;
+}
+ConversationRestore conversation_snapshot_empty_restore(const SavedConversation& image,SessionState& ss,const ModelGeometry& g,const QsaState* draft,std::string& error){
+    if(!conversation_snapshot_empty_validate(image,ss,g,draft,error))return ConversationRestore::invalid;
+    if(!sync(error))return ConversationRestore::transfer_failed;
+    for(size_t i=0;i<image.kv.size();++i)if(!conversation_kv_restore(image.kv[i],owned(ss,i),g,0,true,error))return ConversationRestore::transfer_failed;
+    if(!conversation_checkpoint_restore(image.live,ss,g,error))return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
+}

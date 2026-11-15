@@ -60,5 +60,9 @@ void build_rope_table(int n_rot, const RopeScaling& scaling, int max_pos, float*
 // first token's value forever.  See the same note on `indexer_key_append` in `qsa.hpp`.
 void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
                      const float* sin_tab, const int* pos, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void rope_neox_apply_owned(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
+                     const float* sin_tab, const int* pos, void* stream, const int32_t* position_table);
+
 
 }  // namespace strata::kernels

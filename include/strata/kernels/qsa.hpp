@@ -252,6 +252,11 @@ struct QsaIndexerBuffers {
 void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
                         float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
                         const float* sin_tab, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void indexer_key_append_owned(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
+                        float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
+                        const float* sin_tab, void* stream, const int32_t* position_table);
+
 
 /// Per-CELL indexer scores, `n_kv = pos + 1` of them, fp32.
 ///

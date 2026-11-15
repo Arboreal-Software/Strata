@@ -7,7 +7,10 @@
 macro(strata_gpu_engine)
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/platform/io_priority.cpp src/core/graph.cpp src/core/weights.cpp
-                               src/core/layout.cpp)
+                               src/core/layout.cpp src/core/window_budget.cpp
+                               src/core/verified_inputs.cpp src/core/verified_artifact.cpp src/core/window_hash.cpp)
+  # NativeDense's preflight result owns a real workspace token in both feature
+  # configurations; its special members use the ledger through this core edge.
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # the DFlash2 drafter (src/core/dflash2.cpp, src/kernels/cuda/dflash2.cu) exists in the CUDA and HIP builds; the Metal and SYCL builds compile without it
   target_compile_definitions(strata_core PUBLIC STRATA_HAVE_DFLASH2=1)
@@ -99,6 +102,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
+  if(STRATA_RESIDENT_FAULT_QUALIFICATION)
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/resident_deferred_trap.cu)
+  endif()
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
@@ -284,11 +290,285 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+  add_library(strata_engine STATIC src/core/layer.cpp src/core/qsa_host_release.cpp src/core/qsa_private_upload.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
-    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/verifier_setup_quote.cpp src/core/verify_drain.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+  if(STRATA_BUILD_WINDOW_STATE)
+    # Owned admission and model/window routes retain their feature definitions.
+    target_compile_definitions(strata_engine PRIVATE STRATA_OWNED_BATCH_AVAILABLE=1 STRATA_WINDOW_STATE_AVAILABLE=1)
+    add_library(strata_window_state STATIC ${_strata_window_codec_sources}
+      src/core/window_model_owner.cpp src/core/window_buffer.cpp src/core/window_ple_weights.cpp src/core/window_ple.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_capture.cpp src/core/window_restore.cpp src/core/window_selection.cpp src/core/window_lease.cpp
+      src/core/window_native.cpp src/core/window_suffix.cpp src/core/window_repair_suffix.cpp src/core/window_repair_ancestry.cpp src/core/window_state.cpp src/core/window_disk.cpp src/core/window_manager.cpp src/core/window_admission.cpp src/core/vmm_managed.cpp src/core/owned_qsa_elastic.cpp
+      src/core/window_edit.cpp src/core/window_token_ledger.cpp src/core/window_profile.cpp src/core/window_loader_profile.cpp src/core/expert_runtime_profile.cpp src/core/expert_policy_inventory.cpp src/core/expert_policy_runtime.cpp src/core/remote_policy_publication.cpp src/core/expert_host_execution.cpp src/core/verified_input_manifest.cpp src/core/running_engine_identity.cpp src/core/thread_priority.cpp src/core/thread_dependencies.cpp)
+    target_include_directories(strata_window_state PUBLIC include)
+    target_link_libraries(strata_window_state PUBLIC strata_engine)
+    if(STRATA_WINDOW_NVCOMP)
+      if(NOT CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13 OR CUDAToolkit_VERSION VERSION_GREATER_EQUAL 14)
+        message(FATAL_ERROR "Pinned nvCOMP adapter requires CUDA 13")
+      endif()
+      target_compile_definitions(strata_window_state PRIVATE STRATA_WINDOW_NVCOMP_600=1)
+      target_include_directories(strata_window_state PRIVATE "${STRATA_WINDOW_NVCOMP_ROOT}/include")
+      target_link_libraries(strata_window_state PRIVATE "${_strata_nvcomp_library}" CUDA::cudart)
+    elseif(STRATA_WINDOW_HIPCOMP)
+      target_compile_definitions(strata_window_state PRIVATE STRATA_WINDOW_HIPCOMP_230=1 __HIP_PLATFORM_AMD__=1)
+      target_include_directories(strata_window_state PRIVATE "${STRATA_WINDOW_HIPCOMP_ROOT}/include")
+      target_link_libraries(strata_window_state PRIVATE "${STRATA_WINDOW_HIPCOMP_LIBRARY}" hip::host)
+    endif()
+
+    if(STRATA_BUILD_CONVERSATION_TESTS)
+      add_executable(window_model_link_test src/core/window_model_link_test.cpp)
+      target_link_libraries(window_model_link_test PRIVATE strata_window_state)
+      add_test(NAME window_model_link_test COMMAND window_model_link_test)
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Synthetic source/bundle collector fixture: CUDA declarations/mocks,
+        # explicit host-only closure; no engine archive or HIP qualification.
+        if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+          add_subdirectory(tests/core/expert_runtime_profile)
+        endif()
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_custom_target(check_submitted_work_drain_extract
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/submitted_work_drain/check_extract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/program/generate.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/submitted_work_drain/controller.inc
+          VERBATIM)
+        add_executable(submitted_work_drain_test tests/core/submitted_work_drain/test.cpp)
+        add_dependencies(submitted_work_drain_test check_submitted_work_drain_extract)
+        target_include_directories(submitted_work_drain_test PRIVATE include/strata/core)
+        target_compile_features(submitted_work_drain_test PRIVATE cxx_std_20)
+        target_compile_options(submitted_work_drain_test PRIVATE -UNDEBUG)
+        target_link_libraries(submitted_work_drain_test PRIVATE Threads::Threads)
+        add_test(NAME submitted_work_drain_test COMMAND submitted_work_drain_test)
+        set_tests_properties(submitted_work_drain_test PROPERTIES TIMEOUT 30)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_custom_target(check_serial_adapt_join_extract
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serial_adapt_join/check_extract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/program/generate.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serial_adapt_join
+          VERBATIM)
+        add_executable(serial_adapt_join_test tests/core/serial_adapt_join/test.cpp)
+        add_dependencies(serial_adapt_join_test check_serial_adapt_join_extract)
+        target_include_directories(serial_adapt_join_test PRIVATE include/strata/core)
+        target_compile_features(serial_adapt_join_test PRIVATE cxx_std_20)
+        target_compile_options(serial_adapt_join_test PRIVATE -UNDEBUG)
+        target_link_libraries(serial_adapt_join_test PRIVATE Threads::Threads)
+        add_test(NAME serial_adapt_join_test COMMAND serial_adapt_join_test)
+        set_tests_properties(serial_adapt_join_test PROPERTIES TIMEOUT 30)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_custom_target(check_pipeline_admission_race_extract
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/pipeline_admission_race/check_extract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/program/generate.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/pipeline_admission_race
+          VERBATIM)
+        add_executable(pipeline_admission_race_test tests/core/pipeline_admission_race/test.cpp)
+        add_dependencies(pipeline_admission_race_test check_pipeline_admission_race_extract)
+        target_include_directories(pipeline_admission_race_test PRIVATE include/strata/core)
+        target_compile_features(pipeline_admission_race_test PRIVATE cxx_std_20)
+        target_compile_options(pipeline_admission_race_test PRIVATE -UNDEBUG)
+        target_link_libraries(pipeline_admission_race_test PRIVATE Threads::Threads)
+        add_test(NAME pipeline_admission_race_test COMMAND pipeline_admission_race_test)
+        set_tests_properties(pipeline_admission_race_test PROPERTIES TIMEOUT 30)
+        # Expected-old variant needs a harness requiring exact exit1 + diagnostic and
+        # rejecting sanitizer/crash output; do not use WILL_FAIL alone as reproduction.
+        add_subdirectory(tests/core/verifier_copy_query)
+        add_subdirectory(tests/core/verifier_terminal_copy_query)
+        add_subdirectory(tests/core/verifier_serial_copy)
+        add_subdirectory(tests/core/chain_async_launch)
+        add_subdirectory(tests/core/all_resident_remote_combine)
+        add_subdirectory(tests/core/verifier_completion_gate)
+        add_subdirectory(tests/resident_admission)
+        # CPU gate for the repeated-restore future-page fix: production planner/preflight/dispatch over host
+        # buffers.  Proves range/dispatch correctness only; the live-device proof is the GPU qualification.
+        add_subdirectory(tests/core/raw_int8_restore_clear)
+        add_subdirectory(tests/core/conversation_suffix_provenance)
+        add_subdirectory(tests/core/suffix_edit_span)
+        # CPU gate for the serving suffix-reuse ADMISSION decision: the exact function the request path calls.
+        add_subdirectory(tests/core/suffix_import_policy)
+        # CPU gate for the serving RAW adapter lifecycle contract (phase/cut/destruction rules).
+        add_subdirectory(tests/core/serving_raw_contracts)
+        add_subdirectory(tests/core/native_owned_batch_serving)
+        add_subdirectory(tests/core/owned_batch_slot_sessions)
+        # CPU gate for the retained repair owner registry gates and incoming-prompt identity.
+        add_subdirectory(tests/core/serving_repair_owners)
+        # CPU gate for demand/age hard eligibility, importance selection and monotonic root projection.
+        add_subdirectory(tests/core/serving_repair_scheduler)
+        # CPU gate for the qualification bundle record codec (export/load integrity only).
+        add_subdirectory(tests/core/suffix_bundle_record)
+        add_subdirectory(tests/core/canonical_admission_consumers)
+        add_subdirectory(tests/core/checked_device)
+        add_subdirectory(tests/core/lookahead_drain)
+        if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+          add_subdirectory(tests/core/remote_policy_publication)
+        endif()
+        add_subdirectory(tests/core/remote_optimizer_lifecycle)
+        # Actual worker methods with CPU service mocks; no real IO/device proof.
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        find_package(Threads REQUIRED)
+        set(_retirement_workers ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/retirement_workers)
+        add_custom_target(check_retirement_worker_extracts
+          COMMAND ${Python3_EXECUTABLE} ${_retirement_workers}/check_extracts.py ${CMAKE_CURRENT_SOURCE_DIR}
+          VERBATIM)
+        foreach(_case workers file pool driver)
+          set(_target retirement_${_case}_test)
+          add_executable(${_target} ${_retirement_workers}/${_case}/test.cpp)
+          add_dependencies(${_target} check_retirement_worker_extracts)
+          target_compile_features(${_target} PRIVATE cxx_std_17)
+          target_link_libraries(${_target} PRIVATE Threads::Threads)
+          if(MSVC)
+            target_compile_options(${_target} PRIVATE /UNDEBUG)
+          else()
+            target_compile_options(${_target} PRIVATE -UNDEBUG)
+          endif()
+          add_test(NAME ${_target} COMMAND ${_target})
+          set_tests_properties(${_target} PROPERTIES TIMEOUT 30)
+        endforeach()
+        # Tiny filesystem fixtures exercise actual GGUF and pack loaders; no GPU work.
+        add_executable(verified_inputs_test src/core/verified_inputs_test.cpp)
+        target_link_libraries(verified_inputs_test PRIVATE strata_window_state)
+        target_compile_options(verified_inputs_test PRIVATE -UNDEBUG)
+        target_link_options(verified_inputs_test PRIVATE -Wl,--wrap=unlinkat)
+        add_test(NAME verified_inputs_test COMMAND verified_inputs_test)
+        set_tests_properties(verified_inputs_test PROPERTIES TIMEOUT 120)
+        add_executable(verified_input_manifest_test src/core/verified_input_manifest_test.cpp)
+        target_link_libraries(verified_input_manifest_test PRIVATE strata_window_state)
+        target_compile_options(verified_input_manifest_test PRIVATE -UNDEBUG)
+        add_test(NAME verified_input_manifest_test COMMAND verified_input_manifest_test)
+        set_tests_properties(verified_input_manifest_test PROPERTIES TIMEOUT 120)
+        add_subdirectory(tests/core/running_engine_identity)
+      endif()
+      if(STRATA_ENABLE_CUDA AND UNIX)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+          # Real loader/WeightTable/platform code, CPU CUDA/kernel seams only.
+          # No cudart, frozen archives or section-GC dependency hiding.
+          add_executable(native_dense_load_test src/core/native_dense_load_test.cpp
+            src/core/native_dense.cpp src/core/weights.cpp src/platform/memory.cpp)
+          target_include_directories(native_dense_load_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+          target_link_libraries(native_dense_load_test PRIVATE Threads::Threads)
+          target_compile_options(native_dense_load_test PRIVATE -UNDEBUG)
+          add_test(NAME native_dense_load_test COMMAND native_dense_load_test)
+          add_test(NAME native_dense_load_faults_test COMMAND native_dense_load_test)
+          set_tests_properties(native_dense_load_faults_test PROPERTIES ENVIRONMENT "STRATA_NATIVE_TEST_FAULTS_ONLY=1")
+          set_tests_properties(native_dense_load_test native_dense_load_faults_test PROPERTIES TIMEOUT 60)
+          find_package(Python3 COMPONENTS Interpreter REQUIRED)
+          add_test(NAME native_dense_fixture_isolation_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/native_dense_fixture_isolation_test.py $<TARGET_FILE:native_dense_load_test>)
+          add_test(NAME native_dense_fixture_faults_isolation_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/native_dense_fixture_isolation_test.py $<TARGET_FILE:native_dense_load_test>)
+          set_tests_properties(native_dense_fixture_faults_isolation_test PROPERTIES ENVIRONMENT "STRATA_NATIVE_TEST_FAULTS_ONLY=1")
+          add_test(NAME native_dense_fixture_unwind_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/native_dense_fixture_isolation_test.py $<TARGET_FILE:native_dense_load_test> --throw)
+          set_tests_properties(native_dense_fixture_isolation_test native_dense_fixture_faults_isolation_test
+            native_dense_fixture_unwind_test PROPERTIES TIMEOUT 90)
+        endif()
+        # Real retirement primitives with injected runtime/driver calls only.
+        add_executable(native_retirement_test src/core/native_retirement_test.cpp src/core/native_retirement.cpp)
+        target_include_directories(native_retirement_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(native_retirement_test PRIVATE Threads::Threads)
+        target_compile_options(native_retirement_test PRIVATE -UNDEBUG)
+        add_test(NAME native_retirement_test COMMAND native_retirement_test)
+        add_executable(vmm_retirement_test src/core/vmm_retirement_test.cpp src/core/vmm_retirement_test_driver.cpp
+          src/core/vmm.cpp src/core/vmm_managed.cpp src/core/native_retirement.cpp src/core/window_budget.cpp)
+        target_include_directories(vmm_retirement_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(vmm_retirement_test PRIVATE Threads::Threads)
+        target_compile_options(vmm_retirement_test PRIVATE -UNDEBUG)
+        add_test(NAME vmm_retirement_test COMMAND vmm_retirement_test)
+        foreach(mode inactive drain-get address)
+          add_test(NAME vmm_retirement_${mode}_test COMMAND vmm_retirement_test ${mode})
+        endforeach()
+        foreach(mode drain unmap release)
+          foreach(at 1 2)
+            add_test(NAME vmm_retirement_${mode}_${at}_test COMMAND vmm_retirement_test ${mode} ${at})
+          endforeach()
+        endforeach()
+        foreach(at 1 2 3)
+          add_test(NAME vmm_retirement_drain_set_${at}_test COMMAND vmm_retirement_test drain-set ${at})
+        endforeach()
+        add_test(NAME vmm_retirement_abandon_test COMMAND vmm_retirement_test abandon)
+        set_tests_properties(vmm_retirement_abandon_test PROPERTIES WILL_FAIL TRUE TIMEOUT 30)
+        # Actual owned pool/VMM/context/budget with injected CPU CUDA driver calls.
+        # The geometry predicate is a fixed fixture seam; no GPU libraries link.
+        add_executable(owned_qsa_elastic_retirement_test
+          src/core/owned_qsa_elastic_retirement_test.cpp
+          src/core/owned_qsa_elastic_retirement_test_driver.cpp
+          src/core/owned_qsa_elastic.cpp src/core/vmm.cpp src/core/vmm_managed.cpp
+          src/core/native_retirement.cpp src/core/window_budget.cpp)
+        target_include_directories(owned_qsa_elastic_retirement_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(owned_qsa_elastic_retirement_test PRIVATE Threads::Threads)
+        target_compile_options(owned_qsa_elastic_retirement_test PRIVATE -UNDEBUG)
+        add_test(NAME owned_qsa_elastic_retirement_test COMMAND owned_qsa_elastic_retirement_test)
+        set_tests_properties(owned_qsa_elastic_retirement_test PROPERTIES TIMEOUT 30)
+        # Actual manager/selection code with CPU CUDA mocks; POSIX test fixtures, no GPU or test seams.
+        add_executable(window_manager_test src/core/window_manager_test.cpp
+          src/core/window_manager.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp
+          src/core/window_restore.cpp src/core/window_selection.cpp
+          src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
+          src/core/window_lease.cpp src/core/window_budget.cpp)
+        target_include_directories(window_manager_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(window_manager_test PRIVATE Threads::Threads)
+        add_test(NAME window_manager_test COMMAND window_manager_test)
+        set_tests_properties(window_manager_test PROPERTIES TIMEOUT 120)
+        add_executable(window_admission_test src/core/window_admission_test.cpp
+          src/core/window_admission.cpp src/core/thread_priority.cpp src/core/thread_dependencies.cpp
+          src/core/window_manager.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_restore.cpp
+          src/core/window_selection.cpp src/core/window_native.cpp src/core/window_state.cpp
+          src/core/window_hash.cpp src/core/window_lease.cpp src/core/window_budget.cpp)
+        target_include_directories(window_admission_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(window_admission_test PRIVATE Threads::Threads)
+        add_test(NAME window_admission_test COMMAND window_admission_test)
+        set_tests_properties(window_admission_test PROPERTIES TIMEOUT 120)
+        add_executable(window_initial_test src/core/window_initial_test.cpp
+          src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_restore.cpp src/core/window_selection.cpp
+          src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
+          src/core/window_lease.cpp src/core/window_budget.cpp)
+        target_include_directories(window_initial_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(window_initial_test PRIVATE Threads::Threads)
+        add_test(NAME window_initial_test COMMAND window_initial_test)
+        set_tests_properties(window_initial_test PROPERTIES TIMEOUT 120)
+        add_executable(window_token_ledger_test src/core/window_token_ledger_test.cpp
+          src/core/window_token_ledger.cpp src/core/window_manager.cpp src/core/window_allocator.cpp src/core/native_retirement.cpp
+          src/core/window_restore.cpp src/core/window_selection.cpp src/core/window_capture.cpp
+          src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
+          src/core/window_lease.cpp src/core/window_budget.cpp)
+        target_include_directories(window_token_ledger_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(window_token_ledger_test PRIVATE Threads::Threads)
+        add_test(NAME window_token_ledger_test COMMAND window_token_ledger_test)
+        set_tests_properties(window_token_ledger_test PROPERTIES TIMEOUT 120)
+        # Fixed-KV allocator ownership/failure fixtures; CUDA calls are CPU mocks.
+        # Keep the real session/layer/VMM implementations out of this closure.
+        add_executable(window_allocator_test src/core/window_allocator_test.cpp
+          src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_restore.cpp src/core/window_selection.cpp
+          src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp
+          src/core/window_lease.cpp src/core/window_budget.cpp)
+        target_include_directories(window_allocator_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(window_allocator_test PRIVATE Threads::Threads)
+        add_test(NAME window_allocator_test COMMAND window_allocator_test)
+        add_test(NAME window_allocator_transfer_test COMMAND window_allocator_test --transfer)
+        add_test(NAME window_allocator_lock_scope_test COMMAND window_allocator_test --lock-scope)
+        add_test(NAME window_allocator_retirement_drain_test COMMAND window_allocator_test --retirement-drain)
+        add_test(NAME window_allocator_terminal_retirement_test COMMAND window_allocator_test --terminal-retirement)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_custom_target(check_ple_context_extract
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/check_ple_context_extract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ngram.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/core/window_allocator_ple_context_test.inc
+          VERBATIM)
+        add_executable(window_allocator_ple_retirement_test src/core/window_allocator_ple_retirement_test.cpp
+          src/core/window_allocator.cpp src/core/native_retirement.cpp src/core/window_restore.cpp
+          src/core/window_selection.cpp src/core/window_native.cpp src/core/window_state.cpp
+          src/core/window_hash.cpp src/core/window_lease.cpp src/core/window_budget.cpp)
+        add_dependencies(window_allocator_ple_retirement_test check_ple_context_extract)
+        target_include_directories(window_allocator_ple_retirement_test PRIVATE include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(window_allocator_ple_retirement_test PRIVATE Threads::Threads)
+        target_compile_options(window_allocator_ple_retirement_test PRIVATE -UNDEBUG)
+        add_test(NAME window_allocator_ple_retirement_test COMMAND window_allocator_ple_retirement_test)
+        set_tests_properties(window_allocator_ple_retirement_test PROPERTIES TIMEOUT 30)
+        set_tests_properties(window_allocator_test window_allocator_transfer_test
+          window_allocator_lock_scope_test window_allocator_retirement_drain_test window_allocator_terminal_retirement_test PROPERTIES TIMEOUT 120)
+      endif()
+    endif()
+  endif()
+
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -405,7 +685,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(conversation_snapshot_test_ckpt_vram_slots PROPERTIES
       ENVIRONMENT "STRATA_TEST_BIG_GDN=1;STRATA_CKPT_ASYNC=1;STRATA_CKPT_VRAM_SLOTS=3" SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
-    target_link_libraries(conversation_validation_test PRIVATE strata_engine)
+    add_executable(session_private_plan_test src/core/session_private_plan_test.cpp)
+    target_link_libraries(session_private_plan_test PRIVATE strata_engine)
+    add_test(NAME session_private_plan_test COMMAND session_private_plan_test)
+    set_tests_properties(session_private_plan_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+    find_package(Threads REQUIRED)
+    target_link_libraries(conversation_validation_test PRIVATE strata_engine Threads::Threads)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
     set_tests_properties(conversation_validation_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
     if(NOT STRATA_ENABLE_HIP AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -414,8 +699,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_options(conversation_transfer_test PRIVATE
         -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize
         -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaStreamCreateWithFlags
-        -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
-      target_link_libraries(conversation_transfer_test PRIVATE strata_engine)
+        -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError
+        -Wl,--wrap=cudaSetDevice -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaMallocHost
+        -Wl,--wrap=cudaFree -Wl,--wrap=cudaFreeHost -Wl,--wrap=cudaMemGetInfo
+        -Wl,--wrap=cudaPointerGetAttributes -Wl,--wrap=cudaStreamDestroy -Wl,--wrap=cudaMemsetAsync
+        -Wl,--wrap=cudaEventCreateWithFlags -Wl,--wrap=cudaEventRecord
+        -Wl,--wrap=cudaEventSynchronize -Wl,--wrap=cudaEventDestroy
+        -Wl,--wrap=cudaGetErrorString -Wl,--wrap=cudaStreamWaitEvent
+        -Wl,--export-dynamic-symbol=pthread_create)
+      target_link_libraries(conversation_transfer_test PRIVATE strata_engine Threads::Threads ${CMAKE_DL_LIBS})
       add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
       set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
     endif()
@@ -484,6 +776,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   strata_utf8_manifest(strata)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  if(TARGET strata_window_state)
+    target_link_libraries(strata PRIVATE strata_window_state)
+    target_compile_definitions(strata PRIVATE STRATA_WINDOW_STATE_AVAILABLE=1)
+    # The disposable RAW suffix driver is initially Linux CUDA only. Merely
+    # linking its private transaction helper does not enable an experiment.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+      target_sources(strata PRIVATE src/program/suffix_raw_runtime.cpp)
+    endif()
+  endif()
   if(WIN32 AND STRATA_ENABLE_HIP)
     # 0.2.1.2: the ROCm math libraries live in <package>\rocm\bin, which is on PATH only when the launcher starts the engine; load them on first
     # use (main() adds that folder to the DLL search first) so `strata.exe --version` works from the package folder.  amdhip64_7.dll and the
@@ -1404,6 +1705,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
   target_include_directories(ple_reader_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_reader_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  if(TARGET strata_window_state)
+    target_compile_definitions(ple_reader_test PRIVATE STRATA_TEST_WINDOW_PLE=1)
+    target_link_libraries(ple_reader_test PRIVATE strata_window_state)
+  endif()
   add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 
   # #3602: the same reader under load - several clients, a tiny row cache, one in-flight slot, injected delays, rows on

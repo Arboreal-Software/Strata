@@ -20,13 +20,19 @@
 // Requires the default native decode configuration (native projections, fused GR, fused GDN, fast attention and
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
+#include "strata/core/verifier_setup_quote.hpp"
+#include "strata/core/verifier_incarnation.hpp"
 
 #include <cstdio>
+#include <stdexcept>
+#include <cstdint>
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/flag_order.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/verifier_completion_gate.hpp"
+#include "strata/core/strict_retirement.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -41,7 +47,15 @@
 #include <string>
 #include <vector>
 
+namespace strata::program {class ServingRawSession;class OwnedPositionBankBinding;}
 namespace strata::core {
+class NativeBatchSlotBindings;
+struct NativeBatchSlotToken;
+class NativeBatchSlotInspection;
+class NativeBatchGroupCompletion;
+class NativeBatchSetupAdmission;
+class NativeBatchSlotOccupancy;
+class WindowBudget;
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
@@ -95,11 +109,37 @@ struct VerifyHits {
 
 class Verifier {
 public:
+    // Read-only qualification observation; never acquires a lease or authorizes work.
+    static bool diagnostic_contains_address(std::uintptr_t);
+    friend struct VerifierDrainTestPeer;
+    // Quiescent partial observation: custom pool callback applicability is unverified.
+    RouteTailPolicyObservation route_tail_policy() const noexcept;
     Verifier() = default;
     ~Verifier();
+    /// CUDA ownership mode: configure before init; cleanup uncertainty terminates the worker.
+    bool set_strict_retirement(bool enabled, std::string& error);
+    // Opt-in explicit REQUESTED layout caps, NOT a reservation/graph/runtime
+    // admission or resident-ready capability. Real owner must retain actual
+    // setup+hidden-runtime leases through checked destruction before init.
+    bool set_checked_requested_layout(VerifierSetupQuoteLimits,std::string&);
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
+
+    // Actual serial routing configuration. Caller freezes setters/session/layout
+    // for validation and use; this does not certify device work or authorize it.
+    struct SerialRoutingBinding {
+        const Verifier* next=nullptr;
+        const void* next_user=nullptr;
+        const RemoteExpertOpt* optimizer=nullptr;
+        const SessionState* session=nullptr;
+        const ModelGeometry* geometry=nullptr;
+        const GpuPlanSink* plan=nullptr;
+        int64_t layer_begin=0,layer_end=0;
+    };
+    SerialRoutingBinding serial_routing_binding() const noexcept {
+        return {next_,next_user_,remote_opt_,ss_,g_,&sink_,lb_,le_};
+    }
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -222,7 +262,19 @@ public:
     }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
-    void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    void set_next(Verifier* next, void* next_user) {
+        if(completion_gate_) retirement_failed("sealed verifier completion topology");
+        next_ = next; next_user_ = next_user;
+    }
+    // Host-only, strictly BEFORE init/registry publication for every stage.
+    // Configure strict policy and set_next first. Caller retains all
+    // actual chain owners and admitted metadata. Output must be empty. No CUDA.
+    // Optional lifetime_credit retains quota ownership through every Token/Cut;
+    // it supplies no capacity validation or execution/completion authority.
+    static bool prepare_serial_completion_gate(Verifier& root,
+        std::shared_ptr<const ReservationLease> metadata,
+        std::shared_ptr<VerifierCompletionGate>& output,std::string& error,
+        std::shared_ptr<const void> lifetime_credit = {});
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -321,6 +373,33 @@ public:
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
 
+    enum class SnapshotDrain { pending, drained, unhealthy, unsupported };
+    /// Opt-in snapshot preparation. Caller exclusively owns execution and has stopped
+    /// and joined all host producers, including pipeline peers and expert/PLE tasks.
+    /// Polls this verifier and its next_ chain without waiting. An error remains terminal
+    /// for this object's lifetime. Drained is NOT a logical common-cut certificate:
+    /// caller must still reconcile every stage's accepted/forwarded state and bindings.
+    SnapshotDrain poll_snapshot_drain(std::string& err);
+    // Owned-slot host observations only, never a drain/common-cut/RAW certificate.
+    bool inspect_owned_batch_slot(std::shared_ptr<const NativeBatchSlotBindings>,NativeBatchSlotToken,
+                                  size_t stage,NativeBatchSlotInspection& output) const;
+    bool owned_batch_slot_matches(const NativeBatchSlotInspection&) const noexcept;
+    // Exclusive synchronous owned group. Output publishes only after every real
+    // stage dispatch, accepted-prefix commit, and checked compute+copy drain.
+    // Requested fixed-growth data only; no admission or dispatch authority.
+    static uint64_t owned_position_fixed_growth_bound() noexcept;
+    bool prepare_owned_batch_slots(WindowBudget&,std::shared_ptr<const NativeBatchSlotBindings>,
+        uint64_t host_setup_capacity,std::string& error);
+    bool run_owned_slot_group(const NativeBatchSlotInspection* bindings,size_t stages,
+        uint64_t operation,const int* rows,int count,const int32_t* tokens,const int64_t* positions,
+        const int* accepted,PoolMultiFn pool,void* user,int32_t* output,
+        std::shared_ptr<const ReservationLease> metadata,
+        std::shared_ptr<const NativeBatchGroupCompletion>& completed,std::string& error);
+
+    bool snapshot_binding_matches(const SessionState* session, int device) const {
+        return ss_ == session && device_ == device;
+    }
+
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
     // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven
     // without blocking the host, so one host thread keeps a window in flight on each stage (the batch pipeline's
@@ -347,6 +426,7 @@ public:
         adapt_gate_ = g;
         return true;
     }
+    bool has_adapt_gate() const noexcept { return adapt_gate_ != nullptr; }
     double ms_gate = 0;   ///< host time spent holding a layer's plan for the adaptive copies (decode timing prints it)
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
@@ -445,10 +525,29 @@ public:
     std::string route_stats_report();
 
 private:
+    friend class strata::program::ServingRawSession;
+    std::array<std::weak_ptr<const NativeBatchSlotOccupancy>,2> owned_slot_occupancies_;
+    std::shared_ptr<VerifierCompletionGate> completion_gate_;
+    std::size_t completion_stage_=0;
+    void mark_completion_unhealthy()noexcept {
+        if(completion_gate_)completion_gate_->fail_stage(completion_stage_);
+    }
+    void latch_copy_query_failure()noexcept {
+        mark_completion_unhealthy();
+        terminal_copy_query_failed_.store(true,std::memory_order_release);
+    }
+    bool strict_retirement_ = false;
+    bool retirement_init_started_ = false;
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
+    std::shared_ptr<const NativeBatchSetupAdmission> owned_batch_setup_;
     std::vector<SessionState*> slots_;
+    const uint64_t slot_verifier_incarnation_=next_verifier_incarnation();
+    uint64_t slot_inventory_generation_=0;
+    bool slot_inventory_ready_=false;
+    uint64_t owned_group_last_operation_=0;
+    bool owned_group_busy_=false;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[strata::kernels::kWindowMaxT] = {};                     ///< ... and row t is slot brow_[t]
@@ -459,6 +558,11 @@ private:
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[strata::kernels::kWindowMaxT] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
+        // This map is verifier-local and the bank binding is installed ONCE,
+        // before capture. Its authenticated immutable epoch namespaces every
+        // key; validate it on lookup instead of truncating an epoch into an int.
+        if(position_banks_&&!owned_position_binding_matches())
+            throw std::logic_error("owned batch bank epoch/inventory changed");
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
         return k;
@@ -473,6 +577,9 @@ private:
     // batch_launch / batch_poll (with external serving, batch_serve runs on another thread: running and the served
     // layer count are atomics, set by batch_launch before running)
     std::atomic<bool> b_running_{false};
+    // Host poll/launch owner only. Copy-query uncertainty is terminal for this
+    // verifier; no reset/retry may turn it into completion. Reconstruct the owner.
+    bool batch_copy_failed_ = false;
     std::atomic<int64_t> b_k_{0};
     int64_t b_steps_ = 0;
     std::atomic<bool> ext_serve_{false};
@@ -610,7 +717,17 @@ private:
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
     bool copy_used_ = false;
+    // Terminal copy-stream observation failure, not proof that GPU waits were
+    // released. Never reset on init/relaunch; reconstruct this verifier instead.
+    std::atomic<bool> terminal_copy_query_failed_{false};
+    bool refuse_copy_query_failure(std::string& err) const {
+        if (!terminal_copy_query_failed_.load(std::memory_order_acquire)&&!(owned_batch_setup_&&batch_copy_failed_)) return false;
+        err = "verify: previous terminal copy-stream query failure; reconstruct verifier";
+        return true;
+    }
+
     bool capture_commit(std::string& err);
+    bool finish_serial_copies(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)
@@ -716,6 +833,8 @@ private:
     void pcie_balance_window(int64_t steps, int G);
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
+    std::string commit_failure_;         // failed commit cannot become a successful later wait
+    std::string snapshot_failure_;       // failed drain cannot certify a later snapshot
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     using FlagSet = strata::core::FlagRaise;
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
@@ -736,6 +855,8 @@ private:
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
+    bool checked_layout_enabled_=false;
+    VerifierSetupQuoteLimits checked_layout_limits_{};
     void* arena_ = nullptr;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
@@ -771,6 +892,21 @@ private:
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
+    // Appended fixed enclosing growth is separately quoted at bank startup.
+    // The generate outer keeper outlives this allocation, not just this member.
+    std::shared_ptr<const strata::program::OwnedPositionBankBinding> position_banks_;
+    const int32_t* owned_position_table(int token_row) const;
+    bool owned_position_binding_matches() const noexcept;
+    struct OwnedPositionReplay {
+        uint64_t expected_operation=0,operation=0,epoch=0;
+        int count=0,hbase=0;
+        std::array<int,2> rows{};
+        std::array<uint64_t,2> content_generations{},occupancies{};
+        std::array<const void*,2> image_contexts{};
+        bool ar_off=false,live=false;
+    } owned_position_replay_;
+    bool owned_position_begin_batch(const int*,int,int) noexcept;
+    bool owned_position_commit_matches() const noexcept;
 };
 
 }  // namespace strata::core

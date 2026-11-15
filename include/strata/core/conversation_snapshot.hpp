@@ -6,6 +6,7 @@
 #include "strata/core/session.hpp"
 
 #include <string>
+#include <mutex>
 
 namespace strata::core {
 
@@ -20,6 +21,12 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& state, const Mo
                           int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
+// Metadata-only preflight for restore. It does not authorize host reads; those
+// still require checked completion unless the exact runtime slot is readable.
+bool conversation_kv_metadata_validate(const ConversationKv&,const QsaState&,const ModelGeometry&,int64_t,bool,std::string&);
+bool conversation_kv_slot_ready(const ConversationKv&);
+bool conversation_checkpoint_metadata_validate(const ConversationCheckpoint&,const SessionState&,const ModelGeometry&,std::string&);
+bool conversation_checkpoint_slot_ready(const ConversationCheckpoint&);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
@@ -77,6 +84,15 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
 /// when nothing is in flight.
 /// `only` (non-null): wait only when the copy in flight is into that checkpoint's GDN bytes.
 void conversation_checkpoint_join(const void* only = nullptr);
+// Persistent status inspected by concrete pending owners; false never certifies payload.
+bool conversation_checkpoint_join_checked(const void* only) noexcept;
+bool conversation_park_join_checked(const void*) noexcept;
+bool conversation_checkpoint_probe_checked(const void*) noexcept;
+bool conversation_park_probe_checked(const void*) noexcept;
+// Serialize the actual singleton park builder through its future publication;
+// slot restores have a separate short resource lock and do not take this mutex.
+std::recursive_mutex& conversation_park_capture_mutex();
+bool conversation_park_async_enabled();
 /// STRATA_PARK_ASYNC: waits until the last parked image's K/V has landed in its host buffers (no-op otherwise); the
 /// readers of a parked image's K/V call it first, and the image itself before it frees them (SavedConversation::pending).
 void conversation_park_join();
@@ -141,6 +157,11 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
+// Opt-in transaction capture into a fresh PRIVATE destination, without draft KV.
+// On failure retain this destination and the source until all work is known drained
+// or the runtime confirms device teardown. Never publish a partially filled image.
+bool conversation_snapshot_save_private(SavedConversation& captured, const ConversationView&,
+                                        const SessionState&, const ModelGeometry&, std::string& error);
 /// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
 /// thread has one for the card or a finished thread left one in the pool. A restore writes into buffers that exist
 /// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
@@ -185,3 +206,10 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
                                                           const QsaState* draft, std::string& error);
 
 } // namespace strata::core
+
+// Disposable native qualification only; retains actual empty endpoint bytes.
+namespace strata::core {
+bool conversation_snapshot_empty_save(SavedConversation&,const SessionState&,const ModelGeometry&,std::string&);
+bool conversation_snapshot_empty_validate(const SavedConversation&,const SessionState&,const ModelGeometry&,const QsaState*,std::string&);
+ConversationRestore conversation_snapshot_empty_restore(const SavedConversation&,SessionState&,const ModelGeometry&,const QsaState*,std::string&);
+}

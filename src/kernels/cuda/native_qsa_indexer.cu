@@ -297,6 +297,38 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
+void native_qsa_indexer_append_steps_owned(const float* raw, const int32_t* relative_pos_device,
+                                     int pos_stride, int n_steps, int32_t pos_base,
+                                     const float* gamma, float epsilon, const QsaIndexerBuffers& b,
+                                     const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    if (n_steps <= 0) return;
+    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
+        int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency/scaling and explicit stream");
+    const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+    const Span spans[] = {{raw,std::size_t(n_steps)*D*4},{relative_pos_device,pos_span},{gamma,D*4},{b.tail,(R-1)*D*4},
+        {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
+    for (const auto& span : spans) validate(span);
+    for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
+        if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
+    const RopeTab rt = rope_table_for(scaling);
+    if (rt.cos != nullptr)
+        append<true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+            b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,position_table,rt);
+    else
+        append<false><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+            b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,position_table,rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
 void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_stride, const int32_t* relative_pos_device,
                                             int pos_stride, int n_steps, int32_t pos_base, float epsilon,
                                             const QsaIndexerLayers& layers, int n_layers, const QsaShapes& s,
@@ -332,10 +364,53 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
+void native_qsa_indexer_append_steps_layers_owned(const float* raw0, int64_t raw_stride, const int32_t* relative_pos_device,
+                                            int pos_stride, int n_steps, int32_t pos_base, float epsilon,
+                                            const QsaIndexerLayers& layers, int n_layers, const QsaShapes& s,
+                                            int64_t max_cells, const RopeScaling& scaling, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    if (n_steps <= 0 || n_layers <= 0) return;
+    if (!stream || n_layers > QsaIndexerLayers::kMax || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
+        int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer (layers): bad geometry, layer count or parameters");
+    for (int i = 0; i < n_layers; ++i) {   // the per-layer append's span checks, layer by layer
+        const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+        const Span spans[] = {{raw0 + (std::size_t) i * (std::size_t) raw_stride, std::size_t(n_steps)*D*4},
+            {relative_pos_device,pos_span},{layers.gamma[i],D*4},{layers.tail[i],(R-1)*D*4},{layers.dead[i],D*4},
+            {layers.pooled[i],std::size_t(max_cells/R+1)*D*4},{layers.block_pos[i],4}};
+        for (const auto& span : spans) validate(span);
+        for (int a = 0; a < 7; ++a) for (int b = a + 1; b < 7; ++b)
+            if (overlaps(spans[a], spans[b])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    }
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);
+    const RopeTab rt = rope_table_for(scaling);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (rt.cos != nullptr)
+        append_layers<true><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
+            pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+            k.attn_factor, position_table, rt);
+    else
+        append_layers<false><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
+            pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+            k.attn_factor, position_table, rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
                                const float* gamma, float epsilon, const QsaIndexerBuffers& b,
                                const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
     native_qsa_indexer_append_steps(raw, relative_pos_device, 0, 1, pos_base, gamma, epsilon, b, s, max_cells, scaling, stream);
+}
+
+void native_qsa_indexer_append_owned(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
+                               const float* gamma, float epsilon, const QsaIndexerBuffers& b,
+                               const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    native_qsa_indexer_append_steps_owned(raw, relative_pos_device, 0, 1, pos_base, gamma, epsilon, b, s, max_cells, scaling, stream, position_table);
 }
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
@@ -350,6 +425,43 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const float fsf = k.freq_scale, cl = k.corr_low, ch = k.corr_high, ef = k.ext_factor, ms = k.attn_factor;
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
     const int32_t* mtab = mrope_table();
+    const RopeTab rt = rope_table_for(scaling);
+    if (p0 == 0) {
+        if (rt.cos != nullptr)
+            append_first<true><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                                      fsf, cl, ch, ef, ms, mtab, rt);
+        else
+            append_first<false><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                                       fsf, cl, ch, ef, ms, mtab, rt);
+    }
+    // completed blocks: those whose last cell (4b+3) lies in [p0, p0 + n)
+    const int64_t first = p0 <= R - 1 ? 0 : (p0 - (R - 1) + R - 1) / R;       // the smallest b with 4b+3 >= p0
+    const int64_t hi = p0 + n - 1 >= R - 1 ? (p0 + n - 1 - (R - 1)) / R : -1;   // the largest b with 4b+3 <= p0+n-1
+    if (hi >= first && rt.cos != nullptr)
+        append_blocks<true><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+            b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+    else if (hi >= first)
+        append_blocks<false><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+            b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+    append_tail<<<R - 1, D, 0, st>>>(raw, n, p0, b.tail);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_qsa_indexer_append_batch_owned(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
+                                     float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
+                                     const RopeScaling& scaling, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    if (n <= 0) return;
+    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT || p0 < 0 || p0 + n > max_cells ||
+        max_cells > INT32_MAX || pos_base < 0 || pos_base % R || int64_t(pos_base) + max_cells > INT32_MAX ||
+        !std::isfinite(epsilon) || epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer (batch): bad geometry, positions, parameters or scaling");
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
+    const float fsf = k.freq_scale, cl = k.corr_low, ch = k.corr_high, ef = k.ext_factor, ms = k.attn_factor;
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    const int32_t* mtab = position_table;
     const RopeTab rt = rope_table_for(scaling);
     if (p0 == 0) {
         if (rt.cos != nullptr)

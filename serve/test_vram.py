@@ -18,6 +18,7 @@ class VramEngine(ResidentEngine):
     """The resident test engine with an elastic cache: VRAM n frees what the reserve asks for, None takes the
     start's (700 MiB)."""
     def __init__(self, tok, elastic=True):
+        StrataEngine.__init__(self, "missing-executable", [], env={}, lazy=True)
         super().__init__(tok)
         self.elastic, self.calls = elastic, []
 
@@ -39,6 +40,7 @@ class EngineCommand(unittest.TestCase):
         e.proc.poll.return_value = None
         e.proc.stdin = io.StringIO()
         e.ended = False
+        e._stdin_closing = False
         e.lines = queue.Queue()
         for r in replies:
             e.lines.put(r)

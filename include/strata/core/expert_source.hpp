@@ -20,6 +20,8 @@
 //      internal offsets are compile-time constants and reading a 640-wide expert as a 2560-wide one walks off
 //      the end into the next expert's bytes without faulting.
 #pragma once
+#include "strata/core/expert_source_inventory.hpp"
+#include "strata/core/runtime_policy_observation.hpp"
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/pinned.hpp"
@@ -32,6 +34,7 @@
 #include <cmath>
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
@@ -50,6 +53,7 @@ struct ExpertLayout;
 }
 
 namespace strata::core {
+class ReservationLease;
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
@@ -313,7 +317,46 @@ struct ForesightSwap;
 class RouterLookahead {
 public:
     RouterLookahead() = default;
+    // Exact additional logical residency-array payload; output unchanged on
+    // overflow/invalid dimensions. Zero layers is valid for legacy empty start.
+    static bool residency_snapshot_bytes(size_t layers, int64_t experts, uint64_t& out) noexcept;
+    // Owned startup only. Consumes a genuine exclusive dedicated foreground
+    // lease after validating exact host bytes and no other resource charges.
+    // Caller uses the actual runtime ledger, not an untrusted aliased lease.
+    // No WindowBudget operation is linked into the default source translation unit.
+    bool configure_residency_snapshot(size_t layers, int64_t experts,
+        std::shared_ptr<const ReservationLease>& lease) noexcept;
     ~RouterLookahead();
+    // Terminal stop/join only: preserves source/FS targets and all buffers for
+    // the caller's subsequent GPU drain. False requires retaining this owner.
+    // Concurrent/reentrant/self close refuses; no join under worker mutex.
+    bool close_for_retirement() noexcept;
+    // Reversible writer boundary for the actual borrowed residency table/source.
+    // Caller retains this RouterLookahead through guard destruction, serializes
+    // guard access and freezes configuration. Never destroy the owner via a callback.
+    class SubmittedDrain {
+    public:
+        SubmittedDrain() = default;
+        ~SubmittedDrain() noexcept;
+        void reset() noexcept; // known writer completion/cancellation only
+        SubmittedDrain(const SubmittedDrain&) = delete;
+        SubmittedDrain& operator=(const SubmittedDrain&) = delete;
+        SubmittedDrain(SubmittedDrain&&) = delete;
+        SubmittedDrain& operator=(SubmittedDrain&&) = delete;
+    private:
+        friend class RouterLookahead;
+        RouterLookahead* owner_ = nullptr;
+    };
+    enum class DrainResult { drained, busy, refused };
+    // No deadline means a nonblocking poll. A supplied absolute steady-clock
+    // deadline bounds waiting; callers must not wait on work needing their reactor.
+    // Busy retains the seal in guard for retry; destruction releases it. While
+    // sealed submit drops speculative predictions (counts skipped), never queues.
+    // Only drained authorizes mutation, and only while the same guard is alive.
+    // This joins our submitted warm/predict callbacks, NOT downstream source or
+    // Foresight GPU completion; those owners retain their own ordering contracts.
+    DrainResult drain_submitted(SubmittedDrain& guard,
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
     RouterLookahead(const RouterLookahead&) = delete;
     RouterLookahead& operator=(const RouterLookahead&) = delete;
     /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits, n_expert rows of n_embd.
@@ -325,16 +368,18 @@ public:
     void set_foresight(ForesightSwap* fs);
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
+    /// Caller supplies full startup geometry and serializes writes through this
+    /// synchronous copy. Only the private snapshot survives submit returning.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
     /// STRATA_IO_PREFETCH_DEPTH: how many layers ahead of `layer` are predicted and warmed (default 1, the next layer).
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
-    void set_depth(int d) { depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
+    void set_depth(int d) { std::lock_guard<std::mutex> lock(mu_); if(!retirement_started_.load()) depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
     int depth() const { return depth_; }
     /// STRATA_LOOKAHEAD_STATS=1 (measurement only): remember each prediction (top k, k+4 and k+10 per token) and let the
     /// dispatch score it against the experts the next layer really routes outside the GPU cache.
     void enable_stats(int64_t n_layers);
     bool stats_on() const { return stats_on_; }
-    void stats_window_start() { gen_.fetch_add(1, std::memory_order_relaxed); }
+    void stats_window_start() { std::lock_guard<std::mutex> lock(mu_); if(!retirement_started_.load()) gen_.fetch_add(1, std::memory_order_relaxed); }
     void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0);
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
@@ -342,6 +387,9 @@ public:
 
 private:
     void run();
+    std::mutex retirement_mu_;
+    std::atomic<bool> retirement_started_{false};
+    bool retirement_done_ = false, retirement_failed_ = false; // retirement_mu_
     std::vector<std::vector<uint16_t>> routers_;
     int64_t n_embd_ = 0, n_expert_ = 0;
     int k_ = 10;
@@ -351,9 +399,16 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
+    SubmittedDrain* submitted_drain_ = nullptr; // mu_, nonmovable guard identity
+    std::thread::id worker_id_{}; // mu_, avoids racing thread_ join
+    bool worker_failed_ = false; // sticky, never a successful drain proof
     int64_t layer_ = -1, n_tok_ = 0;
-    std::vector<int32_t> res_;   ///< the residency rows of the layers predicted, copied at submit (admissions write the table)
-    bool has_res_ = false;
+    // Charge declared before allocation: storage is destroyed before its lease.
+    std::shared_ptr<const ReservationLease> residency_lease_;
+    std::vector<int32_t> residency_snapshot_;
+    size_t admitted_layers_ = 0;
+    int64_t admitted_experts_ = 0;
+    bool has_residency_ = false;
     uint64_t sub_gen_ = 0;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;
@@ -497,7 +552,43 @@ struct PcieModel {
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;
 
+// Partial CPU execution evidence only: no GPU kernel, router-weight, or final
+// reduction coverage. The admitted-work owner retains this observer and actual
+// runtime/source/pool/layout authorities through all callbacks and final drains.
+// Install/clear only after producer closure; callbacks are synchronous, noexcept,
+// allocation-free and must not reenter or destroy the dispatch/observer.
+enum class ExpertHostPoolEntry : uint8_t { single, single_split, multi_split, multi_native_split };
+enum class ExpertHostActivation : uint8_t { q8_1, any_q2, native };
+struct ExpertHostCpuRow {
+    uint64_t row=0,token=0,rank=0,batch=0,job=0,job_row=0;
+    int64_t expert=0;
+    // Transient addresses/offsets describe the actual job, NOT canonical identity.
+    // The sink must join retained source receipts; these addresses cannot own data.
+    const uint8_t* blob=nullptr;
+    uint64_t up_offset=0,down_offset=0;
+    bool zero_copy_roles=false;
+    ExpertHostActivation activation=ExpertHostActivation::q8_1;
+    ExpertHostPoolEntry entry=ExpertHostPoolEntry::single;
+};
+class ExpertHostExecutionObserver {
+public:
+    virtual ~ExpertHostExecutionObserver()=default;
+    // Claim preallocated rows/groups/batches (each <= tokens*width) atomically.
+    // Validate exact dispatch/source/pool against the retained work context.
+    // Output ticket unchanged on refusal. Pointer equality is not ownership.
+    virtual bool begin_layer(const void* dispatch,const void* source,const void* pool,
+        int64_t layer,uint64_t tokens,uint64_t width,bool multi,uint64_t& ticket) noexcept=0;
+    virtual bool cpu_row(uint64_t ticket,const ExpertHostCpuRow&) noexcept=0;
+    virtual bool cpu_batch_submitted(uint64_t ticket,uint64_t batch,uint64_t jobs,ExpertHostPoolEntry) noexcept=0;
+    virtual void cpu_batch_completed(uint64_t ticket,uint64_t batch) noexcept=0;
+    // Host service return only, NOT complete GPU/layer/work authorization.
+    virtual void end_host_dispatch(uint64_t ticket) noexcept=0;
+    // May follow already submitted GPU subsets or completed CPU batches.
+    virtual void abort_layer(uint64_t ticket) noexcept=0;
+};
+
 struct ExpertDispatch {
+    ExpertHostExecutionObserver* host_execution_observer = nullptr;
     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
@@ -700,6 +791,8 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
+// Reads the existing atomic only; does not resolve its environment default.
+RouteTailPolicyObservation observe_tail_skip_policy() noexcept;
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
 
@@ -731,6 +824,23 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
 /// token - which is the only way they get debugged before speed matters.
 class FileExpertSource : public ExpertSource {
 public:
+    bool enable_inventory_capture(std::shared_ptr<ExpertSourceCapture> capture, std::string& error) {
+        if(!capture||!strict_retirement_||!inventory_closed_) {error="expert inventory requires strict retirement and closed source";return false;}
+        if(!capture->claim_source()) {error="expert capture already belongs to a source";return false;}
+        inventory_=std::move(capture);return true;
+    }
+    // Borrow requires retained source and serialized close/layout mutation.
+    const ExpertSourceInventory* completed_inventory() const noexcept {
+        return !inventory_closed_&&inventory_?inventory_->completed_inventory():nullptr;
+    }
+    // Serialized with open/close/layout mutation, like completed_inventory().
+    // Retains the exact capture across replacement; not a concurrent read lock.
+    std::shared_ptr<const ExpertSourceCapture> completed_inventory_owner() const noexcept {
+        return completed_inventory()?inventory_:nullptr;
+    }
+
+    /// Configure before open; callers seal producers before close. Mode/topology persist across reopen.
+    bool set_strict_retirement(bool enabled, const std::vector<int>& consumer_devices, std::string& error);
     FileExpertSource() = default;
     ~FileExpertSource() override;
     FileExpertSource(const FileExpertSource&) = delete;
@@ -789,6 +899,11 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    // Caller has completed and joined every foreground/dispatch/lookahead
+    // caller. Terminally seals background scheduling and joins workers only;
+    // retains job buffers, descriptors, maps and pinned storage for GPU drain.
+    // False requires retaining this complete owner; no raw-alias admission proof.
+    bool stop_background_after_callers_joined() noexcept;
     /// The budget passed to `pin_cache_complement` is the automatic RAM copy's (the engine chose it because the expert
     /// arena did not fit), not --resident-budget-gib: the line printed when it is cut names no flag.  Set BEFORE it.
     void budget_is_automatic(bool automatic) { budget_automatic_ = automatic; }
@@ -1015,6 +1130,13 @@ public:
     IoCounters io_counters() const;
 
 private:
+    std::shared_ptr<ExpertSourceCapture> inventory_;
+    bool inventory_closed_=true;
+
+    bool strict_retirement_ = false;
+    bool retirement_open_started_ = false;
+    int retirement_device_ = -1;
+    std::vector<int> retirement_consumers_;
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
@@ -1130,6 +1252,8 @@ private:
     // header has no cuda_runtime.h).
     struct StageBufFree {
         bool pinned = false;
+        bool strict_retirement = false;
+        int device = -1;
         void operator()(uint8_t* p) const noexcept;
     };
     std::mutex stage_mu_;
@@ -1167,6 +1291,7 @@ private:
     // #1237: per stage buffer, the event recorded after the last asynchronous copy out of it (note_async_read); a
     // buffer is refilled only once that event has completed.  cudaEvent_t, stored untyped (no cuda_runtime.h here).
     std::vector<void*> stage_ev_;
+    std::vector<int> stage_ev_device_;
     std::vector<char> stage_ev_live_;                 ///< a copy was queued since the buffer was last waited for
     std::unordered_map<const uint8_t*, size_t> stage_idx_;   ///< buffer address -> index (the buffers never move)
     void stage_free_events();
@@ -1219,6 +1344,10 @@ private:
     void io_worker();
     void io_enqueue(int64_t layer, int64_t expert, bool ahead = false);   ///< ahead: a prediction (warm), not a layer's demand
     static constexpr int32_t kIoAhead = 1 << 30;      ///< io_q_: the expert field's flag for a prediction
+    std::mutex background_close_mu_;
+    std::atomic<bool> background_sealed_{false};
+    std::atomic<bool> background_close_failed_{false};
+    bool background_joined_ = false; // background_close_mu_
     void io_stop();
     const uint8_t* io_blob(int64_t layer, int64_t expert);
     const uint8_t* base_ = nullptr;
@@ -1286,6 +1415,23 @@ private:
 // Phase 3's cache fills and the CPU/PCIe miss split - but registration is best-effort and reported, not assumed.
 class ArenaExpertSource : public ExpertSource {
 public:
+    bool enable_inventory_capture(std::shared_ptr<ExpertSourceCapture> capture, std::string& error) {
+        if(!capture||!strict_retirement_||!inventory_closed_) {error="expert inventory requires strict retirement and closed source";return false;}
+        if(!capture->claim_source()) {error="expert capture already belongs to a source";return false;}
+        inventory_=std::move(capture);return true;
+    }
+    // Borrow requires retained source and serialized close/layout mutation.
+    const ExpertSourceInventory* completed_inventory() const noexcept {
+        return !inventory_closed_&&inventory_?inventory_->completed_inventory():nullptr;
+    }
+    // Serialized with open/close/layout mutation, like completed_inventory().
+    // Retains the exact capture across replacement; not a concurrent read lock.
+    std::shared_ptr<const ExpertSourceCapture> completed_inventory_owner() const noexcept {
+        return completed_inventory()?inventory_:nullptr;
+    }
+
+    /// Configure before open; callers seal producers before close. Mode/topology persist across reopen.
+    bool set_strict_retirement(bool enabled, const std::vector<int>& consumer_devices, std::string& error);
     ArenaExpertSource() = default;
     ~ArenaExpertSource() override;
     ArenaExpertSource(const ArenaExpertSource&) = delete;
@@ -1362,6 +1508,13 @@ public:
     double load_copy_seconds() const { return load_copy_s_; }
 
 private:
+    std::shared_ptr<ExpertSourceCapture> inventory_;
+    bool inventory_closed_=true;
+
+    bool strict_retirement_ = false;
+    bool retirement_open_started_ = false;
+    int retirement_device_ = -1;
+    std::vector<int> retirement_consumers_;
     void* arena_ = nullptr;          ///< the PinnedArena, owned
     void* map_ = nullptr;            ///< STRATA_ARENA_MMAP: the arena file, mapped read-only (not the PinnedArena)
     uint64_t map_bytes_ = 0;

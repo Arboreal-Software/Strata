@@ -1,3 +1,4 @@
+#include <stdexcept>
 // src/kernels/cuda/qsa.cu - P2.S2: the QSA cache, indexer and attention (see include/strata/kernels/qsa.hpp).
 //
 // The header documents the layouts and the scope; this file documents the four decisions that are about the
@@ -734,6 +735,26 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     indexer_key_append_kernel<<<1, threads, smem, (cudaStream_t) stream>>>(
         raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim,
         (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table());
+    check_launch("indexer_key_append");
+    if (stream == nullptr) check_sync("indexer_key_append");
+}
+
+void indexer_key_append_owned(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
+                        float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
+                        const float* sin_tab, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    validate(s, "indexer_key_append");
+    if (pos_dev == nullptr) fail("indexer_key_append: pos_dev is null");
+    if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
+        fail("indexer_key_append: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
+    const int threads = (int) s.idx_dim;
+    const size_t smem = (size_t) s.idx_dim * sizeof(double);
+    // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
+    // arguments here are identical for every token, which is the property a CUDA graph needs: this function can
+    // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
+    indexer_key_append_kernel<<<1, threads, smem, (cudaStream_t) stream>>>(
+        raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim,
+        (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, position_table);
     check_launch("indexer_key_append");
     if (stream == nullptr) check_sync("indexer_key_append");
 }

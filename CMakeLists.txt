@@ -23,6 +23,12 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_gpu_engine.cmake)    # the GPU 
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
 if(STRATA_ENABLE_SYCL)
+  if(STRATA_RESIDENT_FAULT_QUALIFICATION)
+    message(FATAL_ERROR "Resident fault qualification requires the Linux CUDA window-state build")
+  endif()
+  if(STRATA_WINDOW_NVCOMP OR STRATA_WINDOW_HIPCOMP)
+    message(FATAL_ERROR "Window SDK codecs require their CUDA/HIP backend, not SYCL")
+  endif()
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     message(FATAL_ERROR "STRATA_ENABLE_SYCL is a separate backend; leave STRATA_ENABLE_CUDA and STRATA_ENABLE_HIP off")
   endif()
@@ -181,6 +187,16 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/core AND EXISTS ${CMAKE_CURRENT_SOUR
   set(_strata_tests_default ON)
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
+option(STRATA_BUILD_WINDOW_STATE "Build opt-in complete window state runtime adapters (unqualified)" OFF)
+option(STRATA_RESIDENT_FAULT_QUALIFICATION "Enable explicit disposable-process resident CUDA fault qualification (never serving)" OFF)
+if(STRATA_RESIDENT_FAULT_QUALIFICATION)
+  if(NOT STRATA_BUILD_WINDOW_STATE OR NOT STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR
+     NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Resident fault qualification requires Linux CUDA and STRATA_BUILD_WINDOW_STATE")
+  endif()
+  # All participating headers/TUs must see the same inline copy-hook definition.
+  add_compile_definitions(STRATA_RESIDENT_FAULT_QUALIFICATION=1)
+endif()
 # A test that needs a model file (a real expert blob from a pack, which is not in the source tree): registered as the real test
 # when the file is there, and otherwise as a stated skip that ctest lists as "Skipped" with this reason, never as a pass of nothing
 # and not as a failure on a machine that has no pack.
@@ -193,6 +209,65 @@ function(strata_add_pack_test name needs)
   endif()
 endfunction()
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
+
+# Optional local SDKs: RAW/stub support never requires a vendor SDK or download.
+option(STRATA_WINDOW_NVCOMP "Build pinned nvCOMP 6.0.0.12 codec adapter (hardware unqualified)" OFF)
+option(STRATA_WINDOW_HIPCOMP "Build pinned hipCOMP 2.3.0 codec adapter (hardware unqualified)" OFF)
+set(STRATA_WINDOW_NVCOMP_ROOT "" CACHE PATH "Local nvCOMP 6.0.0.12 SDK root containing include and lib64/lib")
+set(STRATA_WINDOW_HIPCOMP_ROOT "" CACHE PATH "Local pinned hipCOMP source/install root containing include")
+set(STRATA_WINDOW_HIPCOMP_LIBRARY "" CACHE FILEPATH "Local library built from the pinned hipCOMP source")
+set(STRATA_WINDOW_HIPCOMP_SOURCE_PIN "" CACHE STRING "hipCOMP library provenance assertion: exact source commit")
+if(STRATA_WINDOW_NVCOMP AND STRATA_WINDOW_HIPCOMP)
+  message(FATAL_ERROR "Select only the codec SDK matching this engine backend")
+endif()
+if((STRATA_WINDOW_NVCOMP OR STRATA_WINDOW_HIPCOMP) AND NOT STRATA_BUILD_WINDOW_STATE)
+  message(FATAL_ERROR "Window SDK codecs require STRATA_BUILD_WINDOW_STATE=ON")
+endif()
+if(STRATA_WINDOW_NVCOMP AND (NOT STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_HIP_GFX906))
+  message(FATAL_ERROR "nvCOMP requires the native CUDA backend")
+endif()
+if(STRATA_WINDOW_HIPCOMP AND NOT (STRATA_ENABLE_HIP OR STRATA_HIP_GFX906))
+  message(FATAL_ERROR "hipCOMP requires a HIP backend")
+endif()
+# Read version macros without running an SDK or compiler probe on a GPU.
+function(strata_codec_header_version header macro expected)
+  if(NOT EXISTS "${header}")
+    message(FATAL_ERROR "Missing codec SDK version header: ${header}")
+  endif()
+  file(STRINGS "${header}" value REGEX "^#define[ \t]+${macro}[ \t]+${expected}([ \t]|$)")
+  if(NOT value)
+    message(FATAL_ERROR "Codec SDK requires ${macro}=${expected}: ${header}")
+  endif()
+endfunction()
+if(STRATA_WINDOW_NVCOMP)
+  if(NOT IS_ABSOLUTE "${STRATA_WINDOW_NVCOMP_ROOT}")
+    message(FATAL_ERROR "Set an absolute STRATA_WINDOW_NVCOMP_ROOT; no automatic SDK discovery")
+  endif()
+  set(_codec_nv_version "${STRATA_WINDOW_NVCOMP_ROOT}/include/nvcomp/version.h")
+  strata_codec_header_version("${_codec_nv_version}" NVCOMP_VER_MAJOR 6)
+  strata_codec_header_version("${_codec_nv_version}" NVCOMP_VER_MINOR 0)
+  strata_codec_header_version("${_codec_nv_version}" NVCOMP_VER_PATCH 0)
+  strata_codec_header_version("${_codec_nv_version}" NVCOMP_VER_BUILD 12)
+  find_library(_strata_nvcomp_library NAMES nvcomp libnvcomp.so.6
+    PATHS "${STRATA_WINDOW_NVCOMP_ROOT}/lib64" "${STRATA_WINDOW_NVCOMP_ROOT}/lib"
+    NO_DEFAULT_PATH NO_CACHE REQUIRED)
+endif()
+if(STRATA_WINDOW_HIPCOMP)
+  if(NOT IS_ABSOLUTE "${STRATA_WINDOW_HIPCOMP_ROOT}" OR
+     NOT IS_ABSOLUTE "${STRATA_WINDOW_HIPCOMP_LIBRARY}" OR NOT EXISTS "${STRATA_WINDOW_HIPCOMP_LIBRARY}")
+    message(FATAL_ERROR "Set absolute local STRATA_WINDOW_HIPCOMP_ROOT and STRATA_WINDOW_HIPCOMP_LIBRARY")
+  endif()
+  if(NOT STRATA_WINDOW_HIPCOMP_SOURCE_PIN STREQUAL "22cc762f54fba7cdfca74a4c50c00f2aac4ace7a")
+    message(FATAL_ERROR "hipCOMP requires explicit pinned source provenance 22cc762f54fba7cdfca74a4c50c00f2aac4ace7a")
+  endif()
+  set(_codec_hip_version "${STRATA_WINDOW_HIPCOMP_ROOT}/include/hipcomp.h")
+  strata_codec_header_version("${_codec_hip_version}" HIPCOMP_MAJOR_VERSION 2)
+  strata_codec_header_version("${_codec_hip_version}" HIPCOMP_MINOR_VERSION 3)
+  strata_codec_header_version("${_codec_hip_version}" HIPCOMP_PATCH_VERSION 0)
+endif()
+set(_strata_window_codec_sources src/core/window_codec.cpp src/core/window_codec_job.cpp
+  src/core/window_codec_nvcomp.cpp src/core/window_codec_hipcomp.cpp)
+
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
 # native-experts section far below, so a first configure registered four tests fewer than the second)
@@ -200,6 +275,239 @@ option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
+  # Standalone actual codec code with disabled SDK adapters: no GPU calls even
+  # when the engine library enables a vendor adapter. UNIX job tests use fork.
+  set(_codec_cpu_tests window_codec_test)
+  if(UNIX)
+    list(APPEND _codec_cpu_tests window_codec_job_test)
+  endif()
+  foreach(codec_test IN LISTS _codec_cpu_tests)
+    add_executable(${codec_test} src/core/${codec_test}.cpp ${_strata_window_codec_sources}
+      src/core/window_budget.cpp src/core/window_hash.cpp)
+    target_include_directories(${codec_test} PRIVATE include)
+    target_compile_options(${codec_test} PRIVATE
+      "$<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>" "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>")
+    find_package(Threads REQUIRED)
+    target_link_libraries(${codec_test} PRIVATE Threads::Threads)
+    add_test(NAME ${codec_test} COMMAND ${codec_test})
+    set_tests_properties(${codec_test} PROPERTIES TIMEOUT 120)
+  endforeach()
+  add_executable(window_hash_test src/core/window_hash_test.cpp src/core/window_hash.cpp)
+  target_include_directories(window_hash_test PRIVATE include)
+  add_test(NAME window_hash_test COMMAND window_hash_test)
+  # Bounded causal-root DATA only: no device/runtime/model dependency.
+  add_executable(window_repair_ancestry_test tests/core/window_repair_ancestry/test.cpp
+    src/core/window_repair_ancestry.cpp)
+  target_include_directories(window_repair_ancestry_test PRIVATE include)
+  add_test(NAME window_repair_ancestry_test COMMAND window_repair_ancestry_test)
+  set_tests_properties(window_repair_ancestry_test PROPERTIES TIMEOUT 30)
+  add_executable(verifier_setup_quote_test tests/core/verifier_setup_quote/test.cpp
+    src/core/verifier_setup_quote.cpp)
+  target_include_directories(verifier_setup_quote_test PRIVATE include)
+  add_test(NAME verifier_setup_quote_test COMMAND verifier_setup_quote_test)
+  set_tests_properties(verifier_setup_quote_test PROPERTIES TIMEOUT 30)
+  # Exercise the actual strict/default completion branch without a GPU.
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  set(_capture_fixture_dir ${CMAKE_CURRENT_BINARY_DIR}/verifier_capture_completion)
+  add_custom_command(OUTPUT ${_capture_fixture_dir}/capture_tail.inc
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${_capture_fixture_dir}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/verifier_capture_completion/prepare.py
+      --source ${CMAKE_CURRENT_SOURCE_DIR}/src/core/verify.cpp
+      --output ${_capture_fixture_dir}/capture_tail.inc
+    DEPENDS src/core/verify.cpp tests/core/verifier_capture_completion/prepare.py
+    VERBATIM)
+  add_executable(verifier_capture_completion_test
+    tests/core/verifier_capture_completion/test.cpp ${_capture_fixture_dir}/capture_tail.inc)
+  target_include_directories(verifier_capture_completion_test PRIVATE ${_capture_fixture_dir})
+  add_test(NAME verifier_capture_completion_test COMMAND verifier_capture_completion_test)
+  set_tests_properties(verifier_capture_completion_test PROPERTIES TIMEOUT 30)
+  add_executable(window_profile_test src/core/window_profile_test.cpp src/core/window_profile.cpp src/core/window_hash.cpp)
+  target_include_directories(window_profile_test PRIVATE include)
+  # This test uses assertions as executable checks, including in Release builds.
+  target_compile_options(window_profile_test PRIVATE
+    "$<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>" "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>")
+  add_test(NAME window_profile_test COMMAND window_profile_test)
+  add_executable(window_state_test src/core/window_state_test.cpp src/core/window_state.cpp src/core/window_hash.cpp)
+  target_include_directories(window_state_test PRIVATE include)
+  add_test(NAME window_state_test COMMAND window_state_test)
+  add_executable(window_native_test src/core/window_native_test.cpp src/core/window_native.cpp src/core/window_state.cpp src/core/window_hash.cpp)
+  target_include_directories(window_native_test PRIVATE include)
+  add_test(NAME window_native_test COMMAND window_native_test)
+  add_executable(window_ple_weights_test src/core/window_ple_weights_test.cpp src/core/window_ple_weights.cpp)
+  target_include_directories(window_ple_weights_test PRIVATE include)
+  add_test(NAME window_ple_weights_test COMMAND window_ple_weights_test)
+  add_executable(window_budget_test src/core/window_budget_test.cpp src/core/window_budget.cpp)
+  target_include_directories(window_budget_test PRIVATE include)
+  find_package(Threads REQUIRED)
+  target_link_libraries(window_budget_test PRIVATE Threads::Threads)
+  add_test(NAME window_budget_test COMMAND window_budget_test)
+  # This allocation-oracle fixture currently uses the Linux allocator profile.
+  # Other platform qualification remains separate from the portable adapter.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(window_suffix_test tests/core/window_suffix/test.cpp
+      src/core/window_suffix.cpp src/core/window_native.cpp src/core/window_state.cpp
+      src/core/window_hash.cpp src/core/window_budget.cpp)
+    target_include_directories(window_suffix_test PRIVATE include src/core)
+    target_link_libraries(window_suffix_test PRIVATE Threads::Threads)
+    add_test(NAME window_suffix_test COMMAND window_suffix_test)
+    set_tests_properties(window_suffix_test PROPERTIES TIMEOUT 60)
+    add_executable(window_repair_suffix_test tests/core/window_repair_suffix/test.cpp
+      src/core/window_repair_suffix.cpp src/core/window_repair_ancestry.cpp
+      src/core/window_native.cpp src/core/window_state.cpp
+      src/core/window_hash.cpp src/core/window_budget.cpp)
+    target_include_directories(window_repair_suffix_test PRIVATE include src/core)
+    target_link_libraries(window_repair_suffix_test PRIVATE Threads::Threads)
+    add_test(NAME window_repair_suffix_test COMMAND window_repair_suffix_test)
+    set_tests_properties(window_repair_suffix_test PROPERTIES TIMEOUT 60)
+  endif()
+  add_executable(suffix_experiment_metrics_test src/program/suffix_experiment_metrics_test.cpp)
+  add_test(NAME suffix_experiment_metrics_test COMMAND suffix_experiment_metrics_test)
+  set_tests_properties(suffix_experiment_metrics_test PROPERTIES TIMEOUT 30)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(verified_artifact_test src/core/verified_artifact_test.cpp
+      src/core/verified_artifact.cpp src/core/window_hash.cpp src/core/window_budget.cpp)
+    target_include_directories(verified_artifact_test PRIVATE include)
+    target_link_libraries(verified_artifact_test PRIVATE Threads::Threads)
+    target_compile_options(verified_artifact_test PRIVATE -UNDEBUG)
+    target_link_options(verified_artifact_test PRIVATE -Wl,--wrap=close)
+    add_test(NAME verified_artifact_test COMMAND verified_artifact_test)
+    set_tests_properties(verified_artifact_test PROPERTIES TIMEOUT 120)
+  endif()
+  if(UNIX)
+    # Filesystem crash/recovery tests use private temporary roots and no GPU.
+    add_executable(window_disk_test src/core/window_disk_test.cpp src/core/window_disk.cpp
+      src/core/window_state.cpp src/core/window_hash.cpp src/core/window_budget.cpp)
+    target_include_directories(window_disk_test PRIVATE include)
+    target_link_libraries(window_disk_test PRIVATE Threads::Threads)
+    add_test(NAME window_disk_test COMMAND window_disk_test)
+    set_tests_properties(window_disk_test PROPERTIES TIMEOUT 120)
+  endif()
+  add_executable(window_lease_test src/core/window_lease_test.cpp src/core/window_lease.cpp src/core/window_budget.cpp)
+  target_include_directories(window_lease_test PRIVATE include)
+  target_link_libraries(window_lease_test PRIVATE Threads::Threads)
+  add_test(NAME window_lease_test COMMAND window_lease_test)
+  add_executable(thread_priority_test src/core/thread_priority_test.cpp src/core/thread_priority.cpp)
+  target_include_directories(thread_priority_test PRIVATE include)
+  target_link_libraries(thread_priority_test PRIVATE Threads::Threads)
+  add_test(NAME thread_priority_test COMMAND thread_priority_test)
+  add_executable(thread_dependencies_test src/core/thread_dependencies_test.cpp src/core/thread_dependencies.cpp src/core/thread_priority.cpp)
+  target_include_directories(thread_dependencies_test PRIVATE include)
+  target_link_libraries(thread_dependencies_test PRIVATE Threads::Threads)
+  add_test(NAME thread_dependencies_test COMMAND thread_dependencies_test)
+  add_executable(serving_thread_bridge_test tests/core/serving_raw_contracts/test_serving_thread_bridge.cpp
+    src/core/thread_priority.cpp src/core/thread_dependencies.cpp src/core/window_budget.cpp)
+  target_include_directories(serving_thread_bridge_test PRIVATE include src/program)
+  target_link_libraries(serving_thread_bridge_test PRIVATE Threads::Threads)
+  add_test(NAME serving_thread_bridge_test COMMAND serving_thread_bridge_test)
+  set_tests_properties(serving_thread_bridge_test PROPERTIES TIMEOUT 120)
+  add_test(NAME serving_thread_bridge_source_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+    --source-root ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(serving_thread_bridge_source_test PROPERTIES TIMEOUT 30)
+  set(_managed_startup_fixture ${CMAKE_CURRENT_BINARY_DIR}/serving_thread_startup/actual.cpp)
+  add_custom_command(OUTPUT ${_managed_startup_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_startup.py
+      --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_managed_startup_fixture}
+    DEPENDS src/program/generate.cpp tests/core/serving_raw_contracts/test_serving_thread_startup.py
+      tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+    VERBATIM)
+  add_executable(serving_thread_startup_test ${_managed_startup_fixture} src/core/window_budget.cpp)
+  target_include_directories(serving_thread_startup_test PRIVATE include src/program)
+  target_link_libraries(serving_thread_startup_test PRIVATE Threads::Threads)
+  add_test(NAME serving_thread_startup_test COMMAND serving_thread_startup_test)
+  set_tests_properties(serving_thread_startup_test PROPERTIES TIMEOUT 120)
+  add_executable(serving_output_capacity_test tests/core/serving_raw_contracts/test_serving_output_capacity.cpp
+    src/core/window_budget.cpp)
+  target_include_directories(serving_output_capacity_test PRIVATE include src/program)
+  target_link_libraries(serving_output_capacity_test PRIVATE Threads::Threads)
+  add_test(NAME serving_output_capacity_test COMMAND serving_output_capacity_test)
+  set_tests_properties(serving_output_capacity_test PROPERTIES TIMEOUT 120)
+  set(_output_capacity_fixture ${CMAKE_CURRENT_BINARY_DIR}/serving_output_capacity/actual.cpp)
+  add_custom_command(OUTPUT ${_output_capacity_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/generate_serving_output_capacity_test.py
+      --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_output_capacity_fixture}
+    DEPENDS src/program/generate.cpp tests/core/serving_raw_contracts/generate_serving_output_capacity_test.py
+      tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py src/program/http_two_slot_receipt.hpp
+    VERBATIM)
+  add_executable(serving_output_admission_test ${_output_capacity_fixture} src/core/window_budget.cpp)
+  target_include_directories(serving_output_admission_test PRIVATE include src/program)
+  target_link_libraries(serving_output_admission_test PRIVATE Threads::Threads)
+  add_test(NAME serving_output_admission_test COMMAND serving_output_admission_test)
+  set_tests_properties(serving_output_admission_test PROPERTIES TIMEOUT 120)
+  add_test(NAME serving_output_capacity_source_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_output_capacity_source.py)
+  set_tests_properties(serving_output_capacity_source_test PROPERTIES TIMEOUT 30)
+  add_executable(prefill_owned_workspace_test tests/core/serving_raw_contracts/test_prefill_owned_workspace.cpp
+    src/core/window_budget.cpp)
+  target_include_directories(prefill_owned_workspace_test PRIVATE include)
+  target_link_libraries(prefill_owned_workspace_test PRIVATE Threads::Threads)
+  add_test(NAME prefill_owned_workspace_test COMMAND prefill_owned_workspace_test)
+  set_tests_properties(prefill_owned_workspace_test PROPERTIES TIMEOUT 120)
+  set(_prefill_workspace_fixture ${CMAKE_CURRENT_BINARY_DIR}/prefill_owned_workspace/actual.cpp)
+  add_custom_command(OUTPUT ${_prefill_workspace_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/generate_prefill_owned_workspace_test.py
+      --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_prefill_workspace_fixture}
+    DEPENDS src/program/generate.cpp src/prefill/prefill.cpp include/strata/prefill/prefill.hpp
+      include/strata/core/pinned_ring.hpp
+      include/strata/core/strict_retirement.hpp
+      include/strata/core/on_device.hpp
+      tests/core/serving_raw_contracts/generate_prefill_owned_workspace_test.py
+      tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+    VERBATIM)
+  add_executable(prefill_owned_workspace_producer_test ${_prefill_workspace_fixture} src/core/window_budget.cpp)
+  target_include_directories(prefill_owned_workspace_producer_test PRIVATE include)
+  target_link_libraries(prefill_owned_workspace_producer_test PRIVATE Threads::Threads)
+  add_test(NAME prefill_owned_workspace_producer_test COMMAND prefill_owned_workspace_producer_test)
+  set_tests_properties(prefill_owned_workspace_producer_test PROPERTIES TIMEOUT 120)
+  add_test(NAME prefill_owned_workspace_source_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_owned_workspace_source.py)
+  set_tests_properties(prefill_owned_workspace_source_test PROPERTIES TIMEOUT 30)
+  add_executable(prefix_replay_policy_test tests/core/serving_raw_contracts/test_prefix_replay_policy.cpp
+    src/core/window_hash.cpp)
+  target_include_directories(prefix_replay_policy_test PRIVATE include src/program)
+  add_test(NAME prefix_replay_policy_test COMMAND prefix_replay_policy_test)
+  set_tests_properties(prefix_replay_policy_test PROPERTIES TIMEOUT 120)
+  set(_prefill_safe_turn_fixture ${CMAKE_CURRENT_BINARY_DIR}/prefill_safe_turn/actual.cpp)
+  add_custom_command(OUTPUT ${_prefill_safe_turn_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/generate_prefill_safe_turn_test.py
+      --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_prefill_safe_turn_fixture}
+    DEPENDS src/program/generate.cpp
+      tests/core/serving_raw_contracts/generate_prefill_safe_turn_test.py
+      tests/core/serving_raw_contracts/prefill_safe_turn_prelude.inc
+      tests/core/serving_raw_contracts/prefill_safe_turn_driver.inc
+    VERBATIM)
+  add_executable(prefill_safe_turn_test ${_prefill_safe_turn_fixture} src/core/window_hash.cpp)
+  target_include_directories(prefill_safe_turn_test PRIVATE include src/program)
+  add_test(NAME prefill_safe_turn_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_safe_turn.py
+    --binary $<TARGET_FILE:prefill_safe_turn_test>)
+  set_tests_properties(prefill_safe_turn_test PROPERTIES TIMEOUT 120)
+  if(UNIX)
+    set(_prefill_refusal_fixture ${CMAKE_CURRENT_BINARY_DIR}/prefill_refusal/actual.cpp)
+    add_custom_command(OUTPUT ${_prefill_refusal_fixture}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_refusal.py
+        --source-root ${CMAKE_CURRENT_SOURCE_DIR} --generate ${_prefill_refusal_fixture}
+      DEPENDS src/program/generate.cpp src/prefill/prefill.cpp
+        tests/core/serving_raw_contracts/test_prefill_refusal.py
+        tests/core/serving_raw_contracts/test_serving_thread_bridge_source.py
+      VERBATIM)
+    add_executable(prefill_refusal_test ${_prefill_refusal_fixture})
+    target_include_directories(prefill_refusal_test PRIVATE include)
+    add_test(NAME prefill_refusal_test COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_prefill_refusal.py
+      --binary $<TARGET_FILE:prefill_refusal_test>)
+    set_tests_properties(prefill_refusal_test PROPERTIES TIMEOUT 120)
+  endif()
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME serving_thread_bridge_nonce_test COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/serving_raw_contracts/test_serving_thread_bridge_nonce.py
+      $<TARGET_FILE:serving_thread_bridge_test>)
+    set_tests_properties(serving_thread_bridge_nonce_test PROPERTIES TIMEOUT 30)
+  endif()
+  add_executable(window_edit_test src/core/window_edit_test.cpp src/core/window_edit.cpp src/core/window_state.cpp src/core/window_hash.cpp)
+  target_include_directories(window_edit_test PRIVATE include)
+  add_test(NAME window_edit_test COMMAND window_edit_test)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)

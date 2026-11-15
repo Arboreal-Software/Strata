@@ -1,3 +1,4 @@
+#include <stdexcept>
 // src/kernels/cuda/rope.cu - P2.S2: NEOX partial RoPE.
 //
 // Semantics from `ref/qsa.py` (`rope_freqs` + `rope_neox`), which `bench/micro/rope_xcheck` validates against
@@ -125,6 +126,26 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
     rope_neox_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, out, rows, head_dim, n_rot, cos_tab,
                                                                  sin_tab, pos, mrope_table());
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "rope_neox_apply launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    if (stream == nullptr) cudaDeviceSynchronize();
+}
+
+void rope_neox_apply_owned(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
+                     const float* sin_tab, const int* pos, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    if (rows <= 0 || n_rot <= 0) return;
+    if (n_rot % 2 != 0 || n_rot > head_dim) {
+        std::fprintf(stderr, "rope_neox_apply: n_rot %d must be even and <= head_dim %d\n", n_rot, head_dim);
+        std::exit(1);
+    }
+    const int threads = 128;
+    const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
+    rope_neox_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, out, rows, head_dim, n_rot, cos_tab,
+                                                                 sin_tab, pos, position_table);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "rope_neox_apply launch: %s\n", cudaGetErrorString(e));

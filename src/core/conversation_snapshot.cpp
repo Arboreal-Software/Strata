@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/raw_int8_restore_clear.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
@@ -16,6 +17,7 @@
 
 namespace strata::core {
 namespace {
+std::recursive_mutex& park_slots_mutex(){static std::recursive_mutex mu;return mu;}
 struct Layout {
     int format;
     int64_t cells, pooled_rows, page_size;
@@ -115,6 +117,31 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
+namespace {
+/// Destination rows beyond a restored prefix are omitted by the copy and keep whatever the session held before.
+/// They are READ: attention's partial page covers positions that were never computed, and the next capture
+/// rounds them into the serialized image.  Canonicalize that tail on the live destination whenever the shape is
+/// one the shared planner is proven for; other shapes (streamed, ring, Q4_0, K8V4, rotated, elastic/VMM) keep
+/// their existing behavior and must be qualified separately rather than cleared by guesswork.
+/// Returns true for a genuine no-op on an unsupported shape; false only on a real submission/drain failure.
+bool canonicalize_restored_suffix(const QsaState& st, const ModelGeometry& g, int64_t cells, std::string& error) {
+    RawInt8RestoreClearPlan plan;
+    if (!raw_int8_restore_clear_plan(st, g, uint64_t(cells), strata::kernels::qsa_real_shapes().page_size, plan))
+        return true;
+    cudaStream_t stream = nullptr;
+    // Same private non-blocking copy stream, acquired on the device that is current for this restore.
+    const bool cleared = apply_raw_int8_restore_clear_plan(plan, [&](void* data, size_t offset, size_t bytes) {
+        if (!stream && conversation_detail::private_stream(stream) != cudaSuccess) return false;
+        return cudaMemsetAsync(static_cast<uint8_t*>(data) + offset, 0, bytes, stream) == cudaSuccess;
+    });
+    if (!cleared) { error = "conversation snapshot: INT8 suffix canonicalization failed"; return false; }
+    if (stream && cudaStreamSynchronize(stream) != cudaSuccess) {
+        error = "conversation snapshot: INT8 suffix canonicalization drain failed";
+        return false;
+    }
+    return true;
+}
+} // namespace
 // STRATA_PARK_VRAM_MIB=N (with STRATA_PARK_ASYNC): a park also keeps the whole K/V of its image in VRAM, in a slot
 // of its own, while the slots' total stays within N MiB; a restore of that image copies from the slot device to
 // device (~1 ms) instead of from the host buffers over PCIe, and needs no wait for the background copy.  A slot is
@@ -185,6 +212,7 @@ VramKvSlot* vram_kv_take(size_t need, int dev, const char*& why) {
         best = s.get();
         v.slots.push_back(std::move(s));
     }
+    if(!v.next_tag||v.next_tag==UINT64_MAX)std::_Exit(1);
     best->tag = v.next_tag++;
     best->used = 0;
     best->parts.clear();
@@ -215,6 +243,10 @@ bool vram_kv_locate(const VramKvSlot& s, uint64_t tag, const std::array<size_t,5
 struct ParkAsync {
     std::mutex mu;
     std::future<cudaError_t> pending;
+    std::atomic<int> failure{0}; // sticky async status, retained across future.get and reuse
+    void record_failure(int code) noexcept {
+        if(code){int expected=0;failure.compare_exchange_strong(expected,code,std::memory_order_acq_rel);}
+    }
     struct Item { uint8_t* dst; size_t n, at; };
     std::vector<Item> items;
     uint8_t* stage = nullptr;
@@ -266,6 +298,9 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
 }
 } // namespace
 
+std::recursive_mutex& conversation_park_capture_mutex(){static std::recursive_mutex mu;return mu;}
+bool conversation_park_async_enabled(){return park_async_on();}
+
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                    int64_t upto, bool index, size_t& bytes, std::string& error) {
     Layout l{};
@@ -292,6 +327,8 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
                           int64_t unchanged_tokens, size_t* reused_bytes) {
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
+    image.wait_pending();image.pending.reset();
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -311,6 +348,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     // STRATA_PARK_VRAM_MIB: this layer's parts go into the park's slot under a fresh tag (0: no slot this park)
+    if(park_async().slot&&(!vram_kv().next_tag||vram_kv().next_tag==UINT64_MAX))std::_Exit(1);
     image.dev_tag = park_async().slot != nullptr ? vram_kv().next_tag++ : 0;
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
@@ -381,7 +419,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     return true;
 }
 
-bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+bool conversation_kv_metadata_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                               int64_t upto, bool index, std::string& error) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
@@ -400,6 +438,21 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     for (size_t i = 0; i < src.size(); ++i)
         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
     return true;
+}
+
+bool conversation_kv_validate(const ConversationKv& image,const QsaState& st,const ModelGeometry& g,
+                              int64_t upto,bool index,std::string& error){
+    image.wait_pending();
+    return conversation_kv_metadata_validate(image,st,g,upto,index,error);
+}
+bool conversation_kv_slot_ready(const ConversationKv& image){
+    if(!image.dev_tag||!image.pending||!image.pending->slot_ready())return false;
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
+    const auto* slot=vram_kv_find(image.dev_tag);
+    if(!slot||slot->tag!=image.pending->tag)return false;
+    const std::array<size_t,5> sizes{image.k.size(),image.v.size(),image.k_scale.size(),image.v_scale.size(),image.pooled.size()};
+    std::array<size_t,5> offsets{};
+    return vram_kv_locate(*slot,image.dev_tag,sizes,offsets);
 }
 
 namespace {
@@ -454,15 +507,16 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
-    // STRATA_PARK_VRAM_MIB: from the image's VRAM slot when it holds every part (no host buffer is read: no join)
-    const VramKvSlot* slot = vram_kv_find(image.dev_tag);
-    if (slot == nullptr) conversation_park_join();
-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
+    if(!conversation_kv_metadata_validate(image,st,g,upto,index,error))return false;
+    // Only the actual fully drained device slot can bypass host completion.
+    const VramKvSlot* slot=conversation_kv_slot_ready(image)?vram_kv_find(image.dev_tag):nullptr;
+    if(slot==nullptr){image.wait_pending();conversation_park_join();}
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
     std::array<size_t,5> sizes{}, off{};
     for (size_t i = 0; i < src.size(); ++i) sizes[i] = src[i]->size();
-    if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; conversation_park_join(); }
+    if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; image.wait_pending(); conversation_park_join(); }
     if (slot != nullptr) {
         for (size_t i = 0; i < src.size(); ++i)
             if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
@@ -472,18 +526,25 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    // The restored extent is the layout's page-rounded cell count; if that cannot be computed, canonicalize
+    // nothing rather than assuming extent 0 (which would clear the whole pool).
+    Layout whole{};
+    std::string ignored;
+    if (layout(st, g, upto, index, whole, ignored) && !canonicalize_restored_suffix(st, g, whole.cells, error))
+        return false;
     return refresh_residency(st, g, upto, error);
 }
 
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                     int64_t captured, int64_t upto, bool index, std::string& error) {
-    const VramKvSlot* slot = vram_kv_find(image.dev_tag);   // (STRATA_PARK_VRAM_MIB, as in conversation_kv_restore)
-    if (slot == nullptr) conversation_park_join();
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
     if (upto < 0 || upto > captured) {
         error = "conversation snapshot: prefix beyond the captured K/V";
         return false;
     }
-    if (!conversation_kv_validate(image, st, g, captured, index, error)) return false;
+    if(!conversation_kv_metadata_validate(image,st,g,captured,index,error))return false;
+    const VramKvSlot* slot=conversation_kv_slot_ready(image)?vram_kv_find(image.dev_tag):nullptr;
+    if(slot==nullptr){image.wait_pending();conversation_park_join();}
     Layout l{};   // the prefix's extent; validation above checked the image against the captured one
     if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
@@ -493,7 +554,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     const auto dst = pools(st);
     // STRATA_PARK_VRAM_MIB: the prefix is the leading bytes of each part in the slot too
     std::array<size_t,5> off{};
-    if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; conversation_park_join(); }
+    if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; image.wait_pending(); conversation_park_join(); }
     if (slot != nullptr) {
         for (size_t i = 0; i < src.size(); ++i)
             if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
@@ -503,6 +564,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    if (!canonicalize_restored_suffix(st, g, l.cells, error)) return false;
     return refresh_residency(st, g, upto, error);
 }
 
@@ -578,13 +640,33 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     return true;
 }
 
-void conversation_park_join() {
+bool conversation_park_probe_checked(const void*) noexcept {
+    auto& a=park_async();
+    try{
+        if(a.failure.load(std::memory_order_acquire))return false;
+        std::unique_lock<std::mutex> lock(a.mu,std::try_to_lock);
+        if(lock&&a.pending.valid()&&a.pending.wait_for(std::chrono::seconds(0))==std::future_status::ready){
+            try{a.record_failure(int(a.pending.get()));}catch(...){a.record_failure(-1);}
+        }
+        return a.failure.load(std::memory_order_acquire)==0;
+    }catch(...){std::_Exit(1);}
+}
+
+bool conversation_park_join_checked(const void*) noexcept {
     ParkAsync& a = park_async();
-    std::lock_guard<std::mutex> lk(a.mu);
-    if (a.pending.valid()) {
-        const cudaError_t e = a.pending.get();
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", cudaGetErrorString(e));
-    }
+    try {
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (a.failure) return false;
+        if (a.pending.valid()) {
+            try { a.record_failure(int(a.pending.get())); }
+            catch (...) { a.record_failure(-1); }
+            if (a.failure) std::fprintf(stderr,"strata: async parking failed, ownership retained (%d)\n",a.failure.load());
+        }
+        return a.failure == 0;
+    } catch (...) { std::_Exit(1); }
+}
+void conversation_park_join() {
+    if (!conversation_park_join_checked(nullptr)) std::_Exit(1);
 }
 
 void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms) {
@@ -595,6 +677,8 @@ void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& cop
 bool conversation_park_async_begin(size_t need) {
     if (park_trace_on()) kv_save_trace() = {};   // (the sums cover this park's saves)
     conversation_park_join();   // (the stage is reused)
+    // Do not hold the slot resource mutex over a host-D2H join.
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
     ParkAsync& a = park_async();
     a.active = false;
     a.items.clear();
@@ -660,17 +744,22 @@ bool conversation_park_async_begin(size_t need) {
 }
 
 void conversation_park_async_abandon() {
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
     ParkAsync& a = park_async();
     if (!a.active) return;
+    cudaStream_t stream = nullptr;
+    const auto found = conversation_detail::private_stream(stream);
+    const auto drained = found == cudaSuccess ? cudaStreamSynchronize(stream) : found;
+    if (drained != cudaSuccess) {
+        a.record_failure(int(drained)); std::_Exit(1); // no clear/release under uncertainty
+    }
     a.active = false;
     a.items.clear();
-    cudaStream_t s = nullptr;
-    if (conversation_detail::private_stream(s) == cudaSuccess) (void) cudaStreamSynchronize(s);   // nothing reads the stage after
-    (void) cudaGetLastError();
-    if (a.slot != nullptr) { vram_kv_release(*a.slot); a.slot = nullptr; a.slot_tag = 0; }   // (STRATA_PARK_VRAM_MIB)
+    if (a.slot) { vram_kv_release(*a.slot); a.slot=nullptr; a.slot_tag=0; }
 }
 
 bool conversation_park_async_launch(std::string& error) {
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
     ParkAsync& a = park_async();
     if (!a.active) return true;
     a.active = false;
@@ -678,10 +767,9 @@ bool conversation_park_async_launch(std::string& error) {
     cudaError_t e = conversation_detail::private_stream(s);
     if (e == cudaSuccess) e = cudaStreamSynchronize(s);   // the device-to-device copies into the stage
     if (e != cudaSuccess) {
-        a.items.clear();
-        if (a.slot != nullptr) { vram_kv_release(*a.slot); a.slot = nullptr; a.slot_tag = 0; }   // (STRATA_PARK_VRAM_MIB)
-        error = std::string("conversation snapshot stage: ") + cudaGetErrorString(e);
-        return false;
+        a.record_failure(int(e));
+        std::fprintf(stderr,"strata: parking launch drain failed, ownership retained (%d)\n",a.failure.load());
+        std::_Exit(1);
     }
     // STRATA_PARK_VRAM_MIB: the host copies read the slot; it stays until the image and its K/V layers go (their tokens)
     const uint8_t* stage = a.slot != nullptr ? static_cast<const uint8_t*>(a.slot->p) : a.stage;
@@ -694,11 +782,12 @@ bool conversation_park_async_launch(std::string& error) {
     const int dev = a.dev;
     std::lock_guard<std::mutex> lk(a.mu);
     // two pinned pieces in turn: the next piece's DMA runs while this one is copied into its segment
+    try {
     a.pending = std::async(std::launch::async, [items = std::move(items), stage, host, st, dev] {
         conversation_detail::background_thread_placement();
-        (void) cudaSetDevice(dev);
+        cudaError_t e = cudaSetDevice(dev);
         cudaEvent_t done[2] = {nullptr, nullptr};
-        cudaError_t e = cudaEventCreateWithFlags(&done[0], cudaEventDisableTiming | cudaEventBlockingSync);
+        if (e == cudaSuccess) e = cudaEventCreateWithFlags(&done[0], cudaEventDisableTiming | cudaEventBlockingSync);
         if (e == cudaSuccess) e = cudaEventCreateWithFlags(&done[1], cudaEventDisableTiming | cudaEventBlockingSync);
         struct Piece { uint8_t* dst; size_t n; };
         Piece held[2] = {{nullptr, 0}, {nullptr, 0}};
@@ -720,15 +809,22 @@ bool conversation_park_async_launch(std::string& error) {
             }
         land(b);
         land(b ^ 1);
-        for (cudaEvent_t d : done) if (d) (void) cudaEventDestroy(d);
+        const auto drained = cudaStreamSynchronize(st);
+        if (e == cudaSuccess) e = drained;
+        for (cudaEvent_t d : done) if (d) { const auto destroyed=cudaEventDestroy(d); if(e==cudaSuccess)e=destroyed; }
         return e;
     });
+    } catch (...) { a.record_failure(-1); std::_Exit(1); }
     return true;
 }
 
-uint64_t conversation_park_slot_tag() { return park_async().slot_tag; }
+uint64_t conversation_park_slot_tag() {
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
+    return park_async().slot_tag;
+}
 
 void conversation_park_slot_release(uint64_t tag) {
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
     if (tag == 0) return;
     for (auto& s : vram_kv().slots)
         if (s->tag == tag) { vram_kv_release(*s); return; }
@@ -737,6 +833,7 @@ void conversation_park_slot_release(uint64_t tag) {
 size_t conversation_park_vram_release_all() {
     if (park_vram_budget() == 0) return 0;   // off: nothing was taken, and the stage stays as it was
     conversation_park_join();   // the background copy may be reading a slot or the stage
+    std::lock_guard<std::recursive_mutex> slots(park_slots_mutex());
     ParkAsync& a = park_async();
     VramKv& v = vram_kv();
     size_t freed = 0;
@@ -760,11 +857,15 @@ size_t conversation_park_vram_release_all() {
 }
 
 void conversation_park_join_for(const SavedConversation& image) {
-    size_t hits = 0;
-    for (const auto& k : image.kv) hits += vram_kv_find(k.dev_tag) != nullptr ? 1 : 0;
+    size_t hits=0;
+    for(const auto& k:image.kv)hits+=conversation_kv_slot_ready(k)?1:0;
     if (park_trace() && park_vram_budget() != 0)
         std::fprintf(stderr, "strata parktrace: kv restore: %zu of %zu layers from the slot\n", hits, image.kv.size());
-    if (hits < image.kv.size()) conversation_park_join();
+    if(hits<image.kv.size()||image.kv.empty()){
+        if(image.pending)image.pending->wait();
+        for(const auto& k:image.kv)if(!conversation_kv_slot_ready(k))k.wait_pending();
+        conversation_park_join();
+    }
 }
 
 } // namespace strata::core

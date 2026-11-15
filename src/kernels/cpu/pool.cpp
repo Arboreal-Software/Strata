@@ -1,6 +1,7 @@
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/diagnostic_readers.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/numa_pool.hpp"
@@ -684,9 +685,9 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 }
 
 namespace {
-std::atomic<const ExpertPool*> g_diag_pool{nullptr};
+strata::core::DiagnosticReaders<ExpertPool> g_pool_readers;
 void diag_active_pool(std::FILE* f) {
-    if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
+    if (auto p = g_pool_readers.acquire_latest()) p->diag(f);
 }
 int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -740,8 +741,8 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
-    : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks, bool checked_retirement)
+    : checked_retirement_(checked_retirement), tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     pinned_ = pin;
     layout_ = logical_cpu_layout();   // now, before anything pins the caller (Linux reads the calling thread's allowed CPUs)
@@ -849,8 +850,6 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
-    g_diag_pool.store(this);
-    strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
     // STRATA_NUMA_SPLIT: decided here, before any worker starts (a worker counts into its slice's `parked` from its
@@ -933,6 +932,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             worker(i);
         });
     }
+    (void) g_pool_readers.publish(this);   // publish only after construction succeeds
+    strata::core::diag_pool_fn().store(&diag_active_pool);
 }
 
 std::string ExpertPool::placement_line() const {
@@ -946,16 +947,50 @@ std::string ExpertPool::placement_line() const {
 }
 
 ExpertPool::~ExpertPool() {
-    const ExpertPool* self = this;
-    g_diag_pool.compare_exchange_strong(self, nullptr);
+    g_pool_readers.retire(this);   // drain readers before member mutation and worker joins
     if (g_numa_owner == this) {
         g_numa_plan = NumaSplitPlan{};
         g_numa_owner = nullptr;
     }
-    stop_.store(true, std::memory_order_release);
-    // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
-    publish();
-    for (auto& t : threads_) t.join();
+    if (checked_retirement_) {
+        if (!stop_after_dispatch_callers_joined()) std::terminate();
+    } else {
+        stop_.store(true, std::memory_order_release);
+        // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
+        publish();
+        for (auto& t : threads_) t.join();
+    }
+}
+
+ExpertPool::DispatchGuard::DispatchGuard(ExpertPool& p) : pool(p) {
+    auto expected = DispatchState::idle;
+    if (!pool.dispatch_state_.compare_exchange_strong(expected, DispatchState::active,
+            std::memory_order_acq_rel))
+        throw std::logic_error("expert pool dispatch is active, stopped, or failed");
+}
+
+ExpertPool::DispatchGuard::~DispatchGuard() {
+    pool.dispatch_state_.store(complete ? DispatchState::idle : DispatchState::failed,
+                               std::memory_order_release);
+}
+
+bool ExpertPool::stop_after_dispatch_callers_joined() noexcept {
+    if (!checked_retirement_) return false;
+    auto expected = DispatchState::idle;
+    if (!dispatch_state_.compare_exchange_strong(expected, DispatchState::sealed,
+            std::memory_order_acq_rel))
+        return expected == DispatchState::joined;
+    // Never set stop while a dispatch still needs workers to complete its phases.
+    try {
+        stop_.store(true, std::memory_order_release);
+        publish();
+        for (auto& t : threads_) if (t.joinable()) t.join();
+    } catch (...) {
+        dispatch_state_.store(DispatchState::failed, std::memory_order_release);
+        return false;
+    }
+    dispatch_state_.store(DispatchState::joined, std::memory_order_release);
+    return true;
 }
 
 void ExpertPool::publish() {
@@ -1303,9 +1338,9 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
 }
 
-void ExpertPool::run_split(ExpertJob* jobs, int n) {
+void ExpertPool::run_split_impl(ExpertJob* jobs, int n) {
     if (n <= 0) return;
-    if (n > kMaxSplit || n_ == 1 || expert_oracle_q8_0_enabled()) { run(jobs, n); return; }
+    if (n > kMaxSplit || n_ == 1 || expert_oracle_q8_0_enabled()) { run_impl(jobs, n); return; }
     const auto t0 = std::chrono::steady_clock::now();
     jobs_ = jobs;
     const int threads = n_ + (host_works_ ? 1 : 0);
@@ -1323,7 +1358,7 @@ int ExpertPool::phase_tasks(int64_t rows) const {
     return tasks_ == 0 ? 3 * (n_ + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
 }
 
-void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
+void ExpertPool::run_split_multi_impl(ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     if (n > kMaxSplitMulti || expert_oracle_q8_0_enabled()) {
         // one token at a time through the single-token path (the oracle contract has no multi kernel)
@@ -1337,7 +1372,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
                 single.push_back(j);
             }
         for (size_t i = 0; i < single.size(); i += kMaxSplit)
-            run_split(single.data() + i, (int) (std::min)((size_t) kMaxSplit, single.size() - i));
+            run_split_impl(single.data() + i, (int) (std::min)((size_t) kMaxSplit, single.size() - i));
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -1362,7 +1397,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
+void ExpertPool::run_split_multi_native_impl(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
     if (n <= 0) return;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
@@ -1394,7 +1429,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void ExpertPool::run(ExpertJob* jobs, int n) {
+void ExpertPool::run_impl(ExpertJob* jobs, int n) {
     if (n <= 0) return;
     if (n_ == 1) {   // no workers: run inline, so a single-core machine still produces a token
         for (int i = 0; i < n; ++i) s2_expert_vnni_q(jobs[i].blob, *jobs[i].act, jobs[i].out, scratch_[0]);
@@ -1474,3 +1509,30 @@ void name_this_thread(const char* base, int index) {
 }
 }  // namespace strata::platform
 #endif
+
+namespace strata::kernels::cpu {
+void ExpertPool::run(ExpertJob* jobs, int n) {
+    if (!checked_retirement_) { run_impl(jobs, n); return; }
+    DispatchGuard guard(*this);
+    run_impl(jobs, n);
+    guard.complete = true;
+}
+void ExpertPool::run_split(ExpertJob* jobs, int n) {
+    if (!checked_retirement_) { run_split_impl(jobs, n); return; }
+    DispatchGuard guard(*this);
+    run_split_impl(jobs, n);
+    guard.complete = true;
+}
+void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
+    if (!checked_retirement_) { run_split_multi_impl(jobs, n); return; }
+    DispatchGuard guard(*this);
+    run_split_multi_impl(jobs, n);
+    guard.complete = true;
+}
+void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
+    if (!checked_retirement_) { run_split_multi_native_impl(f, jobs, n, arithmetic); return; }
+    DispatchGuard guard(*this);
+    run_split_multi_native_impl(f, jobs, n, arithmetic);
+    guard.complete = true;
+}
+} // namespace strata::kernels::cpu

@@ -1,4 +1,5 @@
 #pragma once
+#include "strata/core/expert_tier_open_observer.hpp"
 
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
@@ -6,20 +7,35 @@
 #include "strata/core/expert_source.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace strata::core {
+struct NativeRuntimeAttachment;
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.
 class RemoteExperts {
 public:
+    // SYCL has no owned routing binding producer. Never claim matching ownership.
+    bool bound_to_runtime(const std::shared_ptr<NativeRuntimeAttachment>&) const noexcept { return false; }
+    // No owned copy-reader guard implementation on this backend. Do not emit a
+    // fabricated zero-byte quote or alter the caller's output on refusal.
+    static bool copy_reader_guard_bytes(uint32_t, uint64_t&) noexcept { return false; }
     RemoteExperts() = default;
     ~RemoteExperts();
     RemoteExperts(const RemoteExperts&) = delete;
     RemoteExperts& operator=(const RemoteExperts&) = delete;
+
+    // The SYCL helper has no checked multi-device retirement implementation.
+    // A disabled request preserves the existing path; enabling refuses before effects.
+    bool set_strict_retirement(bool enabled, const std::vector<int>&, std::string& error) {
+        if (!enabled) return true;
+        error = "strict remote expert retirement is not supported by the SYCL engine";
+        return false;
+    }
 
     /// Initialise the device before the host expert arena registers
     /// tens of GiB of portable mapped memory with CUDA.
@@ -27,7 +43,7 @@ public:
     bool open(int device, int slots, int64_t layers, int64_t experts,
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
-              std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false);
+              std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false, ExpertTierOpenObserver* observer = nullptr);
     void close();
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),

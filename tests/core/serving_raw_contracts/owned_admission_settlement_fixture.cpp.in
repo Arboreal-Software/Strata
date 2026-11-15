@@ -1,0 +1,52 @@
+// CPU recording boundary only. Includes the exact extracted proposed production lambda.
+// No GPU/tensor/reset correctness claim; root compiles with C++20 and runs offline.
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cstdio>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+#include <sys/stat.h>
+#include <unistd.h>
+using Clock=std::chrono::steady_clock;
+static bool diagnostic=false,peek=true,reset_ok=true,drain_ok=true,close_ok=true;
+static int calls=0,poll_result=0;
+constexpr int cudaSuccess=0;
+int cudaPeekAtLastError(){return peek?0:1;}
+namespace strata::program { bool http2_receipts_enabled(){return diagnostic;} }
+namespace strata::core {
+[[noreturn]] void retirement_failed(const char* why){throw std::runtime_error(why);}
+struct StateCut { uint64_t id,forwarded,accepted,exact,watermark,history; };
+uint64_t window_history_digest(const std::vector<int32_t>& v){assert(v.empty());return 42;}
+struct Verifier {enum class SnapshotDrain{drained,pending,error};SnapshotDrain status=SnapshotDrain::drained;SnapshotDrain poll_snapshot_drain(std::string&){++calls;return poll_result?SnapshotDrain::error:status;}};
+}
+struct Runtime { bool reset_sessions(int,std::string&){++calls;return reset_ok;} };
+struct Raw {bool drain_work(bool yes,const strata::core::StateCut& c,std::string&){++calls;assert(yes&&c.id==6&&c.forwarded==0&&c.accepted==0&&c.watermark==0);return drain_ok;}bool close_request(std::string&){++calls;return close_ok;}};
+struct Clear {void clear(){}};
+static int capture_fd;
+static off_t size(){std::fflush(stderr);struct stat s{};assert(fstat(capture_fd,&s)==0);return s.st_size;}
+static bool run(bool selected=true,bool fence=true,bool canceled=true,bool authority=true){
+ bool owned_batch_allocation=selected,serving_raw_fence_running=fence,serving_suffix_active=false;
+ int admit_slot=0,g=0;std::atomic<bool>stop_req{canceled};uint64_t serving_raw_cut=5,serving_request_ordinal=123;
+ Runtime runtime;Raw raw;Runtime*owned_runtime=authority?&runtime:nullptr;Raw*serving_raw_session=&raw;
+ strata::core::Verifier ver;bool serving_session_discarded=false,serving_read_gave_way=false,live_ok=true,live_approximate=false;
+ Clear live,live_imgs,checks,serving_tracked_state;int serving_pending_token=9,serving_tracked_provenance=1,serving_donor=1,serving_donor_cut=1,serving_suffix_boundary=1,sfx_repair_at=1;
+#include "settlement.after.inc"
+ bool result=settle_owned_admission_cancel();
+ if(result){assert(serving_raw_cut==6&&!serving_raw_fence_running&&serving_session_discarded&&serving_read_gave_way&&!live_ok);}
+ return result;
+}
+int main(){
+ FILE*f=std::tmpfile();assert(f);capture_fd=fileno(f);int saved=dup(STDERR_FILENO);assert(saved>=0&&dup2(capture_fd,STDERR_FILENO)>=0);
+ diagnostic=false;assert(run());assert(size()==0); // default path no diagnostic output
+ diagnostic=true;off_t at=size();assert(run());off_t after=size();assert(after>at);char buf[2048]{};assert(pread(capture_fd,buf,sizeof(buf)-1,at)>0);std::string line(buf);assert(line.find("req=123 cut=6")!=std::string::npos);
+ for(int failure=0;failure<6;++failure){reset_ok=drain_ok=close_ok=peek=true;poll_result=0;if(failure==0)reset_ok=false;if(failure==1)drain_ok=false;if(failure==2)close_ok=false;if(failure==3)peek=false;if(failure==5)poll_result=1;at=size();bool threw=false;try{run(true,true,true,failure!=4);}catch(const std::runtime_error&){threw=true;}assert(threw&&size()==at);}
+ reset_ok=drain_ok=close_ok=peek=true;poll_result=0;at=size();calls=0;assert(!run(true,false,true));assert(calls==0&&size()==at); // already accepted/no MAIN fence: no fake reset proof
+ assert(!run(true,true,false));assert(size()==at); // no cancellation
+ assert(!run(false,true,true));assert(size()==at); // ordinary default neutrality
+ std::fflush(stderr);assert(dup2(saved,STDERR_FILENO)>=0);close(saved);std::fclose(f);
+}

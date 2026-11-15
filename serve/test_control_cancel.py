@@ -18,7 +18,7 @@ class ControlCancelTest(unittest.TestCase):
         for l in lines:
             eng.lines.put(l)
         eng.sent = []
-        eng._send = eng.sent.append
+        eng._send = lambda text, **kwargs: eng.sent.append(text)
         eng._ctl_mode = "solo"
         eng._ctl_result = None
         eng.progress = None

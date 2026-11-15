@@ -8,6 +8,7 @@
 #include "strata/platform/memory.hpp"
 
 #include <chrono>
+#include <cinttypes>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -146,6 +147,8 @@ bool WeightTable::index_code_bits(const std::string& pack_dir, const std::string
 bool WeightTable::load(const std::string &pack_dir, void *arena_base,
                        uint64_t arena_bytes, std::string &err,
                        const std::set<std::string> *skip) try {
+    if (retired_ || hc_attempted_) { err = "cannot reload retired or HC-owned weight table"; return false; }
+    load_complete_ = false;
     const std::string path = pack_dir + "/index.txt";
     std::FILE* idx = std::fopen(path.c_str(), "rb");
     if (!idx) { err = "cannot open " + path + " (run tools/pack_index.py)"; return false; }
@@ -167,7 +170,7 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
         // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
         // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
         const int n = std::sscanf(line,
-                                  "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+                                  "%255s %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNd64 " %" SCNd64 " %d %d %d %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %d %d",
                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
                                   &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
@@ -518,6 +521,7 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
         0) {
         err = "cudaDeviceSynchronize after the load failed"; return false;
     }
+    load_complete_ = true;
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -529,6 +533,38 @@ catch (sycl::exception const &exc) {
 const WeightRef* WeightTable::find(const std::string& name) const {
     const auto it = table_.find(name);
     return it == table_.end() ? nullptr : &it->second;
+}
+
+// This backend currently loads only canonical weights. It has no HC requantizer
+// or auxiliary device allocation, but shares WeightTable's lifetime interface.
+WeightTable::~WeightTable() = default;
+
+bool WeightTable::enable_inventory_capture(const CanonicalInventoryLimits&,
+    std::shared_ptr<const ReservationLease>,std::shared_ptr<const VerifiedDriverBindings>,
+    const std::string&,std::string& error) {
+    error="completed canonical load inventory is not implemented by the SYCL producer";
+    return false;
+}
+void WeightTable::quarantine_inventory() noexcept {}
+
+
+bool WeightTable::owns_auxiliary_span(const void*, uint64_t) const { return false; }
+
+bool WeightTable::release_auxiliary_checked(std::string& err) {
+    retired_ = true;
+    load_complete_ = false;
+    if (release_failed_ || hc_allocation_) {
+        release_failed_ = true;
+        err = "SYCL weight table has unsupported auxiliary ownership";
+        return false;
+    }
+    return true;
+}
+
+bool WeightTable::load_hc_q8(const std::string&, uint64_t& bytes, std::string& err) {
+    bytes = 0;
+    err = "HC requantization is not implemented by the SYCL weight loader";
+    return false;
 }
 
 }  // namespace strata::core

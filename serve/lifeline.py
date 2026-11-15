@@ -116,10 +116,13 @@ def start_of(p):
     if os.path.exists("/proc/self/stat"):          # Linux, and that PID has no /proc entry any more
         return None
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
+        out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         return None
-    return None if not out else "p:" + out
+    fields = out.split()
+    if len(fields) != 6 or fields[5][0] in "ZX":
+        return None
+    return "s:" + " ".join(fields[:5])
 os.set_blocking(0, True)
 data = b""
 while True:
@@ -166,16 +169,16 @@ def _start_token(pid: int) -> str:
         except (OSError, ValueError, IndexError):
             # procfs IS there and the entry is not readable: the process is gone (or is not ours), and there is
             # nothing to fall back to. Without procfs at all, fall through to `ps` - otherwise this side would
-            # return "" while the watcher's start_of() returns "p:...", the two can never match, and the child
+            # return "" while the watcher's start_of() returns a portable birth token, the two can never match, and the child
             # outlives the server: exactly the failure this change removes, restored for that environment.
             if os.path.exists("/proc/self/stat"):
                 return ""
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+        out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
-    return "" if not out else "p:" + out
+    return procs.ps_start_token(out) or ""
 
 
 def _watch(child: subprocess.Popen) -> None:

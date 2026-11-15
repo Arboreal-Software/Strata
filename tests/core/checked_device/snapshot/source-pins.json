@@ -1,0 +1,6 @@
+{
+  "include/strata/core/on_device.hpp": "b8bdd285fda54fca40b11998134276aa6a8b9745e2a921a93f428df1eaafab87",
+  "include/strata/core/strict_retirement.hpp": "9defda3ff8545936ed99a16e680316e5d3affe841cfb08fca646ccadb2be3bad",
+  "include/strata/core/verify.hpp": "368b1e244f858a4fc1d54774b3c6232ed7d1754fd2c08ae6f578e4dfcc8ddca6",
+  "src/core/verify.cpp": "d1e0817cf4ebf491bc4ce92c1f2a7ba8d3bbe2c7dc7c1a823f04b8db4b5e51b9"
+}

@@ -186,6 +186,11 @@ bool native_norm_rope_usable(int head_dim, int n_rot) {
     return on && (head_dim == 128 || head_dim == 256) && n_rot == 64;
 }
 
+NativeRopePolicyObservation native_rope_policy_observation(int head_dim, int n_rot) {
+    return {true, head_dim, n_rot, native_rope_enabled(), rope_table_enabled(),
+            native_norm_rope_usable(head_dim, n_rot)};
+}
+
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {
     if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||
@@ -217,6 +222,38 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
+void native_rope_apply_owned(const float* x, float* out, int rows, int head_dim,
+                       int n_rot, const RopeScaling& scaling, const int* positions, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||
+        (head_dim != 128 && head_dim != 256) || n_rot != 64 ||
+        rope_scaling_invalid(scaling) != nullptr ||
+        reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(out) % 4 ||
+        reinterpret_cast<uintptr_t>(positions) % 4) {
+        throw std::invalid_argument("native RoPE requires aligned F32 rows, width 128/256, rotation 64, valid base/scaling and explicit stream");
+    }
+    const size_t bytes = size_t(rows) * head_dim * sizeof(float);
+    if ((x != out && overlaps(x, bytes, out, bytes)) ||
+        overlaps(positions, size_t(rows) * sizeof(int), out, bytes) ||
+        overlaps(positions, size_t(rows) * sizeof(int), x, bytes)) {
+        throw std::invalid_argument("native RoPE buffers partially overlap");
+    }
+    // Match pinned host-side float powf before device fast powf/trigonometry.
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
+    const RopeKernelArgs k = scaling.kernel_args(n_rot);   // none: the identity constants
+    const RopeTab rt = rope_table_for(scaling);
+    const unsigned threads = (x == out && n_rot == 64 && native_norm_rope_usable(head_dim, n_rot)) ? 32u : 128u;
+    const dim3 grid(threads == 32u ? 1u : unsigned((head_dim / 2 + 127) / 128), rows);
+    if (rt.cos != nullptr)
+        apply<true><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale,
+            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, position_table, rt);
+    else
+        apply<false><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale,
+            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, position_table, rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
 void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
                               int rows, int head_dim, int n_rot, float epsilon,
                               const RopeScaling& scaling, const int* positions, void* stream) {
@@ -239,6 +276,33 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
         norm_rope_kernel<false><<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
             x, in_stride, gamma, out, head_dim, n_rot, epsilon, theta_scale,
             k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, mrope_table(), rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_qsa_rms_norm_rope_owned(const float* x, int in_stride, const float* gamma, float* out,
+                              int rows, int head_dim, int n_rot, float epsilon,
+                              const RopeScaling& scaling, const int* positions, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
+        (head_dim != 128 && head_dim != 256) || in_stride < head_dim || n_rot != 64 ||
+        !std::isfinite(epsilon) || epsilon < 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr ||
+        reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(gamma) % 4 ||
+        reinterpret_cast<uintptr_t>(out) % 4 || reinterpret_cast<uintptr_t>(positions) % 4) {
+        throw std::invalid_argument("native_qsa_rms_norm_rope: invalid arguments");
+    }
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
+    const RopeKernelArgs k = scaling.kernel_args(n_rot);
+    const RopeTab rt = rope_table_for(scaling);
+    if (rt.cos != nullptr)
+        norm_rope_kernel<true><<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, in_stride, gamma, out, head_dim, n_rot, epsilon, theta_scale,
+            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, position_table, rt);
+    else
+        norm_rope_kernel<false><<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, in_stride, gamma, out, head_dim, n_rot, epsilon, theta_scale,
+            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, position_table, rt);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

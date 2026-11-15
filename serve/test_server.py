@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import shutil
 import socket
 import sys
@@ -39,6 +40,858 @@ class RecordingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_max_new = max_new
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class OwnedObservationBudget(unittest.TestCase):
+    def test_observation_budget_is_not_native_context_admission(self):
+        from serve.two_slot_receipts import OwnedSlotObservations, history_digest
+        for budget in (64, 65, 32768, 524288):
+            with self.subTest(budget=budget):
+                observations = OwnedSlotObservations()
+                observations.register(0, "0123456789ab", [1, 2], budget)
+                observations.observe("BOWN_ACCEPT " + json.dumps({
+                    "slot": 0, "request": "0123456789ab", "occupancy": 7,
+                    "input_count": 2, "input_sha256": history_digest([1, 2]), "full_budget": budget}))
+                self.assertFalse(observations.failed)
+                self.assertEqual(observations.stop(0, "0123456789ab"), "BSTOP 0 occupancy=7")
+        for budget in (0, -1, True, False, 1.0, "65", None):
+            with self.subTest(invalid=budget), self.assertRaises(ValueError):
+                OwnedSlotObservations().register(0, "0123456789ab", [1, 2], budget)
+
+    def test_large_budget_still_requires_exact_native_binding(self):
+        from serve.two_slot_receipts import OwnedSlotObservations, history_digest
+        for changed in ({"full_budget": 32767}, {"input_count": 1},
+                        {"input_sha256": history_digest([1, 3])}, {"request": "0123456789ac"}):
+            observations = OwnedSlotObservations()
+            observations.register(0, "0123456789ab", [1, 2], 32768)
+            observations.observe("BOWN_ACCEPT " + json.dumps({
+                "slot": 0, "request": "0123456789ab", "occupancy": 7,
+                "input_count": 2, "input_sha256": history_digest([1, 2]), "full_budget": 32768, **changed}))
+            self.assertTrue(observations.failed)
+            with self.assertRaises(ValueError):
+                observations.stop(0, "0123456789ab")
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and hasattr(os, "memfd_create"), "Linux sealed transport boundary")
+class OwnedImageTransport(unittest.TestCase):
+    """Actual server helper + real synthetic memfd; engine/root/device is a
+    recording protocol boundary, NOT a genuine native ownership/fit claim.
+    """
+    @staticmethod
+    def complete(generator):
+        while True:
+            try:
+                next(generator)
+            except StopIteration as done:
+                return done.value
+
+    def make(self, directory, mode="ok", *, blob=None, image_tokens=2, copies=1):
+        import queue
+        import struct
+        import subprocess
+        fcntl = getattr(subprocess, "fcntl", None)
+        if fcntl is None or sys.implementation.name != "cpython" or not (3, 11) <= sys.version_info[:2] <= (3, 14):
+            self.fail("unsupported producer profile; no positive qualification")
+        if blob is None:
+            blob = struct.pack("<5i8f", 0x31455653, 2, 2, 1, 4, *range(8))
+        source = Path(directory) / "encoded.sve1"
+        source.write_bytes(blob)
+        paid_blob = blob*copies
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.wlock = threading.Lock()
+        engine.gen, engine.ended, engine._stdin_closing = 1, False, False
+        engine.info = {"owned_image_prepare": 1, "owned_image_control_bytes": 12*(1024+64*8)+256*64+8*(4096+128)+2*4096+2*(128+32*8+64+32*80)+6*80+3*(256+256*2*8+64*80)+(1024+2*64*8)+3*80+3*(80+3*80)+(128+7*8+64+7*80)+(2*128+128+128+128+16+2*8+8+1024)+8*80+2*8*128+128+80+5*80+(16+8+4+8+8+16)*8}
+        events, state = [], SimpleNamespace(producer=None, borrower=None, code=None)
+        epoch = SimpleNamespace(gen=1, lines=queue.Queue(), slots=SimpleNamespace(slot_q=[queue.Queue(), queue.Queue()]))
+        def wait(timeout=None):
+            if mode == "hung":
+                raise subprocess.TimeoutExpired("recording child", timeout)
+            if state.producer is not None:
+                os.fstat(state.producer)  # held through observed child termination
+            if state.borrower is not None:
+                os.close(state.borrower)
+                state.borrower = None
+            state.code = -6
+            events.append("observed_child_exit")
+            return state.code
+        epoch.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: state.code, wait=wait)
+        engine.proc, engine._epoch = epoch.proc, epoch
+        def send(command, **kwargs):
+            self.assertEqual(kwargs.get("born"), epoch.gen)
+            words = command.split()
+            events.append(words[0])
+            if words[0] == "BIPREP":
+                self.assertIsNone(state.producer)
+                self.assertEqual((int(words[2]), int(words[3]), int(words[4])), (32768, image_tokens*copies+1, len(paid_blob)))
+                epoch.lines.put("BIPAY 0 request=012345abcdef ok=0" if mode == "refuse" else
+                    f"BIPAY 0 request=012345abcdef incarnation=7 bytes={len(paid_blob)} tokens={image_tokens*copies+1} budget=32768")
+            elif words[0] == "BGENI":
+                if mode in ("rewrite", "nonregular", "pending", "writer", "mapped", "lostlease", "partial", "preexisting"):
+                    # A guard-removal regression must fail promptly, not wait
+                    # for an ACK from a borrower this case must never create.
+                    raise EngineDied("Source guard unexpectedly submitted an image")
+                path = next(word for word in words if word.startswith("/proc/"))
+                state.producer = int(path.rsplit("/", 1)[1])
+                state.borrower = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+                seals = fcntl.F_SEAL_WRITE|fcntl.F_SEAL_GROW|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_SEAL
+                self.assertEqual(fcntl.fcntl(state.borrower, fcntl.F_GET_SEALS) & seals, seals)
+                self.assertEqual(os.read(state.borrower, len(paid_blob)+1), paid_blob)
+                with self.assertRaises(OSError):
+                    os.write(state.producer, b"x")
+                if mode in ("lost", "hung"):
+                    raise EngineDied("recorded lost capture proof")
+                if mode != "delayed":
+                    os.close(state.borrower)
+                    state.borrower = None
+                    events.append("borrower_closed")
+                    epoch.lines.put("BICAPTURED 0 request=012345abcdef incarnation="+
+                                    ("8" if mode == "foreign" else "7")+" ok=1")
+            elif words[0] == "BICLOSE":
+                with self.assertRaises(OSError):
+                    os.fstat(state.producer)
+                if mode in ("rewrite", "nonregular", "pending", "writer", "mapped", "lostlease", "partial", "preexisting"):
+                    self.assertNotIn("BGENI", events)
+                    self.assertIsNone(state.borrower)
+                    self.assertEqual(command, "BICLOSE 0 request=012345abcdef incarnation=7 cancel=1")
+                    events.append("cancelled_before_submit")
+                else:
+                    self.assertIn("borrower_closed", events)
+                epoch.lines.put("BICLOSED 0 request=012345abcdef incarnation=7 ready="+
+                                ("0" if "cancel=1" in words else "1"))
+            else:
+                self.fail("unexpected transport control "+command)
+        engine._send = send
+        return engine, epoch, [(str(source), image_tokens)]*copies, state, events
+
+    def _same_epoch_batch(self, directory, control, pause="BIPAY"):
+        """Actual Python caller/lock/transport; native protocol/slot output recorded.
+        One engine/epoch/queue, no fabricated payment root or native authority.
+        """
+        import dataclasses
+        import queue
+        import struct
+        import subprocess
+        from serve.server import _EngineEpoch
+        from serve.test_engine_epoch import batch_engine, replace
+        from serve.two_slot_receipts import OwnedSlotObservations
+        source = Path(directory)/"shared.sve1"
+        blob = struct.pack("<5i8f", 0x31455653, 2, 2, 1, 4, *range(8))
+        source.write_bytes(blob)
+        e = batch_engine()
+        del e._take_control  # Actual cancellation/deadline-aware admission.
+        e.ctl, e.slot_busy = control, [False, False]
+        e._shorter_waiting = lambda plen: False
+        e.info = {"owned_image_prepare": 1, "owned_image_control_bytes": 121248}
+        epoch = dataclasses.replace(e._capture_epoch(), strict_owned=True)
+        self.assertIsInstance(epoch, _EngineEpoch)
+        epoch.slots.owned_observations = OwnedSlotObservations()
+        e._epoch = epoch
+        state = SimpleNamespace(epoch=epoch, source=[(str(source), 2)], frames=[], reads=[], records={},
+                                pending=None, paused=False, phase=None, on_vram=None, on_ready=None,
+                                vram_reply="VRAM expert_slots=1 expert_cache_mib=2 expert_cache_full_mib=3 vram_free_mib=4",
+                                restarts=[])
+        raw_get, original_send = queue.Queue.get.__get__(epoch.lines), e._send
+        ticks = iter(range(0, 1000000, 20))
+        state.clock = lambda: next(ticks)
+        def get(*args, _raw_get=raw_get, **kwargs):
+            line = _raw_get(block=False)
+            state.reads.append((threading.get_ident(), line))
+            return line
+        epoch.lines.get = get  # Empty drives the actual heartbeat, no sleep.
+        def admit(slot):
+            epoch.lines.put("DONE 0 3 0 0 length")
+            reply(f"BADM {slot} 1", slot)
+            epoch.slots.slot_q[slot].put(f"BT {slot} {7+2*slot}")
+        def publish(line, slot):
+            epoch.lines.put(line)
+            if line.startswith("BICLOSED ") and line.endswith("ready=1"):
+                admit(slot)
+        def reply(line, slot):
+            record = state.records[slot]
+            if record["request"] == "aaaaaaaaaaaa" and line.split()[0] == pause and not state.paused:
+                state.paused, state.phase, state.pending = True, pause, (line, slot)
+            else:
+                publish(line, slot)
+        def release():
+            self.assertIsNotNone(state.pending)
+            line, slot = state.pending
+            state.pending = None
+            publish(line, slot)
+        state.release = release
+        def send(frame, **kwargs):
+            original_send(frame, **kwargs)  # Real captured-process writer fence.
+            state.frames.append(frame)
+            words = frame.split()
+            if words[0] == "BIPREP":
+                slot = int(words[1])
+                request = words[-1].split("=", 1)[1]
+                self.assertEqual((int(words[2]), int(words[3]), int(words[4])), (32768, 3, len(blob)))
+                self.assertNotIn(slot, state.records)
+                state.records[slot] = {"request": request, "incarnation": 7+slot, "producer": None}
+                reply(f"BIPAY {slot} request={request} incarnation={7+slot} bytes={len(blob)} tokens=3 budget=32768", slot)
+            elif words[0] == "BGENI":
+                slot = int(words[1]); record = state.records[slot]
+                path = next(word for word in words if word.startswith("/proc/"))
+                record["producer"] = int(path.rsplit("/", 1)[1])
+                borrowed = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    seals = subprocess.fcntl.F_SEAL_WRITE | subprocess.fcntl.F_SEAL_GROW | subprocess.fcntl.F_SEAL_SHRINK | subprocess.fcntl.F_SEAL_SEAL
+                    self.assertEqual(subprocess.fcntl.fcntl(borrowed, subprocess.fcntl.F_GET_SEALS) & seals, seals)
+                    self.assertEqual(os.read(borrowed, len(blob)+1), blob)
+                finally:
+                    os.close(borrowed)  # actual borrower close BEFORE capture ACK
+                reply(f"BICAPTURED {slot} request={record['request']} incarnation={record['incarnation']} ok=1", slot)
+            elif words[0] == "BICLOSE":
+                slot = int(words[1]); record = state.records[slot]
+                self.assertIn(f"request={record['request']}", words)
+                self.assertIn(f"incarnation={record['incarnation']}", words)
+                if record["producer"] is not None:
+                    with self.assertRaises(OSError):
+                        os.fstat(record["producer"])
+                ready = 0 if "cancel=1" in words else 1
+                reply(f"BICLOSED {slot} request={record['request']} incarnation={record['incarnation']} ready={ready}", slot)
+            elif words[0] == "VRAM":
+                reply_queue = epoch.lines  # response belongs to the process that received this command
+                if state.on_vram is not None:
+                    state.on_vram()
+                reply_queue.put(state.vram_reply)
+            else:
+                self.fail("unexpected same-epoch recording input "+frame)
+        e._send = send
+        def restart():
+            nonlocal epoch
+            # Engine process/READY endpoint is recorded; actual capture logic,
+            # persistent lock, queue identity and generation fencing are real.
+            with e.wlock, e._state_lock():
+                replace(e)
+                e.slot_busy, e.slot_claims = [False, False], set()
+                e.slot_held, e.slot_live, e.slot_used = [[], []], [None, None], [0, 0]
+                e._stdin_closing, e._stdin_failed, e.unloaded = False, False, False
+                epoch = dataclasses.replace(e._capture_epoch(), strict_owned=True)
+                epoch.slots.owned_observations = OwnedSlotObservations()
+                e._epoch, state.epoch = epoch, epoch
+                new_get = queue.Queue.get.__get__(epoch.lines)
+                epoch.lines.get = lambda *args, **kwargs: get(*args, _raw_get=new_get, **kwargs)
+                state.records.clear()
+                state.pending, state.paused, state.phase = None, False, None
+                state.restarts.append((epoch.gen, id(epoch.proc), id(epoch.lines)))
+            if state.on_ready is not None:
+                state.on_ready()  # NEW epoch already observable as alive, before reserve restoration
+        e.restart = restart
+        def cancel(request):
+            value = threading.Event(); value._strata_request_id = request
+            return value
+        state.cancel = cancel
+        def generator(request):
+            value = cancel(request)
+            return e.generate_batched([1, 1, 2], 32768, {}, value, embeddings=state.source), value
+        state.generator = generator
+        state.finish = lambda slot: epoch.slots.slot_q[slot].put(f"BDONE {slot} 1 length 0")
+        def abort():
+            epoch.lines.put(None)
+            for channel in epoch.slots.slot_q:
+                channel.put(None)
+        state.abort = abort
+        return e, state
+
+    def test_owner_encoding_is_cache_free_and_matches_actual_native_abi(self):
+        def exercise():
+            import struct
+            import subprocess
+            with tempfile.TemporaryDirectory() as directory:
+                engine, epoch, sources, _, events = self.make(directory)
+                # Independent test oracle prepared before blocking module APIs.
+                native_owner = struct.Struct("@ii")
+                expected = native_owner.pack(0, threading.get_native_id())
+                zero = native_owner.pack(0, 0)
+                actual_fcntl = subprocess.fcntl.fcntl
+                owners = []
+                def observed(fd, command, argument=0):
+                    if command == 15:
+                        owners.append(argument)
+                        self.assertEqual(argument, expected if len(owners) == 1 else zero)
+                    return actual_fcntl(fd, command, argument)
+                with contextlib.ExitStack() as stack:
+                    for name in ("pack", "unpack", "calcsize", "Struct"):
+                        stack.enter_context(mock.patch("serve.server.struct."+name,
+                            side_effect=AssertionError("readlease used a compiled format")))
+                    stack.enter_context(mock.patch("serve.server.subprocess.fcntl.fcntl", side_effect=observed))
+                    self.assertEqual(self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                        32768, " http_request=012345abcdef", sources, threading.Event())), 7)
+                self.assertEqual(owners, [expected, zero])
+                self.assertEqual(events, ["BIPREP", "BGENI", "borrower_closed", "BICLOSE"])
+        self._lease_case(exercise)
+
+    def test_refused_payment_uses_no_format_or_source_encoding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, epoch, sources, _, events = self.make(directory, "refuse")
+            with contextlib.ExitStack() as stack:
+                for name in ("pack", "unpack", "calcsize", "Struct"):
+                    stack.enter_context(mock.patch("serve.server.struct."+name,
+                        side_effect=AssertionError("unpaid compiled format")))
+                copy = stack.enter_context(mock.patch.object(engine, "_copy_owned_image_source"))
+                create = stack.enter_context(mock.patch("serve.server.os.memfd_create"))
+                self.assertIsNone(self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                    32768, " http_request=012345abcdef", sources, threading.Event())))
+                copy.assert_not_called()
+                create.assert_not_called()
+            self.assertEqual(events, ["BIPREP"])
+
+    def test_sealed_paid_capture_then_actual_producer_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, epoch, sources, state, events = self.make(directory)
+            actual = os.memfd_create
+            def create(*args):
+                self.assertEqual(events, ["BIPREP"])
+                return actual(*args)
+            with mock.patch("serve.server.os.memfd_create", side_effect=create):
+                value = self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                    32768, " http_request=012345abcdef", sources, threading.Event()))
+            self.assertEqual(value, 7)
+            self.assertLess(events.index("borrower_closed"), events.index("BICLOSE"))
+            self.assertFalse(epoch.proc.stdin.closed)
+            with self.assertRaises(OSError):
+                os.fstat(state.producer)
+
+    def _lease_case(self, action, expected_exit=0):
+        """Own one isolated kernel/signal test group; always kill+reap it."""
+        native = sys.modules["_signal"]
+        handled = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+        prior = native.pthread_sigmask(signal.SIG_BLOCK, ())
+        handlers = {signum: signal.getsignal(signum) for signum in handled}
+        pid = None
+        outcome = None
+        def interrupted(signum, frame):
+            raise SystemExit(128+signum)
+        try:
+            native.pthread_sigmask(signal.SIG_BLOCK, handled)
+            for signum in handled:
+                signal.signal(signum, interrupted)
+            pid = os.fork()  # blocked until this exact child is cleanup-owned
+            if pid == 0:
+                try:
+                    os.setsid()
+                    for signum, handler in handlers.items():
+                        signal.signal(signum, handler)
+                    native.pthread_sigmask(signal.SIG_SETMASK, prior)
+                    action()
+                except BaseException:
+                    import traceback
+                    traceback.print_exc()
+                    os._exit(1)
+                os._exit(0)
+            native.pthread_sigmask(signal.SIG_SETMASK, prior)
+            until = time.monotonic()+10
+            while True:
+                status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if status is not None:
+                    outcome = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+                    break
+                if time.monotonic() >= until:
+                    self.fail("owned source-lease child exceeded its bound")
+                time.sleep(0.005)  # bounded child pickup, not a race trigger
+        finally:
+            native.pthread_sigmask(signal.SIG_BLOCK, handled)
+            if pid is not None and pid > 0:
+                # WNOWAIT retains the PID through group retirement and reap.
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # child may not yet have completed setsid
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(pid, 0)
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+            native.pthread_sigmask(signal.SIG_SETMASK, prior)
+        self.assertEqual(outcome, expected_exit)
+
+    def _assert_source_lease_refusal(self, mode, *, directory=None, receipt=None):
+        import errno
+        import mmap
+        import struct
+        import subprocess
+        native, fcntl = sys.modules["_signal"], subprocess.fcntl
+        with (tempfile.TemporaryDirectory() if directory is None else contextlib.nullcontext(directory)) as directory:
+            blob = struct.pack("<5i", 0x31455653, 128, 16, 8, 2560)+struct.pack("<f", 1.0)*(128*2560)
+            self.assertGreater(len(blob), 1 << 20)
+            engine, epoch, sources, state, events = self.make(directory, mode, blob=blob, image_tokens=128)
+            source = sources[0][0]
+            if mode == "pending":
+                self.assertIsNotNone(receipt)
+                original_send = engine._send
+                def send(command, **kwargs):
+                    if command.startswith("BGENI "):
+                        os.write(receipt, b"BGENI\n")
+                    if command.startswith("BICLOSE "):
+                        os.write(receipt, b"normal_cancel\n")
+                    return original_send(command, **kwargs)
+                engine._send = send
+            actual_create, actual_copy, actual_open, actual_close, actual_fcntl = os.memfd_create, os.sendfile, os.open, os.close, fcntl.fcntl
+            opened, chunks, acquisitions, cleared = [], [], [], []
+            external = mapped = None
+            original_mask = native.pthread_sigmask(signal.SIG_BLOCK, ())
+            try:
+                if mode in ("writer", "mapped"):
+                    external = actual_open(source, os.O_RDWR | os.O_CLOEXEC)
+                    if mode == "mapped":
+                        mapped = mmap.mmap(external, 0, access=mmap.ACCESS_WRITE)
+                        actual_close(external)
+                        external = None  # writable mapping STILL retains the file
+                if mode == "preexisting":
+                    native.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGIO})
+                    signal.pthread_kill(threading.get_ident(), signal.SIGIO)
+                prior = native.pthread_sigmask(signal.SIG_BLOCK, ())
+                def create(*args):
+                    self.assertEqual(events, ["BIPREP"])
+                    state.producer = actual_create(*args)
+                    return state.producer
+                def source_open(path, flags, *args, **kwargs):
+                    result = actual_open(path, flags, *args, **kwargs)
+                    if os.fspath(path) == source and flags & os.O_ACCMODE == os.O_RDONLY:
+                        opened.append(result)
+                    return result
+                def control(fd, command, argument=0):
+                    if command == fcntl.F_SETLEASE and argument == fcntl.F_RDLCK:
+                        acquisitions.append(fd)
+                    result = actual_fcntl(fd, command, argument)
+                    if command == 15 and struct.unpack("@ii", argument) == (0, 0):
+                        self.assertEqual(struct.unpack("@ii", actual_fcntl(fd, 16, argument)), (0, 0))
+                        cleared.append(fd)
+                    if mode == "partial" and command == fcntl.F_SETLEASE and argument == fcntl.F_RDLCK:
+                        raise OSError(errno.EIO, "fault after genuine grant")
+                    return result
+                def close(fd):
+                    if fd in opened and mode != "preexisting":
+                        self.assertIn(fd, cleared)
+                    result = actual_close(fd)
+                    if mode == "pending" and fd in opened:
+                        self.assertNotIn("BGENI", events)
+                        os.write(receipt, b"owner_zero_source_closed\n")
+                    return result
+                def copy(destination, fd, offset, count):
+                    count = actual_copy(destination, fd, offset, count)
+                    chunks.append(count)
+                    if len(chunks) == 1:
+                        self.assertEqual((offset, count), (0, 1 << 20))
+                        if mode == "pending":
+                            with self.assertRaises(BlockingIOError) as blocked:
+                                actual_open(source, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                            self.assertIn(blocked.exception.errno, (errno.EAGAIN, errno.EWOULDBLOCK))
+                            self.assertEqual(actual_fcntl(fd, fcntl.F_GETLEASE), fcntl.F_UNLCK)
+                            self.assertIn(signal.SIGIO, native.sigpending())
+                            self.assertNotIn("BGENI", events)
+                            os.write(receipt, b"real_pending_break\n")
+                        elif mode == "lostlease":
+                            actual_fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)  # real loss, not fake GETLEASE
+                    return count
+                expected = ("already has pending SIGIO" if mode == "preexisting" else
+                            "lease unavailable" if mode in ("writer", "mapped", "partial") else "lease broken")
+                with mock.patch("serve.server.os.memfd_create", side_effect=create), \
+                        mock.patch("serve.server.os.open", side_effect=source_open), \
+                        mock.patch("serve.server.os.close", side_effect=close), \
+                        mock.patch("serve.server.os.sendfile", side_effect=copy), \
+                        mock.patch.object(fcntl, "fcntl", side_effect=control):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1]*128+[2],
+                            32768, " http_request=012345abcdef", sources, threading.Event()))
+                if mode == "pending":
+                    self.fail("notification-bearing break returned instead of fail-stopping")
+                self.assertEqual(native.pthread_sigmask(signal.SIG_BLOCK, ()), prior)
+                if mode == "preexisting":
+                    self.assertIn(signal.SIGIO, native.sigpending())
+                    self.assertEqual(native.sigtimedwait({signal.SIGIO}, 0).si_signo, signal.SIGIO)
+                else:
+                    self.assertNotIn(signal.SIGIO, native.sigpending())
+                self.assertEqual(len(acquisitions), 0 if mode == "preexisting" else 1)  # never reacquire
+                self.assertEqual(events, ["BIPREP", "BICLOSE", "cancelled_before_submit"])
+                self.assertTrue(epoch.lines.empty())
+                self.assertFalse(epoch.proc.stdin.closed)
+                if mode in ("writer", "mapped", "partial", "preexisting"):
+                    self.assertEqual(chunks, [])
+                else:
+                    self.assertGreaterEqual(len(chunks), 2)
+                    self.assertEqual(sum(chunks), len(blob))
+                self.assertEqual(len(opened), 1)
+                for fd in (state.producer, opened[0]):
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+            finally:
+                if mapped is not None:
+                    mapped.close()
+                if external is not None:
+                    actual_close(external)
+                native.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+    def test_pending_source_writer_break_failstops_before_submission(self):
+        # Parent owns the workspace even when the child exits without unwind.
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory)/"pending.receipt"
+            with receipt.open("wb", buffering=0) as report:
+                try:
+                    self._lease_case(lambda: self._assert_source_lease_refusal("pending",
+                        directory=directory, receipt=report.fileno()), expected_exit=72)
+                finally:
+                    self.assertEqual(receipt.read_bytes(), b"real_pending_break\nowner_zero_source_closed\n")
+
+    def test_existing_source_writer_refuses_before_copy(self):
+        self._lease_case(lambda: self._assert_source_lease_refusal("writer"))
+
+    def test_retained_writable_mapping_refuses_after_original_fd_close(self):
+        self._lease_case(lambda: self._assert_source_lease_refusal("mapped"))
+
+    def test_actual_source_lease_loss_never_reacquires(self):
+        self._lease_case(lambda: self._assert_source_lease_refusal("lostlease"))
+
+    def test_partial_native_lease_setup_retires_before_cancel(self):
+        self._lease_case(lambda: self._assert_source_lease_refusal("partial"))
+
+    def test_preexisting_thread_sigio_is_not_consumed(self):
+        self._lease_case(lambda: self._assert_source_lease_refusal("preexisting"))
+
+    def test_regular_cached_source_repeat_and_multiple_images(self):
+        def exercise():
+            with tempfile.TemporaryDirectory() as directory:
+                engine, epoch, sources, state, events = self.make(directory, copies=2)
+                source = Path(sources[0][0])
+                identity = source.stat()
+                for _ in range(2):
+                    state.producer = None
+                    events.clear()
+                    self.assertEqual(self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 1, 1, 2],
+                        32768, " http_request=012345abcdef", sources, threading.Event())), 7)
+                    self.assertEqual((source.stat().st_dev, source.stat().st_ino), (identity.st_dev, identity.st_ino))
+                    self.assertEqual(events, ["BIPREP", "BGENI", "borrower_closed", "BICLOSE"])
+                    self.assertTrue(epoch.lines.empty())
+                    with self.assertRaises(OSError):
+                        os.fstat(state.producer)
+        self._lease_case(exercise)
+
+    def test_two_workers_keep_notification_owners_and_prior_masks_separate(self):
+        def exercise():
+            import struct
+            import subprocess
+            native = sys.modules["_signal"]
+            with tempfile.TemporaryDirectory() as directory:
+                blob = struct.pack("<5i", 0x31455653, 128, 16, 8, 2560)+struct.pack("<f", 1.0)*(128*2560)
+                cases = [self.make(directory, "lostlease", blob=blob, image_tokens=128) for _ in range(2)]
+                states, errors = {}, [None, None]
+                priors, tids = [None, None], [None, None]
+                barrier = threading.Barrier(2)
+                actual_create, actual_copy = os.memfd_create, os.sendfile
+                fcntl, actual_control = subprocess.fcntl, subprocess.fcntl.fcntl
+                def create(*args):
+                    state = states[threading.get_ident()]
+                    state.producer = actual_create(*args)
+                    return state.producer
+                def copy(destination, fd, offset, count):
+                    result = actual_copy(destination, fd, offset, count)
+                    if offset == 0:
+                        self.assertEqual(actual_control(fd, 16, b"\0"*8),
+                                         struct.pack("@ii", 0, threading.get_native_id()))
+                        self.assertEqual(actual_control(fd, fcntl.F_GETSIG), signal.SIGIO)
+                        self.assertEqual(actual_control(fd, fcntl.F_GETLEASE), fcntl.F_RDLCK)
+                        barrier.wait(timeout=3)  # both real owners/FDs are live
+                        actual_control(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+                        self.assertEqual(actual_control(fd, fcntl.F_GETLEASE), fcntl.F_UNLCK)
+                        self.assertNotIn(signal.SIGIO, native.sigpending())
+                        barrier.wait(timeout=3)
+                    return result
+                def worker(index):
+                    saved = native.pthread_sigmask(signal.SIG_BLOCK, ())
+                    try:
+                        native.pthread_sigmask(signal.SIG_BLOCK if index else signal.SIG_UNBLOCK,
+                                               {signal.SIGUSR1})
+                        prior = native.pthread_sigmask(signal.SIG_BLOCK, ())
+                        priors[index], tids[index] = prior, threading.get_native_id()
+                        engine, epoch, sources, state, events = cases[index]
+                        states[threading.get_ident()] = state
+                        with self.assertRaisesRegex(ValueError, "lease broken"):
+                            self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1]*128+[2],
+                                32768, " http_request=012345abcdef", sources, threading.Event()))
+                        self.assertEqual(native.pthread_sigmask(signal.SIG_BLOCK, ()), prior)
+                        self.assertNotIn(signal.SIGIO, native.sigpending())
+                        self.assertEqual(events, ["BIPREP", "BICLOSE", "cancelled_before_submit"])
+                        self.assertTrue(epoch.lines.empty())
+                    except BaseException as error:
+                        errors[index] = error
+                    finally:
+                        native.pthread_sigmask(signal.SIG_SETMASK, saved)
+                with mock.patch("serve.server.os.memfd_create", side_effect=create), \
+                        mock.patch("serve.server.os.sendfile", side_effect=copy):
+                    workers = [threading.Thread(target=worker, args=(index,), name=f"source-lease-{index}", daemon=True) for index in range(2)]
+                    for worker_thread in workers:
+                        worker_thread.start()
+                    for worker_thread in workers:
+                        worker_thread.join(timeout=5)
+                    self.assertTrue(all(not worker_thread.is_alive() for worker_thread in workers))
+                for error in errors:
+                    if error is not None:
+                        raise error
+                self.assertEqual(len(set(tids)), 2)
+                self.assertNotIn(signal.SIGUSR1, priors[0])
+                self.assertIn(signal.SIGUSR1, priors[1])
+                # Check retired numeric FDs only after both workers joined;
+                # no other worker can now borrow that number for a fresh open.
+                for _, _, _, state, _ in cases:
+                    with self.assertRaises(OSError):
+                        os.fstat(state.producer)
+        self._lease_case(exercise)
+
+    def _uncertain_source_lease(self, mode, directory):
+        import errno
+        import struct
+        import subprocess
+        engine, epoch, sources, state, events = self.make(directory)
+        fcntl = subprocess.fcntl
+        actual_control, actual_copy = fcntl.fcntl, os.sendfile
+        def control(fd, command, argument=0):
+            if command == 15 and struct.unpack("@ii", argument) == (0, 0):
+                raise OSError(errno.EIO, "uncertain owner clear")
+            return actual_control(fd, command, argument)
+        def copy(destination, source_fd, offset, count):
+            result = actual_copy(destination, source_fd, offset, count)
+            signal.pthread_kill(threading.get_ident(), signal.SIGIO)  # real foreign SI_TKILL, not owned POLL_MSG
+            return result
+        target, replacement = (("serve.server.os.sendfile", copy) if mode == "foreign" else
+                               ("serve.server.subprocess.fcntl.fcntl", control))
+        with mock.patch(target, side_effect=replacement):
+            self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                32768, " http_request=012345abcdef", sources, threading.Event()))
+        self.fail("uncertain signal ownership returned instead of fail-stopping")
+
+    def test_uncertain_owner_clear_failstops_only_owned_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._lease_case(lambda: self._uncertain_source_lease("clear", directory), expected_exit=72)
+
+    def test_foreign_poll_msg_reused_fd_cannot_return_success(self):
+        import errno
+        import struct
+        import subprocess
+        native, fcntl = sys.modules["_signal"], subprocess.fcntl
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory)/"foreign.receipt"
+            def exercise(report):
+                engine, epoch, sources, _, events = self.make(directory)
+                foreign = Path(directory)/"foreign.source"
+                foreign.write_bytes(b"independent foreign lease")
+                actual_open, actual_close, actual_copy = os.open, os.close, os.sendfile
+                actual_control, actual_wait, original_send = fcntl.fcntl, native.sigtimedwait, engine._send
+                zero = struct.pack("@ii", 0, 0)
+                owner = struct.pack("@ii", 0, threading.get_native_id())
+                native.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGIO})
+                self.assertNotIn(signal.SIGIO, native.sigpending())
+                number = actual_open(foreign, os.O_RDONLY | os.O_CLOEXEC)
+                duplicate, original_held = None, True
+                grants, cleared = [], []
+                def mark(value):
+                    self.assertEqual(os.write(report, value), len(value))
+                try:
+                    actual_control(number, 15, owner)
+                    actual_control(number, fcntl.F_SETSIG, signal.SIGIO)
+                    self.assertEqual(actual_control(number, fcntl.F_SETLEASE, fcntl.F_RDLCK), 0)
+                    duplicate = os.dup(number)  # genuinely retains that open description
+                    self.assertEqual(actual_control(duplicate, fcntl.F_GETLEASE), fcntl.F_RDLCK)
+                    self.assertEqual(actual_control(duplicate, 16, zero), owner)
+                    mark(b"foreign_lease_retained\n")
+                    def waited(watched, timeout):
+                        # Installed only after production profile checks. Forward
+                        # the actual native result: never manufacture a record.
+                        notification = actual_wait(watched, timeout)
+                        self.assertIsNotNone(notification)
+                        self.assertEqual((notification.si_signo, notification.si_code, notification.si_status),
+                                         (signal.SIGIO, 3, number))
+                        self.assertEqual(grants, [number])
+                        self.assertEqual(cleared, [number])
+                        with self.assertRaises(OSError) as closed:
+                            os.fstat(number)
+                        self.assertEqual(closed.exception.errno, errno.EBADF)
+                        self.assertNotIn("BGENI", events)
+                        mark(b"real_aliased_poll_msg_after_target_close\n")
+                        return notification
+                    def opened(path, flags, *args, **kwargs):
+                        nonlocal original_held
+                        if os.fspath(path) != sources[0][0] or flags & os.O_ACCMODE != os.O_RDONLY:
+                            return actual_open(path, flags, *args, **kwargs)
+                        # Hold N through memfd creation; close it immediately
+                        # before the real target open, with no intervening open.
+                        self.assertTrue(original_held)
+                        self.assertEqual(events, ["BIPREP"])
+                        original_held = False
+                        actual_close(number)
+                        result = actual_open(path, flags, *args, **kwargs)
+                        self.assertEqual(result, number)
+                        stack.enter_context(mock.patch.object(native, "sigtimedwait", side_effect=waited))
+                        mark(b"target_reused_foreign_fd\n")
+                        return result
+                    def control(fd, command, argument=0):
+                        result = actual_control(fd, command, argument)
+                        if fd == number and command == fcntl.F_SETLEASE and argument == fcntl.F_RDLCK:
+                            grants.append(fd)
+                        if fd == number and command == 15 and argument == zero:
+                            self.assertEqual(actual_control(fd, 16, zero), zero)
+                            cleared.append(fd)
+                        return result
+                    def copied(destination, fd, offset, count):
+                        self.assertEqual(fd, number)
+                        self.assertEqual(offset, 0)
+                        self.assertEqual(actual_control(fd, fcntl.F_GETLEASE), fcntl.F_RDLCK)
+                        self.assertNotIn(signal.SIGIO, native.sigpending())
+                        result = actual_copy(destination, fd, offset, count)
+                        with self.assertRaises(BlockingIOError) as blocked:
+                            actual_open(foreign, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                        self.assertIn(blocked.exception.errno, (errno.EAGAIN, errno.EWOULDBLOCK))
+                        self.assertEqual(actual_control(duplicate, fcntl.F_GETLEASE), fcntl.F_UNLCK)
+                        self.assertEqual(actual_control(fd, fcntl.F_GETLEASE), fcntl.F_RDLCK)
+                        self.assertIn(signal.SIGIO, native.sigpending())
+                        mark(b"foreign_break_target_intact\n")
+                        return result
+                    def send(command, **kwargs):
+                        if command.startswith("BGENI "):
+                            mark(b"BGENI\n")
+                        return original_send(command, **kwargs)
+                    engine._send = send
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(mock.patch("serve.server.os.open", side_effect=opened))
+                        stack.enter_context(mock.patch("serve.server.os.sendfile", side_effect=copied))
+                        stack.enter_context(mock.patch.object(fcntl, "fcntl", side_effect=control))
+                        self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                            32768, " http_request=012345abcdef", sources, threading.Event()))
+                    self.fail("foreign aliased POLL_MSG returned instead of fail-stopping")
+                finally:
+                    # Expected _exit72 never unwinds; process exit closes M.
+                    # On setup/old-guard failure, retire only still-owned FDs.
+                    if duplicate is not None:
+                        actual_control(duplicate, 15, zero)
+                        actual_control(duplicate, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+                        actual_close(duplicate)
+                    if original_held:
+                        actual_close(number)
+            with receipt.open("wb", buffering=0) as report:
+                try:
+                    self._lease_case(lambda: exercise(report.fileno()), expected_exit=72)
+                finally:
+                    self.assertEqual(receipt.read_bytes(), b"foreign_lease_retained\ntarget_reused_foreign_fd\n"
+                        b"foreign_break_target_intact\nreal_aliased_poll_msg_after_target_close\n")
+
+    def test_foreign_pending_notification_cannot_return_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._lease_case(lambda: self._uncertain_source_lease("foreign", directory), expected_exit=72)
+
+    def test_nonregular_opened_source_cancels_before_submission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, epoch, sources, state, events = self.make(directory, "nonregular")
+            source = Path(sources[0][0])
+            actual_create, actual_open = os.memfd_create, os.open
+            source_descriptors = []
+            def create(*args):
+                self.assertEqual(events, ["BIPREP"])
+                state.producer = actual_create(*args)
+                return state.producer
+            def opened(path, flags, *args, **kwargs):
+                if path == str(source):
+                    self.assertEqual(events, ["BIPREP"])
+                    source.unlink()
+                    source.mkdir()  # real type replacement AFTER size preflight
+                    descriptor = actual_open(path, flags, *args, **kwargs)
+                    source_descriptors.append(descriptor)
+                    return descriptor
+                return actual_open(path, flags, *args, **kwargs)
+            with mock.patch("serve.server.os.memfd_create", side_effect=create), \
+                    mock.patch("serve.server.os.open", side_effect=opened), \
+                    mock.patch("serve.server.os.sendfile") as copy:
+                with self.assertRaisesRegex(ValueError, "Image source is not a regular file"):
+                    self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                        32768, " http_request=012345abcdef", sources, threading.Event()))
+                copy.assert_not_called()
+            self.assertEqual(len(source_descriptors), 1)
+            self.assertEqual(events, ["BIPREP", "BICLOSE", "cancelled_before_submit"])
+            self.assertTrue(epoch.lines.empty())
+            self.assertFalse(epoch.proc.stdin.closed)
+            for descriptor in (state.producer, source_descriptors[0]):
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_unsupported_source_metadata_shape_refuses_before_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, epoch, sources, _, events = self.make(directory)
+            unsupported = SimpleNamespace(n_sequence_fields=10, n_fields=33)
+            with mock.patch("serve.server.os.stat_result", unsupported), \
+                    mock.patch("serve.server.os.stat") as path_stat, \
+                    mock.patch("serve.server.os.memfd_create") as create:
+                with self.assertRaisesRegex(ValueError, "Owned image source metadata profile unavailable"):
+                    self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                        32768, " http_request=012345abcdef", sources, threading.Event()))
+                path_stat.assert_not_called()
+                create.assert_not_called()
+            self.assertEqual(events, [])
+
+    def test_refused_payment_never_creates_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, epoch, sources, _, events = self.make(directory, "refuse")
+            with mock.patch("serve.server.os.memfd_create") as create:
+                self.assertIsNone(self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                    32768, " http_request=012345abcdef", sources, threading.Event())))
+                create.assert_not_called()
+            self.assertEqual(events, ["BIPREP"])
+
+    def test_generator_close_pins_fd_until_real_capture_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, epoch, sources, state, events = self.make(directory, "delayed")
+            # Actual reply generator, deterministic clock and queue; no sleep.
+            # get_nowait delegates to get: retain the original bound method.
+            import queue
+            actual_get = queue.Queue.get.__get__(epoch.lines)
+            epoch.lines.get = lambda **kwargs: actual_get(block=False)
+            ticks = iter(range(0, 10000, 20))
+            generator = engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                32768, " http_request=012345abcdef", sources, threading.Event())
+            with mock.patch("serve.server.time.monotonic", side_effect=lambda: next(ticks)):
+                self.assertIsNone(next(generator))
+                os.fstat(state.producer)
+                os.close(state.borrower)
+                state.borrower = None
+                events.append("borrower_closed")
+                epoch.lines.put("BICAPTURED 0 request=012345abcdef incarnation=7 ok=1")
+                generator.close()
+            self.assertIn("BICLOSE", events)
+            self.assertFalse(epoch.proc.stdin.closed)
+            with self.assertRaises(OSError):
+                os.fstat(state.producer)
+
+    def test_foreign_or_lost_capture_proof_waits_for_exit_before_last_free(self):
+        for mode in ("foreign", "lost"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                engine, epoch, sources, state, events = self.make(directory, mode)
+                with self.assertRaises(EngineDied):
+                    self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                        32768, " http_request=012345abcdef", sources, threading.Event()))
+                self.assertTrue(epoch.proc.stdin.closed)
+                self.assertIn("observed_child_exit", events)
+                with self.assertRaises(OSError):
+                    os.fstat(state.producer)
+
+    def test_uncertain_child_retains_fd_and_blocks_replacement_until_exit(self):
+        from serve.server import EngineStuck
+        with tempfile.TemporaryDirectory() as directory:
+            engine, epoch, sources, state, _ = self.make(directory, "hung")
+            with self.assertRaises(EngineDied):
+                self.complete(engine._owned_image_delivery(epoch, 0, "012345abcdef", [1, 1, 2],
+                    32768, " http_request=012345abcdef", sources, threading.Event()))
+            try:
+                os.fstat(state.producer)
+                with self.assertRaises(EngineStuck):
+                    engine._reap_owned_image_transports(epoch)
+            finally:
+                if state.borrower is not None:
+                    os.close(state.borrower)
+                    state.borrower = None
+                state.code = -6
+                engine._reap_owned_image_transports(epoch)
+            with self.assertRaises(OSError):
+                os.fstat(state.producer)
 
 
 class MaxTokens(unittest.TestCase):
@@ -2673,6 +3526,7 @@ class NonFiniteLogits(unittest.TestCase):
         """StrataEngine.generate: `DONE ... nonfinite` raises EngineNonFinite after the tokens before it."""
         import queue as queue_
         eng = object.__new__(StrataEngine)
+        eng.wlock = threading.Lock()
         eng.lines = queue_.Queue()
         for line in ("T 5", "T 6", "DONE 2 3 1.0 2.0 nonfinite 0 0 0"):
             eng.lines.put(line)
@@ -3088,6 +3942,7 @@ class LiveRate(unittest.TestCase):
         import queue
         from types import SimpleNamespace
         engine = StrataEngine.__new__(StrataEngine)
+        engine.wlock = threading.Lock()
         engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it (#208)
         engine.lines = queue.Queue()
         engine.can_stop = False
@@ -5380,6 +6235,7 @@ class SilentEngine(unittest.TestCase):
         import io
         import queue
         engine = StrataEngine.__new__(StrataEngine)
+        engine.wlock = threading.Lock()
         engine.proc = mock.Mock()
         engine.proc.stdin = io.StringIO()
         engine.proc.poll.return_value = None

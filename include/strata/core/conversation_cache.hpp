@@ -6,6 +6,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdlib>
+#include <stdexcept>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -38,6 +42,91 @@ struct ConversationImageKey {
     bool operator==(const ConversationImageKey&) const = default;
 };
 
+// One portable allocation contains both the intrusive reference count and
+// checked completion. No implementation-private shared_ptr control block, weak
+// export, or late platform refusal. Public estimates charge sizeof this object
+// before the factory is called; host payload owners always wait before freeing.
+class ConversationPendingRef;
+struct ConversationPending {
+    using Join = bool (*)(const void*) noexcept;
+    using Probe = bool (*)(const void*) noexcept;
+    Join join = nullptr;
+    const void* key = nullptr;
+    void (*release)(uint64_t) = nullptr;
+    uint64_t tag = 0;
+    Probe probe = nullptr; // nonblocking sticky-error observation for a real D2D slot
+private:
+    friend class ConversationPendingRef;
+    std::atomic<size_t> refs_{1};
+    mutable std::atomic<unsigned> state_{0}; // pending / host-ready / failed / joining
+    std::atomic<bool> slot_ready_{false};
+    void add_ref() noexcept {
+        if(refs_.fetch_add(1,std::memory_order_relaxed)==SIZE_MAX)std::_Exit(1);
+    }
+    void drop_ref() noexcept {
+        if(refs_.fetch_sub(1,std::memory_order_acq_rel)==1)delete this;
+    }
+public:
+    ConversationPending(Join fn,const void* dst,void (*drop)(uint64_t)=nullptr,
+                        uint64_t id=0,Probe poll=nullptr) noexcept
+        :join(fn),key(dst),release(drop),tag(id),probe(poll){}
+    void wait() const noexcept {
+        for(;;){
+            unsigned expected=state_.load(std::memory_order_acquire);
+            if(expected==1)return;
+            if(expected==2)std::_Exit(1);
+            if(expected==0&&state_.compare_exchange_strong(expected,3,std::memory_order_acq_rel)){
+                const bool okay=join&&join(key);
+                state_.store(okay?1u:2u,std::memory_order_release);
+                if(!okay)std::_Exit(1); // never free failed/uncertain payloads or payment
+                return;
+            }
+            std::this_thread::yield(); // another owner consumes the same checked result
+        }
+    }
+    // Published only after the actual D2D drain and all synchronous small state.
+    // This never certifies a host payload; known host failure remains poison.
+    void publish_slot_ready() noexcept {slot_ready_.store(true,std::memory_order_release);}
+    bool slot_ready() const noexcept {
+        if(!slot_ready_.load(std::memory_order_acquire))return false;
+        const auto state=state_.load(std::memory_order_acquire);
+        if(state==2)return false;
+        if(state==1)return true;
+        if(!probe||!probe(key))return false;
+        return state_.load(std::memory_order_acquire)!=2;
+    }
+    size_t references() const noexcept {return refs_.load(std::memory_order_acquire);}
+    ~ConversationPending(){wait();if(release)release(tag);}
+    static constexpr size_t allocation_bytes() noexcept {return sizeof(ConversationPending);}
+};
+class ConversationPendingRef {
+    ConversationPending* p_=nullptr;
+    // Preserve the existing two-pointer payload-member extent without relying
+    // on any library control-block layout; this word issues no extra resource.
+    void* reserved_=nullptr;
+    explicit ConversationPendingRef(ConversationPending* p) noexcept:p_(p){}
+    friend ConversationPendingRef conversation_pending(ConversationPending::Join,const void*,
+        void (*)(uint64_t),uint64_t,ConversationPending::Probe);
+public:
+    ConversationPendingRef() noexcept=default;
+    ConversationPendingRef(const ConversationPendingRef& other) noexcept:p_(other.p_){if(p_)p_->add_ref();}
+    ConversationPendingRef(ConversationPendingRef&& other) noexcept:p_(other.p_){other.p_=nullptr;}
+    ~ConversationPendingRef(){if(p_)p_->drop_ref();}
+    ConversationPendingRef& operator=(ConversationPendingRef other) noexcept {swap(other);return *this;}
+    void swap(ConversationPendingRef& other) noexcept {std::swap(p_,other.p_);std::swap(reserved_,other.reserved_);}
+    void reset() noexcept {ConversationPendingRef{}.swap(*this);}
+    ConversationPending* get() const noexcept {return p_;}
+    ConversationPending* operator->() const noexcept {return p_;}
+    explicit operator bool() const noexcept {return p_!=nullptr;}
+    friend bool operator==(const ConversationPendingRef& a,const ConversationPendingRef& b) noexcept {return a.p_==b.p_;}
+    friend bool operator!=(const ConversationPendingRef& a,const ConversationPendingRef& b) noexcept {return !(a==b);}
+};
+static_assert(sizeof(ConversationPendingRef)==2*sizeof(void*));
+inline ConversationPendingRef conversation_pending(ConversationPending::Join join,const void* key,
+        void (*drop)(uint64_t)=nullptr,uint64_t tag=0,ConversationPending::Probe probe=nullptr){
+    return ConversationPendingRef(new ConversationPending(join,key,drop,tag,probe));
+}
+
 struct ConversationCheckpoint {
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
@@ -63,12 +152,59 @@ struct ConversationCheckpoint {
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
+    ConversationPendingRef pending;
+    ConversationCheckpoint() = default;
+    ~ConversationCheckpoint() { wait_pending(); }
+    ConversationCheckpoint(const ConversationCheckpoint& other) { *this = other; }
+    ConversationCheckpoint(ConversationCheckpoint&& other) noexcept { *this = std::move(other); }
+    ConversationCheckpoint& operator=(const ConversationCheckpoint& other) {
+        if (this == &other) return *this;
+        wait_pending(); other.wait_pending();
+        ids = other.ids;
+        imgs = other.imgs;
+        gdn = other.gdn;
+        ple = other.ple;
+        tails = other.tails;
+        dead = other.dead;
+        block_pos = other.block_pos;
+        used = other.used;
+        dev_tag = other.dev_tag;
+        pinned = other.pinned;
+        plan = other.plan;
+        stage_parts = other.stage_parts;
+        pending = other.pending;
+        return *this;
+    }
+    ConversationCheckpoint& operator=(ConversationCheckpoint&& other) noexcept {
+        if (this == &other) return *this;
+        wait_pending();
+        ids = std::move(other.ids);
+        imgs = std::move(other.imgs);
+        gdn = std::move(other.gdn);
+        ple = std::move(other.ple);
+        tails = std::move(other.tails);
+        dead = std::move(other.dead);
+        block_pos = std::move(other.block_pos);
+        used = std::move(other.used);
+        dev_tag = std::move(other.dev_tag);
+        pinned = std::move(other.pinned);
+        plan = std::move(other.plan);
+        stage_parts = std::move(other.stage_parts);
+        pending = std::move(other.pending);
+        return *this;
+    }
+    void wait_pending() const noexcept {
+        if (pending) pending->wait();
+        for (const auto& c : stage_parts) c.wait_pending();
+    }
+
 
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
                gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
                stage_parts.capacity() * sizeof(ConversationCheckpoint);
         for (const auto& part : stage_parts) n += part.bytes();
+        if (pending) n += ConversationPending::allocation_bytes();
         return n;
     }
 };
@@ -82,13 +218,59 @@ struct ConversationKv {
     // STRATA_PARK_VRAM_MIB: the tag this layer's parts were recorded under in the park's VRAM slot (0: none).  Set by
     // conversation_kv_save; a restore that finds the slot copies from it instead of from the buffers above.
     uint64_t dev_tag = 0;
-    // STRATA_PARK_VRAM_MIB: set while a background copy fills the buffers above from the slot; its deleter waits for
-    // that copy and releases the slot.  This layer's own token (not shared): the layers outlive their image when they
-    // are retained for the next park (ConversationCache::retain), and go in any order.  Last member: it goes before
-    // any buffer.
-    std::shared_ptr<void> pending;
+    // Shared intrusive completion/slot owner: retained layers may outlive the
+    // image in any order. Each payload destructor waits before its buffers go;
+    // the final alias releases the slot/control, not the first dropped layer.
+    // Last member also keeps control destruction ahead of buffer destruction.
+    ConversationPendingRef pending;
+    ConversationKv() = default;
+    ~ConversationKv() { wait_pending(); }
+    ConversationKv(const ConversationKv& other) { *this = other; }
+    ConversationKv(ConversationKv&& other) noexcept { *this = std::move(other); }
+    ConversationKv& operator=(const ConversationKv& other) {
+        if (this == &other) return *this;
+        wait_pending(); other.wait_pending();
+        format = other.format;
+        cells = other.cells;
+        heads = other.heads;
+        head_dim = other.head_dim;
+        page_size = other.page_size;
+        pooled_rows = other.pooled_rows;
+        idx_dim = other.idx_dim;
+        k = other.k;
+        v = other.v;
+        k_scale = other.k_scale;
+        v_scale = other.v_scale;
+        pooled = other.pooled;
+        dev_tag = other.dev_tag;
+        pending = other.pending;
+        return *this;
+    }
+    ConversationKv& operator=(ConversationKv&& other) noexcept {
+        if (this == &other) return *this;
+        wait_pending();
+        format = std::move(other.format);
+        cells = std::move(other.cells);
+        heads = std::move(other.heads);
+        head_dim = std::move(other.head_dim);
+        page_size = std::move(other.page_size);
+        pooled_rows = std::move(other.pooled_rows);
+        idx_dim = std::move(other.idx_dim);
+        k = std::move(other.k);
+        v = std::move(other.v);
+        k_scale = std::move(other.k_scale);
+        v_scale = std::move(other.v_scale);
+        pooled = std::move(other.pooled);
+        dev_tag = std::move(other.dev_tag);
+        pending = std::move(other.pending);
+        return *this;
+    }
+    void wait_pending() const noexcept {
+        if (pending) pending->wait();
+    }
     size_t bytes() const {
-        return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
+        return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes() +
+            (pending ? ConversationPending::allocation_bytes() : 0);
     }
 };
 
@@ -155,6 +337,8 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
             dst.gdn = std::move(src.gdn); dst.ple = std::move(src.ple);
             dst.tails = std::move(src.tails); dst.dead = std::move(src.dead);
             dst.block_pos = std::move(src.block_pos);
+            dst.dev_tag=src.dev_tag;
+            dst.pending=std::move(src.pending); // completion follows the same moved bytes, without a host wait
         }
         c.stage_parts.clear();
         out.stage0.push_back(std::move(c));
@@ -197,14 +381,64 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
+    /// APPROXIMATE provenance (P12 suffix reuse).  Set when this state was produced through an approximate suffix
+    /// import: its recurrent/indexer/PLE endpoint state reflects the OLD preceding text, not this prompt's.  Such
+    /// an entry can never certify an exact reuse - ConversationCache::best() refuses it - so approximate state
+    /// cannot contaminate the exact conversation cache.  Only an explicitly approximate divergence-match path
+    /// may use it, and it must report itself as approximate.  Default false: today's exact behavior, unchanged.
+    bool approximate = false;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
     // STRATA_PARK_ASYNC: set while a background copy fills this image's K/V; its deleter waits for that copy, and as
     // one of the last members it runs before any buffer is freed (whichever copy of the image goes last)
-    std::shared_ptr<void> pending;
+    ConversationPendingRef pending;
     // STRATA_CKPT_ASYNC: the same for the background copy that fills `live.gdn` (the park's running state)
-    std::shared_ptr<void> live_pending;
+    ConversationPendingRef live_pending;
 
+    SavedConversation() = default;
+    ~SavedConversation() { wait_pending(); }
+    SavedConversation(const SavedConversation& other) { *this = other; }
+    SavedConversation(SavedConversation&& other) noexcept { *this = std::move(other); }
+    SavedConversation& operator=(const SavedConversation& other) {
+        if (this == &other) return *this;
+        wait_pending(); other.wait_pending();
+        geometry = other.geometry;
+        layer_lo = other.layer_lo;
+        layer_hi = other.layer_hi;
+        live = other.live;
+        checkpoints = other.checkpoints;
+        kv = other.kv;
+        cvec = other.cvec;
+        approximate = other.approximate;
+        stage_images = other.stage_images;
+        pending = other.pending;
+        live_pending = other.live_pending;
+        return *this;
+    }
+    SavedConversation& operator=(SavedConversation&& other) noexcept {
+        if (this == &other) return *this;
+        wait_pending();
+        geometry = std::move(other.geometry);
+        layer_lo = std::move(other.layer_lo);
+        layer_hi = std::move(other.layer_hi);
+        live = std::move(other.live);
+        checkpoints = std::move(other.checkpoints);
+        kv = std::move(other.kv);
+        cvec = std::move(other.cvec);
+        approximate = std::move(other.approximate);
+        stage_images = std::move(other.stage_images);
+        pending = std::move(other.pending);
+        live_pending = std::move(other.live_pending);
+        return *this;
+    }
+    void wait_pending() const noexcept {
+        if (pending) pending->wait();
+        if (live_pending) live_pending->wait();
+        live.wait_pending();
+        for (const auto& c : checkpoints) c.wait_pending();
+        for (const auto& k : kv) k.wait_pending();
+        for (const auto& image : stage_images) image.wait_pending();
+    }
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
         for (const auto& c : checkpoints) if (c.pinned) return true;
@@ -217,6 +451,8 @@ struct SavedConversation {
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
+        if (pending) n += ConversationPending::allocation_bytes();
+        if (live_pending && live_pending != live.pending) n += ConversationPending::allocation_bytes();
         return n;
     }
 };
@@ -326,7 +562,10 @@ public:
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
-            if (e.cvec != cvec) continue;
+            // Approximate state never satisfies an exact match: an imported endpoint state describes different
+            // preceding text, so certifying it as reusable would silently upgrade an approximation to a guarantee.
+            if (e.approximate) continue;
+            if (e.approximate || e.cvec != cvec) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
                 if (n > best.tokens) best = {i, n, live, serials_[i]};
@@ -337,12 +576,43 @@ public:
         return best;
     }
 
+    /// Divergence lookup for the P12 suffix-reuse measurement.  Unlike best(), which requires an EXACT prefix and
+    /// therefore returns nothing at all for an edited prompt, this finds the parked entry that a changed question
+    /// most plausibly edited: the same token count with the deepest common prefix, preferring exact candidates
+    /// (eligible for an approximate suffix import) over approximate ones.  It restores nothing and certifies
+    /// nothing; callers may only report or refuse.  Approximate entries are reported separately so the exact path
+    /// can never consume them.
+    struct Divergence {
+        size_t index = 0;
+        uint64_t serial = 0;
+        int64_t common = 0;      // longest common prefix length
+        int64_t tokens = 0;      // |entry.live.ids| == |prompt| for a same-length edit
+        bool approximate = false;
+        bool found = false;
+    };
+
+    template <class Token>
+    Divergence divergence_candidate(const std::vector<Token>& prompt, bool cvec) const {
+        Divergence best;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& e = entries_[i];
+            if (e.cvec != cvec) continue;
+            const int64_t n = (int64_t)e.live.ids.size();
+            if (n != (int64_t)prompt.size()) continue;   // the bounded milestone: a same-length edit
+            int64_t c = 0;
+            while (c < n && e.live.ids[(size_t)c] == prompt[(size_t)c]) ++c;
+            if (c == 0 || c == n) continue;              // nothing in common, or an exact match (best() handles it)
+            if (c > best.common) best = {i, serials_[i], c, n, e.approximate, true};
+        }
+        return best;
+    }
+
     /// A parked conversation holds this state already (its live tokens or one of its checkpoints start with `ids`,
     /// same pictures, same steering): see conversation_covers.  Read-only; no LRU effect.
     template<class Token>
     bool holds(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const {
         for (const auto& e : entries_) {
-            if (e.cvec != cvec) continue;
+            if (e.approximate || e.cvec != cvec) continue;
             if (conversation_covers(e.live, ids, images)) return true;
             for (const auto& c : e.checkpoints)
                 if (conversation_covers(c, ids, images)) return true;
@@ -466,7 +736,7 @@ public:
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
+            if (!e.approximate && e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
                 !(guarded_ != 0 && serials_[i] == guarded_)) {
                 bytes_ -= e.bytes();
                 erase(i);
@@ -497,7 +767,7 @@ public:
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec != cvec || !deepest || deepest->ids.empty() || !held(*deepest) ||
+            if (e.approximate || e.cvec != cvec || !deepest || deepest->ids.empty() || !held(*deepest) ||
                 (guarded_ != 0 && serials_[i] == guarded_))
                 continue;
             for (const auto& c : e.checkpoints)
@@ -514,7 +784,7 @@ public:
                                 const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
         size_t longest = 0;
         for (const auto& e : entries_) {
-            if (e.cvec != cvec) continue;
+            if (e.approximate || e.cvec != cvec) continue;
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
@@ -530,7 +800,8 @@ public:
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
-        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
+        if (!image.approximate)
+            drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
         entries_.push_back(std::move(image));
         serials_.push_back(next_serial_++);

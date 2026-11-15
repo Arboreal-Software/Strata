@@ -1,0 +1,438 @@
+#include "strata/core/window_allocator.hpp"
+#include "strata/core/window_device.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include <mutex>
+#include <new>
+#include <set>
+#include <limits>
+#include <cstdio>
+#include "strata/core/resident_fault_receipt.hpp"
+#include "strata/core/resident_fault_precondition.hpp"
+#include "strata/core/strict_retirement.hpp"
+
+namespace strata::core {
+namespace {
+// Serialize native init/release (stable global configuration is still required).
+// Recursive for same-thread partial-allocation cleanup, not callback allocation.
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+static_assert(int(cudaErrorInvalidValue)==1 && int(cudaErrorMemoryAllocation)==2,
+    "qualification parser requires pinned CUDA13 invalid-value/allocation status values");
+void allocation_fault_record(int fd,const char* phase,size_t stage,int device,size_t requested,
+    uint64_t planned,int status,bool pointer,size_t completed)noexcept {
+    const char* kind=status<0?"not_called":status==int(cudaSuccess)?"success":
+        status==int(cudaErrorInvalidValue)?"invalid_value":status==int(cudaErrorMemoryAllocation)?"memory_allocation":"other";
+    char record[768];const int n=std::snprintf(record,sizeof(record),
+        "resident_allocation_fault case=second_arena_cuda_refusal phase=%s stage=%zu device=%d request_bytes=%zu planned_bytes=%llu status=%d refusal_class=%s pointer_nonnull=%u completed_stages=%zu\n",
+        phase,stage,device,requested,(unsigned long long)planned,status,kind,unsigned(pointer),completed);
+    if(n<=0||size_t(n)>=sizeof(record)||!resident_fault_receipt::write_record(fd,record,size_t(n)))
+        retirement_failed("resident allocation fault durable receipt failed");
+}
+#endif
+std::recursive_mutex operation_mutex;
+// Only health/quarantine metadata; never held across device/IO work or owner destruction.
+std::mutex allocator_mutex;
+struct Stage {
+    std::vector<QsaElasticPlan> elastic_plans;
+    std::vector<std::shared_ptr<QsaElasticView>> elastic_pools;
+    std::vector<QsaElasticView*> elastic_views;
+    int device = -1;
+    std::unique_ptr<SessionState> session;
+    SessionInitUploads uploads;
+    SessionPrivatePlan plan;
+    void* arena = nullptr;
+    void* ple_embedding = nullptr;
+    void* ple_scratch = nullptr;
+    void* ple_native_key = nullptr;
+    std::vector<float> ple_host;
+};
+struct Storage {
+    std::shared_ptr<const ReservationLease> reservation;
+    std::vector<Stage> stages;
+    bool uncertain = false;
+    bool terminal = false, retired = false, poisoned = false;
+    Storage* next = nullptr;
+};
+Storage* quarantined = nullptr;
+uint64_t quarantine_count = 0;
+bool allocator_failed = false;
+template<class... T> bool all_null(T... pointers) { return ((!pointers)&&...); }
+bool fresh_session(const SessionState& s) {
+    const auto& a=s.gdn;const auto& q=s.qsa_bufs;const auto& m=s.moe;const auto& b=s.block;
+    const auto& p=s.ple;const auto& w=p.w;
+    // Explicit resource/alias checks: never inspect object padding or take over
+    // a caller's device allocations, IO reader, weights, or mutable scratch.
+    return all_null(s.gdn_state,s.qsa_states,s.qsa_state_arena,s.qsa_buf_arena,s.moe_arena,s.block_arena,s.R,s.db,s.ple_hist,
+        a.x_q8k,a.x_q8_0,a.x_bf16,a.qkv,a.conv_out,a.h,a.alpha,a.beta,a.gate,a.o,a.z,a.y,a.y_q8k,a.y_q8_0,a.state,a.conv_state,
+        q.x_q8_0,q.x_q8k,q.x_bf16,q.q_full,q.qcur,q.kcur,q.vcur,q.idx_raw,q.q_idx,q.cell_scores,q.ids,q.k_scratch,q.v_scratch,
+        q.attn,q.attn16,q.attn32,q.attn_q8k,q.attn_scratch,
+        m.x_bf16,m.x_f16,m.logits,m.ids,m.weights,m.shared,m.sh_scratch,m.x_q8_0,m.x_q8k,
+        b.R,b.mixed,b.block_out,b.inject,b.inject2,b.gr_rs,b.head_q8k,b.dump,b.gr.xn,b.gr.xq,b.gr.lq,b.gr.gated,b.gr.lo,
+        p.table,p.token,p.prev,p.hist,p.emb_dev,p.emb_host,p.scratch,
+        w.key_codes,w.key_scales,w.value_bf16,w.norm_key,w.norm_query,w.norm_conv,w.conv1d_f16,
+        w.key_native_data,w.key_native_q8_1,w.key_bf16,w.pre_key,w.pre_value) && !p.read_context &&
+        s.max_cells==0&&s.qsa_alloc==0&&s.gdn_alloc==0&&b.gr.bytes==0;
+}
+bool add(uint64_t& total,uint64_t amount) {
+    if(amount>UINT64_MAX-total)return false;
+    total+=amount;return true;
+}
+bool release(Storage& storage) {
+    // Host producers must already be closed by the caller. Drain the complete
+    // gang before releasing any pinned staging or cross-stage borrowed target;
+    // a later stage can still be using an earlier stage's storage.
+    for(const auto& stage:storage.stages) {
+        if(!stage.session)continue;
+        if(!stage.arena&&!stage.session->qsa_states&&!stage.ple_embedding&&!stage.ple_scratch&&!stage.ple_native_key)continue;
+        WindowDeviceScope device(stage.device);
+        const bool drained=device.ok()&&cudaDeviceSynchronize()==cudaSuccess;
+        const bool restored=device.finish(); // attempt even when drain failed
+        if(!drained||!restored)return false;
+    }
+    for(auto& stage:storage.stages) {
+        if(!stage.session)continue; // host preparation refused before ownership transfer
+        if(!stage.arena&&!stage.session->qsa_states&&!stage.ple_embedding&&!stage.ple_scratch&&!stage.ple_native_key)continue;
+        WindowDeviceScope device(stage.device);
+        if(!device.ok())return false;
+        std::string error;
+        auto& session=*stage.session;
+        // Join the window's pending PLE read before its mutable runtime buffers
+        // are released. Shared table/cache storage is retained by the context.
+        session.ple.read_context.reset();
+        for(int64_t j=0;session.qsa_states&&j<session.qsa_alloc;++j)
+            if(!qsa_state_release_host(session.qsa_states[session.qsa_ord0+j],error))return false;
+        session_release(session);
+        // Real owners remain held until all borrowers have closed. Elastic
+        // retirement itself checks device drain before unmapping any KV tensor.
+        for(auto& pool:stage.elastic_pools)if(!pool->retire_checked())return false;
+        // Callers retain owner handles through all device/host/IO use. A failed
+        // release is not evidence that the other allocations are safe to free.
+        for(void** pointer:{&stage.ple_native_key,&stage.ple_scratch,&stage.ple_embedding,&stage.arena}) {
+            if(*pointer) {
+                if(cudaFree(*pointer)!=cudaSuccess)return false;
+                *pointer=nullptr;
+            }
+        }
+        if(!device.finish())return false;
+        delete[] session.qsa_states;session.qsa_states=nullptr;
+    }
+    return true;
+}
+void destroy(Storage* storage) noexcept {
+    std::lock_guard operation(operation_mutex);
+    bool uncertain,retired;
+    { std::lock_guard lock(allocator_mutex);uncertain=storage->uncertain;retired=storage->retired; }
+    if(retired){delete storage;return;}
+    bool safe=false;
+    try { safe=!uncertain&&release(*storage); } catch(...) {}
+    if(safe) {delete storage;return;}
+    // Intrusive quarantine requires no allocation on an already failing path.
+    std::lock_guard lock(allocator_mutex);
+    allocator_failed=true;
+    storage->next=quarantined;quarantined=storage;++quarantine_count;
+}
+}
+bool NativeRetirementAttempt::prepare(const NativeSessionAllocation& allocation,
+    std::span<const int> additional,std::string& error) noexcept {
+    try {
+        if(storage_||attempted_||!allocation.storage_){error="retirement attempt or allocation unavailable";return false;}
+        auto storage=std::static_pointer_cast<Storage>(allocation.storage_);
+        std::array<int,64> devices{};size_t count=0;
+        const auto add_device=[&](int device){
+            if(device<0)return false;
+            for(size_t i=0;i<count;++i)if(devices[i]==device)return true;
+            if(count==devices.size())return false;
+            devices[count++]=device;return true;
+        };
+        for(const auto& stage:storage->stages)if(!add_device(stage.device)){error="retirement consumer set exceeds bound";return false;}
+        for(int device:additional)if(!add_device(device)){error="invalid additional retirement consumer";return false;}
+        {
+            std::lock_guard lock(allocator_mutex);
+            if(storage->terminal||storage->uncertain||allocator_failed){error="retirement requires an unsealed known allocation";return false;}
+            if(!context_.prepare(storage,std::span<const int>(devices.data(),count))){error="retirement context refused";return false;}
+            storage->terminal=true;storage->uncertain=true;
+            storage_=storage; // Retain whole gang before any pool can be sealed.
+        }
+        for(auto& stage:storage->stages)for(auto& pool:stage.elastic_pools)
+            if(!pool->prepare_retirement(context_)){
+                error="elastic retirement preparation refused; whole gang retained";return false;
+            }
+        prepared_=true;return true;
+    } catch(...) {return false;}
+}
+bool NativeRetirementAttempt::drain_and_commit(std::string& error) noexcept {
+    if(!prepared_||attempted_||!storage_)return false;
+    attempted_=true;
+    auto storage=std::static_pointer_cast<Storage>(storage_);
+    bool complete=false;
+    struct FailedRetirement {
+        bool& complete;
+        ~FailedRetirement(){if(!complete){std::lock_guard lock(allocator_mutex);allocator_failed=true;}}
+    } failed{complete};
+    try {
+        // Explicit checked terminal IO closure, outside both allocator mutexes.
+        // A shared_ptr reset alone can silently quarantine an exceptional join.
+        // Other submitters must be joined by the enclosing runtime reactor.
+        for(auto& stage:storage->stages)if(stage.session&&stage.session->ple.read_context){
+            if(!stage.session->ple.read_context->close_for_retirement()){
+                error="PLE retirement join uncertain; whole gang retained";return false;
+            }
+            // Keep the sealed context's table, immutable weight owner and
+            // attachment quota through the gang barrier and any quarantine.
+            // IO completion does not authorize dropping GPU borrowers' owners.
+        }
+        if(!context_.drain_after_producers_closed()){
+            error="retirement consumer drain failed; whole gang retained";return false;
+        }
+        // Only legacy registration/free serialization remains here; no producer
+        // joins or explicit GPU synchronization may be added to this phase.
+        std::lock_guard operation(operation_mutex);
+        for(auto& stage:storage->stages){
+            {std::lock_guard lock(allocator_mutex);
+                if(storage->poisoned||allocator_failed){error="retirement invalidated by allocator poison";return false;}}
+            WindowDeviceScope device(stage.device);
+            if(!device.ok()){error="retirement commit device selection failed";return false;}
+            for(auto& pool:stage.elastic_pools)if(!pool->commit_retirement(context_)){
+                error="elastic retirement commit failed; residual gang retained";return false;
+            }
+            if(stage.session){
+                auto& session=*stage.session;
+                for(int64_t j=0;session.qsa_states&&j<session.qsa_alloc;++j)
+                    if(!qsa_state_release_host(session.qsa_states[session.qsa_ord0+j],error))return false;
+                session_release(session);
+                for(void** pointer:{&stage.ple_native_key,&stage.ple_scratch,&stage.ple_embedding,&stage.arena})if(*pointer){
+                    if(cudaFree(*pointer)!=cudaSuccess){error="retirement device free uncertain; no retry";return false;}
+                    *pointer=nullptr;
+                }
+                delete[] session.qsa_states;session.qsa_states=nullptr;
+            }
+            if(!device.finish()){error="retirement device restoration failed";return false;}
+        }
+        {std::lock_guard lock(allocator_mutex);
+            if(storage->poisoned||allocator_failed){error="retirement invalidated after partial cleanup";return false;}
+            storage->retired=true;storage->uncertain=false;}
+        complete=true;
+        return true;
+    } catch(...) {return false;}
+}
+uint64_t native_session_quarantine_count() {
+    std::lock_guard lock(allocator_mutex);return quarantine_count;
+}
+NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t cells,int64_t k,
+    const std::vector<NativeSessionRequest>& requests,WindowBudget& budget,NativeSessionAllocation& out) {
+    if(requests.empty()||requests.size()>64)return {NativeAllocationStatus::invalid,"invalid native stage count"};
+    try {
+        std::vector<std::unique_ptr<SessionState>> fresh;
+        fresh.reserve(requests.size());
+        for(size_t i=0;i<requests.size();++i)fresh.push_back(std::make_unique<SessionState>());
+        return allocate_native_sessions(g,cells,k,requests,fresh,budget,out);
+    } catch(const std::bad_alloc&) {
+        return {NativeAllocationStatus::budget_refused,"native session host memory unavailable"};
+    }
+}
+NativeAllocationResult allocate_native_sessions(const ModelGeometry& g,int64_t cells,int64_t k,
+    const std::vector<NativeSessionRequest>& requests,std::vector<std::unique_ptr<SessionState>>& fresh,
+    WindowBudget& budget,NativeSessionAllocation& out) {
+    std::lock_guard operation(operation_mutex);
+    {
+        std::lock_guard lock(allocator_mutex);
+        if(allocator_failed)return {NativeAllocationStatus::unhealthy,"native allocator quarantined; worker restart required"};
+    }
+    if(requests.empty()||requests.size()>64)return {NativeAllocationStatus::invalid,"invalid native stage count"};
+    if(fresh.size()!=requests.size())return {NativeAllocationStatus::invalid,"fresh native session count mismatch"};
+    for(size_t i=0;i<fresh.size();++i) {
+        if(!fresh[i]||!fresh_session(*fresh[i]))return {NativeAllocationStatus::invalid,"native session is not fresh and unbound"};
+        for(size_t j=0;j<i;++j)if(fresh[i].get()==fresh[j].get())
+            return {NativeAllocationStatus::invalid,"duplicate native session owner"};
+    }
+    bool qualification_fault=false;
+    (void)qualification_fault;
+    for(size_t i=0;i<requests.size();++i){const auto& r=requests[i];
+        if(r.qualification_fault==NativeAllocationQualificationFault::none){
+            if(r.qualification_receipt_fd!=-1)return {NativeAllocationStatus::invalid,"unarmed native fault receipt"};
+            continue;
+        }
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+        if(qualification_fault||r.qualification_fault!=NativeAllocationQualificationFault::second_arena_cuda_refusal||
+           requests.size()!=2||i!=1||requests[0].device==r.device||!resident_fault_receipt::valid_fd(r.qualification_receipt_fd))
+            return {NativeAllocationStatus::invalid,"invalid explicit second-stage allocation fault scope"};
+        qualification_fault=true;
+#else
+        return {NativeAllocationStatus::invalid,"native fault qualification unavailable in this build"};
+#endif
+    }
+    // Temporary containment: pool/VMM retirement still drains while releasing.
+    // Until every pool supports a non-destructive preparation phase followed by
+    // no-drain release, a later failure could follow earlier borrowed frees.
+    // Keep the implementation below for that follow-up; do not activate it yet.
+    for(const auto& request:requests)
+        if(!request.elastic_plans.empty()||request.prepare_elastic)
+            return {NativeAllocationStatus::invalid,"elastic native retirement requires a two-phase owner contract"};
+    bool attempted=false;
+    try {
+        auto storage=std::shared_ptr<Storage>(new Storage,destroy);
+        storage->stages.resize(requests.size());
+        WindowResources resources;
+        resources.device_bytes.resize(budget.snapshot().capacity.device_bytes.size());resources.shadows=1;
+        int64_t previous=0;std::set<int> devices;
+        for(size_t i=0;i<requests.size();++i) {
+            const auto& request=requests[i];auto& stage=storage->stages[i];
+            if(request.device<0||size_t(request.device)>=resources.device_bytes.size()||!devices.insert(request.device).second||
+               request.layer_begin!=previous||request.layer_end<=request.layer_begin||request.layer_end>g.n_layers||
+               (request.ple_buffers&&!(request.layer_begin<=1&&request.layer_end>1))||
+               (request.ple_native_key&&!request.ple_buffers))
+                return {NativeAllocationStatus::invalid,"invalid native stage topology"};
+            previous=request.layer_end;stage.device=request.device;
+            const QsaElasticPlan* elastic=nullptr;
+            if(!request.elastic_plans.empty()) {
+                if(requests.size()!=1)return {NativeAllocationStatus::invalid,"owned elastic multi-device domain support pending"};
+                if(g.qsa_interval<=0||!request.prepare_elastic)return {NativeAllocationStatus::invalid,"invalid elastic quote/factory"};
+                const auto count=std::max<int64_t>(1,request.layer_end/g.qsa_interval-request.layer_begin/g.qsa_interval);
+                if(request.elastic_plans.size()!=size_t(count))return {NativeAllocationStatus::invalid,"elastic QSA pool count mismatch"};
+                stage.elastic_plans=request.elastic_plans;stage.elastic_views.reserve(stage.elastic_plans.size());
+                for(const auto& plan:stage.elastic_plans)if(plan.device!=request.device||plan.cells!=cells||!qsa_elastic_plan_matches(g,plan))
+                    return {NativeAllocationStatus::invalid,"elastic quote geometry mismatch"};
+                elastic=&stage.elastic_plans[0];
+                for(const auto& plan:stage.elastic_plans)if(plan.format!=elastic->format||plan.rotate!=elastic->rotate||plan.granularity!=elastic->granularity)
+                    return {NativeAllocationStatus::invalid,"elastic pools disagree on session layout"};
+                if(stage.elastic_plans.size()>UINT64_MAX/(sizeof(QsaElasticPlan)*2+64)||
+                   !add(resources.host_bytes,uint64_t(stage.elastic_plans.size())*(sizeof(QsaElasticPlan)*2+64)))
+                    return {NativeAllocationStatus::invalid,"elastic owner metadata overflow"};
+            } else if(request.prepare_elastic)return {NativeAllocationStatus::invalid,"elastic factory without quote"};
+            if(!session_private_plan(g,cells,k,request.layer_begin,request.layer_end,stage.plan,elastic))
+                return {NativeAllocationStatus::invalid,"unsupported native session allocation profile"};
+            if(!add(resources.device_bytes[size_t(request.device)],stage.plan.device_bytes)||
+               !add(resources.host_bytes,stage.plan.host_bytes)||!add(resources.pinned_bytes,stage.plan.pinned_bytes))
+                return {NativeAllocationStatus::invalid,"native allocation size overflow"};
+            if(request.ple_native_key&&!add(resources.device_bytes[size_t(request.device)],
+                strata::kernels::native_q8_1_bytes(strata::kernels::NG_N_EMBD)))
+                return {NativeAllocationStatus::invalid,"native PLE key allocation size overflow"};
+            if(request.ple_buffers) {
+                const auto embedding=uint64_t(strata::kernels::NG_N_EMBD)*sizeof(float);
+                if(!add(resources.device_bytes[size_t(request.device)],embedding)||
+                   !add(resources.device_bytes[size_t(request.device)],ple_run_scratch_bytes())||
+                   !add(resources.host_bytes,embedding*2))return {NativeAllocationStatus::invalid,"PLE allocation size overflow"};
+            }
+        }
+        if(previous!=g.n_layers)return {NativeAllocationStatus::invalid,"native stages must cover the complete model"};
+        auto reserved=budget.reserve(resources,ReservationPurpose::private_work);
+        if(!reserved)return {NativeAllocationStatus::budget_refused,"native gang capacity unavailable"};
+        storage->reservation=reserved.lease;
+        // Allocate the admitted host embedding before transferring session
+        // ownership or issuing device work. Allocation failure can then unwind
+        // normally instead of quarantining an already activated gang.
+        for(size_t i=0;i<requests.size();++i)
+            if(requests[i].ple_buffers)
+                storage->stages[i].ple_host.resize(size_t(strata::kernels::NG_N_EMBD));
+        // Every physical/metadata admission is host-only, before any CUDA, VA,
+        // mapping or session ownership transfer. A failed later stage unwinds all
+        // earlier prepared owners and their genuine parent attachments.
+        for(size_t i=0;i<requests.size();++i) {
+            auto& stage=storage->stages[i];if(stage.elastic_plans.empty())continue;
+            std::string error;bool prepared=false;
+            try {prepared=requests[i].prepare_elastic(stage.elastic_plans,budget,reserved.lease,stage.elastic_pools,error);}
+            catch(...) {return {NativeAllocationStatus::budget_refused,"elastic host preparation threw before device work"};}
+            if(!prepared||stage.elastic_pools.size()!=stage.elastic_plans.size())return {NativeAllocationStatus::budget_refused,"elastic host preparation refused: "+error};
+            for(size_t j=0;j<stage.elastic_pools.size();++j) {
+                const auto& pool=stage.elastic_pools[j];
+                if(!pool||pool->healthy()||pool->base()||!qsa_elastic_plan_equal(pool->plan(),stage.elastic_plans[j]))
+                    return {NativeAllocationStatus::invalid,"elastic factory changed admitted quote"};
+                for(const auto& prior:storage->stages)for(auto* used:prior.elastic_views)if(used==pool.get())
+                    return {NativeAllocationStatus::invalid,"elastic pool duplicated across sessions"};
+                stage.elastic_views.push_back(pool.get());
+            }
+        }
+        // Build all potentially allocating public handles before issuing CUDA
+        // work, so publication allocation cannot strand completed allocations.
+        NativeSessionAllocation candidate;candidate.reservation_=reserved.lease;candidate.storage_=storage;
+        const std::weak_ptr<Storage> weak=storage;
+        candidate.healthy_=[weak] {
+            const auto owner=weak.lock(); // must be destroyed after the state lock
+            std::lock_guard lock(allocator_mutex);
+            if(!owner||owner->terminal||owner->uncertain||allocator_failed)return false;
+            for(const auto& stage:owner->stages)for(const auto& pool:stage.elastic_pools)if(!pool->healthy())return false;
+            return true;
+        };
+        candidate.poison_=[weak] {
+            const auto owner=weak.lock();
+            std::lock_guard lock(allocator_mutex);
+            if(owner){owner->uncertain=true;owner->poisoned=true;allocator_failed=true;}
+        };
+        candidate.stages_.reserve(requests.size());
+        for(size_t i=0;i<storage->stages.size();++i)
+            candidate.stages_.push_back({storage->stages[i].device,fresh[i].get(),storage});
+        // No-throw ownership handoff after reservation and public handle prep.
+        // Every stage transfers before any device work; partial initialization
+        // retains the complete gang, including stages not yet initialized.
+        for(size_t i=0;i<storage->stages.size();++i)storage->stages[i].session=std::move(fresh[i]);
+        { std::lock_guard lock(allocator_mutex);storage->uncertain=true; }
+        attempted=true;
+        size_t completed_stages=0; // derived ONLY after real sync+device restoration
+        for(size_t i=0;i<requests.size();++i) {
+            const auto& request=requests[i];auto& stage=storage->stages[i];
+            WindowDeviceScope device(stage.device);
+            if(!device.ok())return {NativeAllocationStatus::unhealthy,"native allocation device selection failed"};
+            for(auto& pool:stage.elastic_pools) {
+                std::string error;
+                if(!pool->initialize_checked(error))return {NativeAllocationStatus::unhealthy,"elastic QSA initialization failed: "+error};
+            }
+            size_t arena_request=size_t(stage.plan.device_bytes);
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+            if(qualification_fault&&i==1){
+                if(completed_stages!=1||!storage->stages[0].arena)retirement_failed("native fault prior stage not actually complete");
+                if(stage.arena)retirement_failed("native fault arena was already allocated");
+                arena_request=std::numeric_limits<size_t>::max();
+                (void)resident_fault_precondition::check(request.qualification_receipt_fd,"second_arena_cuda_refusal",stage.device);
+                allocation_fault_record(request.qualification_receipt_fd,"before_api",i,stage.device,arena_request,stage.plan.device_bytes,-1,stage.arena!=nullptr,completed_stages);
+            }
+#endif
+            const cudaError_t arena_status=cudaMalloc(&stage.arena,arena_request); // REAL API, no status override
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+            if(qualification_fault&&i==1){
+                allocation_fault_record(request.qualification_receipt_fd,"api_return",i,stage.device,arena_request,stage.plan.device_bytes,int(arena_status),stage.arena!=nullptr,completed_stages);
+                if(arena_status==cudaSuccess)return {NativeAllocationStatus::unhealthy,"impossible native fault allocation unexpectedly succeeded"};
+            }
+#endif
+            if(arena_status!=cudaSuccess)
+                return {NativeAllocationStatus::unhealthy,"native session arena allocation failed"};
+            const auto used=stage.elastic_pools.empty()
+                ? session_init_private(g,cells,k,stage.arena,*stage.session,stage.uploads,request.layer_begin,request.layer_end)
+                : session_init_private(g,cells,k,stage.arena,*stage.session,stage.uploads,request.layer_begin,request.layer_end,
+                    &stage.elastic_pools[0]->plan(),stage.elastic_views.data(),stage.elastic_views.size());
+            if(!used||used>stage.plan.device_bytes)return {NativeAllocationStatus::unhealthy,"native session initialization failed: "+stage.uploads.error};
+            if(request.ple_buffers) {
+                if(cudaMalloc(&stage.ple_embedding,stage.ple_host.size()*sizeof(float))!=cudaSuccess||
+                   cudaMalloc(&stage.ple_scratch,size_t(ple_run_scratch_bytes()))!=cudaSuccess)
+                    return {NativeAllocationStatus::unhealthy,"native PLE allocation failed"};
+                if(request.ple_native_key&&cudaMalloc(&stage.ple_native_key,
+                    strata::kernels::native_q8_1_bytes(strata::kernels::NG_N_EMBD))!=cudaSuccess)
+                    return {NativeAllocationStatus::unhealthy,"private native PLE key allocation failed"};
+                auto& ple=stage.session->ple;
+                ple.w.key_native_q8_1=stage.ple_native_key;
+                ple.token=&stage.session->ple_token;ple.prev=stage.session->ple_prev;ple.hist=stage.session->ple_hist;
+                ple.emb_host=stage.ple_host.data();ple.emb_dev=static_cast<float*>(stage.ple_embedding);
+                ple.scratch=static_cast<float*>(stage.ple_scratch);
+                // table and weights intentionally remain unbound: PleTable has
+                // mutable pending IO and cannot be blindly copied from live state.
+            }
+            if(cudaDeviceSynchronize()!=cudaSuccess||!device.finish())
+                return {NativeAllocationStatus::unhealthy,"native allocation drain/device restoration failed"};
+            ++completed_stages;(void)completed_stages;
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+            if(qualification_fault&&i==0)allocation_fault_record(requests[1].qualification_receipt_fd,"stage0_completed",i,stage.device,
+                size_t(stage.plan.device_bytes),stage.plan.device_bytes,int(cudaSuccess),stage.arena!=nullptr,completed_stages);
+#endif
+        }
+        {
+            std::lock_guard lock(allocator_mutex);
+            // Poison can arrive while device work drains. Never publish that work.
+            if(allocator_failed)return {NativeAllocationStatus::unhealthy,"native allocator poisoned during initialization"};
+            storage->uncertain=false;
+        }
+        out=std::move(candidate);
+        return {NativeAllocationStatus::allocated,{}};
+    } catch(const std::bad_alloc&) {
+        return {attempted?NativeAllocationStatus::unhealthy:NativeAllocationStatus::budget_refused,
+                "native allocation host memory unavailable"};
+    }
+}
+} // namespace strata::core

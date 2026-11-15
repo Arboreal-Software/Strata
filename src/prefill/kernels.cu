@@ -1,3 +1,4 @@
+#include <stdexcept>
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/gdn_chunk.hpp"
@@ -3426,6 +3427,28 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
         rope_kernel<false><<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(
             x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
             strata::kernels::mrope_table(), rt);
+    check("rope");
+}
+void rope_owned(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
+          const strata::kernels::RopeScaling& scaling, void* stream, const int32_t* position_table) {
+    if(!position_table)throw std::invalid_argument("owned rotary bank is missing");
+    // The engine validates the resolved config at startup with the same rule (generate.cpp), so this only
+    // fires for a caller that bypassed it; the prompt path has no error return here, so it stops the process.
+    if (const char* why = strata::kernels::rope_scaling_invalid(scaling)) {
+        std::fprintf(stderr, "prefill rope: invalid rope scaling: %s\n", why);
+        std::exit(1);
+    }
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
+    const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);   // none: the identity constants
+    const strata::kernels::RopeTab rt = strata::kernels::rope_table_for(scaling);
+    if (rt.cos != nullptr)
+        rope_kernel<true><<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(
+            x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
+            position_table, rt);
+    else
+        rope_kernel<false><<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(
+            x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
+            position_table, rt);
     check("rope");
 }
 void rms_rope_rows(const float* in, int64_t in_ts, int64_t in_hs, float* out, int64_t out_ts, const float* w, int64_t T,

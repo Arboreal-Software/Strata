@@ -90,6 +90,8 @@ node_modules/
 /apps/host/docs/evidence/
 /apps/host/docs/checkpoints/
 
+# Local execution plans, handoffs, and agent session records
+/.local/
 # DGX Spark build outputs and local venv (docs/DGX_SPARK_LINUX.md)
 /out-spark/
 /build-spark/

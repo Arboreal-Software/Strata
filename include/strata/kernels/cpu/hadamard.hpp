@@ -35,7 +35,12 @@ struct HadamardSpec {
 };
 
 /// Parses `path` (hadamard.txt) for a model of `n_layers` layers.  False with a reason when it is malformed.
-bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, std::string& err);
+struct HadamardParseLimits {
+    uint64_t max_layers=0,max_line_bytes=0,max_total_bytes=0,max_vectors=0,max_elements=0;
+};
+bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, std::string& err,
+                    const HadamardParseLimits* limits=nullptr);
+uint64_t hadamard_generation() noexcept;
 
 /// The process-wide spec (set by expert_layout_load from the pack; empty for every other pack).
 const HadamardSpec& hadamard_spec();

@@ -1,0 +1,83 @@
+#include <array>
+#include <atomic>
+#include <deque>
+#include <mutex>
+#include <cstdlib>
+SHARED_PREFIX
+namespace strata::program {
+QUEUE_SIGNAL_TYPE
+}
+
+int main(int argc,char** argv) {
+    if(argc!=2)return 90;
+    const std::string name=argv[1];
+    const bool aged=name=="aged_queue_arrival";
+    const bool known=name=="idle_no_arrival"||name=="idle_queue_arrival"||aged||
+        name=="fresh_stop"||name=="fresh_error"||name=="fresh_eof";
+    if(!known)return 91;
+    std::mutex in_mu;
+    std::deque<std::string> in_lines;
+    struct Input {std::atomic<bool> input_error{false};} input;
+    auto* in_shared=&input;
+    bool in_eof=false;
+    std::atomic<bool> stop_req{false};
+ACTUAL_QUEUE_SIGNAL
+
+    // Same real causal ancestry/controller setup as the existing runner.
+ANCESTRY_SETUP
+    const core::RepairMonotonicBirth now{7,1000};
+    const auto age=ServingSuffixRepairOperation::repair_age(operation,now);
+    if(!age.valid||!age.age.oldest_unresolved_inherited_age_ns.has_value())return 92;
+    const auto observed=serving_idle_queue_signal();
+    if(observed.queued_input_lines||observed.input_error||observed.end_of_input||observed.stop_requested)return 93;
+
+    ServingRepairAdmissionPolicy policy;
+    if(aged)policy.live_repair_age_escalation_ns=1;
+    ServingRepairSelectionBoundary boundary;
+    boundary.safe_boundary=true;boundary.now_ns=now.ticks_ns;boundary.clock_domain=now.domain;
+    boundary.foreground.queued_input_lines=observed.queued_input_lines;
+    boundary.foreground.current_request_generating=aged;
+    boundary.foreground.context_room=true;
+    boundary.max_candidates=2;boundary.foreground_weight=1;
+    boundary.max_consecutive_escalated_units=1;
+    std::array<ServingRepairSelectionCandidate,2> candidates{};
+    candidates[0].work.demand=true;candidates[0].work.resource_ready=age.valid;
+    candidates[0].weight=1;candidates[0].age=age.age;
+    candidates[0].observed_at_ns=now.ticks_ns;candidates[0].clock_domain=now.domain;
+    candidates[0].record_version=operation.published.cut.id;
+    candidates[0].ancestry_serial=age.ancestry_serial;
+    // An explicit valid ticket selects real repair after foreground's ticket.
+    // This is the production selection kernel, not a fabricated decision/reason.
+    const auto selected=select_serving_repair_unit(policy,boundary,candidates,aged?1:0);
+    const auto required_reason=aged?RepairAdmissionReason::admitted_age_escalated:RepairAdmissionReason::admitted_idle;
+    if(selected.status!=ServingRepairSelectionStatus::ready||selected.foreground||
+       selected.candidate!=0||selected.admission.reason!=required_reason)return 94;
+
+    // Deterministic arrival after selection and before the unchanged dispatch tail.
+    {
+        std::lock_guard<std::mutex> lock(in_mu);
+        if(name=="idle_queue_arrival"||aged)in_lines.push_back("foreground input");
+        if(name=="fresh_stop")stop_req.store(true);
+        if(name=="fresh_error")in_shared->input_error.store(true);
+        if(name=="fresh_eof")in_eof=true;
+    }
+    // Observe through the actual signal, without making a fixture dispatch decision.
+    const auto arrived=serving_idle_queue_signal();
+    struct Lane {ServingSuffixRepairOperation::Outcome* owned_repair=nullptr;};
+    std::array<Lane,2> bs{};bs[0].owned_repair=&operation;
+    std::string err;
+    uint64_t serving_repair_idle_unit=4,serving_repair_consecutive_escalated=0;
+    const auto dispatch=[&]() -> bool {
+ACTUAL_UNMANAGED_TAIL
+    };
+    const bool advanced=dispatch();
+    const unsigned expected=(name=="idle_no_arrival"||aged)?1:0;
+    const unsigned submissions=ServingSuffixRepairOperation::dispatch_calls;
+    std::printf("DISPATCH case=%s reason=%s selected_before_arrival=1 queue=%llu stop=%d error=%d eof=%d calls=%u expected=%u advanced=%d escalated=%llu\n",
+        name.c_str(),repair_admission_reason_name(selected.admission.reason),
+        (unsigned long long)arrived.queued_input_lines,int(arrived.stop_requested),int(arrived.input_error),int(arrived.end_of_input),
+        submissions,expected,int(advanced),(unsigned long long)serving_repair_consecutive_escalated);
+    if(submissions!=expected||advanced!=(expected!=0))return 21;
+    if(serving_repair_consecutive_escalated!=(aged?1u:0u))return 22;
+    return 0;
+}

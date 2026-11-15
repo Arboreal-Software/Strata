@@ -21,6 +21,13 @@
 // Build: scripts/build_artifact.bat        Run: gguf_reader.exe <file.gguf> [--check]
 
 #include <cmath>
+#include <array>
+#include <span>
+#include <string_view>
+#include <cerrno>
+#include <cstddef>
+#include <new>
+#include <type_traits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -535,6 +542,257 @@ private:
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;
 };
+
+#ifdef __linux__
+// Inventory-only requested-allocation parser. Ordinary GgufFile stays unchanged.
+// The caller pays fixed scan objects before counting and one arena before this
+// directory is constructed. No metadata/string/tree allocation is hidden here.
+enum class GgufWorkspaceCode : uint32_t {
+    none, io, stat, eof, magic, version, depth, array, type, dimensions, duplicate,
+    data, overflow, allocation, quota, authority, missing, conversion, truncated, overlap
+};
+struct GgufWorkspaceSlice { uint64_t offset=0, bytes=0; };
+struct GgufWorkspaceError {
+    GgufWorkspaceCode code=GgufWorkspaceCode::none;
+    uint64_t argument=0;
+    GgufWorkspaceSlice name;
+};
+struct GgufWorkspaceQuote {
+    uint64_t tensors=0,names=0,bytes=0,data_start=0;
+};
+struct GgufWorkspaceTensor {
+    std::string_view name;
+    std::array<uint64_t,4> dimensions{};
+    std::span<const uint64_t> shape;
+    uint32_t type=0;
+    uint64_t offset=0;
+    GgufWorkspaceSlice source_name;
+};
+class GgufDirectoryScan {
+public:
+    struct MetaFrame {
+        uint64_t count=0,index=0,value=0;
+        uint32_t elem=0;
+        uint8_t u8=0;int8_t i8=0;uint16_t u16=0;int16_t i16=0;
+        uint32_t u32=0;int32_t i32=0;int64_t i64=0;
+        GgufWorkspaceSlice text;
+    };
+    struct ReplayFrame {
+        uint64_t saved=0,index=0,skip=0,at=0;
+        uint32_t rank=0;
+        GgufWorkspaceSlice previous;
+    };
+    struct ScanFrame {
+        uint32_t magic=0,version=0,type=0,rank=0;
+        uint64_t tensors=0,metadata=0,i=0,j=0,value=0,alignment=32,names=0,offset=0,directory_begin=0;
+        bool alignment_seen=false;
+        GgufWorkspaceSlice key,name;
+        std::array<uint64_t,4> dimensions{};
+    };
+    GgufDirectoryScan(int fd,uint64_t bytes):fd_(fd),size_(bytes){}
+    const GgufWorkspaceError& error() const noexcept {return error_;}
+    bool fail(GgufWorkspaceCode code,uint64_t argument=0,GgufWorkspaceSlice name={}) noexcept {
+        if(error_.code==GgufWorkspaceCode::none)error_={code,argument,name};
+        return false;
+    }
+    bool read_at(void* out,uint64_t offset,size_t bytes) noexcept {
+        if(offset>size_||uint64_t(bytes)>size_-offset)return fail(GgufWorkspaceCode::eof);
+        size_t done=0;
+        while(done<bytes){
+            const auto got=::pread(fd_,static_cast<uint8_t*>(out)+done,(std::min)(bytes-done,size_t(1)<<20),off_t(offset+done));
+            if(got<0&&errno==EINTR)continue;
+            if(got<=0)return fail(got==0?GgufWorkspaceCode::eof:GgufWorkspaceCode::io);
+            done+=size_t(got);
+        }
+        return true;
+    }
+    template<class T>bool scalar(T& out) noexcept {
+        if(!read_at(&out,position_,sizeof(T)))return false;
+        position_+=sizeof(T);return true;
+    }
+    bool text(GgufWorkspaceSlice& out) noexcept {
+        uint64_t n=0;if(!scalar(n))return false;
+        if(position_>size_||n>size_-position_)return fail(GgufWorkspaceCode::eof);
+        out={position_,n};position_+=n;return true;
+    }
+    bool alignment_key(GgufWorkspaceSlice key) noexcept {
+        constexpr std::string_view expected="general.alignment";
+        return key.bytes==expected.size()&&read_at(key_bytes_.data(),key.offset,expected.size())&&
+            std::memcmp(key_bytes_.data(),expected.data(),expected.size())==0;
+    }
+    bool value(uint32_t type,unsigned depth,uint64_t& result) noexcept {
+        if(depth>2)return fail(GgufWorkspaceCode::depth);
+        MetaFrame f;result=0;
+        switch(type){
+        case 0:
+            if(!scalar(f.u8))return false;
+            result=f.u8;return true;
+        case 1:
+            if(!scalar(f.i8))return false;
+            result=uint64_t(int64_t(f.i8));return true;
+        case 2:
+            if(!scalar(f.u16))return false;
+            result=f.u16;return true;
+        case 3:
+            if(!scalar(f.i16))return false;
+            result=uint64_t(int64_t(f.i16));return true;
+        case 4:
+            if(!scalar(f.u32))return false;
+            result=f.u32;return true;
+        case 5:
+            if(!scalar(f.i32))return false;
+            result=uint64_t(int64_t(f.i32));return true;
+        case 6:return scalar(f.u32); // F32 has MetaValue::u == 0
+        case 7:
+            if(!scalar(f.u8))return false;
+            result=f.u8?1:0;return true;
+        case 8:return text(f.text);
+        case 9:
+            if(!scalar(f.elem)||!scalar(f.count))return false;
+            if(f.count>(1u<<24))return fail(GgufWorkspaceCode::array);
+            for(f.index=0;(f.index)<f.count;++f.index)if(!value(f.elem,depth+1,f.value))return false;
+            return true;
+        case 10:return scalar(result);
+        case 11:
+            if(!scalar(f.i64))return false;
+            result=uint64_t(f.i64);return true;
+        case 12:return scalar(f.value); // F64 has MetaValue::u == 0
+        default:return fail(GgufWorkspaceCode::type);
+        }
+    }
+    bool duplicate_before_rank(uint64_t count,uint64_t begin,GgufWorkspaceSlice name) noexcept {
+        // Preserve the ordinary name-set error precedence without allocating
+        // that set before admission. The immutable descriptor makes replay safe;
+        // this trades bounded startup IO for no unpriced name/node workspace.
+        ReplayFrame f;f.saved=position_;position_=begin;
+        for(f.index=0;(f.index)<count;++f.index){
+            if(!text(f.previous))return false;
+            if(f.previous.bytes==name.bytes){
+                bool equal=true;
+                for(f.at=0;equal&&f.at<name.bytes;){
+                    const size_t n=size_t((std::min)(name.bytes-f.at,uint64_t(compare_a_.size())));
+                    if(!read_at(compare_a_.data(),f.previous.offset+f.at,n)||
+                       !read_at(compare_b_.data(),name.offset+f.at,n))return false;
+                    equal=std::memcmp(compare_a_.data(),compare_b_.data(),n)==0;f.at+=n;
+                }
+                if(equal)return fail(GgufWorkspaceCode::duplicate,0,name);
+            }
+            if(!scalar(f.rank))return false;
+            if(!f.rank||f.rank>4)return fail(GgufWorkspaceCode::dimensions,0,f.previous);
+            f.skip=uint64_t(f.rank)*sizeof(uint64_t)+sizeof(uint32_t)+sizeof(uint64_t);
+            if(position_>size_||f.skip>size_-position_)return fail(GgufWorkspaceCode::eof);
+            position_+=f.skip;
+        }
+        position_=f.saved;return true;
+    }
+    static bool arena_bytes(uint64_t tensors,uint64_t names,uint64_t& bytes) noexcept {
+        constexpr uint64_t unit=sizeof(GgufWorkspaceTensor)+sizeof(uint64_t);
+        if(tensors>(UINT64_MAX-names)/unit)return false;
+        bytes=tensors*unit+names;
+        return bytes<=SIZE_MAX;
+    }
+    bool scan(GgufWorkspaceQuote& quote,void* arena=nullptr,uint64_t capacity=0) noexcept {
+        position_=0;error_={};ScanFrame f;
+        if(!scalar(f.magic))return false;
+        if(f.magic!=0x46554747u)return fail(GgufWorkspaceCode::magic);
+        if(!scalar(f.version))return false;
+        if(f.version!=3)return fail(GgufWorkspaceCode::version,f.version);
+        if(!scalar(f.tensors)||!scalar(f.metadata))return false;
+        for(f.i=0;f.i<f.metadata;++f.i){
+            if(!text(f.key)||!scalar(f.type)||!value(f.type,0,f.value))return false;
+            const bool alignment=alignment_key(f.key);
+            if(error_.code!=GgufWorkspaceCode::none)return false;
+            if(alignment&&!f.alignment_seen){f.alignment_seen=true;if(f.value)f.alignment=f.value;}
+        }
+        f.directory_begin=position_;
+        uint64_t directory=0;
+        if(!arena_bytes(f.tensors,0,directory))return fail(GgufWorkspaceCode::overflow);
+        if(arena&&directory>capacity)return fail(GgufWorkspaceCode::overflow);
+        auto* records=static_cast<GgufWorkspaceTensor*>(arena);
+        auto* names=arena?static_cast<char*>(arena)+directory:nullptr;
+        for(f.i=0;f.i<f.tensors;++f.i){
+            if(!text(f.name)||!duplicate_before_rank(f.i,f.directory_begin,f.name)||!scalar(f.rank))return false;
+            if(!f.rank||f.rank>4)return fail(GgufWorkspaceCode::dimensions,0,f.name);
+            f.dimensions.fill(0);
+            for(f.j=0;f.j<f.rank;++f.j)if(!scalar(f.dimensions[size_t(f.j)]))return false;
+            if(!scalar(f.type)||!scalar(f.offset))return false;
+            if(f.name.bytes==UINT64_MAX||f.name.bytes+1>UINT64_MAX-f.names)return fail(GgufWorkspaceCode::overflow);
+            if(arena){
+                if(f.names>capacity-directory||f.name.bytes+1>capacity-directory-f.names)
+                    return fail(GgufWorkspaceCode::overflow);
+                auto* record=::new (records+size_t(f.i)) GgufWorkspaceTensor;
+                char* name=names+f.names;
+                if(!read_at(name,f.name.offset,size_t(f.name.bytes)))return false;
+                name[size_t(f.name.bytes)]='\0';record->name={name,size_t(f.name.bytes)};
+                record->dimensions=f.dimensions;record->shape={record->dimensions.data(),f.rank};
+                record->type=f.type;record->offset=f.offset;record->source_name=f.name;
+            }
+            f.names+=f.name.bytes+1;
+        }
+        uint64_t bytes=0;if(!arena_bytes(f.tensors,f.names,bytes))return fail(GgufWorkspaceCode::overflow);
+        // Preserve the ordinary reader's unsigned alignment interpretation;
+        // this value never authorizes an allocation or unchecked payload read.
+        uint64_t start=(position_+f.alignment-1)/f.alignment*f.alignment;
+        if(start>size_){if(f.tensors)return fail(GgufWorkspaceCode::data);start=size_;}
+        quote={f.tensors,f.names,bytes,start};return true;
+    }
+private:
+    int fd_;
+    uint64_t size_,position_=0;
+    GgufWorkspaceError error_;
+    std::array<char,sizeof("general.alignment")> key_bytes_{};
+    std::array<char,256> compare_a_{},compare_b_{};
+};
+class GgufWorkspaceDirectory {
+public:
+    struct SortFrame {uint64_t start=0,end=0,root=0,child=0,first_duplicate=UINT64_MAX;};
+    struct SortLess {
+        const GgufWorkspaceTensor* records;
+        bool operator()(uint64_t a,uint64_t b)const noexcept {
+            const int c=records[a].name.compare(records[b].name);return c<0||(c==0&&a<b);
+        }
+    };
+    struct SortSift {
+        uint64_t* order;
+        SortLess less;
+        void operator()(uint64_t root,uint64_t end)const noexcept {
+            while(root<end/2){
+                uint64_t child=root*2+1;
+                if(child+1<end&&less(order[child],order[child+1]))++child;
+                if(!less(order[root],order[child]))break;
+                std::swap(order[root],order[child]);root=child;
+            }
+        }
+    };
+    GgufWorkspaceDirectory(GgufDirectoryScan& scan,void* arena,uint64_t capacity) noexcept {
+        if(!scan.scan(quote_,arena,capacity))return;
+        records_=static_cast<GgufWorkspaceTensor*>(arena);
+        if(!quote_.tensors){valid_=true;return;}
+        auto* order=reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(arena)+quote_.tensors*sizeof(GgufWorkspaceTensor));
+        SortFrame f;
+        for(f.start=0;f.start<quote_.tensors;++f.start)order[f.start]=f.start;
+        const SortLess less{records_};
+        const SortSift sift{order,less};
+        for(f.start=quote_.tensors/2;f.start>0;){--f.start;sift(f.start,quote_.tensors);}
+        for(f.end=quote_.tensors;f.end>1;){--f.end;std::swap(order[0],order[f.end]);sift(0,f.end);}
+        for(f.start=1;f.start<quote_.tensors;++f.start)
+            if(records_[order[f.start-1]].name==records_[order[f.start]].name)
+                f.first_duplicate=(std::min)(f.first_duplicate,order[f.start]);
+        if(f.first_duplicate!=UINT64_MAX){scan.fail(GgufWorkspaceCode::duplicate,0,records_[f.first_duplicate].source_name);return;}
+        valid_=true;
+    }
+    bool valid() const noexcept{return valid_;}
+    std::span<const GgufWorkspaceTensor> tensors() const noexcept{return {records_,size_t(quote_.tensors)};}
+    uint64_t data_start() const noexcept{return quote_.data_start;}
+private:
+    GgufWorkspaceTensor* records_=nullptr;
+    GgufWorkspaceQuote quote_;
+    bool valid_=false;
+};
+static_assert(alignof(GgufWorkspaceTensor)<=alignof(std::max_align_t));
+static_assert(sizeof(GgufWorkspaceTensor)%alignof(uint64_t)==0);
+static_assert(std::is_trivially_destructible_v<GgufWorkspaceTensor>);
+#endif
 
 // Bytes of a tensor's payload from its shape and block geometry; 0 when the type is unknown, a row is not whole
 // blocks, or the count overflows.

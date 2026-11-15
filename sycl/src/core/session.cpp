@@ -139,6 +139,8 @@ void session_release(SessionState& s) {
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
+    for(int64_t j=0;s.qsa_states&&j<s.qsa_alloc;++j)
+        if(s.qsa_states[s.qsa_ord0+j].owned_elastic){std::fprintf(stderr,"strata: owned elastic session reset is not implemented on SYCL\n");std::_Exit(1);}
     dpct::queue_ptr cs = strata::q_of(stream);
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.
@@ -170,6 +172,49 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     s.ple_token = -1;
 }
 
+bool session_zero_checked(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream, std::string& error) {
+    for(int64_t j=0;s.qsa_states&&j<s.qsa_alloc;++j)
+        if(s.qsa_states[s.qsa_ord0+j].owned_elastic){error="owned elastic session reset is not implemented on SYCL";return false;}
+    try {
+    dpct::queue_ptr cs = strata::q_of(stream);
+    // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
+    // embedding broadcast to every stream, which is the reference's own initial condition.
+    if (R_init != nullptr) {
+        for (int64_t c = 0; c < g.hc; ++c)
+            /*
+            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
+            API. While the origin API might be synchronous, it depends on the
+            type of operand memory, so you may need to call wait() on event
+            return by memcpy API to ensure synchronization behavior.
+            */
+            cs->memcpy(s.block.R + (size_t)c * g.n_embd, R_init,
+                       (size_t)g.n_embd * 4);
+    } else {
+        cs->memset(s.block.R, 0, (size_t)g.hc * g.n_embd * 4);
+    }
+    // every owned GDN layer's recurrence and conv history
+    cs->memset(s.gdn_state, 0, (size_t)s.gdn_alloc * gdn_state_floats(g) * 4);
+    // and every owned QSA layer's cache and indexer
+    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+        if (!qsa_state_zero_checked(s.qsa_states[s.qsa_ord0 + j], g, stream, error)) return false;
+    // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
+    // convolve over rows belonging to a different sequence - the conv reads NG_HIST previous NORMALIZED rows,
+    // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
+    // for the same reason: `ngram_rows` treats a missing predecessor as the EOS cut, which is what a sequence
+    // boundary IS.
+    cs->memset(s.ple_hist, 0, (size_t)ple_hist_bytes());
+    cs->wait_and_throw();
+    s.ple_prev[0] = -1;
+    s.ple_prev[1] = -1;
+    s.ple_token = -1;
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("session_zero_checked: ") + e.what(); return false;
+    } catch (...) {
+        error = "session_zero_checked: unknown SYCL reset failure"; return false;
+    }
+}
+
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
 /// the direct and captured paths so the two cannot disagree about which slice a layer owns.
 void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
@@ -191,9 +236,68 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
     }
 }
 
+// BEGIN CHECKED SYCL GRAPH CAPTURE (compiled by the CPU ownership fixture)
+namespace {
+template<class Owner, class Record>
+bool capture_owned_graph(Owner& owner, dpct::experimental::command_graph_exec_ptr& out,
+                         Record&& record, std::string& err) {
+    if (owner.retirement_started || owner.retirement_failed || owner.pending_graph || owner.pending_queue || out) {
+        err = "graph capture requires empty, healthy ownership"; return false;
+    }
+    bool uncertain = false;
+    try {
+        owner.pending_queue = dpct::get_current_device().create_queue(true);
+        if (!owner.pending_queue) { err = "graph capture queue allocation failed"; return false; }
+        owner.pending_graph = new sycl::ext::oneapi::experimental::command_graph<
+            sycl::ext::oneapi::experimental::graph_state::modifiable>(
+                owner.pending_queue->get_context(), owner.pending_queue->get_device());
+        uncertain = true;
+        owner.pending_graph->begin_recording(*owner.pending_queue);
+        uncertain = false;
+        bool ok = false;
+        uncertain = true; // a recording body or its error reporting can throw
+        try { ok = record(owner.pending_queue); }
+        catch (const std::exception& error) { err = error.what(); }
+        catch (...) { err = "graph recording failed"; }
+        // End recording even when a layer refused or threw. The graph and queue
+        // remain visible to the owner throughout every fallible operation.
+        uncertain = true;
+        owner.pending_graph->end_recording();
+        uncertain = false;
+        uncertain = true;
+        dpct::get_current_device().destroy_queue(owner.pending_queue);
+        owner.pending_queue = nullptr;
+        uncertain = false;
+        if (ok) {
+            out = new sycl::ext::oneapi::experimental::command_graph<
+                sycl::ext::oneapi::experimental::graph_state::executable>(owner.pending_graph->finalize());
+        }
+        uncertain = true;
+        delete owner.pending_graph;
+        owner.pending_graph = nullptr;
+        uncertain = false;
+        return ok;
+    } catch (const std::exception& error) {
+        if (uncertain) owner.retirement_failed = true;
+        err = std::string("graph capture: ") + error.what(); return false;
+    } catch (...) {
+        if (uncertain) owner.retirement_failed = true;
+        err = "graph capture failed"; return false;
+    }
+}
+}
+// END CHECKED SYCL GRAPH CAPTURE
+
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
-                     SessionGraphs& gr, std::string& err, bool split, int64_t layer_lo, int64_t layer_hi) {
+                     SessionGraphs& gr, std::string& err, bool split, int64_t layer_lo, int64_t layer_hi) try {
+    if (gr.retirement_started || gr.retirement_failed) { err = "session_capture: graph ownership retired"; return false; }
     if (gr.captured) return true;
+    if (gr.execs || gr.posts || gr.preA || gr.preB || gr.pending_graph || gr.pending_queue || gr.allocated_slots || gr.n) {
+        err = "session_capture: partial graph ownership requires checked retirement"; return false;
+    }
+    for (auto* pre : gr.preP) if (pre) { err = "session_capture: partial prefix graphs require retirement"; return false; }
+    if (g.n_layers <= 0) { err = "session_capture: invalid layer count"; return false; }
+    gr.allocated_slots = g.n_layers;
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     gr.execs =
@@ -229,75 +333,18 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // the CPU pool on what it published; `post` combines those experts with THIS layer's weights.  Capturing
         // them together is what the old single graph could not do, and the reason it could not is that
         // `moe_combine` needs the pool's answer and the pool needs the router's.
-        auto capture =
-            [&](bool post, dpct::experimental::command_graph_exec_ptr *out,
-                const char *what, int half = 0, int stage_prefix = 0) -> bool {
-            try {
-                           dpct::queue_ptr cs = &dpct::get_in_order_queue();
-            if (DPCT_CHECK_ERROR(
-                    cs = dpct::get_current_device().create_queue(true)) != 0) {
-                err = std::string("session_capture: stream create failed");
-                return false;
-            }
-            if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs)) !=
-                0) {
-                err = "session_capture: begin failed at layer " + std::to_string(l);
-                return false;
-            }
-            err.clear();
-            // R0.9: `half` is 0 for every mode except the split capture, where it selects a prefix of the
-            // stages so the mixer and the FFN-front-plus-router can be timed separately.
-            const bool ok = post
-                                ? block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*) cs, err)
-                                : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
-                                                  s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
-                                                  half, stage_prefix);
-            if (!ok) {
-                err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
-                return false;
-            }
-            dpct::experimental::command_graph_ptr graph = nullptr;
-            const dpct::err0 ce =
-                DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs, &graph));
-            dpct::get_current_device().destroy_queue(cs);
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (ce != 0) {
-                /*
-                DPCT1001: The statement could not be removed.
-                */
-                err = "session_capture: " + std::string(what) + " layer " +
-                      std::to_string(l) + ": " +
-                      /*
-                      DPCT1009: SYCL reports errors using exceptions and
-                      does not use error codes. Please replace the
-                      "get_error_string_dummy(...)" with a real error-handling
-                      function.
-                      */
-                      dpct::get_error_string_dummy(ce) +
-                      " (a synchronous call in the layer?)";
-                return false;
-            }
-            if (DPCT_CHECK_ERROR(
-                        *out =
-                            new sycl::ext::oneapi::experimental::command_graph<
-                                sycl::ext::oneapi::experimental::graph_state::
-                                    executable>(graph->finalize())) != 0) {
-                err = "session_capture: instantiate failed at layer " + std::to_string(l);
-                return false;
-            }
-            delete (graph);
-            return true;
-        }
-                           catch (sycl::exception const &exc) {
-                             std::cerr
-                                 << exc.what()
-                                 << "Exception caught at file:" << __FILE__
-                                 << ", line:" << __LINE__ << std::endl;
-                             std::exit(1);
-                           }
+        auto capture = [&](bool post, dpct::experimental::command_graph_exec_ptr* out,
+                           const char* what, int half = 0, int stage_prefix = 0) -> bool {
+            return capture_owned_graph(gr, *out, [&](dpct::queue_ptr cs) {
+                err.clear();
+                const bool ok = post
+                    ? block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*)cs, err)
+                    : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
+                                      s.block, (void*)cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
+                                      half, stage_prefix);
+                if (!ok) err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
+                return ok;
+            }, err);
         };
         if (!capture(/*post=*/false, &gr.execs[l], "pre")) return false;
         if (!capture(/*post=*/true, &gr.posts[l], "post")) return false;
@@ -316,6 +363,9 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
     gr.captured = true;
     gr.parts_dev = const_cast<float*>(parts);   // the address the graphs baked in; the loop copies here
     return true;
+}
+catch (const std::exception& error) {
+    err = std::string("session_capture: ") + error.what(); return false;
 }
 
 bool session_replay(const ModelGeometry &g, int64_t pos, int32_t pos_base,
@@ -705,42 +755,42 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-void session_graphs_free(SessionGraphs& gr) {
-    if (gr.execs) {
-        for (int64_t i = 0; i < gr.n; ++i) delete (gr.execs[i]);
-        delete[] gr.execs;
+// BEGIN CHECKED SYCL SESSION GRAPH RETIREMENT
+bool session_graphs_free_checked(SessionGraphs& gr, std::string& err) {
+    gr.retirement_started = true;
+    gr.captured = false; gr.split_captured = false;
+    if (gr.retirement_failed) { err = "session graph retirement previously failed"; return false; }
+    bool has_arrays = gr.execs || gr.posts || gr.preA || gr.preB;
+    for (auto* pre : gr.preP) has_arrays = has_arrays || pre;
+    if (gr.allocated_slots < 0 || gr.n < 0 || gr.n > gr.allocated_slots || (!gr.allocated_slots && has_arrays)) {
+        gr.retirement_failed = true; err = "session graph capacity is invalid"; return false;
     }
-    if (gr.posts) {
-        for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.posts[i] != nullptr) delete (gr.posts[i]);
-        delete[] gr.posts;
+    try {
+        auto release = [&](dpct::experimental::command_graph_exec_ptr*& array) {
+            if (!array) return;
+            for (int64_t i = 0; i < gr.allocated_slots; ++i) {
+                if (array[i]) { delete array[i]; array[i] = nullptr; }
+            }
+            delete[] array; array = nullptr;
+        };
+        release(gr.execs); release(gr.posts); release(gr.preA); release(gr.preB);
+        for (auto& pre : gr.preP) release(pre);
+        if (gr.pending_graph) { delete gr.pending_graph; gr.pending_graph = nullptr; }
+        if (gr.pending_queue) {
+            dpct::get_current_device().destroy_queue(gr.pending_queue); gr.pending_queue = nullptr;
+        }
+        gr = SessionGraphs{};
+        return true;
+    } catch (const std::exception& error) {
+        gr.retirement_failed = true; err = std::string("session graph retirement: ") + error.what(); return false;
+    } catch (...) {
+        gr.retirement_failed = true; err = "session graph retirement failed"; return false;
     }
-    if (gr.preA) {
-        for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preA[i] != nullptr) delete (gr.preA[i]);
-        delete[] gr.preA;
-    }
-    if (gr.preB) {
-        for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preB[i] != nullptr) delete (gr.preB[i]);
-        delete[] gr.preB;
-    }
-    for (int k = 0; k < 5; ++k) {
-        if (gr.preP[k] == nullptr) continue;
-        for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preP[k][i] != nullptr) delete (gr.preP[k][i]);
-        delete[] gr.preP[k];
-        gr.preP[k] = nullptr;
-    }
-    gr.preA = nullptr;
-    gr.preB = nullptr;
-    gr.split_captured = false;
-    gr.posts = nullptr;
-    gr.execs = nullptr;
-    gr.parts_dev = nullptr;
-    gr.n = 0;
-    gr.captured = false;
 }
+void session_graphs_free(SessionGraphs& gr) {
+    std::string err; (void)session_graphs_free_checked(gr, err);
+}
+// END CHECKED SYCL SESSION GRAPH RETIREMENT
 
 bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) try {
     if (y_miss != nullptr || probe != nullptr) {
@@ -1217,7 +1267,9 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
                            TokenGraph &tg, std::string &err,
                            const TokenHits *hits) try {
     if (hits != nullptr && !hits->on()) { err = "session_capture_token: incomplete hit configuration"; return false; }
+    if (tg.retirement_started || tg.retirement_failed) { err = "session_capture_token: graph ownership retired"; return false; }
     if (tg.captured) return true;
+    if (tg.exec || tg.pending_graph || tg.pending_queue) { err = "session_capture_token: partial graph requires checked retirement"; return false; }
     if (s.db == nullptr || s.db->d_flag == nullptr || s.db->d_seq == nullptr) {
         err = "session_capture_token: the doorbell has no flag";
         return false;
@@ -1233,88 +1285,38 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
         err = "session_capture_token: the parts staging is not mapped pinned memory";
         return false;
     }
-    dpct::queue_ptr cs = &dpct::get_in_order_queue();
-    if (DPCT_CHECK_ERROR(cs = dpct::get_current_device().create_queue(true)) !=
-        0) {
-        err = "session_capture_token: stream create failed"; return false;
-    }
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs)) != 0) {
-        dpct::get_current_device().destroy_queue(cs);
-        err = "session_capture_token: begin capture failed";
-        return false;
-    }
-    int64_t qsa_index = 0;
-    bool ok = true;
-    for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-        gdn_point_at(g, l, s);
-        const bool qsa = is_qsa_layer(g, l);
-        QsaState& qst = qsa ? s.qsa_states[qsa_index] : s.qsa_states[0];
-        err.clear();
-        ok = block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k, s.block, (void*) cs, err, s.db,
-                             s.ple.ready() ? &s.ple : nullptr);
-        if (!ok) { err = "session_capture_token: pre layer " + std::to_string(l) + ": " + err; break; }
-        if (hits != nullptr) {
-            // After the ring (and the shared expert): the GPU's experts run while the CPU computes the misses.
-            strata::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
-                                            (int) hits->n_expert, hits->d_slot, hits->d_dst, hits->d_count, (void*) cs);
-            strata::kernels::quantize_q8_0_scaled(s.block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*) cs);
-            strata::kernels::moe_hit_grouped_s2_dev(hits->cache_base, hits->d_slot, hits->d_dst, hits->d_count, s.k,
-                                                    hits->blob, hits->x_q8, hits->scratch, hits->hit_out, (void*) cs,
-                                                    hits->x_scale);
+    const bool captured = capture_owned_graph(tg, tg.exec, [&](dpct::queue_ptr cs) {
+        int64_t qsa_index = 0;
+        bool ok = true;
+        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+            gdn_point_at(g, l, s);
+            const bool qsa = is_qsa_layer(g, l);
+            QsaState& qst = qsa ? s.qsa_states[qsa_index] : s.qsa_states[0];
+            err.clear();
+            ok = block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k, s.block, (void*) cs, err, s.db,
+                                 s.ple.ready() ? &s.ple : nullptr);
+            if (!ok) { err = "session_capture_token: pre layer " + std::to_string(l) + ": " + err; break; }
+            if (hits != nullptr) {
+                // After the ring (and the shared expert): the GPU's experts run while the CPU computes the misses.
+                strata::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
+                                                (int) hits->n_expert, hits->d_slot, hits->d_dst, hits->d_count, (void*) cs);
+                strata::kernels::quantize_q8_0_scaled(s.block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*) cs);
+                strata::kernels::moe_hit_grouped_s2_dev(hits->cache_base, hits->d_slot, hits->d_dst, hits->d_count, s.k,
+                                                        hits->blob, hits->x_q8, hits->scratch, hits->hit_out, (void*) cs,
+                                                        hits->x_scale);
+            }
+            strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
+            // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
+            strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
+            if (hits != nullptr)
+                strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
+            ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err);
+            if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
+            if (qsa) ++qsa_index;
         }
-        strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
-        // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
-        strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
-        if (hits != nullptr)
-            strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
-        ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err);
-        if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
-        if (qsa) ++qsa_index;
-    }
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    const dpct::err0 ce =
-        DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs, &graph));
-    dpct::get_current_device().destroy_queue(cs);
-    if (!ok) { if (graph) delete (graph); return false; }
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (ce != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("session_capture_token: end capture: ") +
-              dpct::get_error_string_dummy(ce);
-        return false;
-    }
-    const dpct::err0 ie = DPCT_CHECK_ERROR(
-        tg.exec = new sycl::ext::oneapi::experimental::command_graph<
-            sycl::ext::oneapi::experimental::graph_state::executable>(
-            graph->finalize()));
-    delete (graph);
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (ie != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("session_capture_token: instantiate: ") +
-              dpct::get_error_string_dummy(ie);
-        return false;
-    }
+        return ok;
+    }, err);
+    if (!captured) return false;
     tg.captured = true;
     tg.n_layers = g.n_layers;
     tg.y_src = y_miss_host;
@@ -1441,9 +1443,41 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-void token_graph_free(TokenGraph& tg) {
-    if (tg.exec) delete (tg.exec);
-    tg = TokenGraph{};
+// BEGIN CHECKED SYCL TOKEN GRAPH RETIREMENT
+bool token_graph_free_checked(TokenGraph& tg, std::string& err) {
+    tg.retirement_started = true; tg.captured = false;
+    if (tg.retirement_failed) { err = "token graph retirement previously failed"; return false; }
+    try {
+        if (tg.exec) { delete tg.exec; tg.exec = nullptr; }
+        if (tg.pending_graph) { delete tg.pending_graph; tg.pending_graph = nullptr; }
+        if (tg.pending_queue) {
+            dpct::get_current_device().destroy_queue(tg.pending_queue); tg.pending_queue = nullptr;
+        }
+        tg = TokenGraph{};
+        return true;
+    } catch (const std::exception& error) {
+        tg.retirement_failed = true; err = std::string("token graph retirement: ") + error.what(); return false;
+    } catch (...) {
+        tg.retirement_failed = true; err = "token graph retirement failed"; return false;
+    }
 }
+void token_graph_free(TokenGraph& tg) {
+    std::string err; (void)token_graph_free_checked(tg, err);
+}
+// END CHECKED SYCL TOKEN GRAPH RETIREMENT
 
 }  // namespace strata::core
+
+namespace strata::core {
+// Optional private allocation has no SYCL ownership/upload implementation yet.
+// Refuse before any state/device effect; legacy session_init is unchanged.
+bool session_private_plan(const ModelGeometry&,int64_t,int64_t,int64_t,int64_t,SessionPrivatePlan&) { return false; }
+bool session_private_plan(const ModelGeometry&,int64_t,int64_t,int64_t,int64_t,SessionPrivatePlan&,const QsaElasticPlan*) { return false; }
+uint64_t session_init_private(const ModelGeometry&,int64_t,int64_t,void*,SessionState&,SessionInitUploads& u,int64_t,int64_t) {
+    u.error="private session ownership is not implemented on SYCL";return 0;
+}
+uint64_t session_init_private(const ModelGeometry&,int64_t,int64_t,void*,SessionState&,SessionInitUploads& u,
+    int64_t,int64_t,const QsaElasticPlan*,QsaElasticView* const*,size_t) {
+    u.error="private elastic session ownership is not implemented on SYCL";return 0;
+}
+} // namespace strata::core

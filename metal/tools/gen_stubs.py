@@ -166,8 +166,16 @@ for qn in sorted(wanted):
         if kind == "FunctionDecl":
             ns, fn = qn.rsplit("::", 1)
             r = ret_of(ty)
-            body = 'strata::metal_engine::missing("%s");' % qn
-            body += ret_stmt(r)
+            # Optional observation explicitly refuses unsupported native policy;
+            # unlike executable kernel stubs it must not terminate the process.
+            if qn == "strata::kernels::native_rope_policy_observation":
+                if (r not in ("NativeRopePolicyObservation", "strata::kernels::NativeRopePolicyObservation")
+                        or [t for _, t in params] != ["int", "int"] or nx(ty)):
+                    raise RuntimeError("native RoPE policy observation signature changed")
+                body = "return {false, p0, p1, false, false, false};"
+            else:
+                body = 'strata::metal_engine::missing("%s");' % qn
+                body += ret_stmt(r)
             lines.append("namespace %s { %s %s(%s)%s { %s } }" % (ns, r, fn, ps, nx(ty), body))
         elif kind == "CXXMethodDecl":
             r = ret_of(ty)

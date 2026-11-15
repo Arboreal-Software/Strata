@@ -1,0 +1,304 @@
+#include "strata/core/window_budget.hpp"
+
+#include <mutex>
+#include <cstdio>
+#include <cstdlib>
+#include <new>
+#include <stdexcept>
+#include <utility>
+
+namespace strata::core {
+struct WindowBudgetState {
+    mutable std::mutex mutex;
+    WindowResources capacity, baseline, reserved;
+};
+namespace {
+bool valid(const WindowResources& r, size_t devices) {
+    return r.device_bytes.size() == devices && r.pinned_bytes <= r.host_bytes;
+}
+bool fits(uint64_t capacity, uint64_t baseline, uint64_t held, uint64_t request) {
+    return baseline <= capacity && held <= capacity - baseline && request <= capacity - baseline - held;
+}
+bool covers(const WindowResources& held, const WindowResources& required) {
+    if (!valid(required,held.device_bytes.size())) return false;
+    bool nonzero = false;
+    for (size_t i = 0; i < held.device_bytes.size(); ++i) {
+        if (held.device_bytes[i] < required.device_bytes[i]) return false;
+        nonzero |= required.device_bytes[i] != 0;
+    }
+    for (auto field : {&WindowResources::host_bytes, &WindowResources::pinned_bytes, &WindowResources::disk_bytes,
+                       &WindowResources::io_slots, &WindowResources::shadows}) {
+        if (held.*field < required.*field) return false;
+        nonzero |= required.*field != 0;
+    }
+    return nonzero;
+}
+ReservationResult check(const WindowBudgetState& s, const WindowResources& r) {
+    if (!valid(r, s.capacity.device_bytes.size())) return {ReservationError::invalid_vector, -1, {}};
+    for (size_t i = 0; i < r.device_bytes.size(); ++i)
+        if (!fits(s.capacity.device_bytes[i], s.baseline.device_bytes[i], s.reserved.device_bytes[i], r.device_bytes[i]))
+            return {ReservationError::device_limit, int(i), {}};
+    if (!fits(s.capacity.host_bytes,s.baseline.host_bytes,s.reserved.host_bytes,r.host_bytes))
+        return {ReservationError::host_limit,-1,{}};
+    if (!fits(s.capacity.pinned_bytes,s.baseline.pinned_bytes,s.reserved.pinned_bytes,r.pinned_bytes))
+        return {ReservationError::pinned_limit,-1,{}};
+    if (!fits(s.capacity.disk_bytes,s.baseline.disk_bytes,s.reserved.disk_bytes,r.disk_bytes))
+        return {ReservationError::disk_limit,-1,{}};
+    if (!fits(s.capacity.io_slots,s.baseline.io_slots,s.reserved.io_slots,r.io_slots))
+        return {ReservationError::io_limit,-1,{}};
+    if (!fits(s.capacity.shadows,s.baseline.shadows,s.reserved.shadows,r.shadows))
+        return {ReservationError::shadow_limit,-1,{}};
+    return {};
+}
+void charge(WindowResources& held, const WindowResources& r, bool add) {
+    // Addition only follows subtraction-based fit checks under the same lock;
+    // subtraction only occurs once, at the last shared lease's destruction.
+    for (size_t i = 0; i < r.device_bytes.size(); ++i)
+        if (add) held.device_bytes[i] += r.device_bytes[i]; else held.device_bytes[i] -= r.device_bytes[i];
+    for (auto field : {&WindowResources::host_bytes, &WindowResources::pinned_bytes, &WindowResources::disk_bytes,
+                       &WindowResources::io_slots, &WindowResources::shadows})
+        if (add) held.*field += r.*field; else held.*field -= r.*field;
+}
+}
+GgufHostWorkspace::~GgufHostWorkspace(){reset();}
+GgufHostWorkspace::GgufHostWorkspace(GgufHostWorkspace&& other) noexcept
+    :state_(std::move(other.state_)),bytes_(std::exchange(other.bytes_,0)),io_(std::exchange(other.io_,0)){}
+GgufHostWorkspace& GgufHostWorkspace::operator=(GgufHostWorkspace&& other) noexcept {
+    if(this!=&other){reset();state_=std::move(other.state_);bytes_=std::exchange(other.bytes_,0);io_=std::exchange(other.io_,0);}return *this;
+}
+void GgufHostWorkspace::reset() noexcept {
+    if(!state_)return;
+    try{
+        {std::lock_guard lock(state_->mutex);
+         if(bytes_>state_->reserved.host_bytes||io_>state_->reserved.io_slots)std::_Exit(86);
+         state_->reserved.host_bytes-=bytes_;state_->reserved.io_slots-=io_;}
+        bytes_=io_=0;state_.reset();
+    }catch(...){std::_Exit(86);} // never certify a refund on uncertainty
+}
+ReservationError WindowBudget::begin_gguf_scan(uint64_t prepaid_setup,GgufHostWorkspace& out) noexcept {
+    try{
+        std::lock_guard lock(state_->mutex);
+        if(out.state_||!prepaid_setup||state_->baseline.host_bytes<prepaid_setup)
+            return ReservationError::invalid_vector;
+        for(size_t d=0;d<state_->capacity.device_bytes.size();++d)
+            if(!fits(state_->capacity.device_bytes[d],state_->baseline.device_bytes[d],state_->reserved.device_bytes[d],0))return ReservationError::device_limit;
+        if(!fits(state_->capacity.pinned_bytes,state_->baseline.pinned_bytes,state_->reserved.pinned_bytes,0))return ReservationError::pinned_limit;
+        if(!fits(state_->capacity.disk_bytes,state_->baseline.disk_bytes,state_->reserved.disk_bytes,0))return ReservationError::disk_limit;
+        if(!fits(state_->capacity.shadows,state_->baseline.shadows,state_->reserved.shadows,0))return ReservationError::shadow_limit;
+        if(!fits(state_->capacity.host_bytes,state_->baseline.host_bytes,state_->reserved.host_bytes,0))return ReservationError::host_limit;
+        if(!fits(state_->capacity.io_slots,state_->baseline.io_slots,state_->reserved.io_slots,1))return ReservationError::io_limit;
+        ++state_->reserved.io_slots;out.state_=state_;out.io_=1;
+        return ReservationError::none;
+    }catch(...){std::_Exit(86);}
+}
+ReservationError WindowBudget::admit_gguf_workspace(uint64_t bytes,uint64_t prepaid_setup,
+                                                  GgufHostWorkspace& out) noexcept {
+    try{
+        std::lock_guard lock(state_->mutex);
+        // This checks the floor, not ownership of arbitrary observed baseline.
+        // The verified-input caller dedicates exactly this setup term before
+        // constructing any introduced scan/result/report/control object.
+        if(out.state_!=state_||out.io_!=1||out.bytes_||!prepaid_setup||state_->baseline.host_bytes<prepaid_setup)
+            return ReservationError::invalid_vector;
+        for(size_t d=0;d<state_->capacity.device_bytes.size();++d)
+            if(!fits(state_->capacity.device_bytes[d],state_->baseline.device_bytes[d],state_->reserved.device_bytes[d],0))
+                return ReservationError::device_limit;
+        if(!fits(state_->capacity.pinned_bytes,state_->baseline.pinned_bytes,state_->reserved.pinned_bytes,0))return ReservationError::pinned_limit;
+        if(!fits(state_->capacity.disk_bytes,state_->baseline.disk_bytes,state_->reserved.disk_bytes,0))return ReservationError::disk_limit;
+        if(!fits(state_->capacity.io_slots,state_->baseline.io_slots,state_->reserved.io_slots,0))return ReservationError::io_limit;
+        if(!fits(state_->capacity.shadows,state_->baseline.shadows,state_->reserved.shadows,0))return ReservationError::shadow_limit;
+        if(!fits(state_->capacity.host_bytes,state_->baseline.host_bytes,state_->reserved.host_bytes,bytes))
+            return ReservationError::host_limit;
+        if(bytes){state_->reserved.host_bytes+=bytes;out.bytes_=bytes;}
+        return ReservationError::none;
+    }catch(...){std::_Exit(86);}
+}
+bool WindowBudget::gguf_setup_paid(uint64_t bytes) const noexcept {
+    try{std::lock_guard lock(state_->mutex);return bytes&&state_->baseline.host_bytes>=bytes&&
+        state_->baseline.host_bytes<=state_->capacity.host_bytes;}catch(...){std::_Exit(86);}
+}
+
+ReservationLease::ReservationLease(std::shared_ptr<WindowBudgetState> s, WindowResources r, ReservationPurpose p,
+                                   std::shared_ptr<const ReservationLease> returned)
+    : state_(std::move(s)), resources_(std::move(r)), purpose_(p), return_(std::move(returned)) {}
+ReservationLease::~ReservationLease() {
+    if (charged_) {
+        std::lock_guard lock(state_->mutex);
+        charge(state_->reserved, resources_, false);
+        if (return_ && purpose_ == ReservationPurpose::saved_maintenance) return_->return_in_use_ = false;
+    }
+    // return_ is released after the lock: its destructor can charge the same ledger.
+}
+WindowBudget::WindowBudget(WindowResources capacity, WindowResources baseline)
+    : state_(std::make_shared<WindowBudgetState>()) {
+    if (capacity.device_bytes.empty() || capacity.device_bytes.size() > 64 ||
+        !valid(capacity,capacity.device_bytes.size()) || !valid(baseline,capacity.device_bytes.size()))
+        throw std::invalid_argument("invalid window resource dimensions or pinned subset");
+    state_->capacity = std::move(capacity); state_->baseline = std::move(baseline);
+    state_->reserved.device_bytes.resize(state_->capacity.device_bytes.size());
+}
+ReservationResult WindowBudget::reserve(const WindowResources& resources, ReservationPurpose purpose,
+                                        std::shared_ptr<const ReservationLease> returned,
+                                        const WindowReturnObligation* obligation) {
+    const bool return_related = purpose == ReservationPurpose::foreground_return || purpose == ReservationPurpose::saved_maintenance;
+    if (return_related && (!obligation || obligation->identity.empty()))
+        return {ReservationError::return_unavailable,-1,{}};
+    if (!return_related && ((returned && purpose != ReservationPurpose::private_attachment) || obligation)) return {ReservationError::invalid_vector,-1,{}};
+    if (purpose == ReservationPurpose::foreground_return &&
+        (returned || !covers(resources,obligation->required))) return {ReservationError::return_unavailable,-1,{}};
+    if ((purpose == ReservationPurpose::private_work || purpose == ReservationPurpose::saved_maintenance) && resources.shadows != 1)
+        return {ReservationError::invalid_vector,-1,{}};
+    if (purpose == ReservationPurpose::private_attachment && (resources.shadows != 0 || !returned))
+        return {ReservationError::invalid_vector,-1,{}};
+    switch (purpose) {
+    case ReservationPurpose::foreground: case ReservationPurpose::foreground_return:
+    case ReservationPurpose::private_work: case ReservationPurpose::saved_maintenance:
+    case ReservationPurpose::private_attachment: break;
+    default: return {ReservationError::invalid_vector,-1,{}};
+    }
+    // Shared parents need authenticated retention, not exclusive ownership.
+    // A live pointer aliased to an unrelated control block can pass every
+    // pointee check yet release the real parent's charge before its child dies.
+    if (returned && !returned->canonical_owner(returned))
+        return {return_related ? ReservationError::return_unavailable : ReservationError::invalid_vector,-1,{}};
+    std::shared_ptr<ReservationLease> lease;
+    try {
+        // Allocate before taking the ledger lock; failed allocation never changes admission.
+        lease = std::shared_ptr<ReservationLease>(new ReservationLease(state_,resources,purpose,std::move(returned)));
+        lease->owner_ = lease;
+        if (obligation) lease->obligation_ = *obligation;
+    } catch (const std::bad_alloc&) { return {ReservationError::allocation_failed,-1,{}}; }
+    std::lock_guard lock(state_->mutex);
+    if (purpose == ReservationPurpose::saved_maintenance &&
+        (!lease->return_ || lease->return_->state_ != state_ || !lease->return_->charged_ ||
+         lease->return_->purpose_ != ReservationPurpose::foreground_return))
+        return {ReservationError::return_unavailable,-1,{}};
+    if (purpose == ReservationPurpose::saved_maintenance &&
+        (lease->return_->return_in_use_ || lease->return_->obligation_ != *obligation ||
+         !covers(lease->return_->resources_,obligation->required)))
+        return {ReservationError::return_unavailable,-1,{}};
+    if (purpose == ReservationPurpose::private_attachment &&
+        (lease->return_->state_ != state_ || !lease->return_->charged_ ||
+         (lease->return_->purpose_ != ReservationPurpose::private_work &&
+          lease->return_->purpose_ != ReservationPurpose::saved_maintenance)))
+        return {ReservationError::invalid_vector,-1,{}};
+    auto result = check(*state_,resources);
+    if (!result) return result;
+    charge(state_->reserved,resources,true);
+    lease->charged_ = true;
+    if (purpose == ReservationPurpose::saved_maintenance) lease->return_->return_in_use_ = true;
+    result.lease = std::move(lease);
+    return result;
+}
+bool WindowBudget::observe_baseline(const WindowResources& baseline) {
+    if (!valid(baseline,state_->capacity.device_bytes.size())) return false;
+    WindowResources copy = baseline;
+    std::lock_guard lock(state_->mutex);
+    state_->baseline = std::move(copy);
+    return true;
+}
+WindowBudgetSnapshot WindowBudget::snapshot() const {
+    std::lock_guard lock(state_->mutex);
+    WindowResources zero;
+    zero.device_bytes.resize(state_->capacity.device_bytes.size());
+    return {state_->capacity,state_->baseline,state_->reserved,!check(*state_,zero)};
+}
+} // namespace strata::core
+
+namespace strata::core {
+bool WindowBudget::shrink_foreground(const std::shared_ptr<const ReservationLease>& owner,WindowResources retained) {
+    if(!owner||owner.use_count()!=1||!owner->canonical_owner(owner)||owner->state_!=state_||
+       owner->purpose_!=ReservationPurpose::foreground||owner->return_||!owner->charged_)return false;
+    std::lock_guard lock(state_->mutex);
+    const auto& old=owner->resources_;
+    if(!valid(retained,old.device_bytes.size()))return false;
+    for(size_t device=0;device<old.device_bytes.size();++device)
+        if(retained.device_bytes[device]>old.device_bytes[device])return false;
+    for(auto field:{&WindowResources::host_bytes,&WindowResources::pinned_bytes,&WindowResources::disk_bytes,
+                    &WindowResources::io_slots,&WindowResources::shadows})
+        if(retained.*field>old.*field)return false;
+    charge(state_->reserved,old,false);charge(state_->reserved,retained,true);
+    const_cast<ReservationLease*>(owner.get())->resources_=std::move(retained);
+    return true;
+}
+}
+
+namespace strata::core {
+namespace {
+struct HeadSpillLedgerFrame {
+    std::lock_guard<std::mutex> lock;
+    ReservationLease* lease = nullptr;
+    size_t index = 0;
+    explicit HeadSpillLedgerFrame(std::mutex& mutex) : lock(mutex) {}
+};
+}
+HeadSpillCharge::~HeadSpillCharge() {
+    if (phase_ == Phase::peak) {
+        std::fputs("strata: unsettled head spill; worker restart required\n", stderr);
+        std::_Exit(86);
+    }
+}
+uint64_t WindowBudget::head_spill_control_bytes() noexcept {
+    // One real ledger frame plus separately named formal/return storage for
+    // admission and settlement. They run serially; summing both is conservative.
+    return sizeof(HeadSpillLedgerFrame) +
+        sizeof(WindowBudget*) + sizeof(const std::shared_ptr<const ReservationLease>*) +
+        sizeof(int) + 2*sizeof(uint64_t) + sizeof(HeadSpillCharge*) + sizeof(bool) +
+        sizeof(WindowBudget*) + sizeof(const std::shared_ptr<const ReservationLease>*) +
+        sizeof(HeadSpillCharge*) + sizeof(bool) + sizeof(bool) +
+        // Explicit LedgerFrame constructor forwarding arguments.
+        sizeof(HeadSpillLedgerFrame*) + sizeof(std::mutex*);
+}
+bool WindowBudget::admit_head_spill(const std::shared_ptr<const ReservationLease>& owner,
+                                   int device, uint64_t bytes, uint64_t fixed_host,
+                                   HeadSpillCharge& token) noexcept {
+    if (token.phase_ != HeadSpillCharge::Phase::empty || !owner || owner.use_count()!=1 ||
+        !owner->canonical_owner(owner) || owner->state_!=state_ || !owner->charged_ ||
+        owner->purpose_!=ReservationPurpose::foreground || owner->return_ ||
+        device<0 || size_t(device)>=owner->resources_.device_bytes.size() || !bytes || !fixed_host)
+        return false;
+    HeadSpillLedgerFrame frame(state_->mutex);
+    frame.lease=const_cast<ReservationLease*>(owner.get());
+    if (frame.lease->resources_.device_bytes[size_t(device)]<bytes ||
+        frame.lease->resources_.host_bytes<fixed_host ||
+        !fits(state_->capacity.host_bytes,state_->baseline.host_bytes,state_->reserved.host_bytes,bytes) ||
+        !fits(state_->capacity.pinned_bytes,state_->baseline.pinned_bytes,state_->reserved.pinned_bytes,bytes))
+        return false;
+    // This operation is deliberately restricted to one model-stage foreground
+    // allocation, not arbitrary return/private/multidevice leases.
+    for (frame.index=0;frame.index<frame.lease->resources_.device_bytes.size();++frame.index)
+        if (frame.index!=size_t(device) && frame.lease->resources_.device_bytes[frame.index]) return false;
+    if (frame.lease->resources_.disk_bytes || frame.lease->resources_.io_slots || frame.lease->resources_.shadows)
+        return false;
+    token.owner_=owner.get();token.state_=state_.get();token.device_=device;token.bytes_=bytes;
+    token.device_before_=frame.lease->resources_.device_bytes[size_t(device)];
+    token.host_before_=frame.lease->resources_.host_bytes;token.pinned_before_=frame.lease->resources_.pinned_bytes;
+    frame.lease->resources_.host_bytes+=bytes;frame.lease->resources_.pinned_bytes+=bytes;
+    state_->reserved.host_bytes+=bytes;state_->reserved.pinned_bytes+=bytes;
+    token.phase_=HeadSpillCharge::Phase::peak;
+    return true;
+}
+bool WindowBudget::settle_head_spill(const std::shared_ptr<const ReservationLease>& owner,
+                                    HeadSpillCharge& token, bool commit) noexcept {
+    if (token.phase_!=HeadSpillCharge::Phase::peak || !owner || owner.use_count()!=1 ||
+        !owner->canonical_owner(owner) || owner.get()!=token.owner_ || owner->state_!=state_ ||
+        token.state_!=state_.get() || !owner->charged_ ||
+        owner->purpose_!=ReservationPurpose::foreground || owner->return_ ||
+        token.device_<0 || size_t(token.device_)>=owner->resources_.device_bytes.size()) return false;
+    HeadSpillLedgerFrame frame(state_->mutex);
+    frame.lease=const_cast<ReservationLease*>(owner.get());
+    if (frame.lease->resources_.device_bytes[size_t(token.device_)]!=token.device_before_ ||
+        frame.lease->resources_.host_bytes!=token.host_before_+token.bytes_ ||
+        frame.lease->resources_.pinned_bytes!=token.pinned_before_+token.bytes_) return false;
+    if (commit) {
+        frame.lease->resources_.device_bytes[size_t(token.device_)]-=token.bytes_;
+        state_->reserved.device_bytes[size_t(token.device_)]-=token.bytes_;
+        token.phase_=HeadSpillCharge::Phase::committed;
+    } else {
+        frame.lease->resources_.host_bytes-=token.bytes_;frame.lease->resources_.pinned_bytes-=token.bytes_;
+        state_->reserved.host_bytes-=token.bytes_;state_->reserved.pinned_bytes-=token.bytes_;
+        token.phase_=HeadSpillCharge::Phase::rolled_back;
+    }
+    return true;
+}
+} // namespace strata::core

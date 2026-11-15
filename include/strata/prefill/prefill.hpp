@@ -17,6 +17,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/prefill/owned_workspace.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -24,10 +25,15 @@
 #include <memory>
 #include <string>
 
+namespace strata::program {class ServingRawSession;class OwnedPositionBankBinding;class OwnedImageRequestOperation;class OwnedImageRequestDriver;}
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
 
 namespace strata::prefill {
+
+// Actual Stager worker ceiling, shared with host reader-admission planning.
+// Changing this requires revisiting helper copy-reader metadata reservations.
+inline constexpr int kMaxStagerThreads = 32;
 
 struct PrefillStats {
     int64_t tokens = 0;
@@ -63,8 +69,24 @@ public:
     /// `why` (optional): on a decline (false, `err` empty) the reason, a static string.
     bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                   std::string& err, const char** why = nullptr);
+    // Owner-thread/quiescent only, including process-wide policy writers.
+    // Does not resolve lazy configuration; incomplete and not a compatibility seal.
+    core::PrefillCpuShareObservation cpu_share_policy() const noexcept;
+    // Quiescent owner-thread observation for the fixed serving qualification
+    // adapter. Not a synchronization fence or a general compatibility seal.
+    struct ReplayActivity {
+        const void* session=nullptr;const void* source=nullptr;const void* cache=nullptr;
+        const int32_t* residency=nullptr;const Prefill* next=nullptr;
+        int device=-1;int64_t begin=0,end=0;
+        int64_t allocated_chunk=0,chunk=0,ring_slots=0;
+        bool initialized=false,helper=false,peer=false,taps=false,borrow_spill=false,pending_force=false,workspace_paid=false;
+    };
+    ReplayActivity replay_activity() const noexcept;
+    static uint64_t owned_position_fixed_growth_bound() noexcept;
     Prefill();
     ~Prefill();
+    /// CUDA ownership mode: configure before init; cleanup uncertainty terminates the worker.
+    bool set_strict_retirement(bool enabled, std::string& error);
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
 
@@ -80,6 +102,12 @@ public:
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0,
               bool borrow_spill = false);
+    // Strict text/no-helper setup: quote the actual maximum workspace before
+    // init. The driver supplies its genuine ledger, not a caller-provided seal.
+    // Credit remains here through checked reset/destruction of all consumers.
+    using WorkspaceAdmitter=std::function<WorkspaceAdmission(const OwnedWorkspaceBytes&,std::shared_ptr<const void>&)>;
+    WorkspaceAdmission admit_owned_workspace(const core::ModelGeometry&,const core::SessionState&,core::ExpertSource*,
+                              int64_t chunk,bool borrowed,const WorkspaceAdmitter&,std::string& error);
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
@@ -318,7 +346,12 @@ public:
         return p->lm_mid_;
     }
 
+    // Observation for the existing short-read chooser; no row pointer or
+    // execution authority escapes the private authenticated prefill view.
+    bool owned_image_rows_present(int64_t begin,int64_t end)const noexcept;
 private:
+    bool strict_retirement_ = false;
+    bool retirement_init_started_ = false;
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
@@ -371,8 +404,23 @@ private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
+    std::shared_ptr<const void> workspace_credit_; // destroyed AFTER Impl
+    const core::ModelGeometry* workspace_geometry_=nullptr;
+    const core::SessionState* workspace_session_=nullptr;
+    const core::ExpertSource* workspace_source_=nullptr;
+    int64_t workspace_chunk_=0;
+    bool workspace_borrowed_=false,workspace_successor_=false;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
+    friend class strata::program::ServingRawSession;
+    friend class strata::program::OwnedImageRequestDriver;
+    // Outside Impl: do not duplicate the already-paid actual sizeof(Impl).
+    std::shared_ptr<const strata::program::OwnedPositionBankBinding> position_banks_;
+    std::shared_ptr<const strata::program::OwnedImageRequestOperation> image_operation_;
+    uint64_t image_generation_=0;
+    bool owned_position_bank_target(const core::ModelGeometry*,const core::SessionState*,int) const noexcept;
+    bool owned_image_target(const core::ModelGeometry*,const core::SessionState*,int) const noexcept;
+    bool owned_image_retirement_ready(const program::OwnedImageRequestOperation*) noexcept;
 };
 
 }  // namespace strata::prefill

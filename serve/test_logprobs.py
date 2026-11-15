@@ -190,9 +190,9 @@ class Generate(unittest.TestCase):
     """The token's LP line is read next to it, and only when it was asked for."""
 
     def engine(self, *lines):
-        e = StrataEngine.__new__(StrataEngine)
-        e.proc = __import__("types").SimpleNamespace(
-            stdin=__import__("io").StringIO(), poll=lambda: None)
+        from serve.test_engine_writer import engine as recording_engine
+        e = recording_engine()
+        e.proc.stdin = __import__("io").StringIO()
         e.lines, e.can_stop, e.max_context, e.silence_s = queue.Queue(), False, 262144, 0
         for line in lines:
             e.lines.put(line)

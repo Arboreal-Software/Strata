@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 
@@ -37,17 +38,33 @@ bool native_qsa_indexer_enabled();
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
                                      const RopeScaling& scaling, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void native_qsa_indexer_append_batch_owned(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
+                                     float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
+                                     const RopeScaling& scaling, void* stream, const int32_t* position_table);
+
 
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device,
                                int32_t pos_base, const float* gamma, float epsilon,
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, const RopeScaling& scaling, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void native_qsa_indexer_append_owned(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
+                               const float* gamma, float epsilon, const QsaIndexerBuffers& b,
+                               const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream, const int32_t* position_table);
+
 
 void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device,
                                      int pos_stride, int n_steps, int32_t pos_base,
                                      const float* gamma, float epsilon,
                                      const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                      int64_t max_cells, const RopeScaling& scaling, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void native_qsa_indexer_append_steps_owned(const float* raw, const int32_t* relative_pos_device,
+                                     int pos_stride, int n_steps, int32_t pos_base,
+                                     const float* gamma, float epsilon, const QsaIndexerBuffers& b,
+                                     const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream, const int32_t* position_table);
+
 
 // engine-latency: the commit's append of the same window rows into several QSA layers in one launch.  Layer i reads
 // raw0 + i * raw_stride and its own gamma/buffers; with tail_src[i] set its tail is first restored from there (the
@@ -65,5 +82,11 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
                                             int pos_stride, int n_steps, int32_t pos_base, float epsilon,
                                             const QsaIndexerLayers& layers, int n_layers, const QsaShapes& shapes,
                                             int64_t max_cells, const RopeScaling& scaling, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void native_qsa_indexer_append_steps_layers_owned(const float* raw0, int64_t raw_stride, const int32_t* relative_pos_device,
+                                            int pos_stride, int n_steps, int32_t pos_base, float epsilon,
+                                            const QsaIndexerLayers& layers, int n_layers, const QsaShapes& s,
+                                            int64_t max_cells, const RopeScaling& scaling, void* stream, const int32_t* position_table);
+
 
 } // namespace strata::kernels

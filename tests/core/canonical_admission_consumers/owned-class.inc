@@ -1,0 +1,32 @@
+class OwnedQsaElasticPool final:public QsaElasticView {
+public:
+    static bool host_bound(const QsaElasticPlan&,uint64_t& owner_bytes,uint64_t& range_bytes) noexcept;
+    // Host only. batch owns its genuine physical and batch-metadata admission;
+    // range/owner leases are separate. All metadata and output slots are created
+    // before any GPU work. Caller admits the complete gang before initialize.
+    static bool prepare(const ModelGeometry&,const QsaElasticPlan&,
+        std::shared_ptr<const ReservationLease> owner_metadata,
+        std::shared_ptr<const ReservationLease> range_metadata,
+        std::unique_ptr<PreparedVmmAllocationBatch>& batch,
+        std::shared_ptr<OwnedQsaElasticPool>& out,std::string&);
+    ~OwnedQsaElasticPool();
+    OwnedQsaElasticPool(const OwnedQsaElasticPool&)=delete;
+    OwnedQsaElasticPool& operator=(const OwnedQsaElasticPool&)=delete;
+    const QsaElasticPlan& plan()const noexcept override;
+    uint8_t* base()const noexcept override;
+    int64_t committed_slots()const noexcept override;
+    bool healthy()const noexcept override;
+    bool initialize_checked(std::string&) override;
+    bool claim_state(QsaState*) noexcept override;
+    // Host-only seal retains bound state identity and every admitted owner.
+    // False after seal is terminal: caller retains the context/owner, no retry.
+    bool prepare_retirement(const NativeRetirementContext&) noexcept override;
+    // Requires exact checked gang context; no device synchronization here.
+    // False may follow successful frees: residual owners stay retained, no rollback.
+    bool commit_retirement(const NativeRetirementContext&) noexcept override;
+    bool retire_checked() noexcept override;
+private:
+    OwnedQsaElasticPool()=default;
+    struct Storage;
+    std::unique_ptr<Storage> storage_;
+};

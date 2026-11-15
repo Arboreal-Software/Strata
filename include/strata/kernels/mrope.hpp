@@ -23,6 +23,15 @@
 
 namespace strata::kernels {
 
+// Requested int32 triple storage for one owned bank, including fixed lookahead.
+// No allocation or admission; callers sum THREE banks on every actual device.
+inline bool owned_mrope_bank_layout(uint64_t context,uint64_t& cells,uint64_t& bytes) noexcept {
+    if(!context||context>uint64_t(INT32_MAX)-64)return false;
+    cells=context+64;
+    if(cells>UINT64_MAX/(3*sizeof(int32_t)))return false;
+    bytes=cells*(3*sizeof(int32_t));return true;
+}
+
 /// The table of the CURRENT device (a layer split sets one per device; null = the identity).
 void mrope_table_set(const int32_t* device_table);
 const int32_t* mrope_table();

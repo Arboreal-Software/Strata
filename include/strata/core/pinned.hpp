@@ -22,6 +22,7 @@
 
 namespace strata::core {
 
+class ExpertSourceReadObserver;
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
 /// #243: STRATA_ARENA_PIN_GIB, the cap on the expert arena's CUDA registration in GiB.  -1 when unset (the engine
@@ -103,6 +104,9 @@ struct PinnedArena {
     /// loading it, ~0: it is complete).  Shared by every engine that maps the file; null for a private arena.
     std::atomic<uint64_t>* shared_state = nullptr;
     ~PinnedArena();
+    void set_strict_retirement(int device) { strict_retirement_ = true; retirement_device_ = device; }
+    bool strict_retirement_ = false;
+    int retirement_device_ = -1;
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;
 
@@ -177,6 +181,12 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
                               const std::atomic<int>* ready = nullptr);
+
+// Optional actual-read observer; old signatures remain ABI/source compatible.
+LoadStats load_experts_ranges(const std::string&,uint8_t*,const std::vector<uint64_t>&,
+    const std::vector<uint64_t>&,int,uint64_t,const std::atomic<int>*,const PadMap*,ExpertSourceReadObserver*);
+LoadStats load_experts_direct(const std::string&,uint8_t*,const std::vector<uint64_t>&,
+    const std::vector<uint64_t>&,int,uint64_t,const std::atomic<int>*,ExpertSourceReadObserver*);
 
 /// Whether the expert files are better read unbuffered (Windows; false elsewhere): a timed probe of random 64 KiB
 /// reads says they are not in the OS file cache (a cached read takes ~10 us, the drive ~80), and the RAM left

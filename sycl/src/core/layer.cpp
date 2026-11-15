@@ -979,6 +979,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
+    if(st.owned_elastic){std::fprintf(stderr,"strata: owned elastic QSA reset is not implemented on SYCL\n");std::_Exit(1);}
     const QsaShapes s = qsa_shapes(g);
     dpct::queue_ptr cs = strata::q_of(stream);
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
@@ -1016,6 +1017,55 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cs->memset(st.idx_tail, 0, (size_t)(s.idx_block - 1) * s.idx_dim * 4);
     cs->memset(st.idx_dead, 0, (size_t)s.idx_dim * 4);
     cs->memset(st.idx_pooled, 0, (size_t)st.idx_pooled_rows * s.idx_dim * 4);
+}
+
+bool qsa_state_zero_checked(const QsaState& st, const ModelGeometry& g, void* stream, std::string& error) {
+    if(st.owned_elastic){error="owned elastic QSA reset is not implemented on SYCL";return false;}
+    try {
+    const QsaShapes s = qsa_shapes(g);
+    dpct::queue_ptr cs = strata::q_of(stream);
+    // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
+    const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+    const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
+    if (st.kv_hybrid) {
+        strata::big_fill_zero(*cs, st.k_q, rows * s.head_dim);
+        strata::big_fill_zero(*cs, st.k_scale,
+                   rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+        strata::big_fill_zero(*cs, st.v_q4,
+                   rows *
+                       strata::kernels::kv_q4_bytes_per_head((int)s.head_dim));
+    } else if (st.kv_q4) {
+        strata::big_fill_zero(*cs, st.k_q4,
+                   rows *
+                       strata::kernels::kv_q4_bytes_per_head((int)s.head_dim));
+        strata::big_fill_zero(*cs, st.v_q4,
+                   rows *
+                       strata::kernels::kv_q4_bytes_per_head((int)s.head_dim));
+    } else if (st.kv_int8) {
+        strata::big_fill_zero(*cs, st.k_q, rows * s.head_dim);
+        strata::big_fill_zero(*cs, st.v_q, rows * s.head_dim);
+        strata::big_fill_zero(*cs, st.k_scale,
+                   rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+        strata::big_fill_zero(*cs, st.v_scale,
+                   rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+    } else {
+        strata::big_fill_zero(*cs, st.k_pool, rows * s.head_dim * 2);
+        strata::big_fill_zero(*cs, st.v_pool, rows * s.head_dim * 2);
+    }
+    // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
+    // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
+    // carries the unwritten cells past the end, which nothing reads.
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    cs->memset(st.idx_tail, 0, (size_t)(s.idx_block - 1) * s.idx_dim * 4);
+    cs->memset(st.idx_dead, 0, (size_t)s.idx_dim * 4);
+    cs->memset(st.idx_pooled, 0, (size_t)st.idx_pooled_rows * s.idx_dim * 4);
+    cs->wait_and_throw();
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("qsa_state_zero_checked: ") + e.what(); return false;
+    } catch (...) {
+        error = "qsa_state_zero_checked: unknown SYCL reset failure"; return false;
+    }
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
@@ -1739,3 +1789,18 @@ bool block_layer(const WeightTable& tables, const ModelGeometry& g, int64_t laye
 // has only just seen the router.  That is why the captured path calls the halves separately.
 if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err, db, ple))        return false;    return block_layer_post(tables, g, layer, k, mb, bb, parts, stream, err);}}
 // namespace strata::core
+
+namespace strata::core {
+// Honest pre-effect refusal until actual SYCL private allocation/owned VMM exists.
+// Plan outputs and states are unchanged; only initialization diagnostics update.
+bool qsa_elastic_plan(const ModelGeometry&,int64_t,QsaElasticFormat,bool,int64_t,int,uint64_t,QsaElasticPlan&) {return false;}
+bool qsa_elastic_plan_matches(const ModelGeometry&,const QsaElasticPlan&) {return false;}
+bool qsa_private_host_plan(const ModelGeometry&,int64_t,bool,QsaPrivateHostPlan&) {return false;}
+bool qsa_private_host_plan(const ModelGeometry&,int64_t,bool,QsaPrivateHostPlan&,const QsaElasticPlan*) {return false;}
+uint64_t qsa_state_init_private(const ModelGeometry&,int64_t,void*,QsaState&,QsaInitUploads& u,const QsaState*) {
+    u.error="private QSA ownership is not implemented on SYCL";return 0;
+}
+uint64_t qsa_state_init_private(const ModelGeometry&,int64_t,void*,QsaState&,QsaInitUploads& u,const QsaState*,QsaElasticView*) {
+    u.error="owned elastic QSA is not implemented on SYCL";return 0;
+}
+} // namespace strata::core

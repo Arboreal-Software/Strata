@@ -560,6 +560,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                     if cancel is not None and cancel.is_set():
                         raise _client_gone(svc)
             try:
+                if ctl is not None and not hasattr(svc.engine, "_exclusive_control"):
+                    svc.engine._ctl_held = ctl
                 if ctl is not None:                   # running parallel requests finish first
                     while getattr(svc, "live_reqs", None):
                         if cancel is not None and cancel.is_set():
@@ -570,29 +572,34 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 with svc.status_lock:
                     svc.status.update(busy=True, phase="generating an image", started=time.time(),
                                       first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
-                restore = _make_room(svc, gen, policy, need)
+                restore = _make_room(svc, gen, policy, need, ctl)
                 try:
                     yield policy
                 finally:
-                    _give_back(svc, gen, policy, restore)
+                    _give_back(svc, gen, policy, restore, ctl)
                     with svc.status_lock:
                         svc.status["busy"] = False
                     svc.last_request_at = time.time()
             finally:
                 if ctl is not None:
-                    ctl.release()
+                    try:
+                        if not hasattr(svc.engine, "_exclusive_control"):
+                            svc.engine._ctl_held = False
+                    finally:
+                        ctl.release()
     finally:
         if queued:
             with svc.status_lock:
                 svc.status["queued"] -= 1
 
 
-def _make_room(svc, gen: ImageGen, policy: str, need: int):
+def _make_room(svc, gen: ImageGen, policy: str, need: int, _control=None):
     """Do what `policy` says before the job; -> what _give_back needs."""
-    eng = svc.engine
     if policy == "shrink":
         try:
-            out = eng.vram(need)
+            out = (svc.engine.vram(need, _control=_control)
+                   if _control is not None and hasattr(svc.engine, "_exclusive_control")
+                   else svc.engine.vram(need))
             gen._say(f"image job: the engine's expert cache gave VRAM back ({out.get('vram_free_mib')} MiB free)")
             return "shrunk"
         except Exception as e:                       # noqa: BLE001 - the job still runs, with what is free
@@ -600,28 +607,31 @@ def _make_room(svc, gen: ImageGen, policy: str, need: int):
             return None
     if policy == "unload":
         saved = None
-        if hasattr(eng, "session_file") and not getattr(eng, "batch", 0):
+        if hasattr(svc.engine, "session_file") and not getattr(svc.engine, "batch", 0):
             path = str(gen.dir / f"llm-session-{secrets.token_hex(6)}.bin")
             try:
-                r = eng.session_file("save", path)
+                r = svc.engine.session_file("save", path)
                 saved = path
                 gen._say(f"image job: the conversation ({r.get('tokens')} tokens) saved; unloading the model")
             except Exception as e:                   # noqa: BLE001 - unloading still frees the GPU
                 gen._say(f"image job: the conversation could not be saved ({e}); unloading the model")
                 with contextlib.suppress(OSError):
                     os.unlink(path)
-        eng.unload()
+        svc.engine.unload()
         if svc.vision is not None and hasattr(svc.vision, "unload"):
             svc.vision.unload()
         return saved or "unloaded"
     return None
 
 
-def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
-    eng = svc.engine
+def _give_back(svc, gen: ImageGen, policy: str, restore, _control=None) -> None:
+    # Only gpu_turn supplies its actual acquired owner, held through this call.
     if restore == "shrunk":
         try:
-            eng.vram(svc.vram_reserve)               # the reserve asked for last (None: the start's)
+            if _control is not None and hasattr(svc.engine, "_exclusive_control"):
+                svc.engine.vram(svc.vram_reserve, _control=_control)
+            else:
+                svc.engine.vram(svc.vram_reserve)
         except Exception as e:                       # noqa: BLE001
             gen._say(f"image job: the expert cache did not grow back ({e}); POST /v1/vram can retry")
     elif policy == "unload" and restore:
@@ -629,20 +639,27 @@ def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
             svc.restore_after_load = restore         # Service.ensure_loaded restores it after the next start
         if gen.reload == "eager":
             try:
-                svc.ensure_loaded()                  # the caller still holds the FIFO
+                if _control is None:
+                    svc.ensure_loaded()  # preserve default/nonbatch caller shape
+                else:
+                    svc.ensure_loaded(_control)  # borrow, never reacquire/release here
             except Exception as e:                   # noqa: BLE001 - the next request tries again
                 gen._say(f"image job: the model did not load again yet ({e}); the next request loads it")
 
 
-def restore_session(svc) -> None:
+def restore_session(svc, _control=None) -> None:
     """After an engine start: restore the conversation an image job saved before it unloaded the engine."""
     path = getattr(svc, "restore_after_load", None)
     if not path:
         return
     svc.restore_after_load = None
     try:
-        r = svc.engine.session_file("restore", path)
-        print(f"[strata] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)
+        # Replace the old result-local slot with the forwarding argument;
+        # after the call it holds the result, never an extra lock owner.
+        _control = (svc.engine.session_file("restore", path, _control=_control)
+                    if _control is not None and hasattr(svc.engine, "_exclusive_control")
+                    else svc.engine.session_file("restore", path))
+        print(f"[strata] the conversation from before the image job is back ({_control.get('tokens')} tokens)", flush=True)
     except Exception as e:                           # noqa: BLE001 - the engine runs, without the old cache
         print(f"[strata] the conversation from before the image job was not restored ({e}); the next request "
               "reads its prompt again", flush=True)

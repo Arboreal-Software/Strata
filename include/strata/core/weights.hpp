@@ -27,6 +27,7 @@
 // logits.  Python wrote the manifest and already parses it correctly.
 #pragma once
 
+#include "strata/core/canonical_load_inventory.hpp"
 #include <cstdint>
 #include <map>
 #include <set>
@@ -112,6 +113,19 @@ struct LoadReport {
 
 class WeightTable {
 public:
+    WeightTable() = default;
+    // Enable once before any load attempt. Caller derives expected_path from the
+    // retained verified bindings; this loader checks the actual argument only.
+    bool enable_inventory_capture(const CanonicalInventoryLimits&,
+        std::shared_ptr<const ReservationLease>,std::shared_ptr<const VerifiedDriverBindings>,
+        const std::string& expected_path,std::string& error);
+    // Borrowed receipt; invalidated by any subsequent load/HC attempt or retire.
+    const CanonicalLoadInventory* loaded_inventory() const noexcept {
+        return load_complete_&&!retired_&&!inventory_uncertain_?inventory_.get():nullptr;
+    }
+    ~WeightTable();
+    WeightTable(const WeightTable&) = delete;
+    WeightTable& operator=(const WeightTable&) = delete;
     /// The arena size the index asks for, readable WITHOUT loading anything - so a caller can size its
     /// `DeviceArena` before committing to the load, and a plan that cannot fit is refused at startup rather
     /// than halfway through a 5 GB upload.
@@ -147,12 +161,29 @@ public:
     static void hc_q8_names(int64_t n_layers, std::set<std::string>& out);
     const std::map<std::string, WeightRef>& all() const { return table_; }
     const LoadReport& report() const { return report_; }
+    /// True only after the most recent canonical load completed its final device drain.
+    /// Partial metadata can survive a failed load and is not evidence of readiness.
+    bool load_complete() const { return load_complete_; }
+    uint64_t auxiliary_bytes() const { return hc_bytes_; }
+    int auxiliary_device() const { return hc_device_; }
+    bool owns_auxiliary_span(const void*, uint64_t) const;
+    /// Caller must drain every user and select the owning device first.
+    /// A failed free is sticky: retain the owner and reservation, never retry it.
+    bool release_auxiliary_checked(std::string& err);
 
 private:
     friend class NativeDense;
+    std::unique_ptr<CanonicalLoadInventory> inventory_;
+    bool inventory_load_attempted_=false,inventory_uncertain_=false;
+    void quarantine_inventory() noexcept;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
     std::string pack_dir_;
+    bool load_complete_ = false;
+    void* hc_allocation_ = nullptr;
+    uint64_t hc_bytes_ = 0;
+    int hc_device_ = -1;
+    bool hc_attempted_ = false, retired_ = false, release_failed_ = false;
 };
 
 }  // namespace strata::core

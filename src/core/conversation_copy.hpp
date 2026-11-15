@@ -5,6 +5,7 @@
 #include "strata/platform/aux_cpus.hpp"
 
 #include <cuda_runtime.h>
+#include "strata/core/resident_copy_fault.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -58,6 +59,19 @@ struct ThreadCopyHandles {
     ThreadCopyHandles(const ThreadCopyHandles&) = delete;
     ThreadCopyHandles& operator=(const ThreadCopyHandles&) = delete;
     ~ThreadCopyHandles() {
+        // Pool reuse is a new owner: every queued copy on each device must end
+        // first. On uncertainty retain handles outside the reusable pool.
+        int previous = -1;
+        if (cudaGetDevice(&previous) != cudaSuccess) return;
+        bool complete = true;
+        for (size_t d = 0; d < streams.size(); ++d) if (streams[d]) {
+            if (cudaSetDevice((int)d) != cudaSuccess || cudaStreamSynchronize(streams[d]) != cudaSuccess) {
+                complete = false; break;
+            }
+        }
+        if (cudaSetDevice(previous) != cudaSuccess) complete = false;
+        if (!complete) return;
+        try {
         CopyHandlePool& p = copy_handle_pool();
         std::lock_guard<std::mutex> lk(p.mu);
         if (p.streams.size() < streams.size()) p.streams.resize(streams.size());
@@ -66,6 +80,10 @@ struct ThreadCopyHandles {
             if (streams[d]) p.streams[d].push_back(streams[d]);
         for (size_t d = 0; d < events.size(); ++d)
             if (events[d]) p.events[d].push_back(events[d]);
+        } catch (...) {
+            // Allocation failure in a noexcept destructor cannot prove ownership
+            // transfer. Already returned handles are drained; others stay retained.
+        }
     }
 };
 inline ThreadCopyHandles& thread_copy_handles() {
@@ -145,7 +163,11 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
     cudaStream_t s = nullptr;
     cudaError_t e = private_stream(s);
     if (e != cudaSuccess) return e;
+#if defined(STRATA_RESIDENT_FAULT_QUALIFICATION) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_SYCL)
+    e = core::ResidentCopyFault::copy(dst,src,bytes,cudaMemcpyDefault,s);
+#else
     e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
+#endif
     if (e != cudaSuccess || queued) return e;
     e = cudaStreamSynchronize(s);
     core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress
@@ -179,6 +201,8 @@ inline std::vector<T> copy_beating(const std::vector<T>& src) {
 }
 
 inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoint& c) {
+    c.wait_pending(); // recursive stage payloads, not merely the singleton's current key
+    core::conversation_checkpoint_join(c.gdn.data()); // preserve the legacy key guard for older manual moves
     ConversationCheckpoint o;
     o.ids = copy_beating(c.ids);
     o.imgs = copy_beating(c.imgs);
@@ -211,6 +235,10 @@ inline void assign_beating(V& out, const V& src) {
 
 /// copy_checkpoint_beating into `o`, a dropped checkpoint's storage (STRATA_CKPT_POOL): the same bytes
 inline void copy_checkpoint_into(ConversationCheckpoint& o, const ConversationCheckpoint& c) {
+    o.wait_pending(); c.wait_pending();
+    core::conversation_checkpoint_join(o.gdn.data());
+    core::conversation_checkpoint_join(c.gdn.data());
+    o.pending.reset();
     assign_beating(o.ids, c.ids);
     assign_beating(o.imgs, c.imgs);
     assign_beating(o.gdn, c.gdn);
@@ -228,7 +256,7 @@ inline void copy_checkpoint_into(ConversationCheckpoint& o, const ConversationCh
 /// `storage` (optional): dropped checkpoints whose vectors the copies go into, taken from its back while it lasts
 inline std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs,
                                                                     std::vector<ConversationCheckpoint>* storage = nullptr) {
-    for (const auto& c : cs) core::conversation_checkpoint_join(c.gdn.data());
+    for (const auto& c : cs) {c.wait_pending();core::conversation_checkpoint_join(c.gdn.data());}
     std::vector<ConversationCheckpoint> out;
     out.reserve(cs.size());
     for (const auto& c : cs) {

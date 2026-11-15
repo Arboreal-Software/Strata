@@ -150,6 +150,10 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
 /// scaling (rope_scaling.hpp) rides in as the process config - none is today's arithmetic exactly.
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
           const strata::kernels::RopeScaling& scaling, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void rope_owned(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
+          const strata::kernels::RopeScaling& scaling, void* stream, const int32_t* position_table);
+
 /// rms_rows + rope (+ split_q) in one pass, the same bits as the separate kernels (STRATA_QSA_FUSE_NR, default on):
 /// out[t * out_ts + h * dim + d] = rope(rms(in[t * in_ts + h * in_hs + :]) * w), 64 <= dim <= 256, rotating the first
 /// 64 dims at position pos0 + t.  `in` and `out` may be the same buffer.

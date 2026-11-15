@@ -12,18 +12,62 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 
 namespace strata::core {
 
-NativeHead::~NativeHead() {
-    if (weights_) strata::kernels::native_q6_k_unpack(weights_);
-    if (scratch_) sycl::free(scratch_, dpct::get_in_order_queue());
-    if (weights_) sycl::free(weights_, dpct::get_in_order_queue());
+bool NativeHead::enable_inventory_capture(const NativeInventoryLimits&,std::shared_ptr<const ReservationLease>,std::shared_ptr<const void>,std::string& error) {
+    error="SYCL head inventory producer unavailable";return false;
+}
+bool NativeEmbed::enable_inventory_capture(const NativeInventoryLimits&,std::shared_ptr<const ReservationLease>,std::shared_ptr<const void>,std::string& error) {
+    error="SYCL embedding inventory producer unavailable";return false;
+}
+NativeHead::~NativeHead() { unload(); }
+
+uint64_t NativeHead::allocated_bytes() const {
+    return (weights_ ? allocated_weight_bytes_ : 0) + (scratch_ ? scratch_bytes_ : 0) +
+           (weights_ ? strata::kernels::native_head_packed_allocation_bytes(weights_) : 0);
+}
+
+bool NativeHead::release_checked(std::string& err) {
+    release_started_ = true;
+    load_complete_ = false;
+    if (release_failed_) { err = "native head release previously failed"; return false; }
+    try {
+        if ((weights_ || scratch_) && int(dpct::get_current_device_id()) != device_) {
+            err = "native head release requires owning device"; return false;
+        }
+        if (weights_ && !strata::kernels::native_head_packed_release_checked(weights_)) {
+            release_failed_ = true; err = "native head packed release failed"; return false;
+        }
+        if (scratch_) { sycl::free(scratch_, dpct::get_in_order_queue()); scratch_ = nullptr; scratch_bytes_ = 0; }
+        if (weights_) { sycl::free(weights_, dpct::get_in_order_queue()); weights_ = nullptr; allocated_weight_bytes_ = 0; }
+        bytes_ = 0;
+        return true;
+    } catch (const std::exception& e) {
+        release_failed_ = true; err = std::string("native head release: ") + e.what(); return false;
+    }
+}
+
+void NativeHead::unload() {
+    if (release_failed_) return;
+    if (!weights_ && !scratch_) { load_complete_ = false; release_started_ = false; return; }
+    const auto previous = dpct::get_current_device_id();
+    try {
+        if (device_ >= 0) dpct::select_device(unsigned(device_));
+        dpct::get_current_device().queues_wait_and_throw();
+        std::string err;
+        if (release_checked(err)) {
+            release_started_ = false; device_ = -1; n_in_ = n_out_ = 0; type_ = -1;
+        }
+    } catch (...) { release_failed_ = true; }
+    try { dpct::select_device(previous); } catch (...) { release_failed_ = true; }
 }
 
 bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
                       int64_t n_out, std::string &err) try {
-    if (loaded()) { err = "native head is already loaded"; return false; }
+    if (weights_ || scratch_ || release_started_ || release_failed_) { err = "native head is already loaded or retired"; return false; }
+    load_complete_ = false;
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";
         return false;
@@ -48,29 +92,31 @@ bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
             err = "native head: truncated output.weight payload";
             return false;
         }
-        void* weights = nullptr;
-        void* scratch = nullptr;
+        device_ = int(dpct::get_current_device_id());
+        bytes_ = bytes;
+        allocated_weight_bytes_ = bytes;
+        scratch_bytes_ = strata::kernels::native_q8_1_bytes((int)n_in, 1);
         dpct::err0 status =
-            DPCT_CHECK_ERROR(weights = (void *)strata::malloc_device_guarded(
+            DPCT_CHECK_ERROR(weights_ = (void *)strata::malloc_device_guarded(
                                  bytes, dpct::get_in_order_queue()));
         if (status == 0)
             status = DPCT_CHECK_ERROR(
-                scratch = (void *)strata::malloc_device_guarded(
+                scratch_ = (void *)strata::malloc_device_guarded(
                     strata::kernels::native_q8_1_bytes((int)n_in, 1),
                     dpct::get_in_order_queue()));
+        if (!weights_ || !scratch_) status = dpct::default_error;
         strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
         if (status == 0)
             status = DPCT_CHECK_ERROR(
                 dpct::get_in_order_queue()
-                    .memcpy(weights, gguf.tensor_data(*tensor), bytes)
+                    .memcpy(weights_, gguf.tensor_data(*tensor), bytes)
                     .wait());
         /*
         DPCT1000: Error handling if-stmt was detected but could not be
         rewritten.
         */
         if (status != 0) {
-            if (scratch) sycl::free(scratch, dpct::get_in_order_queue());
-            if (weights) sycl::free(weights, dpct::get_in_order_queue());
+            // Partial allocations remain owned until checked retirement.
             /*
             DPCT1009: SYCL reports errors using exceptions and does not use
             error codes. Please replace the "get_error_string_dummy(...)" with a
@@ -83,16 +129,28 @@ bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
                   dpct::get_error_string_dummy(status);
             return false;
         }
-        weights_ = weights;
-        scratch_ = scratch;
         bytes_ = bytes;
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
-        if (type_ == 14 && !strata::kernels::native_q6_k_packed_enabled() && strata::kernels::native_q6_k_planar_enabled())   // STRATA_Q6_PLANAR: stored as planes (same bytes)
+        if (type_ == 14 && !strata::kernels::native_q6_k_packed_enabled() && strata::kernels::native_q6_k_planar_enabled()) {
+            void* original = weights_;
+            // A thrown transaction may have attempted to release the source. Do
+            // not retry its free or expose it to adoption during stack unwinding.
+            release_failed_ = true;
             weights_ = strata::kernels::native_q6_k_planar_adopt(weights_, n_in_, n_out_, "output head");
+            release_failed_ = false;
+            if (weights_ != original) {
+                // Same payload, but each plane starts at a 256-byte boundary.
+                const uint64_t nb = uint64_t(n_in_ / 256) * uint64_t(n_out_);
+                const auto align = [](uint64_t n) { return (n + 255) & ~uint64_t(255); };
+                allocated_weight_bytes_ = align(align(align(nb * 128) + nb * 64) + nb * 16) + nb * 2;
+            }
+        }
+        dpct::get_current_device().queues_wait_and_throw();
+        load_complete_ = true;
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
@@ -161,14 +219,49 @@ const NativeEmbed* g_embed = nullptr;
 void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
+bool NativeEmbed::release_checked(std::string& err) {
+    release_started_ = true;
+    load_complete_ = false;
+    if (release_failed_) { err = "native embedding release previously failed"; return false; }
+    try {
+        if ((host_ || dev_) && int(dpct::get_current_device_id()) != device_) {
+            err = "native embedding release requires owning device"; return false;
+        }
+        if (g_embed == this) g_embed = nullptr;
+        if (host_) {
+            sycl::free(host_, dpct::get_in_order_queue()); host_ = nullptr;
+            if (!device_owned_) dev_ = nullptr;
+        }
+        if (device_owned_ && dev_) {
+            sycl::free(const_cast<void*>(dev_), dpct::get_in_order_queue()); dev_ = nullptr;
+        }
+        bytes_ = 0; device_owned_ = false;
+        return true;
+    } catch (const std::exception& e) {
+        release_failed_ = true; err = std::string("native embedding release: ") + e.what(); return false;
+    }
+}
+
 NativeEmbed::~NativeEmbed() {
-    if (host_) sycl::free(host_, dpct::get_in_order_queue());
-    else if (dev_)
-        sycl::free((void *) dev_, dpct::get_in_order_queue()); // the VRAM fallback below
+    if (release_failed_ || (!host_ && !dev_)) return;
+    const auto previous = dpct::get_current_device_id();
+    try {
+        if (device_ >= 0) dpct::select_device(unsigned(device_));
+        // Mapped users on other devices must already be drained by the runtime.
+        dpct::get_current_device().queues_wait_and_throw();
+        std::string err; release_checked(err);
+    } catch (...) {}
+    try { dpct::select_device(previous); } catch (...) {}
 }
 
 bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
                        int64_t n_vocab, std::string &err) try {
+    if (host_ || dev_ || release_started_ || release_failed_) { err = "native embedding is already loaded or retired"; return false; }
+    load_complete_ = false;
+    if (n_embd <= 0 || n_vocab <= 0 || n_embd > INT_MAX || n_vocab > INT_MAX) {
+        err = "native embedding requires positive int32 dimensions"; return false;
+    }
+    device_ = int(dpct::get_current_device_id());
     try {
         const strata::GgufModel model(shards);
         // --embd-gguf's one-tensor file (tools/embd_bf16_pack.py) says "strata-embd": only its tensor is checked
@@ -205,7 +298,7 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
         check the migrated code.
         */
         if (DPCT_CHECK_ERROR(host_ = (void *)sycl::malloc_host(
-                                 bytes_, dpct::get_in_order_queue())) != 0) {
+                                 bytes_, dpct::get_in_order_queue())) != 0 || !host_) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM
             // instead: it costs its size there and reads faster than over PCIe.
@@ -215,26 +308,12 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
             */
             host_ = nullptr;
             void* d = nullptr;
-            if (DPCT_CHECK_ERROR(d = (void *)strata::malloc_device_guarded(
-                                     bytes_, dpct::get_in_order_queue())) !=
-                    0 ||
-                /*
-                DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-                assuming in the original code the source host memory is pageable
-                memory. If the memory is not pageable, call wait() on event
-                return by memcpy API to ensure synchronization behavior.
-                */
-                DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                    d, gguf.tensor_data(*t), bytes_).wait()) != 0) {
-                if (d) sycl::free(d, dpct::get_in_order_queue());
-                /*
-                DPCT1026: The call to cudaGetLastError was removed because
-                this functionality is redundant in SYCL.
-                */
-                err = "native embedding: cannot pin " +
-                      std::to_string(bytes_ >> 20) +
-                      " MiB, nor place it in VRAM";
-                return false;
+            if (DPCT_CHECK_ERROR(d = (void*)strata::malloc_device_guarded(bytes_, dpct::get_in_order_queue())) != 0 || !d) {
+                err = "native embedding: cannot pin or allocate device table"; return false;
+            }
+            dev_ = d; device_owned_ = true;
+            if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(d, gguf.tensor_data(*t), bytes_).wait()) != 0) {
+                err = "native embedding: device upload failed"; return false;
             }
             std::fprintf(stderr, "strata: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
                          (unsigned long long) (bytes_ >> 20));
@@ -272,6 +351,8 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
         type_ = (int) t->type;
         n_embd_ = n_embd;
         n_vocab_ = n_vocab;
+        dpct::get_current_device().queues_wait_and_throw();
+        load_complete_ = true;
         return true;
     } catch (const std::exception& e) {
         err = std::string("native embedding: ") + e.what();
@@ -285,10 +366,12 @@ catch (sycl::exception const &exc) {
 }
 
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
+    if (!ready_for_adoption()) throw std::runtime_error("native embedding is not loaded");
     strata::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream);
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
+    if (!ready_for_adoption()) throw std::runtime_error("native embedding is not loaded");
     strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
 }
 

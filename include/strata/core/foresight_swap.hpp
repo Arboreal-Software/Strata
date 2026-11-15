@@ -43,6 +43,7 @@ struct ForesightSwap {
         unsigned long long dptr = 0;         ///< the slot's device address
         const uint8_t* src = nullptr;        ///< the host blob being copied in
         uint64_t bytes = 0;
+        int event_device = -1;              ///< strict cleanup: exact creating device, including partial init
         void* ev = nullptr;                  ///< cudaEvent_t on the layer's card
     };
 
@@ -69,9 +70,16 @@ struct ForesightSwap {
     static constexpr int32_t kDropped = -2;  ///< Slot::expert: dropped by `hold`, reusable under the same depth rule
 
     /// Allocates the slots on each card and starts the filler.  `card_of_layer[l]` indexes `devices` (CUDA ids).
+    /// Configure before init. Before destruction, detach and join all external readers;
+    /// atomic callback-pointer clearing alone is not a reader drain. Strict uncertainty terminates the worker.
+    bool set_strict_retirement(bool enabled, const std::vector<int>& consumer_devices, std::string& error);
     bool init(int slots_per_layer, int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
               const std::vector<int>& devices, std::string& err);
     ~ForesightSwap();
+    // Terminal stop/join only; retains allocations, events, streams and borrowed
+    // source addresses until caller drains all GPU consumers. False is not a
+    // completion certificate. Public configuration fields remain caller-owned.
+    bool close_for_retirement() noexcept;
 
     /// The pool, for a routed expert that is not in the cache: true and its device address when a landed slot holds it.
     bool take(int64_t layer, int32_t expert, unsigned long long& ptr);
@@ -91,6 +99,16 @@ struct ForesightSwap {
     std::string report() const;
 
 private:
+    struct ActiveRequest { ForesightSwap* owner; ActiveRequest* previous; };
+    static thread_local ActiveRequest* active_request_;
+    std::mutex retirement_mu_;
+    std::atomic<bool> retirement_started_{false};
+    bool retirement_done_ = false, retirement_failed_ = false; // retirement_mu_
+    bool strict_retirement_ = false;
+    bool retirement_init_started_ = false;
+    int retirement_device_ = -1;
+    uint64_t allocated_slots_ = 0;
+    std::vector<int> retirement_consumers_;
     void request_locked(ExpertSource* src, int64_t layer, int32_t expert, bool predicted);
     std::mutex smu_;                         ///< slot, where, card_* and the counters: the pool thread and the look-ahead thread
     std::mutex mu_;
@@ -102,6 +120,7 @@ private:
 };
 
 ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
-                                       const std::vector<int>& devices);
+                                       const std::vector<int>& devices, bool strict_retirement = false,
+                                       const std::vector<int>& consumer_devices = {});
 
 }  // namespace strata::core

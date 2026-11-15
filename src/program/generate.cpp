@@ -1,4 +1,23 @@
 #include "strata/core/logit_bias.hpp"
+#include "suffix_experiment_input.hpp"
+#include "owned_admission_cancel.hpp"
+#include "serving_suffix_cancel_qualification.hpp"
+#include "serving_suffix_fault_qualification.hpp"
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+// Opt-in retained repair owner registry and the shared owner gates (demand/age scheduler slice 2).  CUDA-free
+// header; it is used only inside the STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE blocks below, and nothing in the
+// serving path calls it unless STRATA_SERVING_REPAIR_OWNER_SLOTS names a slot bound (and, for the idle private
+// tick, STRATA_SERVING_REPAIR_IDLE_UNIT_TOKENS names a unit cap).
+#include "serving_repair_owners.hpp"
+#include "owned_batch_slot_sessions.hpp"
+#include "owned_vision_position_banks.hpp"
+#include "strata/core/native_batch_slot_binding.hpp"
+#include "strata/core/native_batch_group_completion.hpp"
+#include "http_two_slot_receipt.hpp"
+#include "http_prealignment_receipt.hpp"
+#include "serving_repair_scheduler.hpp"
+#include "serving_thread_bridge.hpp"
+#endif
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -32,6 +51,11 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/suffix_edit_span.hpp"
+#include "strata/core/suffix_import_policy.hpp"
+#include "strata/core/native_serial_serving.hpp"
+#include "strata/core/native_owned_batch_serving.hpp"
+#include "strata/core/raw_int8_restore_clear.hpp"
 #include "strata/core/lookup_default.hpp"
 #include "strata/core/serve_stop_bound.hpp"
 #include "strata/core/conversation_file.hpp"
@@ -48,6 +72,7 @@
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/uma_cache.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/expert_retirement.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
@@ -77,6 +102,29 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+#include "strata/core/window_model_owner.hpp"
+#include "strata/core/verified_input_manifest.hpp"
+#include "strata/core/expert_profile_inventory.hpp"
+#include "strata/core/expert_policy_inventory.hpp"
+#include "strata/core/expert_host_execution.hpp"
+#include "strata/core/expert_tier_open_observer.hpp"
+#include "strata/core/window_loader_profile.hpp"
+#include "strata/core/expert_runtime_profile.hpp"
+#include "strata/core/running_engine_identity.hpp"
+#include "strata/core/remote_policy_publication.hpp"
+#include "strata/core/remote_routing_unit.hpp"
+#include "strata/core/window_consumer_guard.hpp"
+#include "strata/core/submitted_work_drain.hpp"
+#include "strata/core/joined_thread_scope.hpp"
+#include "strata/core/window_graph_guard.hpp"
+#include "strata/core/window_allocator.hpp"
+#include "strata/core/window_restore.hpp"
+#include "strata/core/window_buffer.hpp"
+#include "strata/core/window_gpu_handles.hpp"
+#include "strata/core/window_ple.hpp"
+#include "strata/core/window_device.hpp"
+#endif
 #include "strata/core/spill_gate.hpp"
 #include "strata/core/pcie_share_rule.hpp"
 #include "strata/core/verify.hpp"
@@ -147,6 +195,7 @@
 #include <io.h>
 #else
 #include <unistd.h>
+#include <fcntl.h>
 #include <cerrno>
 #include <sys/stat.h>
 #if !defined(__APPLE__)   // major() / minor(): <sys/types.h> on macOS
@@ -168,6 +217,7 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 
 #include <array>
 #include <chrono>
+#include <span>
 #include <algorithm>
 #include <memory>
 #include <iostream>
@@ -175,6 +225,7 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 #include <future>
 #include <thread>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -601,8 +652,27 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
 }
 
 struct Options {
+    bool owned_model_lifetime = false;
+    bool owned_session_lifetime = false;
+    std::string verified_input_manifest, verified_input_sha256, verified_input_private_dir;
+    uint64_t verified_input_host_bytes = 0, verified_input_disk_bytes = 0;
+    // Explicit original paths only; defaults must never masquerade as user overrides.
+    std::map<std::string,std::vector<std::string>> verified_original_paths;
+    bool verified_inputs_active = false;
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
+    // Opt-in disposable suffix experiment; separate from serving and exact cache.
+    std::string suffix_experiment_file;
+    uint64_t suffix_experiment_host_bytes=0;
+    bool suffix_repair_experiment=false;
+    bool suffix_repair_cancel=false;
+    bool suffix_repair_prepared_cancel=false;
+    unsigned suffix_repair_cycles=1;bool suffix_repair_cycles_set=false;
+    bool suffix_repair_fault_second_arena=false,suffix_repair_fault_second_copy=false,suffix_repair_fault_deferred_trap=false;
+    std::string suffix_repair_fault_receipt;
+    int suffix_experiment_requested_spec=0;
+    // Mode is validated from argv; manifest stays unread until real H admission.
+    bool suffix_experiment_mode() const noexcept { return !suffix_experiment_file.empty(); }
     int64_t max_new = 16;
     int64_t max_context = 4096;
     bool greedy = true;
@@ -853,6 +923,13 @@ struct Options {
 #else
     int spec = 0;
 #endif
+    bool native_serial_serving = false; // resolved native-pack intent, never a command-line switch
+    bool native_owned_batch_serving = false; // resolved strict owned two-slot intent, not ownership authority
+    int serving_verifier_capacity()const noexcept {
+        if(native_owned_batch_serving)
+            return strata::core::native_owned_batch_serving::verifier_capacity(spec,true);
+        return strata::core::native_serial_serving::verifier_capacity(spec,native_serial_serving);
+    }
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
@@ -951,6 +1028,24 @@ struct Options {
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
+    /// --serve REPORTING ONLY: print, per request, what an edited prompt could reuse as an APPROXIMATE suffix under
+    /// the P12 contract (edit location, unchanged suffix, eligibility/refusal).  It imports and restores nothing, so
+    /// outputs stay byte-identical; it exists to make the reuse measurement observable before the import lands.
+    bool suffix_reuse_report = false;
+    /// --serve (P12 suffix reuse, opt-in): when a request EDITS the conversation this session holds - same-length
+    /// changed run, one unambiguous unchanged suffix at identical positions, page-aligned cuts - keep the state for
+    /// that suffix instead of reading it again, and read only what follows the edit.  The kept state was computed
+    /// under the OLD text, so it is APPROXIMATE: it never certifies an exact reuse and the conversation it produces
+    /// parks as approximate, which ConversationCache::best() then refuses.  Any other shape takes exact replay.
+    bool suffix_cache = false;
+    /// The approximate import implemented today keeps the OLD endpoint whole (including the changed run) and reads
+    /// only the new turn: it does NOT propagate B', so it is a measurement arm, not the scoped attach/repair
+    /// feature. `--suffix-cache` alone therefore stays INACTIVE; this explicit flag is the only way to run the
+    /// unrepaired path, so a deployment can never serve an unrepaired approximation by accident.
+    bool suffix_cache_unrepaired_experiment = false;
+    /// --serve + --suffix-cache: explicit aggregate HOST cap (bytes) charged to the private RAW transaction the
+    /// serving owner holds.  Required and positive: an unbounded or inherited allowance is refused at parse time.
+    uint64_t suffix_cache_host_bytes = 0;
     /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = 248045;
@@ -1025,7 +1120,25 @@ void usage() {
     std::fprintf(stderr,
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
                  "\n"
+                 "  --verified-input-manifest PATH  opt-in strict TSV-v1/v2 immutable input manifest (Linux)\n"
+                 "  --verified-input-manifest-sha256 HEX  required full lowercase manifest SHA256\n"
+                 "  --verified-input-private-dir DIR  required trusted private snapshot directory\n"
+                 "  --verified-input-host-bytes N  required private host envelope, carved from model cap\n"
+                 "  --verified-input-disk-bytes N  required full logical snapshot disk allowance\n"
+                 "                       all five required; owned sessions and raw token IDs only\n"
                  "  --pack DIR           the pack directory (default pack/full)\n"
+                 "  --suffix-reuse-experiment PATH  opt-in standalone V1 old/edited token experiment; not --serve\n"
+                 "  --suffix-reuse-host-bytes N     required RAW peak host cap; actual admission still required\n"
+                 "  --suffix-repair-experiment      also exercise resident repair; requires suffix reuse mode\n"
+                 "  --suffix-repair-cancel          test drained cancellation before the second attachment\n"
+                 "  --suffix-repair-prepared-cancel discard actual second prepared candidate before restore\n"
+                 "  --suffix-repair-cycles 2        test two normal same-process private retirement cycles\n"
+                 "  --suffix-repair-fault-deferred-trap explicit disposable private-stage execution fault\n"
+                 "  --suffix-repair-fault-second-arena  explicit test-only private allocation refusal\n"
+                 "  --suffix-repair-fault-second-copy  explicit test-only second-attachment copy refusal\n"
+                 "  --suffix-repair-fault-receipt PATH  fresh /output/RESIDENT-FAULT.jsonl for a fault build\n"
+                 "                       requires owned sessions, requested --spec 0, no draft/lookup/batch/pipeline\n"
+                 "                       storage capacity 2, executed width 1; returns before stdin/exact cache\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
@@ -1105,9 +1218,23 @@ void usage() {
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
+                 "  --owned-session-lifetime Experimental reserved private session ownership (implies model ownership)\n"
+                 "  --owned-model-lifetime  Experimental checked model ownership (window-state build only)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
+                 "  --suffix-reuse-report        --serve: report per-request what an edited prompt could reuse as an\n"
+                 "                       approximate suffix (edit location, unchanged suffix, refusal reason). Imports\n"
+                 "                       nothing and restores nothing: a measurement aid, not suffix reuse.\n"
+                 "  --suffix-cache       --serve: after an edit of the conversation this session holds, reuse its\n"
+                 "                       unchanged suffix APPROXIMATELY instead of reading it again.  Native resident\n"
+                 "                       INT8 only, one session, no drafter, no pictures; an exact prefix reuse always\n"
+                 "                       wins, anything else reads the prompt in full.  Never certifies exactness.\n"
+                 "                       INACTIVE by itself until the attach/repair integration exists; add\n"
+                 "                       --suffix-cache-unrepaired-experiment to measure the unrepaired path.\n"
+                 "  --suffix-cache-unrepaired-experiment  --serve: run the APPROXIMATE import that exists today\n"
+                 "                       (the changed run is NOT propagated into the reused state). Measurement\n"
+                 "                       only; never a deployment configuration.\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
@@ -1485,15 +1612,511 @@ void drive_pool_split_invariant(void* u, const float* x, const int32_t* ids, int
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
 /// expert cache for its layers, a verify window and a prompt path; the last one also holds the head (the drafter
 /// lives on its device too).
+// Mutable progress belongs to one runtime; callback binding and the exact
+// accepted/pending publication ledger remain separate integration steps.
+struct DriverPromptState {
+    std::vector<int64_t> cur;
+    std::vector<int32_t> live;
+    std::vector<strata::core::ConversationImageKey> live_imgs,req_imgs;
+    bool live_ok=false,nan_flush=false,nf_prompt_windows=false,short_read_off_once=false;
+    std::vector<strata::core::ConversationCheckpoint> checks;
+    uint64_t check_clock=0;
+    int64_t tail_ckpt_len=-1;
+    strata::core::ConversationCheckpoint::PromptPlan seg_plan;
+    bool cvec_cached=true;
+    // P12 suffix reuse: this session's endpoint state came from an APPROXIMATE suffix import, so what it parks
+    // must carry approximate provenance and can never satisfy an exact conversation-cache match.
+    bool live_approximate=false;
+    int64_t pp_total=0,pp_from=0,pp_next_check=0,pp_reached=0;
+    bool pp_tail_saved=false,pp_exact=false,nf_hit=false;
+    Clock::time_point pp_t0{};
+    std::mutex part_mu;
+    std::map<int64_t,std::vector<strata::core::ConversationCheckpoint>> part_at;
+    std::vector<int64_t> part_next;
+    std::string ckpt_why;
+    struct ReqTimes {
+        int ckpts=0;
+        double sync_ms=0.0,save_ms=0.0,evict_ms=0.0,read_ms=0.0,windows_ms=0.0;
+    } req_times;
+};
+
+// The disabled path keeps its stack object. The opt-in driver path transfers
+// the heap object itself into a checked owner; all existing references keep the
+// same address, with no copied metadata or no-op lifetime aliases.
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+// One process, one input group. This is a startup/retirement lane, not a general
+// asynchronous scheduler. No worker receives its private IO1 budget.
+struct DriverInputRetirementSlot {
+    std::shared_ptr<const strata::core::VerifiedInputBundle> pending;
+    bool retry() {
+        if(!pending)return true;
+        if(pending->retire_checked()!=strata::core::VerifiedInputRetirement::retired)return false;
+        pending.reset();return true;
+    }
+    ~DriverInputRetirementSlot() {
+        if(!retry())strata::core::retirement_failed("verified input outstanding retirement at process shutdown");
+    }
+};
+static DriverInputRetirementSlot& driver_input_retirement_slot() {
+    static DriverInputRetirementSlot slot;return slot;
+}
+struct DriverVerifiedInputs {
+    // Authority is declared before all borrowers in main. The binding owner is
+    // also retained by the actual model gang; strings alone confer no lifetime.
+    std::unique_ptr<strata::core::WindowBudget> budget;
+    std::shared_ptr<const strata::core::ParsedVerifiedInputs> plan;
+    std::shared_ptr<const strata::core::RunningEngineReceipt> running_engine;
+    std::shared_ptr<const strata::core::VerifiedInputBundle> bundle;
+    std::shared_ptr<strata::core::VerifiedDriverBindings> bindings;
+    bool finish() {
+        bindings.reset();running_engine.reset();plan.reset();
+        if(!bundle)return true;
+        if(bundle->retire_checked()!=strata::core::VerifiedInputRetirement::retired)return false;
+        bundle.reset();budget.reset();return true;
+    }
+    ~DriverVerifiedInputs() {
+        if(finish())return;
+        // A normal IO refusal is retained for an explicit later attempt, never
+        // dropped or spun on. Dedicated synchronous IO1 has no competing work
+        // after construction; reaching this branch indicates an outstanding user.
+        auto& slot=driver_input_retirement_slot();
+        if(slot.pending)strata::core::retirement_failed("verified input pending retirement slot occupied");
+        std::fprintf(stderr,"strata: verified input retirement deferred; authority retained\n");
+        slot.pending=std::move(bundle);
+    }
+};
+// Actual private state ownership, with stable host addresses for SessionState's
+// doorbell binding. Consumers/callback targets must also move into this owner
+// before it can be published for selected execution. Never retain prepared
+// storage here: that would create a cycle with NativeRuntimeAttachment.
+struct GpuStage;
+// Synchronous open bridge: pending storage has its own admitted lifetime;
+// observer callbacks only append into the already prepaid policy recorder.
+struct DriverExpertOpenObservation {
+    std::shared_ptr<const strata::core::ReservationLease> reservation;
+    std::vector<strata::core::ExpertTierOpenDecision> pending;
+    std::shared_ptr<strata::core::ExpertPolicyCapture> policy;
+    uint64_t tier_id=0;
+    strata::core::ExpertPolicyTierKind kind=strata::core::ExpertPolicyTierKind::peer;
+    strata::core::ExpertTierOpenObserver observer;
+    bool prepare(std::shared_ptr<strata::core::ExpertPolicyCapture> capture,uint64_t id,
+        strata::core::ExpertPolicyTierKind tier_kind,const std::vector<uint64_t>& ordinals,
+        strata::core::WindowBudget& budget,std::string& error) {
+        if(!capture)return true;
+        using namespace strata::core;
+        try {
+            if(ordinals.size()>(UINT64_MAX-4096)/sizeof(ExpertTierOpenDecision))return false;
+            WindowResources charge;
+            charge.device_bytes.resize(budget.snapshot().capacity.device_bytes.size());
+            charge.host_bytes=4096+ordinals.size()*sizeof(ExpertTierOpenDecision);
+            auto admitted=budget.reserve(charge,ReservationPurpose::foreground);
+            if(!admitted){error="helper expert pending metadata quota refused";return false;}
+            reservation=std::move(admitted.lease);policy=std::move(capture);tier_id=id;kind=tier_kind;
+            pending.resize(ordinals.size());
+            observer.context=this;observer.source_ordinals=ordinals.data();observer.ordinal_count=ordinals.size();
+            observer.pending=pending.data();observer.pending_capacity=pending.size();
+            observer.configure=[](void* ptr,const ExpertTierOpenCapacity& c) noexcept {
+                auto& self=*static_cast<DriverExpertOpenObservation*>(ptr);
+                ExpertPolicyTier tier;tier.id=self.tier_id;tier.kind=self.kind;
+                tier.device=c.device;tier.layer_end=c.layers;tier.slots=c.slots;tier.decision_limit=c.decision_limit;
+                tier.slot_guard_bytes=c.slot_guard_bytes;tier.per_layer=c.per_layer;
+                // Successful helper opens currently require nonempty capacity.
+                if(c.disabled){self.policy->fail();return false;}
+                return self.policy->configure_tier(tier);
+            };
+            observer.decision=[](void* ptr,const ExpertTierOpenDecision& d) noexcept {
+                auto& self=*static_cast<DriverExpertOpenObservation*>(ptr);
+                ExpertPolicyOutcome outcome;
+                switch(d.outcome) {
+                case ExpertTierOpenOutcome::copied:outcome=ExpertPolicyOutcome::copied;break;
+                case ExpertTierOpenOutcome::already_resident:outcome=ExpertPolicyOutcome::already_resident;break;
+                case ExpertTierOpenOutcome::skipped_full:outcome=ExpertPolicyOutcome::skipped_full;break;
+                case ExpertTierOpenOutcome::skipped_other:outcome=ExpertPolicyOutcome::skipped_other;break;
+                default:self.policy->fail();return false;
+                }
+                return self.policy->record_placement({self.tier_id,d.source_ordinal,d.bytes,d.layer,d.expert,d.slot,outcome});
+            };
+            observer.complete=[](void* ptr,uint64_t attempts,bool full) noexcept {
+                auto& self=*static_cast<DriverExpertOpenObservation*>(ptr);
+                return self.policy->complete_tier(self.tier_id,attempts,full?
+                    ExpertPolicyTermination::capacity_full:ExpertPolicyTermination::ranking_end);
+            };
+            observer.abort=[](void* ptr) noexcept {static_cast<DriverExpertOpenObservation*>(ptr)->policy->fail();};
+            return true;
+        } catch(const std::bad_alloc&) {error.clear();return false;}
+    }
+    strata::core::ExpertTierOpenObserver* get() noexcept {return policy?&observer:nullptr;}
+    DriverExpertOpenObservation()=default;
+    DriverExpertOpenObservation(const DriverExpertOpenObservation&)=delete;
+    DriverExpertOpenObservation& operator=(const DriverExpertOpenObservation&)=delete;
+};
+
+static uint64_t driver_mint_runtime_incarnation() noexcept {
+    static std::atomic<uint64_t> next{1};
+    uint64_t value=next.load(std::memory_order_relaxed);
+    for (;;) {
+        if(value==0 || value==UINT64_MAX)return 0; // sticky exhaustion, never wrap
+        if(next.compare_exchange_weak(value,value+1,std::memory_order_relaxed))return value;
+    }
+}
+
+struct DriverWindowRuntime final : strata::core::NativeRuntimeAttachment,
+                                   strata::core::ExpertHostRuntimeBinding,
+                                   strata::core::ExpertRuntimeProfileBinding {
+    ~DriverWindowRuntime();
+    const uint64_t remote_policy_incarnation = driver_mint_runtime_incarnation();
+    // Genuine geometry owner is established before model/session construction.
+    // All consumers keep the SAME address used during init; retained private
+    // executions must never relabel a copy as their foreground geometry.
+    // Declared before consumers so their destruction precedes geometry release.
+    std::shared_ptr<const strata::core::ModelGeometry> geometry_owner;
+    // Shared table/cache only; each resident gang constructs its OWN read
+    // context, pending IO and mutable PleRun buffers under its session owner.
+    std::shared_ptr<strata::kernels::PleTable> ple_table_owner;
+    // Execution-scope controllers must first finish doorbell/pipeline work and
+    // join all external dispatch/foreground callers while their captures live.
+    // This joins only the runtime-owned background producers; it is not proof
+    // that arbitrary external raw aliases or controller threads have stopped.
+    bool close_background_after_callers_joined() noexcept;
+    std::atomic<unsigned> background_retirement{0}; // open/closing/closed/failed
+    // The selected runtime must own the exact dispatch receiver and its source
+    // and pool. Matching independent source receipts alone cannot establish this
+    // join. Caller serializes consumer replacement and selected-work callbacks.
+    bool owns_expert_dispatch(const strata::core::ExpertDispatch* candidate) const noexcept override {
+        return candidate && drive && pool && candidate == &drive->d &&
+            candidate->pool == pool.get() &&
+            ((source && candidate->src == source.get()) ||
+             (arena_source && candidate->src == arena_source.get()));
+    }
+    // Actual source membership and retained loader authority; collection and
+    // borrowed profile use require serialized source/layout mutation.
+    strata::core::ExpertProfileSourceView expert_profile_source() const noexcept override {
+        return {profile_source==source.get()?source.get():nullptr,
+                profile_source==arena_source.get()?arena_source.get():nullptr,profile_bindings};
+    }
+    const strata::core::ExpertSource* profile_source=nullptr;
+    std::shared_ptr<const strata::core::VerifiedDriverBindings> profile_bindings;
+    std::shared_ptr<const strata::core::OwnedModelGang> model;
+    // Actual loaded fragment; never a substitute for the complete runtime profile.
+    strata::core::WindowLoaderProfile loader_profile;
+    std::shared_ptr<const strata::core::ReservationLease> expert_policy_workspace;
+    std::shared_ptr<strata::core::ExpertPolicyCapture> expert_policy;
+    std::vector<uint64_t> profile_ordinals;
+    std::vector<std::vector<uint64_t>> stage_profile_ordinals;
+    strata::kernels::PleResolvedTable ple_table_metadata;
+    bool ple_table_metadata_valid=false;
+    // Issuers and callback targets retain their actual source/cache/pool objects.
+    // Workers join before callback targets and their source/cache storage retire.
+    std::unique_ptr<strata::core::FileExpertSource> source;
+    std::unique_ptr<strata::core::ArenaExpertSource> arena_source;
+    std::unique_ptr<strata::core::ExpertCache> cache;
+    // Explicit startup envelope: <=8 stages, their streams/events and primary
+    // handoff/adaptation handles. Dynamic/pipeline growth still needs admission.
+    strata::core::OwnedWindowGpuHandles gpu_handles{64,16};
+    cudaStream_t main_stream=nullptr;
+    cudaStream_t adaptation_stream=nullptr;
+    cudaEvent_t hit_event=nullptr;
+    cudaEvent_t adaptation_event=nullptr;
+
+    std::vector<int32_t> host_residency;
+    strata::core::Doorbell doorbell{};
+    strata::core::NativeSessionAllocation sessions;
+    // Declared before graphs/verifiers/stages: reverse destruction keeps slot
+    // allocations alive until every runtime-owned graph borrower has retired.
+    strata::program::OwnedBatchSlotSessions batch_slot_sessions;
+    std::shared_ptr<const strata::core::NativeBatchSlotBindings> batch_slot_bindings;
+    std::array<strata::core::NativeBatchSlotInspection,16> batch_slot_inspections;
+    std::weak_ptr<const strata::core::NativeBatchGroupCompletion> batch_last_completion;
+    uint64_t batch_group_operation=0;
+    std::vector<strata::core::OwnedWindowBuffer> scratch;
+    float* parts=nullptr;
+    float* logits=nullptr;
+    float* embedding_row=nullptr;
+    int* sampled_token=nullptr;
+    int32_t* penalty_history=nullptr;
+    void* hit_scratch=nullptr;
+    int32_t* hit_slots=nullptr;
+    int32_t* hit_destinations=nullptr;
+    uint8_t* hit_q8=nullptr;
+    float* hit_q8_scale=nullptr;
+    float* hit_output=nullptr;
+    std::vector<float*> verifier_handoffs;
+    std::vector<uint32_t*> handoff_flags_host, handoff_flags_device;
+    std::vector<int32_t> penalty_staging;
+    bool allocate_scratch(strata::core::WindowBudget&,int,uint64_t,void**,
+        strata::core::WindowBufferMemory,void**);
+    bool reset_sessions(const strata::core::ModelGeometry&,std::string&);
+    bool initialize_sessions(const strata::core::ModelGeometry&,int64_t,int64_t,
+        const std::vector<strata::core::NativeSessionRequest>&,
+        std::vector<std::unique_ptr<strata::core::SessionState>>&,
+        strata::core::WindowBudget&,std::string&);
+
+
+    std::unique_ptr<Drive> drive;
+    std::unique_ptr<SplitDrive> split_drive;
+    std::unique_ptr<SplitDrive> split_drive_b;
+    // Pool/lookahead readers retire before the swap space and its source.
+    std::unique_ptr<strata::core::ForesightSwap> foresight;
+    std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
+    std::unique_ptr<std::array<strata::core::RemoteExperts,3>> remote_experts;
+    std::unique_ptr<strata::core::RemoteExpertOpt> remote_opt;
+    struct RemoteAttachObservation {
+        std::size_t configured_slot = 3; // actual index in owned remote_experts array
+        int opened_device = -1;         // argument of actual successful open()
+        bool open_completed = false;
+    };
+    std::array<RemoteAttachObservation,3> remote_attach_observations{};
+    std::size_t remote_attach_count = 0;
+    const strata::core::RemoteExpertOpt* remote_attached_optimizer = nullptr;
+    bool remote_attach_valid = true;
+    bool remote_attach_sealed = false;
+
+    std::unique_ptr<strata::core::PeerExperts> peer;
+    std::unique_ptr<strata::core::RouterLookahead> lookahead;
+    std::vector<std::unique_ptr<GpuStage>> stages;
+    // Primary consumers retire before stage/peer/source bindings they borrow.
+    std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_source;
+    std::unique_ptr<DriverPromptState> prompt_state;
+    std::unique_ptr<strata::core::AdaptGate> adapt_gate;
+    std::unique_ptr<strata::prefill::Prefill> primary_prefill;
+    std::unique_ptr<strata::core::Verifier> primary_verifier;
+    std::unique_ptr<strata::core::Verifier> same_device_verifier;
+    std::unique_ptr<strata::core::Verifier> odd_verifier;
+    int graph_device = -1;
+    std::unique_ptr<strata::core::SessionGraphs> session_graphs;
+    std::unique_ptr<strata::core::TokenGraph> token_graph;
+};
+static bool driver_owns_remote_policy(
+    const strata::core::NativeRuntimeAttachment& attachment,
+    const strata::core::ExpertSource& source,
+    const strata::core::RemoteExpertOpt& optimizer,
+    std::span<const strata::core::RemotePolicyPeerBinding> peers) noexcept {
+    const auto* runtime = dynamic_cast<const DriverWindowRuntime*>(&attachment);
+    if (!runtime || !runtime->remote_attach_valid || !runtime->remote_attach_sealed ||
+        !runtime->remote_opt || runtime->remote_opt.get() != &optimizer ||
+        runtime->remote_attached_optimizer != &optimizer || !runtime->remote_experts ||
+        !runtime->drive || runtime->profile_source != &source ||
+        runtime->drive->d.src != &source)
+        return false;
+    // Reject a merely owned but inactive File/Arena source.
+    if ((runtime->source.get() != &source && runtime->arena_source.get() != &source) ||
+        runtime->remote_attach_count == 0 || runtime->remote_attach_count > 3 ||
+        peers.size() != runtime->remote_attach_count ||
+        runtime->drive->d.remote_count < 0 ||
+        std::size_t(runtime->drive->d.remote_count) != peers.size())
+        return false;
+    if(optimizer.attached_peer_count()!=peers.size())return false;
+    for (std::size_t i = 0; i < peers.size(); ++i) {
+        const auto& observed = runtime->remote_attach_observations[i];
+        const auto& supplied = peers[i];
+        if (!observed.open_completed || observed.configured_slot >= 3 || observed.opened_device < 0)
+            return false;
+        const auto* actual = &(*runtime->remote_experts)[observed.configured_slot];
+        if(optimizer.attached_peer(i)!=actual)return false;
+        if (supplied.helper != actual || runtime->drive->d.remote[i] != actual ||
+            supplied.tier != 512u + observed.configured_slot || supplied.device != observed.opened_device)
+            return false;
+        for (std::size_t j = 0; j < i; ++j)
+            if (runtime->remote_attach_observations[j].configured_slot == observed.configured_slot ||
+                peers[j].helper == supplied.helper || peers[j].tier == supplied.tier)
+                return false;
+    }
+    return true;
+}
+
+struct DriverRemotePolicySetup {
+    // Declared first: prepaid charge survives destruction of workspace/adapter.
+    std::shared_ptr<const strata::core::ReservationLease> workspace_and_holder_charge;
+    strata::core::RemoteExpertOpt::OwnedAdaptWorkspace workspace;
+    // The gate retains its own dedicated lease through every verifier/token/cut.
+    std::shared_ptr<strata::core::VerifierCompletionGate> completion_gate;
+    // Tracker retires/quarantines before workspace is destroyed.
+    std::unique_ptr<strata::core::RemotePolicyPublication> publication;
+    // Declared last: releases seal BEFORE publication may drop the actual runtime.
+    strata::core::RouterLookahead::SubmittedDrain lookahead_drain;
+    int call_swaps=0; // actual bounded argument to FUTURE managed adapt bridge
+};
+
+static bool driver_remote_policy_remaining_host(strata::core::WindowBudget& budget,
+                                               uint64_t& available) {
+    const auto snapshot=budget.snapshot();
+    const auto cap=snapshot.capacity.host_bytes;
+    const auto base=snapshot.baseline.host_bytes;
+    const auto used=snapshot.reserved.host_bytes;
+    if(snapshot.overcommitted || base>cap || used>cap-base)return false;
+    available=cap-base-used;
+    return true;
+}
+
+// Trusted startup-only factory. Read-only authority checks and host reservations;
+// no reader binding, CUDA calls, source reads, adaptation or routing activation.
+static bool driver_prepare_remote_policy(
+    const std::shared_ptr<DriverWindowRuntime>& runtime,
+    strata::core::ExpertSource* actual_source,
+    strata::core::RemoteExpertOpt* actual_optimizer,
+    const strata::core::ModelGeometry& geometry,int requested_swaps,
+    strata::core::WindowBudget& budget,
+    std::unique_ptr<DriverRemotePolicySetup>& out,std::string& error) {
+    using namespace strata::core;
+    try {
+        // One setup per runtime. Replacing a previously active holder is not a
+        // host-allocation operation and requires a separate controller teardown.
+        if(out || !runtime || !runtime->remote_policy_incarnation || !actual_source ||
+           !actual_optimizer || !runtime->expert_policy || requested_swaps<0)return false;
+        const auto* initial=runtime->expert_policy->completed_inventory();
+        if(!initial || !initial->initial_only || geometry.n_layers<=0 || geometry.n_expert<=0)return false;
+        const auto layers=uint64_t(geometry.n_layers),experts=uint64_t(geometry.n_expert);
+        if(layers>uint64_t(INT32_MAX)/experts)return false;
+        const auto rows=layers*experts; // actual OwnedAdaptWorkspace representable bound
+        const auto call_swaps=std::min<uint64_t>(uint64_t(requested_swaps),rows);
+        if(call_swaps>uint64_t(INT_MAX))return false;
+        // Even disabled adaptation needs retained RemoteOpt control ownership.
+        // Current tracker/workspace APIs require positive capacities; their
+        // minimum allocation is one, while the actual call argument stays zero.
+        const auto swaps=std::max<uint64_t>(1,call_swaps);
+        const size_t n=runtime->remote_attach_count;
+        std::array<RemotePolicyPeerBinding,3> joined{};
+        if(n==0 || n>joined.size() || !runtime->remote_experts)return false;
+        for(size_t i=0;i<n;++i) {
+            const auto& observed=runtime->remote_attach_observations[i];
+            if(!observed.open_completed || observed.configured_slot>=3)return false;
+            joined[i]={&(*runtime->remote_experts)[observed.configured_slot],
+                       512u+observed.configured_slot,observed.opened_device};
+        }
+        const auto peers=std::span<const RemotePolicyPeerBinding>(joined.data(),n);
+        if(!driver_owns_remote_policy(*runtime,*actual_source,*actual_optimizer,peers))return false;
+        std::shared_ptr<const ExpertSourceCapture> source_capture;
+        if(runtime->source.get()==actual_source)
+            source_capture=runtime->source->completed_inventory_owner();
+        else if(runtime->arena_source.get()==actual_source)
+            source_capture=runtime->arena_source->completed_inventory_owner();
+        else return false;
+        const auto* source_receipt=source_capture?source_capture->completed_inventory():nullptr;
+        if(!source_receipt || source_receipt->layers!=layers || source_receipt->experts!=experts)return false;
+        std::shared_ptr<NativeRuntimeAttachment> attachment=runtime;
+        std::shared_ptr<ExpertSource> source_alias(runtime,actual_source);
+
+        // Tracker creates cells for EVERY initial tier, not only remote tiers.
+        // Sum actual capacities (not populated decisions), guarding both integer
+        // overflow and the tracker's signed slot representation before admission.
+        uint64_t all_slots=0;
+        for(const auto& tier:initial->tiers) {
+            if(tier.slots>uint64_t(INT32_MAX) || tier.slots>UINT64_MAX-all_slots)return false;
+            all_slots+=tier.slots;
+        }
+        if(!all_slots || initial->tiers.empty() || swaps>UINT64_MAX/n)return false;
+        RemotePolicyPublicationLimits limits;
+        limits.max_peers=n;
+        limits.max_changes_per_peer=swaps;
+        limits.max_total_changes=swaps*n;
+        limits.tracker.max_tiers=initial->tiers.size();
+        limits.tracker.max_slots=all_slots;
+        limits.tracker.max_transactions=n;
+        limits.tracker.max_changes=swaps;
+        // Existing tracker requires a nonzero dependency capacity even though
+        // synchronous remote copies use zero dependencies; reserve its minimum.
+        limits.tracker.max_dependencies=1;
+        uint64_t workspace_bytes=0,adapter_bytes=0;
+        if(!RemoteExpertOpt::OwnedAdaptWorkspace::required_bytes(size_t(rows),size_t(experts),size_t(swaps),workspace_bytes) ||
+           !RemotePolicyPublication::required_bytes(limits,adapter_bytes))return false;
+        limits.max_host_bytes=adapter_bytes; // exact adapter quote, not arbitrary cap
+        // Workspace quote already contains its object and storage allowance.
+        // Conservatively include the full external holder too; no undercharge
+        // from trying to subtract nested object bytes or allocator internals.
+        uint64_t holder_bytes=sizeof(DriverRemotePolicySetup);
+        // Exactly ONE serialized primary unit, matching run_serial_remote_unit.
+        // RemoteRoutingUnit already includes its three RoutingRead handles and
+        // private helper array. The wrapper has an additional helper list.
+        for(uint64_t bytes : {
+                uint64_t(sizeof(RemoteRoutingUnit)),
+                uint64_t(sizeof(std::array<RemoteExperts*,RemoteRoutingUnit::max_helpers>)),
+                uint64_t(3*sizeof(int)), // target_device, entry_device, completed_device
+                uint64_t(sizeof(RemoteRoutingUnit::CheckedCompletion))}) {
+            if(bytes>UINT64_MAX-holder_bytes)return false;
+            holder_bytes+=bytes;
+        }
+        // Fixed allocator/reservation bookkeeping allowance only; actual unit
+        // objects above are explicit, not assumed to fit this allowance.
+        constexpr uint64_t metadata_bookkeeping_allowance=4096;
+        if(metadata_bookkeeping_allowance>UINT64_MAX-holder_bytes)return false;
+        holder_bytes+=metadata_bookkeeping_allowance;
+        uint64_t guard_bytes_per_helper=0;
+        if (!RemoteExperts::copy_reader_guard_bytes(
+                uint32_t(strata::prefill::kMaxStagerThreads),guard_bytes_per_helper) ||
+            guard_bytes_per_helper>(UINT64_MAX-holder_bytes)/n)
+            return false;
+        holder_bytes+=guard_bytes_per_helper*n;
+        if(workspace_bytes>UINT64_MAX-holder_bytes)return false;
+        const uint64_t charge_bytes=workspace_bytes+holder_bytes;
+        auto budget_snapshot=budget.snapshot();
+        WindowResources resource;
+        resource.device_bytes.resize(budget_snapshot.capacity.device_bytes.size());
+        resource.host_bytes=charge_bytes;
+        auto admitted=budget.reserve(resource,ReservationPurpose::foreground);
+        if(!admitted || !admitted.lease)return false;
+        auto candidate=std::make_unique<DriverRemotePolicySetup>();
+        candidate->workspace_and_holder_charge=std::move(admitted.lease);
+        candidate->call_swaps=int(call_swaps);
+        // Host-only allocations are allowed only after their reservation above.
+        if(!candidate->workspace.prepare(size_t(rows),size_t(experts),size_t(swaps),error))return false;
+        uint64_t remaining=0;
+        if(!driver_remote_policy_remaining_host(budget,remaining) || adapter_bytes>remaining)return false;
+        // Tracker's own factory calculates and reserves its exact internal size.
+        // Its max_host limit is genuine remaining allowance after adapter charge;
+        // it is NOT represented as an additional prepaid/private shadow lease.
+        limits.tracker.max_host_bytes=remaining-adapter_bytes;
+        if(!limits.tracker.max_host_bytes)return false;
+        if(!RemotePolicyPublication::create(runtime->expert_policy,attachment,source_alias,
+             source_capture,*actual_optimizer,peers,runtime->remote_policy_incarnation,
+             limits,budget,&driver_owns_remote_policy,candidate->publication,error))return false;
+        error.clear();out=std::move(candidate);return true;
+    } catch(const std::bad_alloc&) {error.clear();return false;}
+      catch(...) {error.clear();return false;}
+}
+
+
+#endif
+// Construct exactly one object, in the legacy local slot or directly under the
+// runtime owner. Nonmovable consumers keep the same address from construction.
+template<class T> struct DriverRuntimeObject {
+    std::optional<T> baseline;
+    T* value=nullptr;
+    template<class... Args> explicit DriverRuntimeObject(std::unique_ptr<T>* destination,Args&&... args) {
+        if(destination) {
+            if(*destination)throw std::logic_error("runtime object already constructed");
+            *destination=std::make_unique<T>(std::forward<Args>(args)...);
+            value=destination->get();
+        } else value=&baseline.emplace(std::forward<Args>(args)...);
+    }
+    DriverRuntimeObject(const DriverRuntimeObject&)=delete;
+    DriverRuntimeObject& operator=(const DriverRuntimeObject&)=delete;
+    T& get(){return *value;}
+};
+template<class T> struct DriverModelObject {
+    T baseline;
+    std::unique_ptr<T> owned;
+    T* value;
+    explicit DriverModelObject(bool enable=false):owned(enable?std::make_unique<T>():nullptr),value(owned?owned.get():&baseline){}
+    DriverModelObject(const DriverModelObject&)=delete;
+    DriverModelObject& operator=(const DriverModelObject&)=delete;
+    T& get(){return *value;}
+};
 struct GpuStage {
+    explicit GpuStage(bool own_model=false,bool own_session=false):weights(own_model),native(own_model),output(own_model),session(own_session){}
     int dev = 0;
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
     double link_gbps = 0.0;   ///< this card's probed host->device bandwidth (PcieAuto's per-stage share)
-    strata::core::WeightTable wt;
-    strata::core::NativeDense dense;
-    strata::core::NativeHead head;
-    strata::core::SessionState ss;
+    DriverModelObject<strata::core::WeightTable> weights;
+    DriverModelObject<strata::core::NativeDense> native;
+    DriverModelObject<strata::core::NativeHead> output;
+    strata::core::WeightTable& wt=weights.get();
+    strata::core::NativeDense& dense=native.get();
+    strata::core::NativeHead& head=output.get();
+    void* weight_arena=nullptr;
+    uint64_t weight_arena_bytes=0;
+    DriverModelObject<strata::core::SessionState> session;
+    strata::core::SessionState& ss=session.get();
     cudaStream_t stream = nullptr;
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
@@ -1506,6 +2129,278 @@ struct GpuStage {
     bool adapt_live = false;                             ///< swaps of this request are in flight on it
     int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
 };
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+// Validate immediately before try_acquire while the serial controller excludes
+// topology/source/dispatch mutation. No raw caller object is dereferenced until
+// its address equals a genuine owned runtime object.
+static bool driver_owns_serial_remote_unit(
+    const std::shared_ptr<DriverWindowRuntime>& runtime,
+    const strata::core::Verifier& target,strata::core::PoolMultiFn callback,void* user,
+    std::span<strata::core::RemoteExperts* const> helpers) noexcept {
+    using namespace strata::core;
+    if(!runtime||!runtime->primary_verifier||&target!=runtime->primary_verifier.get()||
+       !runtime->drive||!runtime->pool||!runtime->remote_opt||!runtime->remote_experts||
+       !runtime->remote_attach_valid||!runtime->remote_attach_sealed)return false;
+    const auto& dispatch=runtime->drive->d;
+    if(dispatch.pool!=runtime->pool.get()||!dispatch.src||
+       (dispatch.src!=runtime->source.get()&&dispatch.src!=runtime->arena_source.get())||
+       runtime->profile_source!=dispatch.src||dispatch.remote_count<0||
+       size_t(dispatch.remote_count)!=helpers.size()||helpers.empty()||
+       helpers.size()!=runtime->remote_attach_count||helpers.size()>3||
+       runtime->remote_opt->attached_peer_count()!=helpers.size())return false;
+    std::array<RemotePolicyPeerBinding,3> peers{};
+    for(size_t i=0;i<helpers.size();++i) {
+        const auto& a=runtime->remote_attach_observations[i];
+        if(!a.open_completed||a.configured_slot>=3||a.opened_device<0)return false;
+        const auto* actual=&(*runtime->remote_experts)[a.configured_slot];
+        if(helpers[i]!=actual||dispatch.remote[i]!=actual||
+           runtime->remote_opt->attached_peer(i)!=actual||!actual->bound_to_runtime(runtime))return false;
+        peers[i]={helpers[i],512u+a.configured_slot,a.opened_device};
+    }
+    if(!driver_owns_remote_policy(*runtime,*dispatch.src,*runtime->remote_opt,
+         {peers.data(),helpers.size()}))return false;
+    const auto primary=target.serial_routing_binding();
+    const auto& allocations=runtime->sessions.stages();
+    if(primary.optimizer!=runtime->remote_opt.get()||!primary.session||!primary.geometry||
+       allocations.empty()||!allocations[0].owner||primary.session!=allocations[0].session||
+       target.device()!=allocations[0].device)return false;
+    if(callback==&drive_pool_multi) {
+        return user==runtime->drive.get()&&primary.next==nullptr&&primary.next_user==nullptr&&
+               primary.layer_begin==0&&primary.layer_end==primary.geometry->n_layers&&dispatch.plan==primary.plan&&
+               runtime->cache&&dispatch.cache_base==runtime->cache->device_slot(0)&&
+               dispatch.cache_slot_off==runtime->cache->slot_offsets();
+    }
+    // Only the primary owned serial SplitDrive, never split_drive_b or arbitrary
+    // structurally similar caller storage. Odd/pipeline units need their own API.
+    if(callback!=&drive_pool_split||!runtime->split_drive||user!=runtime->split_drive.get())return false;
+    const auto& split=*runtime->split_drive;
+    if(split.base!=runtime->drive.get()||split.n<2||split.n>SplitDrive::kMax)return false;
+    std::array<const Verifier*,SplitDrive::kMax> expected{};
+    expected[0]=&target;
+    const bool same=primary.next==runtime->same_device_verifier.get()&&runtime->same_device_verifier;
+    if(same) {
+        if(split.n!=2||!runtime->stages.empty())return false;
+        expected[1]=runtime->same_device_verifier.get();
+    } else {
+        if(runtime->stages.size()!=size_t(split.n-1))return false;
+        for(int i=1;i<split.n;++i) {
+            const auto& stage=runtime->stages[size_t(i-1)];if(!stage)return false;
+            expected[size_t(i)]=&stage->ver;
+        }
+    }
+    int64_t begin=0;
+    for(int i=0;i<split.n;++i) {
+        const auto& verifier=*expected[size_t(i)];
+        const auto b=verifier.serial_routing_binding();
+        if(b.optimizer!=runtime->remote_opt.get()||!b.session||b.geometry!=primary.geometry||
+           b.layer_begin!=begin||b.layer_end<=begin||split.end[i]!=b.layer_end||
+           split.plan[i]!=b.plan)return false;
+        const auto* next=i+1<split.n?expected[size_t(i+1)]:nullptr;
+        if(b.next!=next||b.next_user!=(next?static_cast<const void*>(&split):nullptr))return false;
+        if(i==0||same) {
+            if(b.session!=primary.session||verifier.device()!=target.device())return false;
+        }else {
+            const auto& stage=*runtime->stages[size_t(i-1)];
+            if(size_t(i)>=allocations.size()||!allocations[size_t(i)].owner||
+               b.session!=allocations[size_t(i)].session||verifier.device()!=allocations[size_t(i)].device||
+               b.session!=&stage.ss||verifier.device()!=stage.dev||
+               b.layer_begin!=stage.lb||b.layer_end!=stage.le||
+               split.cache_base[i]!=stage.cache.device_slot(0)||
+               split.cache_slot_off[i]!=stage.cache.slot_offsets())return false;
+        }
+        if(i==0||same) {
+            if(!runtime->cache||split.cache_base[i]!=runtime->cache->device_slot(0)||
+               split.cache_slot_off[i]!=runtime->cache->slot_offsets())return false;
+        }
+        begin=b.layer_end;
+    }
+    return begin==primary.geometry->n_layers;
+}
+
+// Construction-scope cleanup only. This does not authorize resuming a runtime
+// with these callbacks: each admitted unit must install its own owned context.
+class DriverPrefillCallbacks {
+public:
+    DriverPrefillCallbacks(std::shared_ptr<const strata::core::OwnedModelGang> model,
+                          strata::prefill::Prefill& primary,
+                          const std::vector<std::unique_ptr<GpuStage>>& stages)
+        :model_(std::move(model)) {
+        if(!model_)return;
+        consumers_.reserve(stages.size()+1);
+        consumers_.push_back(&primary);
+        for(const auto& stage:stages)consumers_.push_back(&stage->sp);
+    }
+    DriverPrefillCallbacks(const DriverPrefillCallbacks&)=delete;
+    DriverPrefillCallbacks& operator=(const DriverPrefillCallbacks&)=delete;
+    ~DriverPrefillCallbacks() noexcept {
+        if(!model_)return;
+        // The actual run/successor chain and any later reader threads must have
+        // joined before this scope ends. Drain any device work they issued first.
+        { strata::core::WindowConsumerDrainGuard drain{model_}; }
+        for(auto* consumer:consumers_) {
+            consumer->on_chunk=nullptr;
+            consumer->on_taps=nullptr;
+            consumer->on_stage_chunk=nullptr;
+            consumer->should_stop=nullptr;
+            consumer->stop_at_chunk=nullptr;
+            consumer->on_routes=nullptr;
+        }
+    }
+private:
+    std::shared_ptr<const strata::core::OwnedModelGang> model_;
+    std::vector<strata::prefill::Prefill*> consumers_;
+};
+bool DriverWindowRuntime::initialize_sessions(const strata::core::ModelGeometry& g,
+    int64_t max_cells,int64_t k,const std::vector<strata::core::NativeSessionRequest>& requests,
+    std::vector<std::unique_ptr<strata::core::SessionState>>& fresh,
+    strata::core::WindowBudget& budget,std::string& error) {
+    using namespace strata::core;
+    if(!sessions.stages().empty() || !scratch.empty() || requests.empty() ||
+       k<=0 || g.n_embd<=0 || uint64_t(k)>SIZE_MAX/4/uint64_t(g.n_embd)) {
+        error="private runtime requires fresh sessions and bounded scratch geometry";return false;
+    }
+    const auto allocated=allocate_native_sessions(g,max_cells,k,requests,fresh,budget,sessions);
+    if(!allocated){error=allocated.detail;return false;}
+    auto failed=[&](const char* reason){sessions.mark_unhealthy();error=reason;return false;};
+    const int primary_device=requests.front().device;
+    WindowDeviceScope primary(primary_device);
+    if(!primary.ok())return failed("private runtime primary device selection failed");
+    if(!allocate_scratch(budget,primary_device,uint64_t(k)*g.n_embd*4,
+        reinterpret_cast<void**>(&parts),WindowBufferMemory::device,nullptr))
+        return failed("private runtime parts allocation failed");
+    if(cudaMemset(parts,0,size_t(k)*g.n_embd*4)!=cudaSuccess)
+        return failed("private runtime parts initialization failed");
+    doorbell.n_embd=g.n_embd;doorbell.k=k;
+    const auto mapped=[&](uint64_t bytes,void** host,void** gpu) {
+        return allocate_scratch(budget,primary_device,bytes,host,WindowBufferMemory::mapped_host,gpu);
+    };
+    if(!mapped(uint64_t(g.n_embd)*4,reinterpret_cast<void**>(&doorbell.h_x_f),reinterpret_cast<void**>(&doorbell.d_x_f))||
+       !mapped(uint64_t(k)*4,reinterpret_cast<void**>(&doorbell.h_ids),reinterpret_cast<void**>(&doorbell.d_ids))||
+       !mapped(uint64_t(k)*4,reinterpret_cast<void**>(&doorbell.h_weights),reinterpret_cast<void**>(&doorbell.d_weights))||
+       !mapped(4,reinterpret_cast<void**>(&doorbell.h_seq),reinterpret_cast<void**>(&doorbell.d_seq))||
+       !mapped(4,reinterpret_cast<void**>(&doorbell.h_flag),reinterpret_cast<void**>(&doorbell.d_flag)))
+        return failed("private runtime doorbell allocation failed");
+    sessions.stages().front().session->db=&doorbell;
+    for(const auto& stage:sessions.stages()) {
+        WindowDeviceScope device(stage.device);
+        if(!device.ok() || cudaGetLastError()!=cudaSuccess)
+            return failed("private runtime stage initialization device failed");
+        if(!session_zero_checked(*stage.session,g,nullptr,nullptr,error)) {
+            sessions.mark_unhealthy();return false;
+        }
+        if(cudaGetLastError()!=cudaSuccess || cudaDeviceSynchronize()!=cudaSuccess || !device.finish())
+            return failed("private runtime stage initialization drain failed");
+    }
+    if(!primary.finish())return failed("private runtime primary device restore failed");
+    return true;
+}
+bool DriverWindowRuntime::reset_sessions(const strata::core::ModelGeometry& g,std::string& error) {
+    using namespace strata::core;
+    const auto& allocated=sessions.stages();
+    // Validate the complete binding before resetting any device. This is the
+    // current owned driver reset, not a managed-window generation transition.
+    if(!sessions.healthy() || allocated.empty() || allocated.size()!=stages.size()+1 || !main_stream) {
+        error="owned reset requires healthy complete runtime bindings";return false;
+    }
+    for(size_t i=1;i<allocated.size();++i) {
+        if(!stages[i-1] || allocated[i].session!=&stages[i-1]->ss ||
+           allocated[i].device!=stages[i-1]->dev || !stages[i-1]->stream) {
+            error="owned reset stage binding mismatch";return false;
+        }
+    }
+    try {
+    for(size_t i=0;i<allocated.size();++i) {
+        const auto& stage=allocated[i];
+        WindowDeviceScope device(stage.device);
+        auto stream=i?stages[i-1]->stream:main_stream;
+        if(!device.ok() || cudaGetLastError()!=cudaSuccess) {
+            sessions.mark_unhealthy();error="owned reset device selection failed";return false;
+        }
+        if(!session_zero_checked(*stage.session,g,nullptr,stream,error)) {
+            sessions.mark_unhealthy();return false;
+        }
+        if(cudaStreamSynchronize(stream)!=cudaSuccess || !device.finish()) {
+            sessions.mark_unhealthy();error="owned reset drain or device restore failed";return false;
+        }
+    }
+    } catch(...) {
+        // Even reporting a submission error can allocate. Once any stage may
+        // have changed, exceptional unwind must not leave this runtime reusable.
+        sessions.mark_unhealthy();
+        throw;
+    }
+    return true;
+}
+bool DriverWindowRuntime::allocate_scratch(strata::core::WindowBudget& budget,
+    int device,uint64_t bytes,void** pointer,strata::core::WindowBufferMemory memory,void** mapped) {
+    if(!pointer||!sessions.healthy())return false;
+    // Complete host handle setup before issuing device work. The allocation is
+    // retained by this exact runtime, independently of the current driver scope.
+    scratch.emplace_back();
+    std::vector<int> consumers;
+    for(const auto& stage:sessions.stages())consumers.push_back(stage.device);
+    std::string error;
+    if(!strata::core::allocate_window_buffer(device,bytes,consumers,budget,
+        sessions.reservation(),scratch.back(),error,memory)) {
+        sessions.mark_unhealthy();
+        std::fprintf(stderr,"strata generate: owned scratch: %s\n",error.c_str());return false;
+    }
+    *pointer=scratch.back().data();
+    if(mapped)*mapped=scratch.back().device_data();
+    return true;
+}
+bool DriverWindowRuntime::close_background_after_callers_joined() noexcept {
+    unsigned expected=0;
+    if(!background_retirement.compare_exchange_strong(expected,1,std::memory_order_acq_rel))
+        return expected==2;
+    bool closed=false;
+    try {
+        // No new predictions may reach the swap source or dispatch pool once
+        // their workers are stopped. Keep every buffer and callback target alive.
+        closed=(!lookahead||lookahead->close_for_retirement())&&
+               (!foresight||foresight->close_for_retirement())&&
+               (!pool||pool->stop_after_dispatch_callers_joined())&&
+               (!source||source->stop_background_after_callers_joined());
+        if(closed)for(const auto& stage:sessions.stages()){
+            if(stage.session&&stage.session->ple.read_context&&
+               !stage.session->ple.read_context->close_for_retirement()){
+                closed=false;break;
+            }
+        }
+        if(closed)for(size_t slot=0;slot<strata::program::OwnedBatchSlotSessions::capacity;++slot)
+            for(const auto& stage:batch_slot_sessions.allocation_for_teardown(slot).stages())
+                if(stage.session&&stage.session->ple.read_context&&
+                   !stage.session->ple.read_context->close_for_retirement())closed=false;
+    } catch(...) {closed=false;}
+    background_retirement.store(closed?2u:3u,std::memory_order_release);
+    return closed;
+}
+DriverWindowRuntime::~DriverWindowRuntime() {
+    if(!close_background_after_callers_joined()){
+        std::fputs("strata: runtime producer closure uncertain; worker restart required\n",stderr);
+        std::_Exit(1);
+    }
+    // Caller has closed and joined producers. Keep external streams alive while
+    // downstream consumer destructors retire their graphs and borrowed bindings.
+    gpu_handles.drain_after_producers_closed();
+    remote_attach_valid = false;
+    remote_attach_sealed = false;
+    // Graphs borrow the actual session/scratch addresses. Retire them before any
+    // backing member, even when this owner outlives its construction scope.
+    if (session_graphs || token_graph) {
+        if (!model || graph_device < 0) {
+            std::fputs("strata: runtime graph ownership is incomplete; worker restart required\n",stderr);
+            std::_Exit(1);
+        }
+        if (token_graph) {
+            strata::core::WindowGraphGuard guard{model,*token_graph,graph_device,strata::core::token_graph_free_checked};
+        }
+        if (session_graphs) {
+            strata::core::WindowGraphGuard guard{model,*session_graphs,graph_device,strata::core::session_graphs_free_checked};
+        }
+    }
+}
+#endif
 
 // what a refusal on the RAM guard says it had: "900 MiB available, source cgroup" (the smallest of MemAvailable, the
 // cgroup limits above the engine and --memory-limit-mib; see strata/core/conversation_memory.hpp)
@@ -1682,8 +2577,17 @@ struct PlDiag {
     std::atomic<long long> iters{0};
 };
 PlDiag g_pl_diag;
+std::mutex g_pl_diag_pointers;
 void pl_diag_print(std::FILE* f) {
     PlDiag& d = g_pl_diag;
+    strata::core::Verifier* verifiers[2][2];
+    {
+        std::lock_guard<std::mutex> lock(g_pl_diag_pointers);
+        for (int st = 0; st < 2; ++st)
+            for (int par = 0; par < 2; ++par) verifiers[st][par] = d.v[st][par];
+    }
+    // In owned mode the watchdog joins before these outer-scope verifiers die.
+    // Do not hold the publication lock across diagnostic output/device queries.
     auto bits = [](int b, char* o) {
         std::snprintf(o, 16, "%c%c%c%c%c%c", b & 1 ? 'R' : '-', b & 2 ? 'L' : '-', b & 4 ? 'F' : '-', b & 8 ? 'C' : '-',
                       b & 16 ? 'S' : '-', b & 32 ? 'V' : '-');
@@ -1697,7 +2601,7 @@ void pl_diag_print(std::FILE* f) {
     const char* names[2][2] = {{"stage 0 even", "stage 0 odd"}, {"stage 1 even", "stage 1 odd"}};
     for (int st = 0; st < 2; ++st)
         for (int par = 0; par < 2; ++par)
-            if (d.v[st][par] != nullptr) d.v[st][par]->diag_pipelined(f, names[st][par]);
+            if (verifiers[st][par] != nullptr) verifiers[st][par]->diag_pipelined(f, names[st][par]);
 }
 
 // #1341 #964: CUDA_LAUNCH_BLOCKING=1 in the environment.  A verify window's graph waits on the GPU for flags the host
@@ -2142,6 +3046,42 @@ int32_t* res_pairs_alloc(size_t cap, const std::vector<int>& devs) {
     }
     return (int32_t*) p;
 }
+
+// Opt-in watchdog ownership: finish diagnostic readers before borrowed objects unwind.
+// Legacy mode keeps its detached worker.
+class DriverWatchdog {
+public:
+    struct Stop {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool requested = false;
+    };
+    DriverWatchdog() = default;
+    DriverWatchdog(const DriverWatchdog&) = delete;
+    DriverWatchdog& operator=(const DriverWatchdog&) = delete;
+    ~DriverWatchdog() {
+        if (!stop_) return;
+        { std::lock_guard<std::mutex> lock(stop_->mutex); stop_->requested = true; }
+        stop_->cv.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+    template<class F> void start(bool owned, F run) {
+        if (owned) {
+            stop_ = std::make_shared<Stop>();
+            thread_ = std::thread(std::move(run), stop_);
+        } else {
+            std::thread(std::move(run), std::shared_ptr<Stop>{}).detach();
+        }
+    }
+    static bool wait_stop(const std::shared_ptr<Stop>& stop, std::chrono::milliseconds delay) {
+        if (!stop) { std::this_thread::sleep_for(delay); return false; }
+        std::unique_lock<std::mutex> lock(stop->mutex);
+        return stop->cv.wait_for(lock, delay, [&] { return stop->requested; });
+    }
+private:
+    std::shared_ptr<Stop> stop_;
+    std::thread thread_;
+};
 
 /// --adapt-async: one background job at a time (the asynchronous adaptive tier's copies and memcpys).  `post` hands
 /// it over, `idle` says whether it has finished; the owner never posts while a job runs.
@@ -2792,6 +3732,25 @@ struct PcieAuto {
     }
 };
 
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+struct DriverSuffixExperimentContext {
+    const Options& options;
+    const strata::core::ModelGeometry& geometry;
+    std::shared_ptr<DriverWindowRuntime> owner;
+    strata::core::WindowBudget& budget;
+    strata::prefill::Prefill& prefill;
+    strata::core::Verifier& primary_verifier;
+    strata::core::SessionState& primary_session;
+    const std::vector<std::unique_ptr<GpuStage>>& secondary_stages;
+    int primary_device;
+    void* primary_stream;
+    int stage_count;
+    strata::core::PoolMultiFn pool;
+    void* pool_user;
+};
+
+#endif
+
 // ---- STRATA_EXPERT_NIBBLE=1 (strata/core/expert_nibble.hpp): the gate/up experts of IQ2_S / IQ3_XXS / IQ3_S layers as
 // 4-bit codes in their VRAM slots.  Everything below runs only with the switch on.
 
@@ -3084,6 +4043,1354 @@ std::string nibble_refusal(const Options& o) {
 }
 
 }  // namespace
+
+#if defined(STRATA_WINDOW_STATE_AVAILABLE) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+#define STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE 1
+#include "http_native_receipt.hpp"
+#include "suffix_raw_runtime.hpp"
+#include "owned_image_request_operation.hpp"
+#include "strata/core/serving_raw_metadata.hpp"
+#include "resident_repair_runtime.inc"
+#include "resident_repair_dispatch.inc"
+#include "resident_repair_compare.inc"
+#include "resident_repair_controller.inc"
+#include "resident_repair_construction.inc"
+#include "suffix_experiment_driver.hpp"
+#include "suffix_experiment_execution.inc"
+#endif
+
+#if defined(STRATA_WINDOW_STATE_AVAILABLE) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+// EXECUTION-PLAN step 3: one bounded serving suffix-reuse OPERATION, in the order the qualified standalone driver
+// proved it: quote the bounded import, claim its aggregate cap, prepare it (real global reservation + copies),
+// restore it through the transaction, then run the ACTUAL repair through the qualified controller with
+// request-parameterized frontiers, capture what the controller published, and retire the private work while
+// keeping the cut identity monotonic.
+//
+// What it does NOT do: it makes no admission decision (the caller runs suffix_import_plan plus the request's own
+// shape gate, and core::serving_raw::repair_plan_acceptable on the positions), it opens no fence (the caller holds
+// the ServingRawSession request open at a DRAINED all-stage cut, which is the only phase where capture/restore and
+// the splice operands are legal), and it never fabricates exactness: `certified_exact` reports only what the
+// controller's own published cut says.
+namespace strata::program {
+class ServingSuffixRepairOperation final {
+public:
+    struct Facts {
+        std::span<const int32_t> accepted;         ///< caller retains A+B'+C through this synchronous admission
+        std::vector<uint64_t> frontiers;           ///< where the donor suffix is re-attached (request positions)
+        unsigned foreground_between = 0;           ///< the request's own fresh forwards between attachments
+        uint64_t cut_id = 0;                       ///< strictly newer than every operand cut
+        uint64_t first_unresolved_unix_ms = 0;     ///< age anchor of the introduced approximation
+        strata::core::RepairMonotonicBirth first_unresolved_birth{}; // causal import clock, never park/restore time
+        bool retain_foreground = false;
+        std::span<const int64_t> request_tokens;   ///< caller retains ids until the admitted owned copy exists
+        uint64_t max_generated = 0;
+    };
+    struct Outcome {
+        // Declaration order IS destruction order's mirror: members die in reverse, so the credits are declared
+        // FIRST and are released only after every payload below them (splice, published, both bundles).  The
+        // driver uses the same pattern for its Buffers/splice pair; inverting it would free a charge that its
+        // payload still points at.
+        std::shared_ptr<const void> operation_credit, splice_credit, request_credit;
+        strata::core::PreparedNativeSuffix splice;             ///< dies before its aggregate credit
+        strata::core::SnapshotDescriptor published{};          ///< the controller's actual CURRENT publication
+        // Deep metadata is staged before cohort submission. Completion only fills the actual sample/cut and
+        // swaps this owned snapshot; nested metadata must never allocate after a BT has been published.
+        strata::core::SnapshotDescriptor cohort_publication{};
+        uint64_t cohort_operation=0,cohort_capacity_bound=0;
+        bool cohort_prepared=false,cohort_known=false;
+        strata::core::BundleHandle repaired_catchup, repaired_final;
+        // Retained repair across a response boundary (opt-in slice 2). `retained_exact` is the frozen all-stage
+        // image of the private cut the certified yield left behind - the state that IS certified at that cut -
+        // and it carries its own capture reservation, so the registry entry that holds this Outcome is what keeps
+        // it. `certified_cut` names that cut and `retained_debt` is published-cut forwarded minus its forwarded:
+        // it is never zero for a retained owner, and nothing here claims the debt was exact.
+        strata::core::BundleHandle retained_exact;
+        // Slice 6 (activation restore operand): the frozen all-stage image of the CURRENT publication cut D, i.e.
+        // the state the live transaction stood on when this owner was yielded and parked. `activate_retained`
+        // refuses to mutate unless the live transaction already stands on `published_->metadata.cut`
+        // (resident_repair_controller.inc:529-536), and at an A-return it stands on another conversation's cut, so
+        // the serving scope restores THIS image onto the session before it asks the controller to activate. It is
+        // captured at the certified yield, while the fence is open at the drained cut; without it an owner can be
+        // parked but never activated, so the yield is refused rather than parking an unactivatable owner.
+        strata::core::BundleHandle retained_publication;
+        // Qualification-only origin data/credit; no request-local execution callbacks survive here.
+        std::shared_ptr<strata::program::PrefixReplayPlan> retained_prefix;
+        std::unique_ptr<SuffixExperimentDriver::ServingQualification> owned_slot_qualification;
+        strata::core::StateCut certified_cut{};
+        uint64_t retained_debt = 0, retained_residency_swaps = 0;
+        std::shared_ptr<resident_repair_detail::ResidentRepairController> controller;
+        std::vector<int32_t> request_tokens;
+        uint64_t boundary = 0, donor_forwarded = 0, max_generated = 0, next_operation = 1;
+        uint64_t known_forwarded = 0, generated = 0;
+        uint64_t request_receipt_base = 0, request_known_base = 0, request_watermark_base = 0;
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        uint64_t exact_frontier = 0, reused_suffix = 0, fresh = 0, next_cut = 0;
+        bool repaired = false, certified_exact = false, retired = false;
+        // True once `yield_retained` certified this owner's private cut and moved its controller into the
+        // suspended state. Only a yielded owner may be parked; only a parked owner may be advanced.
+        bool yielded = false;
+        /// True once the splice has been installed through the transaction. From that point on a failure is NOT a
+        /// safe pre-mutation admission refusal: the serving session's device state no longer matches its own
+        /// bookkeeping, and the only correct handling is the established poison/failstop path.
+        bool mutated = false;
+        std::string detail;
+
+        // Lifetime discipline: assignment is deleted, because the compiler's memberwise move-assignment would
+        // release the credits (declared first) while the payloads still pointed at them.  Re-use goes through
+        // clear(), which tears payloads down before credits; a caller that hands back a populated Outcome is
+        // refused rather than silently reset.
+        Outcome() = default;
+        Outcome(const Outcome&) = delete;
+        Outcome(Outcome&&) = delete;
+        Outcome& operator=(const Outcome&) = delete;
+        Outcome& operator=(Outcome&&) = delete;
+
+        bool populated() const noexcept {
+            return bool(operation_credit) || bool(splice_credit) || bool(splice) || bool(repaired_catchup) ||
+                   bool(repaired_final) || bool(retained_exact) || bool(retained_publication) || bool(retained_prefix) || bool(owned_slot_qualification) ||
+                   bool(controller) || cohort_prepared || cohort_capacity_bound != 0 || next_cut != 0 || mutated ||
+                   repaired || retired || yielded || retained_debt != 0 || certified_cut.id != 0;
+        }
+        // The narrow trusted route from this payload to its controller's own facts (slice 2).  The owner registry
+        // can only ever see a controller through this call: nothing in it can be stated by a caller, and the
+        // maker inside the controller refuses a snapshot that contradicts itself.
+        strata::program::RepairOwnerEvidence owner_evidence_snapshot() const noexcept {
+            return ServingSuffixRepairOperation::owner_evidence(*this);
+        }
+        void clear() noexcept {
+            if (controller) strata::core::retirement_failed("retained suffix operation cleared before explicit retirement");
+            repaired_final = {}; repaired_catchup = {}; retained_exact = {}; retained_publication = {};
+            retained_prefix.reset();owned_slot_qualification.reset();
+            splice = {};
+            published = {};
+            cohort_publication = {};cohort_operation=cohort_capacity_bound=0;cohort_prepared=cohort_known=false;
+            std::vector<int32_t>().swap(request_tokens);
+            request_credit.reset(); splice_credit.reset(); operation_credit.reset();
+            exact_frontier = reused_suffix = fresh = next_cut = 0;
+            repaired = certified_exact = retired = mutated = yielded = false;
+            retained_debt = retained_residency_swaps = 0;
+            certified_cut = {};
+            detail.clear();
+            boundary = donor_forwarded = max_generated = known_forwarded = generated = 0;
+            request_receipt_base = request_known_base = request_watermark_base = 0; next_operation = 1;
+        }
+    };
+
+    static strata::program::SuffixRawResult run(strata::program::ServingRawSession& session,
+                                                const std::shared_ptr<DriverWindowRuntime>& runtime,
+                                                strata::core::BundleHandle donor,
+                                                strata::core::BundleHandle prefix, const Facts& facts,
+                                                Outcome& out) {
+        namespace rrd = strata::program::resident_repair_detail;
+        auto refuse = [](const char* why) {
+            return strata::program::SuffixRawResult{strata::program::SuffixRawStatus::invalid, why, {}};
+        };
+        if (out.populated())
+            return refuse("the repair outcome must start empty: reusing a populated one would release a charge "
+                          "before the payload it retains");
+        out.clear();
+        if (!runtime || !runtime->sessions.healthy() || !runtime->model)
+            return refuse("serving runtime is not healthy for suffix repair");
+        if(const char* why=rrd::resident_service_refusal(*runtime))return refuse(why);
+        const auto parent = session.native_allocation().reservation();
+        if (!parent || !parent->canonical_owner(parent) || session.native_allocation().stages().empty())
+            return refuse("serving session parent is not a canonical owned reservation");
+        if (!donor || !prefix) return refuse("suffix repair needs both operand bundles");
+        const auto* actual_donor_key=session.suffix_donor_key(donor);
+        if(!actual_donor_key)return refuse("suffix donor is neither original nor authentically progressed captured operand");
+        if (facts.accepted.empty() || facts.frontiers.empty() || !facts.cut_id ||
+            facts.cut_id == std::numeric_limits<uint64_t>::max() || facts.accepted.size() > session.max_tokens())
+            return refuse("suffix repair needs an accepted run, request frontiers and a fresh cut");
+        if (facts.retain_foreground && (facts.frontiers.size()!=1 || facts.max_generated==0 ||
+            facts.request_tokens.size()<facts.accepted.size() || facts.request_tokens.size()>session.max_tokens() ||
+            facts.max_generated>session.max_tokens()-facts.request_tokens.size() ||
+            !std::equal(facts.accepted.begin(),facts.accepted.end(),facts.request_tokens.begin())))
+            return refuse("retained suffix request/history/output bounds");
+        // The operation's own host scratch (metadata, roots, receipt observers), admitted through the transaction's
+        // real ledger and retained by the credit it returns: a credit is budget, never completion.
+        uint64_t control = (1ULL << 20);
+        if(facts.retain_foreground){
+            if(!serving_output_history_quote(facts.request_tokens.size(),facts.max_generated,control))
+                return refuse("suffix repair output/history quote overflow");
+        }else{
+            const auto metadata_tokens=std::max(facts.accepted.size(),facts.request_tokens.size());
+            if(metadata_tokens>(UINT64_MAX-control)/128ULL)return refuse("suffix repair control quote overflow");
+            control+=metadata_tokens*128ULL;
+        }
+        if (auto admitted = session.admit_host(control, out.operation_credit); !admitted) return admitted;
+        rrd::ResidentRepairController::ReceiptHistory initial_receipts;
+        rrd::ResidentRepairController::ReceiptHistory::Prepared receipt_growth;
+        if (facts.retain_foreground) {
+            // Pay finite generated history as well as short-input/long-output requests.
+            // Receipt growth is independent, stable-address storage, prepared BEFORE restore.
+            uint64_t required=0;
+            const uint64_t comparison_headroom=SuffixExperimentDriver::serving_qualification_enabled()?1:0;
+            if(!serving_receipt_requirement(0,facts.max_generated,comparison_headroom,required)||
+               !initial_receipts.prepare(required,[&](uint64_t bytes,std::shared_ptr<const void>& credit){
+                   return bool(session.admit_host(bytes,credit));},receipt_growth))
+                return refuse("suffix repair cumulative receipt admission refused");
+            out.cohort_capacity_bound=uint64_t(facts.request_tokens.size())+facts.max_generated;
+            out.request_tokens.reserve(facts.request_tokens.size());
+            for(auto token:facts.request_tokens)out.request_tokens.push_back(int32_t(token));
+            out.max_generated=facts.max_generated;
+            out.boundary=prefix.get()->cut.forwarded;out.donor_forwarded=donor.get()->cut.forwarded;
+        }
+
+        auto tx = session.transaction();
+        if (!tx) return refuse("serving RAW owner lost its transaction before suffix installation");
+        std::string error;
+        rrd::ResidentConstructionInputs construction;
+        construction.max_cells = 0;
+        for (const auto& stage : session.native_allocation().stages()) {
+            if (!stage.session) return refuse("serving native stage has no session before suffix installation");
+            if (construction.max_cells == 0)
+                construction.max_cells = stage.session->qsa_states[stage.session->qsa_primary()].max_cells;
+            if (stage.device >= 0 && size_t(stage.device) < parent->resources().device_bytes.size()) {
+                if (construction.platform_and_control.device_bytes.size() <= size_t(stage.device))
+                    construction.platform_and_control.device_bytes.resize(size_t(stage.device) + 1);
+                construction.platform_and_control.device_bytes[size_t(stage.device)] = 512ULL << 20;
+            }
+            if (stage.session->layer_lo <= 1 && 1 < stage.session->layer_hi)
+                construction.native_ple_key = stage.session->ple.w.key_native_data != nullptr;
+        }
+        for (auto& bytes : construction.platform_and_control.device_bytes)
+            if (!bytes) return refuse("a participating serving device has no bounded control envelope");
+        construction.platform_and_control.host_bytes = 128ULL << 20;
+        construction.buffer_metadata_host_ceiling = 4096;
+        std::shared_ptr<rrd::ResidentRepairRuntime> preconstructed;
+        std::unique_ptr<strata::program::SuffixRawTransaction> preinitialized;
+        struct PreparedRuntimeGuard {
+            std::shared_ptr<rrd::ResidentRepairRuntime>& value;
+            std::unique_ptr<strata::program::SuffixRawTransaction>& transaction;
+            ~PreparedRuntimeGuard(){
+                if(value)ServingSuffixRepairOperation::retire_prebuilt(value);
+                transaction.reset(); // matching controller retirement: raw owner dies after checked native retirement
+            }
+        } prepared_guard{preconstructed,preinitialized};
+        // Real setup, native allocation, streams, graph arenas and metadata are admitted/constructed while LIVE
+        // is still the legitimate exact prefix. Capacity refusal here can retire and take exact fallback.
+        if(!rrd::ResidentRepairController::construct(runtime,*tx,construction,preconstructed,error)) {
+            out.detail="resident preconstruction refused before suffix install: "+error;
+            return {strata::program::SuffixRawStatus::invalid,out.detail,{}};
+        }
+        if(!rrd::ResidentRepairController::initialize_preconstructed_raw(runtime,*tx,preconstructed,
+                                                                       prefix.get()->key,preinitialized,error)){
+            out.detail="private RAW setup refused before suffix install: "+error;
+            return {strata::program::SuffixRawStatus::invalid,out.detail,{}};
+        }
+        std::shared_ptr<const void> initial_root_credit;
+        if(!rrd::ResidentRepairController::admit_initial_roots(*tx,initial_root_credit,error)){
+            out.detail="causal root setup refused before suffix install: "+error;
+            return {strata::program::SuffixRawStatus::invalid,out.detail,{}};
+        }
+
+        const auto target_key = session.edited_key();
+        strata::core::NativeSuffixTarget target{target_key, std::span<const int32_t>(facts.accepted),
+                                               facts.cut_id, facts.first_unresolved_unix_ms};
+        // Producer metadata includes all-stage native directories and per-stage layout headroom. The operation's
+        // small scratch credit is not that producer ceiling. Quote against the explicit aggregate host cap, then
+        // claim/reserve the actual returned bytes below; never charge this ceiling as though it were usage.
+        strata::core::NativeSuffixLimits limits{session.max_tokens(), session.max_payload_bytes(), session.host_limit()};
+        uint64_t splice_bytes = 0;
+        if (auto quote = session.quote_suffix(donor, *actual_donor_key, prefix, target_key, target, limits,
+                                             splice_bytes); !quote) return quote;
+        if (auto claim = session.claim_splice(splice_bytes, out.splice_credit); !claim) return claim;
+        if (auto prepared = session.prepare_suffix(donor, *actual_donor_key, prefix, target_key, target, limits,
+                                                  out.splice); !prepared) return prepared;
+        // The splice becomes the session's state through the transaction, not by relabeling ids. From here every
+        // failure is a POST-mutation fault: it returns `poisoned`, never `invalid`, because the caller may not
+        // fall back to exact replay over state it can no longer trust (the caller must abandon the fence, which
+        // destroys this owner and terminates - the RAW contract's failstop).
+        if (auto restored = session.restore(out.splice.bundle(), target_key); !restored) {
+            if(restored.status==strata::program::SuffixRawStatus::poisoned)
+                failstop(session,"initial suffix restore poisoned; retaining prepared private gang");
+            return restored;
+        }
+        out.mutated = true;
+        auto post_refuse = [&out](const char* why) {
+            out.detail = why;
+            return strata::program::SuffixRawResult{strata::program::SuffixRawStatus::poisoned, out.detail, {}};
+        };
+        auto post_error = [&out](const char* prefix, const std::string& error) {
+            out.detail = std::string(prefix) + error;
+            return strata::program::SuffixRawResult{strata::program::SuffixRawStatus::poisoned, out.detail, {}};
+        };
+        out.reused_suffix = out.splice.stats().reused_suffix_tokens;
+        out.fresh = out.splice.stats().pending_tokens;
+
+        // The controller's initial CURRENT metadata and roots come from the installed splice and the retained
+        // exact donor; the exact seed is the prefix bundle, so the private gang starts from checked state.
+        const auto current = rrd::ResidentRepairController::metadata_only(*out.splice.bundle().get());
+        std::shared_ptr<const strata::core::NativeRepairSuffixData> roots;
+        if (!rrd::ResidentRepairController::make_initial_roots(runtime, *tx, donor, current, roots, error,
+                                                              std::move(initial_root_credit), facts.first_unresolved_birth))
+            return post_error("resident ancestry refused after install: ", error);
+        std::shared_ptr<rrd::ResidentRepairController> repair;
+        if (!rrd::ResidentRepairController::create(runtime, tx, construction, current, roots, prefix, repair,
+                                                   error, facts.cut_id, preconstructed,std::move(preinitialized),
+                                            session.slot_occupancy_incarnation()?&session:nullptr))
+            return post_error("resident binding refused after install: ", error);
+        preconstructed.reset(); // controller now owns the initialized private gang; guard must not retire it
+        if(facts.retain_foreground&&!repair->receipts_.commit(receipt_growth))
+            failstop(session,"prepared receipt capacity changed before controller adoption");
+        // Copies and restores are complete: the old operand payloads are no longer consumers, so free their
+        // charges before the controller works (the driver releases them at the same point).
+        roots.reset();donor={};prefix={};out.splice={};out.splice_credit.reset();
+        const bool completed = facts.retain_foreground
+            ? (repair->repair_to(repair->published_->serial,facts.frontiers.front(),error) &&
+               repair->attach_prefix(repair->published_->serial,error))
+            : repair->execute_suffix_repair(facts.frontiers, facts.foreground_between, error);
+        if(completed && facts.retain_foreground) {
+            out.controller=std::move(repair);
+            // RAW output watermarks belong to the imported conversation, not this request's receipts.
+            out.request_watermark_base=out.controller->initial_output_watermark_;
+            if(!cohort_metadata_shape_supported(out.controller->published_->metadata))
+                failstop(session,"cohort outer metadata exceeds admitted metadata-only shape");
+            out.published=out.controller->published_->metadata;
+            out.published.accepted_tokens.reserve(size_t(out.cohort_capacity_bound));
+            out.published.pending_tokens.reserve(1);
+            out.next_cut=out.controller->next_cut_;out.exact_frontier=out.published.cut.exact_frontier;
+            out.repaired=true;out.certified_exact=false;
+            return {strata::program::SuffixRawStatus::ok,{}, {}};
+        }
+        // ONE retirement path for every created controller. `~ResidentRepairController` calls
+        // retirement_failed (resident_repair_controller.inc:65), so returning out of here while the controller is
+        // still alive would turn a handled refusal into an accidental destructor failure.
+        std::string failure;
+        if (completed) {
+            out.published = repair->published_->metadata;
+            const auto captured = session.capture(out.published, out.repaired_final);
+            if (!captured)
+                failure = "repaired endpoint capture refused: " + captured.detail;
+            else {
+                out.repaired_catchup = repair->catchup_snapshot_;
+                if (!out.repaired_catchup) failure = "controller installed no catchup capture: repair is not certified";
+            }
+        } else
+            failure = "resident repair refused: " + error;
+        // Preserve the controller's actual cut high-water, including its private cuts, before destroying it.
+        out.next_cut = repair->next_cut_;
+        std::string retire_error;
+        out.retired = repair->retire(retire_error);
+        repair.reset();   // private cuts, roots, splice images and the RAW gang die here, after retire()
+        if (!failure.empty()) {
+            // The splice is installed and (unless the controller retired cleanly) private work may remain: this is
+            // never a safe admission refusal. The caller must abandon the fence (durable poison -> the contract's
+            // failstop) before doing anything else; exact fallback on this state is forbidden.
+            out.detail = failure + (out.retired ? std::string() : " (retirement also refused: " + retire_error + ")");
+            return {strata::program::SuffixRawStatus::poisoned, out.detail, {}};
+        }
+        if (!out.retired)
+            return post_error("resident private retirement refused: ", retire_error);
+        // Before anything advances on this state: the published accepted history must be the REQUEST's own tokens
+        // through the installed frontier and the current endpoint.  A controller that generated instead of
+        // re-read would show up here as a mismatch, and the caller must not trust it.
+        const uint64_t published_forwarded = out.published.cut.forwarded;
+        if (published_forwarded != facts.accepted.size() - 1 || out.published.accepted_tokens.size() < facts.accepted.size())
+            return post_refuse("published accepted history does not cover the request's own tokens");
+        if (!std::equal(facts.accepted.begin(), facts.accepted.begin() + std::ptrdiff_t(published_forwarded + 1),
+                        out.published.accepted_tokens.begin()))
+            return post_refuse("published accepted history differs from the request tokens through the frontier");
+        if (out.published.pending_tokens.size() != 1 ||
+            out.published.pending_tokens.front() != facts.accepted[size_t(published_forwarded)])
+            return post_refuse("published pending token is not the request's own token at the current endpoint");
+        out.repaired = true;
+        out.certified_exact = out.published.cut.exact_frontier == out.published.cut.forwarded;
+        out.exact_frontier = out.published.cut.exact_frontier;
+        return {strata::program::SuffixRawStatus::ok, {}, {}};
+    }
+
+#if defined(STRATA_SERVING_FAULT_QUALIFICATION_AVAILABLE)
+    static void arm_serving_fault(Outcome& out,const strata::core::resident_serving_fault::Binding& binding){
+        if(!binding.valid()||!out.controller||out.retired||out.generated||out.controller->receipt_count_||
+           out.controller->partial_count_!=1||out.controller->serving_fault_.valid()||
+           !out.controller->check_idle(out.controller->published_->serial))
+            strata::core::retirement_failed("serving fault request/controller arm refused");
+        out.controller->serving_fault_=binding;
+    }
+#endif
+    using SlotCohortInput=resident_repair_detail::ResidentRepairController::CohortDecodeInput;
+    static bool cohort_metadata_shape_supported(const core::SnapshotDescriptor& metadata)noexcept {
+        // metadata_only's existing text/no-speculation shape. The fixed control margin covers these bounded
+        // strings/regions; native tensor payloads and opaque continuation are never hidden inside that margin.
+        return metadata.devices.empty()&&metadata.continuation.mode==core::ContinuationMode::new_generation_policy&&
+            metadata.continuation.adapter.empty()&&metadata.continuation.payload.empty()&&
+            metadata.speculation_disabled&&!metadata.steering_enabled&&metadata.native_layout.size()<=4096&&
+            metadata.key.session_id.size()<=4096&&metadata.key.thread_id.size()<=4096&&metadata.key.window_id.size()<=4096&&
+            metadata.approximation.size()<=core::RepairAncestry::capacity;
+    }
+    static const SlotCohortInput* prepare_slot_cohort(ServingRawSession& session,Outcome& out,
+                                                    bool& known,std::string& error){
+        known=false;
+        if(!out.controller||out.retired||out.yielded||out.cohort_prepared||!out.next_operation||out.next_operation==UINT64_MAX)return nullptr;
+        if(out.request_tokens.size()>session.max_tokens()||out.max_generated>session.max_tokens()-out.request_tokens.size())return nullptr;
+        const uint64_t bound=uint64_t(out.request_tokens.size())+out.max_generated;
+        if(!bound||bound>out.cohort_capacity_bound)return nullptr; // exact request shape paid before installation
+        auto& controller=*out.controller;const auto& actual=controller.published_->metadata;
+        const uint64_t position=actual.cut.forwarded;
+        known=position+1<out.request_tokens.size();
+        const SlotCohortInput* input=nullptr;
+        if(known){
+            if(actual.accepted_tokens.size()!=position+1||!std::equal(actual.accepted_tokens.begin(),
+                actual.accepted_tokens.end(),out.request_tokens.begin()))return nullptr;
+            input=controller.prepare_cohort_known(controller.published_->serial,out.next_operation,session,
+                out.request_tokens[size_t(position+1)],error);
+        }else{
+            if(position+1!=out.request_tokens.size()+out.generated||out.generated>=out.max_generated)return nullptr;
+            input=controller.prepare_cohort_decode(controller.published_->serial,out.next_operation,session,error);
+        }
+        if(!input)return nullptr;
+        try{
+            if(!cohort_metadata_shape_supported(controller.cohort_pending_->next->metadata))
+                throw std::runtime_error("cohort snapshot exceeds admitted metadata-only shape");
+            out.cohort_publication=controller.cohort_pending_->next->metadata;
+            out.cohort_publication.accepted_tokens.reserve(size_t(bound));
+            if(out.cohort_publication.pending_tokens.size()!=1)
+                throw std::runtime_error("cohort staged pending shape differs");
+        }catch(...){
+            if(!controller.cancel_cohort_preparation(session,error))
+                strata::core::retirement_failed("cohort metadata refusal could not cancel untouched preparation");
+            error="cohort outer metadata snapshot refused before native dispatch";return nullptr;
+        }
+        out.cohort_operation=out.next_operation;out.cohort_known=known;out.cohort_prepared=true;
+        return input;
+    }
+    static bool complete_slot_cohort(ServingRawSession& session,Outcome& out,
+            const core::NativeBatchGroupCompletion& group,bool known,std::string& error){
+        if(!out.controller||out.retired||!out.cohort_prepared||out.cohort_operation!=out.next_operation||
+           out.cohort_known!=known)return false;
+        auto& controller=*out.controller;
+        if(known){
+            const auto* receipt=controller.complete_cohort_known(session,group,error);
+            if(!receipt)return false;
+            if(receipt->operation!=out.cohort_operation)
+                strata::core::retirement_failed("known cohort receipt differs from its staged outer operation");
+            ++out.known_forwarded;
+        }else{
+            const auto* receipt=controller.complete_cohort_decode(session,group,stdout,error);
+            if(!receipt)return false;
+            if(receipt->operation!=out.cohort_operation)
+                strata::core::retirement_failed("decode cohort receipt differs from its staged outer operation");
+            out.cohort_publication.accepted_tokens.push_back(receipt->token); // reserved before dispatch
+            out.cohort_publication.pending_tokens[0]=receipt->token;
+            ++out.generated;
+        }
+        ++out.next_operation;out.next_cut=controller.next_cut_;
+        out.cohort_publication.cut=controller.published_->metadata.cut; // fixed-size native evidence, no deep copy
+        static_assert(noexcept(std::swap(out.published,out.cohort_publication)));
+        std::swap(out.published,out.cohort_publication);
+        out.cohort_prepared=false;out.cohort_operation=0;
+        out.exact_frontier=out.published.cut.exact_frontier;
+        return true;
+    }
+    static bool cancel_slot_cohort(ServingRawSession& session,Outcome& out,std::string& error){
+        if(!out.controller||!out.controller->cancel_cohort_preparation(session,error))return false;
+        out.cohort_prepared=false;out.cohort_operation=0;return true;
+    }
+    static bool retire_slot_controller(ServingRawSession& session,Outcome& out,std::string& error){
+        if(!out.controller)return out.retired;
+        auto& controller=*out.controller;
+        if(controller.cohort_pending_&&!cancel_slot_cohort(session,out,error))return false;
+        if(!controller.retire(error))return false;
+        out.retired=true;out.yielded=false;out.controller.reset();return true;
+    }
+    static bool reset_main_after_slot_handoff(ServingRawSession& session,
+            const std::shared_ptr<DriverWindowRuntime>& runtime,core::StateCut& actual,std::string& error){
+        if(!runtime||session.slot_occupancy_incarnation()||!session.request_open()||
+           session.phase()!=ServingRawSession::Phase::drained||session.cut().id==UINT64_MAX||
+           session.native_allocation().reservation().get()!=runtime->sessions.reservation().get())return false;
+        core::StateCut empty;empty.id=session.cut().id+1;empty.history=core::window_history_digest(std::vector<int32_t>{});
+        if(!session.begin_work(error)||!runtime->reset_sessions(session.geometry(),error)||
+           !session.drain_work(true,empty,error)||!session.close_request(error))
+            core::retirement_failed("owned slot handoff main reset/drain failed");
+        actual=session.cut();return actual==empty;
+    }
+    static bool forward_known(Outcome& out,std::string& error) {
+        if(!out.controller||out.retired){error="retained known forward has no active owner";return false;}
+        auto& c=*out.controller;const auto& h=c.published_->metadata;
+        const uint64_t pos=h.cut.forwarded;
+        if(pos+1>=out.request_tokens.size()||h.accepted_tokens.size()!=pos+1||
+           !std::equal(h.accepted_tokens.begin(),h.accepted_tokens.end(),out.request_tokens.begin())){
+            error="retained prompt frontier/history differs from immutable request";return false;
+        }
+        const auto* receipt=c.foreground_known(c.published_->serial,out.next_operation,out.request_tokens[size_t(pos+1)],error);
+        if(!receipt)return false;
+        ++out.next_operation;out.published=c.published_->metadata;out.next_cut=c.next_cut_;
+        out.known_forwarded=c.known_count_-out.request_known_base;
+        return true;
+    }
+    static bool generate_one(Outcome& out,int32_t& token,std::string& error) {
+        if(!out.controller||out.retired){error="retained generation has no active owner";return false;}
+        auto& c=*out.controller;
+        if(c.published_->metadata.cut.forwarded+1<out.request_tokens.size()||c.receipt_count_<out.request_receipt_base||c.receipt_count_-out.request_receipt_base>=out.max_generated){
+            error="retained generation before prompt end or beyond admitted outputs";return false;
+        }
+        const auto* receipt=c.foreground(c.published_->serial,out.next_operation,error);
+        if(!receipt)return false;
+        ++out.next_operation;token=receipt->token;out.published=c.published_->metadata;out.next_cut=c.next_cut_;
+        out.generated=uint64_t(c.receipt_count_)-out.request_receipt_base;
+        return true;
+    }
+    // Qualification-only caller copies the actual immutable receipt; never synthesize it from output counters.
+    static auto qualification_first_receipt(const Outcome& out) {
+        if(!out.controller||out.retired||out.generated!=1||out.controller->receipt_count_!=out.request_receipt_base+1||
+           out.controller->receipts_[size_t(out.request_receipt_base)].publication!=out.controller->published_->serial||
+           out.controller->receipts_[size_t(out.request_receipt_base)].cut!=out.published.cut.id)
+            strata::core::retirement_failed("first-output qualification actual receipt unavailable");
+        return out.controller->receipts_[size_t(out.request_receipt_base)];
+    }
+    static ServingRepairAgeObservation repair_age(const Outcome& out,
+                                                  strata::core::RepairMonotonicBirth now) noexcept {
+        if(!out.controller || out.retired)return {};
+        const auto& c=*out.controller;
+        if(c.busy_ || !c.published_ || !c.published_->data || !c.private_)return {};
+        return observe_serving_repair_age(c.published_->data->coverage,now,
+            c.published_->metadata.cut.forwarded,c.private_forwarded(),c.published_->serial);
+    }
+    // Each call performs at most four exact tokens. Live progress is independent of partial-publication
+    // alignment/capacity: two attachment slots limit copies/publications, never private causal computation.
+    // Keep the first useful output ahead of additional imported-C work; known prompt growth remains debt.
+    static bool repair_unit(Outcome& out,bool attach,std::string& error,uint64_t token_limit=4) {
+        if(!out.controller||out.retired){error="retained repair has no active owner";return false;}
+        auto& c=*out.controller;const uint64_t current=c.published_->metadata.cut.forwarded;
+        if(attach&&c.receipt_count_==0)return true;
+        const uint64_t before=c.private_forwarded();
+        const uint64_t target=std::min(current,before+std::min<uint64_t>(std::min<uint64_t>(4,token_limit),UINT64_MAX-before));
+        if(target>before&&!c.repair_to(c.published_->serial,target,error))return false;
+        // The publication branch alone checks the controller's own attachment contract
+        // (resident_repair_controller.inc:379-381): two slots, an intervening foreground, and P<R<C with every
+        // position page-aligned plus C-R>=4. The scheduler must never attempt an attachment the controller would
+        // refuse, because a refused attachment on a retained request is the established poison/failstop path.
+        const uint64_t exact_frontier=c.published_->metadata.cut.exact_frontier;
+        const bool attachable=c.partial_count_<2&&c.foreground_count_>c.foreground_at_attachment_&&
+            exact_frontier%4==0&&exact_frontier<target&&target%4==0&&current%4==0&&current-target>=4;
+        if(attach&&attachable&&!c.attach_prefix(c.published_->serial,error))return false;
+        out.published=c.published_->metadata;out.next_cut=c.next_cut_;
+        return true;
+    }
+    static bool private_cache_restored(const Outcome& out)noexcept {
+        return out.controller&&!out.retired&&out.controller->original_private_residency_restored();
+    }
+    // ---- retained repair across a response boundary (OPT-IN: STRATA_SERVING_REPAIR_OWNER_SLOTS) ----------
+    // The three operations below are the serving-side half of the certified yield.  They add no admission of
+    // their own: every decision is the controller's (`retained_yield_allowed` / `retained_private_unit_allowed`,
+    // shared with the CPU gate) and the registry's, and none of them publishes a live frontier, retires, or
+    // upgrades a retained debt into an exact certificate.
+    /// The controller's own evidence about itself.  This is the ONLY evidence source the registry accepts, and
+    /// there is no caller-facing way to state any of these facts (slice 2 removed the injected witness booleans).
+    static RepairOwnerEvidence owner_evidence(const Outcome& out) noexcept {
+        if(!out.controller)return {};
+        return out.controller->owner_evidence();
+    }
+    /// The certified yield at a non-zero-debt coherent cut: it certifies the controller's private cut, captures
+    /// that state as a real frozen image, and leaves the controller LIVE and unretired with its debt open.  On
+    /// refusal nothing is mutated, so the caller falls back to today's drain-and-finish path unchanged.
+    static bool yield_retained(Outcome& out,std::string& error){
+        if(!out.controller||out.retired||out.yielded){error="retained yield has no live unyielded owner";return false;}
+        auto& c=*out.controller;
+        strata::core::StateCut certified{};
+        strata::core::BundleHandle image;
+        if(!c.yield_retained(c.published_->serial,certified,image,error))return false;
+        if(!image||!image.get()||!(image.get()->cut==certified)){error="retained yield captured no image of its certified cut";return false;}
+        out.certified_cut=certified;
+        out.retained_exact=std::move(image);
+        out.published=c.published_->metadata;      // the live publication is unchanged: still approximate at D
+        out.next_cut=c.next_cut_;
+        out.retained_debt=repair_token_debt(out.published.cut.forwarded,certified.forwarded);
+        if(out.retained_debt==0){error="retained yield closed its own debt: use the exact finish path";return false;}
+        // Explicit, and load-bearing: the published CURRENT state is NOT certified exact at D, and the exact
+        // continuation/qualification paths below key off exactly these two flags.
+        out.certified_exact=false;
+        out.yielded=true;
+        return true;
+    }
+    /// The private gang's ledger lease, reached through the trust this class already holds as the controller's
+    /// friend (BUILD-4 error 2). `ResidentRepairController::retained_charge` STAYS PRIVATE: the serving scope
+    /// cannot take the raw lease, it can only ask the operation that owns this payload for the charge the owner
+    /// registry has to pin. The lease's identity as the ledger's `private_work` charge is asserted by the
+    /// controller itself, never by the caller, and a refusal leaves `lease_out` empty.
+    static bool retained_charge(const Outcome& out,
+                                std::shared_ptr<const strata::core::ReservationLease>& lease_out,
+                                std::string& error) {
+        lease_out.reset();
+        if (!out.controller || out.retired) {
+            error = "the retained owner has no live controller to report its own charge";
+            return false;
+        }
+        return out.controller->retained_charge(lease_out, error);
+    }
+    /// One bounded private unit for a parked owner, through the controller's own suspended-owner gate.  The
+    /// caller must hold the session's private work window; the registry re-validates the record before and after.
+    /// The retained image is refreshed at the new certified cut, so the entry never carries an image of a cut it
+    /// no longer records.
+    static bool retained_private_unit(Outcome& out,uint64_t cap_tokens,uint64_t& advanced,
+                                      RepairOwnerEvidence& after,std::string& error){
+        advanced=0;after={};
+        if(!out.controller||out.retired||!out.yielded){error="retained private work has no suspended owner";return false;}
+        auto& c=*out.controller;
+        if(!c.retained_private_unit(c.published_->serial,cap_tokens,advanced,error))return false;
+        strata::core::BundleHandle fresh;
+        if(!c.capture_exact(fresh,error))return false;
+        after=c.owner_evidence();
+        if(!after.produced()||!(after.private_cut()==c.private_cut())){error="retained unit returned no evidence for its own cut";return false;}
+        if(!fresh||!fresh.get()||!(fresh.get()->cut==after.private_cut())){error="retained unit captured no image of its new cut";return false;}
+        out.retained_exact=std::move(fresh);       // the older image dies here; the entry keeps one image, current
+        out.published=c.published_->metadata;      // unchanged: a private unit never moves CURRENT
+        out.next_cut=c.next_cut_;
+        out.certified_cut=after.private_cut();
+        out.retained_debt=repair_token_debt(out.published.cut.forwarded,out.certified_cut.forwarded);
+        return true;
+    }
+    // ---- slice 5: the versioned retained RESULT (prepare, publish-if-current, activate) -----------------
+    // The serving-side entry points to the controller's own versioned path. Each one reaches the controller only
+    // through the payload, and each one refuses with a named reason without mutating anything it has not already
+    // been allowed to touch. `record_version` is the registry's own record version, which the serving scope reads
+    // from `entry_facts` and hands back: the controller compares it against its mirror of the record, so a result
+    // prepared before another bounded unit can never be published or activated onto a moved record.
+    static bool prepare_retained_result(const Outcome& out, uint64_t record_version,
+                                        PreparedRetainedResult& result, std::string& error) {
+        result = {};
+        if (!out.controller || !out.yielded || out.retired) {
+            error = "the retained result has no parked owner"; return false;
+        }
+        strata::program::RepairOwnerRefusal why = strata::program::RepairOwnerRefusal::none;
+        result = out.controller->prepare_retained_result(record_version, out.retained_exact, why);
+        if (!result.produced()) {
+            error = std::string("prepare retained result refused: ") +
+                    strata::program::repair_owner_refusal_name(why);
+            return false;
+        }
+        return true;
+    }
+    /// Publishes the prepared result onto THIS owner's record only: the live session is not touched, so the other
+    /// conversation keeps standing on its own state.
+    static bool publish_retained_if_current(Outcome& out, uint64_t record_version,
+                                            PreparedRetainedResult& published, std::string& error) {
+        published = {};
+        if (!out.controller || !out.yielded || out.retired) {
+            error = "the retained publication has no parked owner"; return false;
+        }
+        if (!out.controller->publish_retained_if_current(record_version, out.retained_exact, published, error))
+            return false;
+        // Deliberate: the payload keeps NO copy of the record version. The registry entry is the version
+        // authority (it stamps `record_version`, bumps it per bounded unit and refuses a stale result against
+        // it), and the controller checks the version the registry passes against its own mirror; a payload-side
+        // mirror would be a second, staler source of truth that nothing validates. BUILD-4 error 1 was that
+        // storage; it is removed rather than given a life it never had (nothing read it).
+        return true;
+    }
+    /// The activation attempt `activate_parked_owner` runs: the controller captures the live session's prior
+    /// conversation state, installs this owner's certified image at a drained all-stage boundary, and restores and
+    /// verifies the prior state if it cannot. The payload's view is refreshed only from what the controller says
+    /// about itself afterwards.
+    static bool activate_retained(Outcome& out, const LiveSessionFacts& session,
+                                  const strata::program::RetainedActivationFacts& activation,
+                                  const ConversationStateFacts& prior,
+                                  const strata::core::SnapshotDescriptor& prior_metadata,
+                                  ConversationStateFacts& restored_out, RepairOwnerEvidence& after,
+                                  std::string& error) {
+        restored_out = {}; after = {};
+        if (!out.controller || !out.yielded || out.retired) {
+            error = "the retained activation has no parked owner"; return false;
+        }
+        // The version the controller's own record mirror is checked against comes from the registry, which is the
+        // authority on the owner record; the payload never states it.
+        auto& c = *out.controller;
+        const bool activated = c.activate_retained(activation.record_version, out.retained_exact, session, prior,
+                                                   prior_metadata, restored_out, error, activation.authority);
+        // A refused attempt still has to attest that its owner remains suspended at the recorded cut. The
+        // registry checks this evidence independently before allowing the parked entry to remain resumable.
+        after = c.owner_evidence();
+        if (!activated) return false;
+        if (!after.produced() || !after.live_coherent() || after.suspended()) {
+            error = "the activation left the controller without a coherent live publication";
+            strata::core::retirement_failed("activated repair owner is not live-coherent");
+        }
+        out.published = c.published_->metadata;
+        out.certified_cut = after.private_cut();
+        out.retained_debt = repair_token_debt(out.published.cut.forwarded, out.certified_cut.forwarded);
+        out.next_cut = c.next_cut_;
+        out.yielded = false;      // the owner is a live, coherent controller again, not a parked one
+        return true;
+    }
+    /// The live session's own conversation-state facts, observed from the adapter (the fields the registry
+    /// compares a restore against).
+    static strata::program::ConversationStateFacts conversation_facts(const ServingRawSession& session) {
+        strata::program::ConversationStateFacts facts;
+        facts.key = session.key();
+        facts.cut = session.cut();
+        facts.session_cut = session.cut();
+        return facts;
+    }
+    // ---- slice 6: the activation seam, in the order the reviewed contract requires ----------------------
+    /// The serving scope's route from a PARKED owner back onto the live session. The order is fixed by
+    /// `ResidentRepairController::activate_retained`'s pre-mutation boundary (resident_repair_controller.inc),
+    /// which insists the live transaction already stands on this owner's own publication cut, drained and
+    /// all-stage, with both gangs quiescent - and at an A-return it stands on another conversation's cut:
+    ///   1. open the returning conversation's request fence at the drained boundary (capture/restore are legal
+    ///      only inside it) - a refusal here mutates nothing and the request takes today's path;
+    ///   2. capture the conversation that stands on the session NOW, from the previous request's own accepted run
+    ///      and recorded cut (the same operands the donor capture uses), and VERIFY the capture: the image must
+    ///      be of the session's own cut and carry that run's history digest, mirroring the yield oracle's
+    ///      "captured no image of its own cut" check. An unverified capture is a clean refusal;
+    ///   3. publish the owner's own result onto its record through the registry (prepare-on-behalf, so the scope
+    ///      never states a controller-only fact);
+    ///   4. ask the registry to activate. Inside the attempt: restore the owner's publication image
+    ///      (`retained_publication`, captured at the certified yield), verify the session now matches the owner
+    ///      record's publication field by field, activate through the controller, and on ANY failure restore the
+    ///      prior conversation image and verify that restore - a restore that cannot be verified is the
+    ///      established failstop, never a continued request. The owner stays parked and charged on a refusal.
+    /// 5. close on refusal. On success keep this request fence OPEN for the admitted new immutable request;
+    ///      the request scope owns the live controller and closes only after yield or checked exact finish.
+    struct PreparedContinuationRequest {
+        // Credit precedes the payload: old/new request vectors die before their own reservation.
+        std::shared_ptr<const void> credit;
+        std::vector<int32_t> tokens;
+        core::SnapshotDescriptor publication,cohort_publication;
+        resident_repair_detail::ResidentRepairController::ReceiptHistory::Prepared receipts;
+        uint64_t history_bound=0;
+        uint64_t max_generated=0;
+    };
+    static bool prepare_continuation_request(ServingRawSession& session,const Outcome& owner,
+        std::span<const int64_t> incoming,uint64_t budget,PreparedContinuationRequest& prepared,std::string& error) {
+        if(!session.request_open()||!owner.controller||owner.retired||!owner.yielded||prepared.credit||
+           !prepared.tokens.empty()){error="continuation request requires an open retained admission";return false;}
+        const auto& c=*owner.controller;const auto& h=c.published_->metadata;
+        if(c.receipt_count_>c.receipts_.size()||!budget||
+           h.cut.accepted!=h.cut.forwarded+1||h.accepted_tokens.size()!=h.cut.accepted||
+           h.pending_tokens.size()!=1||h.pending_tokens.front()!=h.accepted_tokens.back()||
+           incoming.size()<h.accepted_tokens.size()||incoming.size()>session.max_tokens()||
+           budget>session.max_tokens()-incoming.size()||
+           !std::equal(h.accepted_tokens.begin(),h.accepted_tokens.end(),incoming.begin())){
+            error="continuation incoming history/pending or cumulative receipt/window capacity refused";return false;
+        }
+        const uint64_t known=incoming.size()-h.accepted_tokens.size();
+        if(c.partial_count_>2){error="continuation attachment history exceeds controller capacity";return false;}
+        const uint64_t publication_cuts=uint64_t(2-c.partial_count_)+1; // remaining attachments and exact finish
+        if(known>UINT64_MAX-budget||known+budget>UINT64_MAX-owner.next_operation||
+           known+budget>UINT64_MAX-c.foreground_count_||known>UINT64_MAX-c.known_count_||
+           known+budget>UINT64_MAX-h.key.append_epoch||budget>UINT64_MAX-h.cut.output_watermark||
+           publication_cuts>UINT64_MAX-c.published_->serial||publication_cuts>UINT64_MAX-h.key.selection_epoch||
+           known+budget> (UINT64_MAX-c.next_cut_)/2 ||
+           UINT64_MAX-c.next_cut_-2*(known+budget)<=publication_cuts){
+            error="continuation operation/cut/append counter capacity refused";return false;
+        }
+        const auto vocabulary=session.geometry().n_vocab;
+        for(auto token:incoming)if(token<0||token>=vocabulary||token>INT32_MAX){
+            error="continuation token outside actual model vocabulary";return false;
+        }
+        uint64_t bytes=0,required=0;
+        const uint64_t comparison_headroom=SuffixExperimentDriver::serving_qualification_enabled()?1:0;
+        if(!serving_output_history_quote(incoming.size(),budget,bytes)||bytes>UINT64_MAX-sizeof(PreparedContinuationRequest)||
+           !serving_receipt_requirement(c.receipt_count_,budget,comparison_headroom,required)){
+            error="continuation output/history/receipt quote overflow";return false;}
+        if(!c.receipts_.prepare(required,[&](uint64_t quote,std::shared_ptr<const void>& credit){
+            return bool(session.admit_host(quote,credit));},prepared.receipts)){
+            error="continuation cumulative receipt allocation refused before displacement";return false;}
+        const auto admitted=session.admit_host(bytes+sizeof(PreparedContinuationRequest),prepared.credit);
+        if(!admitted){error=admitted.detail;return false;}
+        try{prepared.tokens.reserve(incoming.size());for(auto token:incoming)prepared.tokens.push_back(int32_t(token));
+            prepared.history_bound=uint64_t(incoming.size())+budget;
+            prepared.publication=owner.published;prepared.cohort_publication=owner.cohort_publication;
+            prepared.publication.accepted_tokens.reserve(size_t(prepared.history_bound));
+            prepared.cohort_publication.accepted_tokens.reserve(size_t(prepared.history_bound));}
+        catch(...){error="continuation immutable request allocation refused before displacement";return false;}
+        prepared.max_generated=budget;return true;
+    }
+    static void adopt_continuation_request(Outcome& owner,PreparedContinuationRequest& prepared) noexcept {
+        auto& c=*owner.controller;
+        if(prepared.publication.key!=owner.published.key||prepared.publication.cut!=owner.published.cut||
+           prepared.publication.accepted_tokens!=owner.published.accepted_tokens||
+           prepared.publication.pending_tokens!=owner.published.pending_tokens)
+            strata::core::retirement_failed("prepared continuation publication changed during activation");
+        if(!c.receipts_.commit(prepared.receipts))strata::core::retirement_failed("prepared continuation receipt capacity changed");
+        owner.request_tokens.swap(prepared.tokens);owner.request_credit.swap(prepared.credit);
+        static_assert(std::is_nothrow_swappable_v<core::SnapshotDescriptor>);
+        std::swap(owner.published,prepared.publication);std::swap(owner.cohort_publication,prepared.cohort_publication);
+        owner.cohort_capacity_bound=prepared.history_bound;
+        owner.max_generated=prepared.max_generated;
+        owner.request_receipt_base=c.receipt_count_;owner.request_known_base=c.known_count_;
+        owner.request_watermark_base=c.published_->metadata.cut.output_watermark;
+        owner.generated=0;owner.known_forwarded=0;owner.started=std::chrono::steady_clock::now();
+    }
+    struct ActivationQualificationHooks {
+        uint64_t request_ordinal=4;
+        bool refuse_after_publication_restore=false;
+        bool displaced=false,rolled_back=false;
+        std::function<bool(std::string&)> admit;
+        std::function<bool(const Outcome&,const strata::core::BundleHandle&)> before;
+        std::function<bool(const strata::core::BundleHandle&)> rollback;
+    };
+    static bool activate_retained_owner(ServingRawSession& session,
+                                        ServingRepairOwnerRegistry<Outcome>& registry,
+                                        const strata::core::WindowKey& identity,
+                                        const strata::core::serving_raw::TrackedState& installed,
+                                        uint64_t residency_generation,
+                                        std::unique_ptr<Outcome>& active_out,
+                                        std::string& error, ActivationQualificationHooks* qualification=nullptr,
+                                        std::span<const int64_t> incoming_request=std::span<const int64_t>(),uint64_t request_budget=0) {
+        active_out.reset();
+        strata::program::SuspendedOwnerFacts record;
+        if (!registry.entry_facts(identity, record)) { error = "the parked owner has no record to activate"; return false; }
+        if (record.quarantined) { error = "the parked record is quarantined: retire it, never activate it"; return false; }
+        std::string fence_error;
+        if (!session.open_request(fence_error)) { error = fence_error; return false; }
+        auto refuse = [&session, &error](const char* why) {
+            std::string close_error;
+            if (!session.close_request(close_error))
+                failstop(session, "a refused retained activation left the request fence open");
+            error = why;
+            return false;
+        };
+        PreparedContinuationRequest prepared_request;
+        bool request_admitted=false;
+        registry.inspect_parked_owner(identity,[&](const Outcome& owner){
+            request_admitted=prepare_continuation_request(session,owner,incoming_request,request_budget,prepared_request,error);
+            return request_admitted;
+        });
+        if(!request_admitted){const std::string why=error.empty()?"retained request owner unavailable":error;return refuse(why.c_str());}
+        // Qualification scratch is host-reserved only inside this already-open request, before even
+        // capturing B or preparing publication. Refusal closes the same drained fence without displacement.
+        if(qualification && qualification->admit && !qualification->admit(error)){
+            const std::string admission_error=error;
+            return refuse(admission_error.c_str());
+        }
+        // (2) The prior conversation's state, captured through the transaction and then verified against the
+        // operands that certify it. `installed` is the accepted run and cut that the PREVIOUS request drained for
+        // its own all-stage work (slice 7 tracking), together with the approximation regions that state honestly
+        // carries; if they do not describe what the session stands on now, nothing here is trusted and the owner
+        // stays parked.
+        const strata::program::ConversationStateFacts prior = conversation_facts(session);
+        if (!strata::core::serving_raw::accepted_run_certifies_cut(installed.cut, prior.cut,
+                                                                   installed.accepted))
+            return refuse("the accepted run on record does not certify the cut the live session stands on");
+        const strata::core::SnapshotDescriptor prior_metadata =
+            strata::core::serving_raw::tracked_metadata(session.key(), installed);
+        const strata::core::StateDigest installed_history =
+            strata::core::window_history_digest(installed.accepted);
+        strata::core::BundleHandle prior_image;
+        const auto prior_capture = session.capture(prior_metadata, prior_image);
+        if (!prior_capture) {
+            const std::string why = "the prior conversation capture was refused: " + prior_capture.detail;
+            return refuse(why.c_str());
+        }
+        if (!prior_image || !prior_image.get() || !(prior_image.get()->cut == prior.cut) ||
+            !(prior_image.get()->cut.history == installed_history))
+            return refuse("the prior conversation capture is an image of another cut");
+        // (3) The owner states its own result; the registry holds the version authority.
+        strata::program::PreparedRetainedResult published;
+        std::string publish_error;
+        if (!registry.publish_retained_result_from_owner(
+                identity,
+                [](Outcome& payload, uint64_t record_version, strata::program::PreparedRetainedResult& result,
+                   std::string& why) {
+                    return ServingSuffixRepairOperation::prepare_retained_result(payload, record_version, result,
+                                                                                why);
+                },
+                published, publish_error))
+            return refuse(("the retained result could not be published: " + publish_error).c_str());
+        // (4) Activate. The session facts the registry sees are the PRE-restore observations (the state being
+        // displaced is the captured one); the restore that satisfies the controller's own boundary happens inside
+        // the attempt, where the payload's publication image is reachable.
+        const strata::program::LiveSessionFacts pre_session = live_session_facts(session);
+        strata::program::LiveSessionFacts activation_session_facts = pre_session;
+        activation_session_facts.residency_generation = residency_generation;
+        std::unique_ptr<Outcome> returned;
+        strata::program::ConversationStateFacts restored{};
+        strata::program::RepairOwnerEvidence after{};
+        std::vector<strata::program::OwnerReservationHandle> charges;
+        std::string activation_error;
+        const bool activated = registry.activate_parked_owner(
+            identity, activation_session_facts, prior,
+            [&](Outcome& payload, const strata::program::RetainedActivationFacts& activation,
+                strata::program::RepairOwnerEvidence& after_evidence,
+                strata::program::ConversationStateFacts& restored_out, std::string& attempt_error) -> bool {
+                // Before displacement, refusal still attests the actual suspended owner and unchanged B.
+                after_evidence = ServingSuffixRepairOperation::owner_evidence(payload);
+                restored_out = prior;
+                if (!payload.retained_publication || !payload.retained_publication.get() ||
+                    !(payload.retained_publication.get()->cut == payload.published.cut) ||
+                    payload.retained_publication.get()->key != identity || payload.published.key != identity) {
+                    attempt_error = "the parked owner carries no image of its own publication cut";
+                    return false;
+                }
+                if(qualification&&qualification->before&&!qualification->before(payload,prior_image))
+                    failstop(session,"activation qualification admission/provenance refused");
+                // The restore onto the owner's publication cut, then the verification that the session now
+                // matches the owner record before the controller is asked to mutate anything.
+                const auto installed = session.restore(payload.retained_publication, identity);
+                if (!installed) {
+                    attempt_error = "the publication restore was refused: " + installed.detail;
+                    const auto back = session.restore(prior_image, prior.key);
+                    if (!back || !ConversationStateFacts::identical(prior, conversation_facts(session)))
+                        failstop(session, "a refused publication restore did not restore the prior conversation");
+                    after_evidence = ServingSuffixRepairOperation::owner_evidence(payload);
+                    return false;
+                }
+                // key() is the immutable RAW runtime identity, not an observation of the installed image's
+                // revision/append/selection epochs. restore validates the image's exact key above and only
+                // accepts this runtime's stable window; the cut below is its actual installed all-stage cut.
+                if (!(session.cut() == record.published_cut) ||
+                    !strata::program::same_stable_window(session.key(), payload.published.key) ||
+                    ServingRawSession::raw_phase(session.phase()) != strata::core::serving_raw::Phase::drained) {
+                    attempt_error = "the restored session does not match the owner record";
+                    const auto back = session.restore(prior_image, prior.key);
+                    if (!back || !(session.cut() == prior.cut))
+                        failstop(session, "a refused retained activation did not restore the prior conversation");
+                    restored_out = prior;
+                    after_evidence = ServingSuffixRepairOperation::owner_evidence(payload);
+                    return false;
+                }
+                // The state the controller stands on and can itself capture/restore is now the publication, and
+                // the session facts handed to the controller are the POST-restore observations (the registry's
+                // gate above was run over the pre-restore ones, which is what accounts for the displaced state).
+                strata::program::ConversationStateFacts on_publication = conversation_facts(session);
+                on_publication.key = payload.retained_publication.get()->key;
+                strata::program::LiveSessionFacts post_session = live_session_facts(session);
+                post_session.residency_generation = residency_generation;
+                const strata::core::SnapshotDescriptor publication_metadata = payload.published;
+                if(qualification)qualification->displaced=true;
+                const bool forced=qualification&&qualification->refuse_after_publication_restore;
+                const bool landed = !forced&&ServingSuffixRepairOperation::activate_retained(
+                    payload, post_session, activation, on_publication, publication_metadata,
+                    restored_out, after_evidence, attempt_error);
+                if(forced){
+                    attempt_error="qualification refusal after checked publication restore";
+                    after_evidence=ServingSuffixRepairOperation::owner_evidence(payload);
+                    std::fprintf(stderr,"suffix_activation_displaced req=%llu forced_refusal=1\n",
+                        (unsigned long long)qualification->request_ordinal);
+                }
+                if (landed) {
+                    // The controller's inner transaction captured A's installed publication. The
+                    // outer transaction displaced B and retained B's verified image before that
+                    // restore. Keep those two prior-state reports distinct on successful activation.
+                    if (!ConversationStateFacts::identical(on_publication, restored_out))
+                        failstop(session, "the controller lost the publication state its activation captured");
+                    restored_out = prior;
+                    return true;
+                }
+                // The activation refused (or failed) after the restore: put the prior conversation back through
+                // the same primitive and VERIFY that restore. An unverified rollback is the RAW contract's
+                // failstop; it is never a continued request and never a silently stranded conversation.
+                const auto back = session.restore(prior_image, prior.key);
+                if (!back || !(session.cut() == prior.cut))
+                    failstop(session, "a refused retained activation did not restore the prior conversation");
+                if(qualification&&qualification->rollback){
+                    if(!qualification->rollback(prior_image))
+                        failstop(session,"activation rollback numerical qualification failed");
+                    qualification->rolled_back=true;
+                }
+                restored_out = prior;
+                return false;
+            },
+            returned, restored, after, charges, activation_error);
+        if (!activated) {
+            std::string close_error;
+            if (!session.close_request(close_error))
+                failstop(session, "a refused retained activation could not close the request fence");
+            if(qualification&&qualification->refuse_after_publication_restore){
+                strata::program::SuspendedOwnerFacts now;
+                if(!qualification->displaced||!qualification->rolled_back||!registry.entry_facts(identity,now)||
+                   now.quarantined||!now.holds_live_controller||now.state!=record.state||
+                   now.record_version!=record.record_version||now.published_cut!=record.published_cut||
+                   now.certified_cut!=record.certified_cut||now.token_debt!=record.token_debt||
+                   now.identity!=record.identity||now.versions!=record.versions||
+                   now.published_serial!=record.published_serial||
+                   now.reservation_purposes!=record.reservation_purposes||
+                   now.capacity_reserved!=record.capacity_reserved||
+                   now.activation_resources_pinned!=record.activation_resources_pinned)
+                    failstop(session,"qualification rollback lost the parked owner/version/charges");
+                std::fprintf(stderr,"suffix_activation_owner_preserved req=%llu parked=1 version_equal=1 charges_equal=1\n",
+                    (unsigned long long)qualification->request_ordinal);
+                std::fflush(stderr);
+            }
+            error = activation_error; return false;
+        }
+        if (!ConversationStateFacts::identical(prior, restored))
+            failstop(session, "a landed retained activation cannot report the prior conversation state it displaced");
+        if(!returned||!returned->controller)failstop(session,"landed activation returned no live request owner");
+        adopt_continuation_request(*returned,prepared_request);
+        active_out = std::move(returned);
+        return bool(active_out); // same request fence remains open through all A3 work and final capture
+
+    }
+
+    /// The registry's retire attempt: the existing controller retirement, then the payload-side bookkeeping
+    /// finish() does (generate.cpp:3556-3557).  This is the only way a parked controller may be released.
+    struct RetainRetire {
+        bool operator()(Outcome& out,std::string& error) const {
+            if(!out.controller){error="the parked owner has no controller left to retire";return false;}
+            if(out.retired){error="the parked owner already reported retirement";return false;}
+            out.retired=out.controller->retire(error);
+            if(out.retired)out.controller.reset();
+            return out.retired;
+        }
+    };
+    /// The live session's facts, all observed from the adapter itself.
+    static LiveSessionFacts live_session_facts(const ServingRawSession& session) {
+        LiveSessionFacts facts;
+        facts.session_key=session.key();
+        facts.session_cut=session.cut();
+        facts.live_phase=ServingRawSession::raw_phase(session.phase());
+        facts.request_open=session.request_open();
+        facts.private_window_open=session.private_window_open();
+        return facts;
+    }
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+    static ServingSuffixCancelQualification::Facts cancel_facts(const Outcome& out,uint64_t request,
+                                                               uint64_t private_before=0) noexcept {
+        const auto& h=out.published;
+        return {request,out.controller?out.controller->published_->serial:0,h.cut.id,h.cut.accepted,
+            h.cut.forwarded,h.cut.exact_frontier,h.cut.output_watermark,out.known_forwarded,out.generated,
+            private_before,out.controller?out.controller->private_forwarded():h.cut.exact_frontier,h.cut.history};
+    }
+#endif
+    static bool exact_ready(const Outcome& out) noexcept {
+        return out.controller&&out.controller->private_forwarded()==out.controller->published_->metadata.cut.forwarded;
+    }
+    // Metadata for actual serial exact commits AFTER the retired repair owner handed back its pending token.
+    // This is not a completion certificate: the caller must still RAW-drain every stage, capture and qualify.
+    static bool exact_continuation_metadata(const Outcome& out,const std::vector<int32_t>& consumed,int32_t pending,
+                                            uint64_t generated,uint64_t cut_id,
+                                            strata::core::SnapshotDescriptor& final,std::string& error) {
+        const auto& base=out.published;
+        if(out.controller||!out.retired||!out.certified_exact||!base.approximation.empty()||
+           base.cut.exact_frontier!=base.cut.forwarded||base.cut.accepted!=base.cut.forwarded+1||
+           base.accepted_tokens.size()!=base.cut.accepted||base.pending_tokens.size()!=1||
+           base.pending_tokens.front()!=base.accepted_tokens.back()||base.cut.output_watermark!=out.request_watermark_base+out.generated||
+           generated<out.generated||generated>out.max_generated||pending<0||
+           !cut_id||cut_id<=base.cut.id||consumed.size()>UINT64_MAX-1){error="exact continuation lost its certified base/output bounds";return false;}
+        const uint64_t appended=generated-out.generated;
+        if(appended>UINT64_MAX-base.cut.forwarded||consumed.size()!=base.cut.forwarded+appended||
+           appended>UINT64_MAX-base.key.append_epoch||appended>UINT64_MAX-base.cut.output_watermark||
+           base.accepted_tokens.size()>consumed.size()+1){error="exact continuation commit/append counts differ";return false;}
+        for(size_t i=0;i<base.accepted_tokens.size();++i)
+            if(base.accepted_tokens[i]!=(i<consumed.size()?consumed[i]:pending)){
+                error="exact continuation replaced previously accepted output/pending history";return false;
+            }
+        final=base;final.accepted_tokens=consumed;final.accepted_tokens.push_back(pending);
+        final.pending_tokens.assign(1,pending);final.key.append_epoch+=appended;
+        final.cut.id=cut_id;final.cut.forwarded=final.cut.exact_frontier=consumed.size();
+        final.cut.accepted=final.accepted_tokens.size();final.cut.output_watermark+=appended;
+        final.cut.history=strata::core::window_history_digest(final.accepted_tokens);
+        return true;
+    }
+    static bool finish(ServingRawSession& session,Outcome& out,std::string& error,bool defer_retirement=false) {
+        if(!out.controller||out.retired||!exact_ready(out)){error="retained finish requires exact CURRENT private state";return false;}
+        auto& c=*out.controller;
+        const auto& accepted=c.published_->metadata.accepted_tokens;
+        const size_t prefix=std::min(accepted.size(),out.request_tokens.size());
+        if(!std::equal(accepted.begin(),accepted.begin()+std::ptrdiff_t(prefix),out.request_tokens.begin())||
+           (out.generated&&accepted.size()!=out.request_tokens.size()+out.generated)||
+           c.receipt_count_<out.request_receipt_base||c.receipt_count_-out.request_receipt_base!=out.generated){error="retained final accepted request/output history differs";return false;}
+        for(size_t i=size_t(out.request_receipt_base);i<c.receipt_count_;++i){const auto& receipt=c.receipts_[i];
+            if(receipt.token!=accepted[out.request_tokens.size()+i-size_t(out.request_receipt_base)]||!receipt.operation||
+               (i&&(c.receipts_[i-1].operation>=receipt.operation||c.receipts_[i-1].cut>=receipt.cut))){
+                error="retained final immutable emitted receipt differs from accepted history";return false;
+            }
+        }
+        if(!c.finish_request_current(c.published_->serial,error))return false;
+        out.published=c.published_->metadata;out.next_cut=c.next_cut_;
+        const auto captured=session.capture(out.published,out.repaired_final);
+        if(!captured){error=captured.detail;return false;}
+        out.certified_exact=out.published.approximation.empty()&&out.published.cut.exact_frontier==out.published.cut.forwarded;
+        out.exact_frontier=out.published.cut.exact_frontier;
+        if(defer_retirement)return out.certified_exact;
+        out.retired=c.retire(error);
+        if(!out.retired)return false;
+        out.controller.reset();return out.certified_exact;
+    }
+    static void progress(const Outcome& out,uint64_t ordinal,const char* phase,
+                         bool retained_yield_witness=false) {
+        const auto& h=out.published;
+        const uint64_t private_at=out.controller?out.controller->private_forwarded():h.cut.exact_frontier;
+        const uint64_t replayed=std::min(private_at,out.donor_forwarded)>out.boundary
+            ?std::min(private_at,out.donor_forwarded)-out.boundary:0;
+        const auto generated=out.generated;
+        const auto known=out.known_forwarded;
+        const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-out.started).count();
+        // Every existing step keeps its reviewed bytes; only the `retained_yield` step appends the debt witness
+        // (published cut, certified private cut, debt) so the debt is on the record, never inferred (D3).
+        std::fprintf(stderr,"suffix_repair_progress req=%llu phase=%s forwarded=%llu exact_frontier=%llu watermark=%llu reused_suffix=%llu private_replayed=%llu known_forwarded=%llu generated=%llu elapsed_ms=%.3f",
+            (unsigned long long)ordinal,phase,(unsigned long long)h.cut.forwarded,(unsigned long long)h.cut.exact_frontier,
+            (unsigned long long)h.cut.output_watermark,(unsigned long long)out.reused_suffix,(unsigned long long)replayed,
+            (unsigned long long)known,(unsigned long long)generated,ms);
+        if(retained_yield_witness) {
+            if(!out.yielded||out.certified_cut.id==0||out.retained_debt==0||
+               out.certified_cut.forwarded>=h.cut.forwarded||
+               out.certified_cut.forwarded!=private_at||out.retained_debt!=h.cut.forwarded-private_at)
+                strata::core::retirement_failed("retained yield progress debt witness differs from the controller's own cuts");
+            std::fprintf(stderr," published_cut=%llu private_cut=%llu debt=%llu",
+                (unsigned long long)h.cut.forwarded,(unsigned long long)out.certified_cut.forwarded,
+                (unsigned long long)out.retained_debt);
+        }
+        std::fputs("\n",stderr);
+        std::fflush(stderr);
+    }
+    static bool exact_first() noexcept {
+        const char* value=std::getenv("STRATA_SUFFIX_REPAIR_EXACT_FIRST");
+        return value&&std::strcmp(value,"1")==0;
+    }
+    [[noreturn]] static void failstop(ServingRawSession& session,const char* reason) noexcept {
+        session.abandon();std::fflush(stdout);std::fflush(stderr);
+        strata::core::retirement_failed(reason); // controller retains tx: dropping the adapter alone cannot terminate
+    }
+    static void retire_prebuilt(std::shared_ptr<resident_repair_detail::ResidentRepairRuntime>& runtime) noexcept {
+        try {
+            std::string error;
+            if(!resident_repair_detail::ResidentRepairController::retire_preconstructed(runtime,error))
+                strata::core::retirement_failed("pre-install private runtime checked retirement refused");
+        }catch(...){strata::core::retirement_failed("pre-install private runtime retirement exception");}
+    }
+
+private:
+    ServingSuffixRepairOperation() = delete;
+};
+// Trusted composition only: no constructor, root, payload, import method or
+// receipt is available outside the actual serving driver translation unit.
+class OwnedImageRequestDriver final {
+public:
+    struct Input {
+            bool owned_admission=false;
+            bool owned_cancel_diagnostics=false;
+            strata::program::OwnedAdmissionCancel admissions;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            bool managed_threads=false;
+            size_t max_control_lines=0,max_control_bytes=0;
+            std::deque<std::string> controls;
+            std::shared_ptr<const strata::core::ReservationLease> scheduler_reservation;
+#endif
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            // The detached reader retains its charge until its buffers and queue
+            // have retired, even after the serving stack has unwound.
+            std::shared_ptr<const strata::core::ReservationLease> reservation;
+#endif
+            size_t max_line_bytes=0, max_queue_lines=0;
+            std::atomic<bool> input_error{false};
+            std::atomic<bool> stop_req{false};
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+            std::atomic<uint64_t> stop_sequence{0}; // advanced only by a real committed stdin STOP line
+#endif
+            std::mutex mu;
+            std::condition_variable cv;
+            std::deque<std::string> lines;
+            bool eof = false;
+            // Caller holds mu. A preparation becoming runnable again keeps its
+            // ORIGINAL admission rank; it neither re-enqueues nor ages afresh.
+            void queue_image(std::string command,int slot,uint64_t request){
+                const auto rank=admissions.incarnation(slot,request);
+                auto at=lines.end();
+                for(auto it=lines.begin();it!=lines.end();++it){int other=-1;uint64_t key=0;
+                    if(OwnedAdmissionCancel::parse(*it,false,other,key)){
+                        const auto old=admissions.incarnation(other,key);
+                        if(old&&rank&&old>rank){at=it;break;}
+                    }
+                }
+                lines.insert(at,std::move(command));
+            }
+        };
+    struct Preparation {int slot=-1;uint64_t request=0,output=0,tokens=0,bytes=0,deadline=0;};
+    class ChoiceFrame final {
+        friend class OwnedImageRequestDriver;
+        std::shared_ptr<const OwnedImageRequestOperation> record_; // survives actual command free
+    public:
+        std::string command;
+    };
+    static constexpr uint64_t choice_quote(){return sizeof(ChoiceFrame)+2*sizeof(bool)+2*sizeof(void*);}
+    static bool pin_choice(ChoiceFrame& frame,const ServingRawSession& source,std::string_view command){
+        int slot=-1;uint64_t request=0;
+        if(!OwnedAdmissionCancel::parse(command,false,slot,request))return false;
+        const auto directory=source.image_directory();
+        if(!directory||slot<0||slot>1)return false;
+        const auto& record=directory->prepared_[size_t(slot)];
+        if(!record||record->request_key_!=request)return false;
+        frame.record_=record; // before allocating the new caller command copy
+        frame.command.assign(command);return true;
+    }
+    static constexpr uint64_t producer_control_quote(){return OwnedImageRequestOperation::producer_control_bytes;}
+    static constexpr uint64_t reactor_control_quote() {
+#if defined(__GLIBCXX__) && __GLIBCXX__==20240904 && defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE==13
+        using A=VisionRequestOwner::HostAllocator<Input>;
+        using Control=std::_Sp_counted_ptr_inplace<Input,A,__gnu_cxx::__default_lock_policy>;
+        // The pinned GNU deque default constructor allocates an eight-pointer
+        // map and one 512-byte node for each of the two string deques. These
+        // exact newly constructed controls are paid before allocate_shared.
+        return sizeof(Control)+alignof(Control)-1+
+            2*(8*sizeof(void*)+std::__deque_buf_size(sizeof(std::string))*sizeof(std::string));
+#else
+        return 0;
+#endif
+    }
+    static constexpr uint64_t reactor_quote() {
+        return reactor_control_quote()+4*3*sizeof(std::shared_ptr<const void>)+
+            sizeof(VisionRequestOwner::Keepers)+4*sizeof(std::shared_ptr<Input>)+
+            2*OwnedImageRequestOperation::producer_control_bytes+
+            2*8*(sizeof(core::Verifier*)+sizeof(core::NativeBatchSlotInspection))+
+            4*sizeof(std::vector<void*>)+3*sizeof(std::string)+sizeof(Preparation)+
+            // Introduced bounded image error spellings: per-stage Prefill and
+            // verifier/caller errors plus eight reactor/forwarding temporaries.
+            // These requested char extents have the startup payer, so they may
+            // survive a refused operation and die with their enclosing actor.
+            (2*8+8)*128;
+    }
+    static std::shared_ptr<Input> reactor(ServingRawSession& session) {
+#if defined(__GLIBCXX__) && __GLIBCXX__==20240904 && defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE==13
+        const auto keepers=session.image_reactor_keepers();
+        return std::allocate_shared<Input>(VisionRequestOwner::HostAllocator<Input>(keepers));
+#else
+        (void)session;std::terminate();
+#endif
+    }
+    static bool bind(ServingRawSession& session,const std::shared_ptr<Input>& input,
+        const ServingThreadBridge* bridge,std::string& error) {
+        return session.image_bind_controller(input->admissions,input->mu,input,bridge,error);
+    }
+    static bool prepare_line(std::string_view line,Preparation& parsed) noexcept {
+        if(!OwnedAdmissionCancel::parse(line,false,parsed.slot,parsed.request)||!line.starts_with("BIPREP "))return false;
+        line.remove_prefix(7);std::array<uint64_t*,5> fields{nullptr,&parsed.output,&parsed.tokens,&parsed.bytes,&parsed.deadline};
+        for(size_t i=0;i<fields.size();++i){const auto gap=line.find(' ');if(gap==line.npos)return false;
+            const auto word=line.substr(0,gap);uint64_t v=0;
+            const auto result=std::from_chars(word.data(),word.data()+word.size(),v);
+            if(result.ec!=std::errc{}||result.ptr!=word.data()+word.size()||(i==0&&v!=uint64_t(parsed.slot)))return false;
+            if(fields[i])*fields[i]=v;
+            line.remove_prefix(gap+1);
+        }
+        return line.starts_with("http_request=")&&line.find(' ')==line.npos&&parsed.output&&parsed.tokens&&parsed.bytes;
+    }
+    static bool prepare(ServingRawSession& source,ServingRawSession& destination,
+        const std::shared_ptr<Input>& input,const ServingThreadBridge* bridge,
+        const Preparation& p,std::string& error) {
+        uint64_t incarnation=0;
+        {std::lock_guard<std::mutex> lock(input->mu);incarnation=input->admissions.incarnation(p.slot,p.request);}
+        if(!source.image_prepare_transport(destination,&input->admissions,&input->mu,input,bridge,
+            p.slot,p.request,incarnation,p.bytes,p.tokens,p.output,error))return false;
+        auto op=source.image_directory()->prepared_[size_t(p.slot)];op->deadline_ms_=p.deadline;
+        op->transport_published_=true; // before publishing permission to allocate
+        std::printf("BIPAY %d request=%012llx incarnation=%llu bytes=%llu tokens=%llu budget=%llu\n",
+            p.slot,(unsigned long long)(p.request-1),(unsigned long long)incarnation,
+            (unsigned long long)p.bytes,(unsigned long long)p.tokens,(unsigned long long)p.output);
+        std::fflush(stdout);return true;
+    }
+    static bool select(ServingRawSession& source,size_t slot,uint64_t request,
+        const std::shared_ptr<Input>& input,std::string& error) {
+        uint64_t incarnation=0;
+        {std::lock_guard<std::mutex> lock(input->mu);incarnation=input->admissions.incarnation(int(slot),request);}
+        return source.image_select_preparation(slot,request,incarnation,error);
+    }
+    static bool parameters(const ServingRawSession& source,size_t slot,uint64_t request,uint64_t tokens,uint64_t output) {
+        const auto directory=source.image_directory();if(!directory||slot>=2)return false;
+        const auto& op=directory->prepared_[slot];
+        return op&&op->request_key_==request&&op->token_count_==tokens&&op->full_output_budget_==output;
+    }
+    static bool discard(ServingRawSession& source,size_t slot,uint64_t request) {
+        const auto directory=source.image_directory();if(!directory||slot>=2)return false;
+        auto& op=directory->prepared_[slot];
+        if(!op||op->request_key_!=request||!op->producer_closed_||directory->current_.get()==op.get()||
+           op->phase_.load(std::memory_order_acquire)!=OwnedImageRequestOperation::Phase::unsealed)return false;
+        auto state=OwnedImageRequestOperation::Phase::unsealed;
+        if(!op->phase_.compare_exchange_strong(state,OwnedImageRequestOperation::Phase::poisoned,std::memory_order_acq_rel))std::terminate();
+        op.reset();return true;
+    }
+    static bool ready(const ServingRawSession& source,size_t slot,uint64_t request) {
+        const auto directory=source.image_directory();if(!directory||slot>=2)return false;
+        const auto& op=directory->prepared_[slot];
+        return op&&op->request_key_==request&&op->captured_&&op->producer_closed_;
+    }
+    static bool capture(ServingRawSession& source,size_t slot,uint64_t request,
+        const std::shared_ptr<Input>& input,std::string_view command,std::string_view path,
+        std::span<const int64_t> tokens,std::string& error) {
+#if defined(__linux__)
+        if(!select(source,slot,request,input,error)){
+            const auto directory=source.image_directory();
+            const auto op=directory&&slot<2?directory->prepared_[slot]:nullptr;
+            if(op&&op->request_key_==request){
+                std::printf("BICAPTURED %zu request=%012llx incarnation=%llu ok=0\n",slot,
+                    (unsigned long long)(request-1),(unsigned long long)op->admission_incarnation_);std::fflush(stdout);
+            }
+            return false;
+        }
+        auto op=source.image_operation();
+        // command allocation is prepaid by the transport's bounded spelling
+        // term. Its only consumer is this canonical source's real input queue.
+        op->command_.assign(command);
+        const int fd=::open(std::string(path).c_str(),O_RDONLY|O_CLOEXEC);
+        const bool captured=fd>=0&&source.image_capture_transport(fd,tokens,error);
+        if(fd>=0&&::close(fd)!=0)std::terminate(); // actual close BEFORE ACK
+        if(!source.close_request(error))std::terminate();
+        source.image_directory()->current_.reset();
+        std::printf("BICAPTURED %zu request=%012llx incarnation=%llu ok=%d\n",slot,
+            (unsigned long long)(request-1),(unsigned long long)op->admission_incarnation_,int(captured));
+        std::fflush(stdout);return captured;
+#else
+        (void)source;(void)slot;(void)request;(void)input;(void)command;(void)path;(void)tokens;
+        error="image platform";return false;
+#endif
+    }
+    // The source owns both the canonical record and the actual reactor. A close
+    // confirmation never asserts native completion and never changes another
+    // foreground's request/work fence.
+    static int producer_close(ServingRawSession& source,size_t slot,uint64_t request,uint64_t incarnation,
+        bool cancel,const std::shared_ptr<Input>& input,std::string& error) {
+        const auto directory=source.image_directory();if(!directory||slot>=2)return -1;
+        auto op=directory->prepared_[slot];
+        if(!op||op->request_key_!=request||op->admission_incarnation_!=incarnation||
+           !source.image_close_transport(request,incarnation,error))return -1;
+        bool abandoned=cancel||!op->captured_;
+        {std::lock_guard<std::mutex> lock(input->mu);
+            abandoned=abandoned||!input->admissions.image_current(int(slot),request,incarnation,true);
+            if(!abandoned){
+                if(input->lines.size()>=input->max_queue_lines)std::terminate();
+                input->queue_image(std::move(op->command_),int(slot),request);input->cv.notify_all();
+            }else input->admissions.finish(int(slot),request);
+        }
+        if(abandoned){
+            auto state=OwnedImageRequestOperation::Phase::unsealed;
+            if(!op->phase_.compare_exchange_strong(state,OwnedImageRequestOperation::Phase::poisoned,std::memory_order_acq_rel))std::terminate();
+            directory->prepared_[slot].reset();
+        }
+        std::printf("BICLOSED %zu request=%012llx incarnation=%llu ready=%d\n",slot,
+            (unsigned long long)(request-1),(unsigned long long)incarnation,int(!abandoned));
+        std::fflush(stdout);return abandoned?0:1;
+    }
+    static bool prefill(ServingRawSession& source,std::span<prefill::Prefill* const> parts,std::string& error) {
+        return source.image_bind_prefill(parts,error);
+    }
+    static bool transfer(ServingRawSession& source,ServingRawSession& destination,
+        const core::SnapshotDescriptor& metadata,std::string& error) {
+        auto op=source.image_operation();if(!op)return false;
+        // Called only after the real prefill/verifier call has returned and its
+        // common cut is drained. Join each actual prefill ring/stream borrower.
+        if(source.phase()!=ServingRawSession::Phase::drained||source.cut()!=metadata.cut)return false;
+        for(auto* p:op->prefills_)if(p&&!p->owned_image_retirement_ready(op.get()))std::terminate();
+        op->source_callers_joined_=true;
+        return source.image_transfer_to(destination,metadata,error);
+    }
+    static bool cancel(ServingRawSession& source,std::string& error){return source.image_cancel_current(error);}
+    static bool finish_source(ServingRawSession& source,std::string& error) {
+        auto op=source.image_operation();if(!op||source.phase()!=ServingRawSession::Phase::drained)return false;
+        for(auto* p:op->prefills_)if(p&&!p->owned_image_retirement_ready(op.get()))std::terminate();
+        op->source_callers_joined_=true;
+        auto state=op->phase_.load(std::memory_order_acquire);
+        if(state==OwnedImageRequestOperation::Phase::unsealed){
+            if(!op->phase_.compare_exchange_strong(state,OwnedImageRequestOperation::Phase::poisoned,std::memory_order_acq_rel))std::terminate();
+        }else if(state!=OwnedImageRequestOperation::Phase::consumed&&state!=OwnedImageRequestOperation::Phase::poisoned)return false;
+        return source.close_request(error); // checked reset/empty cut, bank identity, view retirement
+    }
+    static bool image(const ServingRawSession& session) {return bool(session.image_operation());}
+    static bool observe_peer(ServingRawSession& session,
+        std::shared_ptr<OwnedImagePeerObservation>& witness,std::string& error) {
+        return session.image_observe_peer(witness,error);
+    }
+    static bool compare_peer(ServingRawSession& session,
+        const std::shared_ptr<OwnedImagePeerObservation>& witness,
+        uint64_t& tensors,uint64_t& bytes,std::string& error) {
+        return session.image_compare_peer(witness,tensors,bytes,error);
+    }
+private:
+    OwnedImageRequestDriver()=delete;
+};
+} // namespace strata::program
+#endif
 
 // #1425 #1549 #1629: --ple-io direct (the default) does unbuffered random reads of the n-gram table; on some drives
 // (DRAM-less NVMe, Windows unbuffered I/O) they run at 34 MB/s or 4-8 tok/s and a prompt reads layer 1 for minutes.
@@ -3396,10 +5703,14 @@ int main(int argc, char** argv) {
         break;
     }
 #if defined(STRATA_HAVE_QWEN35)
+    bool verified_input_requested=false;
+    for(int i=1;i<argc;++i)
+        if(std::strncmp(argv[i],"--verified-input-",17)==0)verified_input_requested=true;
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
     // goes on below exactly as before.  Only the architecture string is read (the header of --native's shard).
     for (int i = 1; i + 1 < argc; ++i) {
+        if(verified_input_requested)break; // no original model opens before verified preparation
         if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
         bool qwen35 = false;
         try {
@@ -3416,7 +5727,73 @@ int main(int argc, char** argv) {
     prime_hw_queues();
 #endif
     Options o;
+    auto configure_retirement=[&](auto& consumer)->bool {
+        if(!o.owned_session_lifetime)return true;
+        std::string error;
+        if(consumer.set_strict_retirement(true,error))return true;
+        std::fprintf(stderr,"strata generate: owned consumer retirement: %s\n",error.c_str());
+        return false;
+    };
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    // Declared before every model borrower, graph, expert pool and stage: these
+    // owners outlive those local objects on normal return and exception unwind.
+    // Outside EVERY runtime alias/consumer allocation. On all post-admission
+    // returns (including bad_alloc/refusal), keep payment beyond actual enclosing
+    // free. An escaped runtime alias is terminal, not a weak-expiry free proof.
+    struct OwnedPositionBankRetirement {
+        strata::program::OwnedPositionBankSetup setup;
+        std::shared_ptr<DriverWindowRuntime> runtime;
+        ~OwnedPositionBankRetirement() {
+            if(!runtime)return;
+            if(runtime.use_count()!=1)std::terminate();
+            runtime.reset(); // synchronous last-owner destruction AND allocation free
+            // setup (roots/credit/owner) is destroyed only after this returns.
+        }
+    } position_bank_retirement;
+    DriverVerifiedInputs verified_inputs;
+    std::unique_ptr<strata::core::WindowBudget> model_budget;
+    std::shared_ptr<const strata::core::OwnedModelGang> owned_model;
+    std::shared_ptr<DriverWindowRuntime> owned_runtime;
+    // External owner: the profile retains owned_runtime, so storing it inside
+    // DriverWindowRuntime would create an ownership cycle. Always partial.
+    strata::core::ExpertRuntimeProfile expert_runtime_profile;
+    // External controller retains the real runtime; never store it back in that runtime.
+    std::unique_ptr<DriverRemotePolicySetup> remote_policy_setup;
+    // Published only by the completed reader/writer/controller binding step.
+    strata::core::RemotePolicyPublication* remote_policy = nullptr;
+    auto allocate_scratch=[&](int device,uint64_t bytes,void** pointer,
+        strata::core::WindowBufferMemory memory=strata::core::WindowBufferMemory::device,void** mapped=nullptr)->bool {
+        return owned_runtime && model_budget &&
+            owned_runtime->allocate_scratch(*model_budget,device,bytes,pointer,memory,mapped);
+    };
+#endif
+    auto create_driver_stream=[&](int device,unsigned flags,cudaStream_t& out)->bool {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(owned_runtime) {
+            std::string error;
+            if(owned_runtime->gpu_handles.create_stream(device,flags,out,error))return true;
+            std::fprintf(stderr,"strata generate: owned stream: %s\n",error.c_str());return false;
+        }
+#endif
+        (void)device;
+        return cudaStreamCreateWithFlags(&out,flags)==cudaSuccess;
+    };
+    auto create_driver_event=[&](int device,unsigned flags,cudaEvent_t& out)->bool {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(owned_runtime) {
+            std::string error;
+            if(owned_runtime->gpu_handles.create_event(device,flags,out,error))return true;
+            std::fprintf(stderr,"strata generate: owned event: %s\n",error.c_str());return false;
+        }
+#endif
+        (void)device;
+        return cudaEventCreateWithFlags(&out,flags)==cudaSuccess;
+    };
     bool have_tokens = false;
+    enum class TokenInputSource { none, inline_list, file };
+    TokenInputSource token_input_source=TokenInputSource::none;
+    const char* token_input_value=nullptr; // argv-owned; no early file/list materialization
+    bool have_max_context=false;
     bool have_logits_stride = false;
     bool ram_keep_by_flag = false;
     for (int i = 1; i < argc; ++i) {
@@ -3428,27 +5805,73 @@ int main(int argc, char** argv) {
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--gpu") { (void) next("--gpu"); }   // applied at startup, before any CUDA call
-        else if (a == "--pack") o.pack = next("--pack");
-        else if (a == "--tokens") {
-            if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
-            std::string e;
-            if (!parse_i64_list(next("--tokens"), o.tokens, e)) { std::fprintf(stderr, "%s\n", e.c_str()); return 2; }
-            have_tokens = true;
-        }
-        else if (a == "--tokens-file") {
-            if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
-            std::ifstream input(next("--tokens-file"));
-            if (!input) { std::fprintf(stderr, "cannot open token file\n"); return 2; }
-            std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-            if (input.bad()) { std::fprintf(stderr, "cannot read token file\n"); return 2; }
-            std::string error;
-            if (text.find('\0') != std::string::npos || !parse_i64_list(text.c_str(), o.tokens, error)) {
-                std::fprintf(stderr, "malformed token file: %s\n", error.c_str()); return 2;
+        else if (a == "--pack") { o.pack = next("--pack"); o.verified_original_paths["pack"].push_back(o.pack); }
+        else if (a == "--suffix-reuse-experiment") {
+            const std::string path=next("--suffix-reuse-experiment");
+            if(path.empty()||!o.suffix_experiment_file.empty()) {
+                std::fputs("suffix experiment needs one nonempty input path\n",stderr);return 2;
             }
-            have_tokens = true;
+            o.suffix_experiment_file=path;
+        }
+        else if (a == "--suffix-repair-experiment") {
+            if(o.suffix_repair_experiment) {
+                std::fputs("supply suffix repair experiment once\n",stderr);return 2;
+            }
+            o.suffix_repair_experiment=true;
+        }
+        else if (a == "--suffix-repair-cycles") {
+            const std::string_view value=next("--suffix-repair-cycles");
+            if(o.suffix_repair_cycles_set||value!="2") {
+                std::fputs("suffix repair cycles requires one explicit value 2\n",stderr);return 2;
+            }
+            o.suffix_repair_cycles=2;o.suffix_repair_cycles_set=true;
+        }
+        else if (a == "--suffix-repair-fault-deferred-trap") {
+            if(o.suffix_repair_fault_deferred_trap){std::fputs("supply deferred trap once\n",stderr);return 2;}
+            o.suffix_repair_fault_deferred_trap=true;
+        }
+        else if (a == "--suffix-repair-fault-second-arena") {
+            if(o.suffix_repair_fault_second_arena){std::fputs("supply arena fault once\n",stderr);return 2;}
+            o.suffix_repair_fault_second_arena=true;
+        }
+        else if (a == "--suffix-repair-fault-second-copy") {
+            if(o.suffix_repair_fault_second_copy){std::fputs("supply copy fault once\n",stderr);return 2;}
+            o.suffix_repair_fault_second_copy=true;
+        }
+        else if (a == "--suffix-repair-fault-receipt") {
+            const std::string path=next("--suffix-repair-fault-receipt");
+            if(path.empty()||!o.suffix_repair_fault_receipt.empty()){std::fputs("one fault receipt path required\n",stderr);return 2;}
+            o.suffix_repair_fault_receipt=path;
+        }
+        else if (a == "--suffix-repair-prepared-cancel") {
+            if(o.suffix_repair_prepared_cancel){std::fputs("supply prepared cancellation once\n",stderr);return 2;}
+            o.suffix_repair_prepared_cancel=true;
+        }
+        else if (a == "--suffix-repair-cancel") {
+            if(o.suffix_repair_cancel) {
+                std::fputs("supply suffix repair cancellation once\n",stderr);return 2;
+            }
+            o.suffix_repair_cancel=true;
+        }
+        else if (a == "--suffix-reuse-host-bytes") {
+            const std::string_view value=next("--suffix-reuse-host-bytes");uint64_t bytes=0;
+            const auto parsed=std::from_chars(value.data(),value.data()+value.size(),bytes);
+            if(o.suffix_experiment_host_bytes||parsed.ec!=std::errc{}||parsed.ptr!=value.data()+value.size()||
+               !bytes||bytes>SIZE_MAX) {
+                std::fputs("suffix RAW host cap needs one positive bounded integer\n",stderr);return 2;
+            }
+            o.suffix_experiment_host_bytes=bytes;
+        }
+        else if (a == "--tokens" || a == "--tokens-file") {
+            if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
+            token_input_source=a=="--tokens"?TokenInputSource::inline_list:TokenInputSource::file;
+            token_input_value=next(a.c_str());
+            have_tokens=true;
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
-        else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+        else if (a == "--max-context") {
+            o.max_context = std::atoll(next("--max-context"));have_max_context=true;
+        }
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
         else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(next("--rope-freq-base"));
@@ -3476,7 +5899,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
-        else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
+        else if (a == "--ple-gguf") { o.ple_gguf = next("--ple-gguf"); o.verified_original_paths["ple"].push_back(o.ple_gguf); }
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
@@ -3503,10 +5926,10 @@ int main(int argc, char** argv) {
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
-        else if (a == "--native") o.native_preset = next("--native");
-        else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
-        else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
-        else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
+        else if (a == "--native") { o.native_preset = next("--native"); o.verified_original_paths["native-primary"].push_back(o.native_preset); }
+        else if (a == "--native-head-gguf") { o.native_head_gguf = next("--native-head-gguf"); o.verified_original_paths["head-primary"].push_back(o.native_head_gguf); }
+        else if (a == "--embd-gguf") { o.embd_gguf = next("--embd-gguf"); o.verified_original_paths["embedding"].push_back(o.embd_gguf); }
+        else if (a == "--native-dense-gguf") { o.native_dense_gguf.push_back(next("--native-dense-gguf")); o.verified_original_paths["dense-group"].push_back(o.native_dense_gguf.back()); }
         else if (a == "--no-capture") o.no_capture = true;
         else if (a == "--no-pool") o.no_pool = true;
         else if (a == "--sync-every-layer") o.sync_every_layer = true;
@@ -3667,6 +6090,19 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+        else if (a == "--suffix-reuse-report") o.suffix_reuse_report = true;
+        else if (a == "--suffix-cache") o.suffix_cache = true;
+        else if (a == "--suffix-cache-unrepaired-experiment") o.suffix_cache_unrepaired_experiment = true;
+        else if (a == "--suffix-cache-host-bytes") {
+            const std::string value = next(a.c_str());
+            char* end = nullptr;
+            const unsigned long long bytes = std::strtoull(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0' || bytes == 0 || bytes > (1ULL << 40)) {
+                std::fprintf(stderr, "--suffix-cache-host-bytes needs a positive byte count up to 1 TiB\n");
+                return 2;
+            }
+            o.suffix_cache_host_bytes = bytes;
+        }
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
@@ -3762,7 +6198,7 @@ int main(int argc, char** argv) {
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
-        else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
+        else if (a == "--expert-profile") { o.expert_profile = next("--expert-profile"); o.verified_original_paths["expert-profile"].push_back(o.expert_profile); }
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
@@ -3798,6 +6234,27 @@ int main(int argc, char** argv) {
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
+        else if (a == "--verified-input-manifest" || a == "--verified-input-manifest-sha256" ||
+                 a == "--verified-input-private-dir") {
+            auto& value=a=="--verified-input-manifest"?o.verified_input_manifest:
+                a=="--verified-input-manifest-sha256"?o.verified_input_sha256:o.verified_input_private_dir;
+            if(!value.empty()){std::fprintf(stderr,"duplicate verified input option\n");return 2;}
+            value=next(a.c_str());if(value.empty()){std::fprintf(stderr,"empty verified input option\n");return 2;}
+        }
+        else if(a=="--verified-input-host-bytes" || a=="--verified-input-disk-bytes") {
+            auto& value=a=="--verified-input-host-bytes"?o.verified_input_host_bytes:o.verified_input_disk_bytes;
+            if(value){std::fprintf(stderr,"duplicate verified input allowance\n");return 2;}
+            const std::string text=next(a.c_str());
+            for(char c:text) {
+                if(c<'0'||c>'9'||value>(UINT64_MAX-uint64_t(c-'0'))/10) {
+                    std::fprintf(stderr,"invalid/overflow verified input allowance\n");return 2;
+                }
+                value=value*10+uint64_t(c-'0');
+            }
+            if(!value){std::fprintf(stderr,"verified input allowance must be positive\n");return 2;}
+        }
+        else if (a == "--owned-model-lifetime") o.owned_model_lifetime = true;
+        else if (a == "--owned-session-lifetime") o.owned_session_lifetime = o.owned_model_lifetime = true;
         else if (a == "--no-token-graph") o.no_token_graph = true;
         else if (a == "--no-fused-gr") o.no_fused_gr = true;
         else if (a == "--no-fast-attn") o.no_fast_attn = true;
@@ -3823,6 +6280,230 @@ int main(int argc, char** argv) {
         if (o.ram_keep > 0 && !(hv != nullptr && std::atof(hv) >= 0.0) && o.resident_headroom < o.ram_keep)
             o.resident_headroom = o.ram_keep;
     }
+    // --suffix-cache is a SERVING feature (P12 approximate suffix reuse); the --suffix-experiment/--suffix-repair
+    // flags are the dedicated serial harness and refuse --serve.  Keep the two impossible to confuse.
+    if (const char* value=std::getenv("STRATA_SUFFIX_REPAIR_EXACT_FIRST"); value&&
+        std::strcmp(value,"0")&&std::strcmp(value,"1")) {
+        std::fputs("STRATA_SUFFIX_REPAIR_EXACT_FIRST must be 0 or 1\n",stderr);return 2;
+    }
+#if !defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+    if(o.suffix_cache){std::fputs("--suffix-cache requires the supported native owned RAW serving backend\n",stderr);return 2;}
+#endif
+    if (o.suffix_cache && !o.serve) {
+        std::fputs("--suffix-cache needs --serve: it reuses the unchanged suffix of an edited request in serving\n", stderr);
+        return 2;
+    }
+    if (o.suffix_cache_unrepaired_experiment && !o.suffix_cache) {
+        std::fputs("--suffix-cache-unrepaired-experiment needs --suffix-cache (it selects the path that flag gates)\n", stderr);
+        return 2;
+    }
+    if (o.suffix_cache && o.suffix_cache_host_bytes == 0) {
+        std::fputs("--suffix-cache needs --suffix-cache-host-bytes N: the private RAW session must carry an "
+                   "explicit aggregate host allowance\n", stderr);
+        return 2;
+    }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    {
+        std::string qualification_error;
+        if (!strata::program::SuffixExperimentDriver::serving_qualification_policy(o, qualification_error)||
+            !strata::program::SuffixExperimentDriver::owned_slot_qualification_policy(o,qualification_error)) {
+            std::fprintf(stderr, "%s\n", qualification_error.c_str());
+            return 2;
+        }
+    }
+#else
+    if (std::getenv("STRATA_SUFFIX_REPAIR_QUALIFY")||std::getenv("STRATA_SUFFIX_ACTIVATION_QUALIFY")||
+        std::getenv("STRATA_SUFFIX_ACTIVATION_REQUEST")||std::getenv("STRATA_OWNED_BATCH_QUALIFY")) {
+        std::fputs("suffix qualification requires the supported Linux CUDA window-state build\n", stderr);
+        return 2;
+    }
+#endif
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+    strata::program::ServingSuffixCancelQualification serving_cancel_qualification;
+    {
+        std::string error;
+        const bool policy=o.serve&&o.suffix_cache&&!o.suffix_cache_unrepaired_experiment&&
+            o.owned_session_lifetime&&o.owned_model_lifetime&&
+            strata::program::SuffixExperimentDriver::serving_qualification_enabled()&&
+            !strata::program::ServingSuffixRepairOperation::exact_first();
+        if(!serving_cancel_qualification.configure(std::getenv("STRATA_SUFFIX_REPAIR_CANCEL_AT"),policy,error)){
+            std::fprintf(stderr,"%s\n",error.c_str());return 2;
+        }
+    }
+#else
+    if(std::getenv("STRATA_SUFFIX_REPAIR_CANCEL_AT")){
+        std::fputs("retained cancellation selector requires supported fault-ON qualification build\n",stderr);return 2;
+    }
+#endif
+#if defined(STRATA_SERVING_FAULT_QUALIFICATION_AVAILABLE)
+    strata::program::ServingSuffixFaultQualification serving_fault_qualification;
+    {
+        std::string error;
+        const bool policy=o.serve&&o.suffix_cache&&!o.suffix_cache_unrepaired_experiment&&
+            o.layer_split=="24"&&o.split_device=="1"&&
+            o.owned_session_lifetime&&o.owned_model_lifetime&&o.spec==0&&o.mtp.empty()&&o.draft.empty()&&
+            o.draft_model.empty()&&o.spec_oracle.empty()&&o.spec_follow.empty()&&!o.lookup_chain&&!o.suffix_draft&&
+            !o.vision&&!o.batch&&!o.pipeline_windows&&!o.adapt_every&&!o.adapt_async&&!o.prefill_head_alias&&
+            !std::getenv("STRATA_SUFFIX_REPAIR_CANCEL_AT")&&!o.suffix_repair_experiment&&
+            !o.suffix_repair_fault_second_arena&&!o.suffix_repair_fault_second_copy&&!o.suffix_repair_fault_deferred_trap&&
+            o.suffix_repair_fault_receipt.empty()&&
+            strata::program::SuffixExperimentDriver::serving_qualification_enabled()&&
+            !strata::program::ServingSuffixRepairOperation::exact_first();
+        if(!serving_fault_qualification.configure(std::getenv("STRATA_SUFFIX_REPAIR_FAULT_AT"),policy,error)){
+            std::fprintf(stderr,"%s\n",error.c_str());return 2;
+        }
+    }
+#else
+    if(std::getenv("STRATA_SUFFIX_REPAIR_FAULT_AT")){
+        std::fputs("serving fault selector requires supported fault-ON qualification build\n",stderr);return 2;
+    }
+#endif
+    // Validate the dedicated profile before model startup; defer real input
+    // until its actual runtime/global and aggregate host admissions exist.
+    if(!o.suffix_experiment_file.empty()||o.suffix_experiment_host_bytes||o.suffix_repair_experiment||o.suffix_repair_cancel||o.suffix_repair_prepared_cancel||o.suffix_repair_cycles_set||o.suffix_repair_fault_second_arena||o.suffix_repair_fault_second_copy||o.suffix_repair_fault_deferred_trap||!o.suffix_repair_fault_receipt.empty()) {
+#if !defined(STRATA_WINDOW_STATE_AVAILABLE) || !defined(__linux__) || defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+        std::fputs("suffix experiment first target needs Linux CUDA window-state build\n",stderr);return 2;
+#else
+        if(o.suffix_repair_fault_second_arena||o.suffix_repair_fault_second_copy||o.suffix_repair_fault_deferred_trap||!o.suffix_repair_fault_receipt.empty()) {
+#if !defined(STRATA_RESIDENT_FAULT_QUALIFICATION) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_SYCL)
+            std::fputs("resident fault qualification unavailable in this build\n",stderr);return 2;
+#else
+            if((unsigned(o.suffix_repair_fault_second_arena)+unsigned(o.suffix_repair_fault_second_copy)+unsigned(o.suffix_repair_fault_deferred_trap)!=1)||!o.suffix_repair_experiment||
+               o.suffix_repair_cancel||o.suffix_repair_prepared_cancel||o.suffix_repair_cycles_set||o.suffix_repair_cycles!=1||
+               o.suffix_repair_fault_receipt!="/output/RESIDENT-FAULT.jsonl"||o.layer_split!="24"||o.split_device!="1") {
+                std::fputs("exactly one resident fault needs one normal dual-stage repair attempt and exact receipt path\n",stderr);return 2;
+            }
+#endif
+        }
+        if(o.suffix_experiment_file.empty()||!o.suffix_experiment_host_bytes||have_tokens||
+           (o.suffix_repair_experiment&&o.max_new<9)||
+           (o.suffix_repair_cancel&&!o.suffix_repair_experiment)||
+           (o.suffix_repair_prepared_cancel&&(!o.suffix_repair_experiment||o.suffix_repair_cancel||o.suffix_repair_cycles_set||o.suffix_repair_cycles!=1))||
+           (o.suffix_repair_cycles_set&&(!o.suffix_repair_experiment||o.suffix_repair_cancel))||
+           !o.owned_session_lifetime||o.serve||o.batch||o.pipeline_windows!=0||o.spec!=0||
+           !o.mtp.empty()||!o.draft.empty()||!o.draft_model.empty()||o.suffix_draft||o.lookup_chain||
+           o.vision||!o.cvec_files.empty()||o.prefill_head_alias||o.kv_grow||o.vram_elastic||
+           o.remote_expert_opt||o.peer_device>=0||
+           std::any_of(o.expert_cache_remote.begin(),o.expert_cache_remote.end(),[](int n){return n!=0;})||
+           o.adapt_every||o.adapt_async||o.adapt_warm_every||
+           o.no_pool||o.graph_only||o.gpu_only_full||o.gpu_stages||o.stage_timing||
+           !o.spec_oracle.empty()||!o.spec_follow.empty()||!o.dump_halves.empty()||!o.dump_layers.empty()||
+           !o.dump_logits.empty()||!o.dump_residual.empty()||!o.dump_mixed.empty()||!o.dump_final_r.empty()||
+           o.prefill_chunk<=0||!o.greedy||!have_max_context||o.max_context<=0||o.max_new<=0||o.max_new>64||
+           o.max_new>=o.max_context||uint64_t(o.max_context)>(SIZE_MAX-128)/24) {
+            std::fputs("incompatible standalone suffix experiment profile/input/bounds\n",stderr);return 2;
+        }
+        // Avoid background predictor startup before the dedicated branch. Other
+        // environment-derived producers must be rejected by runtime revalidation.
+        const char* lookahead=std::getenv("STRATA_LOOKAHEAD");
+        const auto enabled_env=[](const char* name){const char* v=std::getenv(name);return v&&v[0]&&v[0]!='0';};
+        for(const char* diagnostic:{"STRATA_DBG_NAN","STRATA_TAP_FILE","STRATA_NAN_INJECT",
+                                    "STRATA_VERIFY_PROFILE","STRATA_VERIFY_NODES","STRATA_COMMIT_TIMING"})
+            if(std::getenv(diagnostic)!=nullptr) {
+                std::fprintf(stderr,"suffix experiment requires %s unset (unadmitted diagnostics)\n",diagnostic);return 2;
+            }
+        if(!lookahead||std::strcmp(lookahead,"0")!=0||enabled_env("STRATA_LOOKAHEAD_STATS")||
+           enabled_env("STRATA_FS_SLOTS")||enabled_env("STRATA_RAM_ADAPT2")||enabled_env("STRATA_ADAPT_ASYNC")) {
+            std::fputs("suffix experiment requires explicit LOOKAHEAD=0 and optional producers disabled\n",stderr);return 2;
+        }
+        // Nonempty startup sizing ONLY. No manifest read, parsing, prompt copy,
+        // actual vocabulary claim or prompt forward occurs here. Explicit
+        // max_context sizes real fixed sessions; late admitted input rechecks
+        // BOTH actual lengths <=max_context-max_new. max_new remains1..64.
+        try { o.tokens={0};have_tokens=true; }
+        catch(const std::bad_alloc&) {std::fputs("suffix sizing allocation refused\n",stderr);return 2;}
+        // Explicit experiment-only STORAGE normalization before startup pricing.
+        // Actual execution is T=1 exclusively. This does NOT enable drafting.
+        o.suffix_experiment_requested_spec=o.spec;o.spec=2;
+#endif
+    }
+    // Ordinary input materialization is deferred until all argv flags are known.
+    // This blocks --tokens-file BEFORE an experiment flag from reading an
+    // unbounded file before the order-independent conflict check above.
+    // Successful ordinary inputs are unchanged; error/help precedence changes.
+    if(!o.suffix_experiment_mode() && token_input_source!=TokenInputSource::none) {
+        if(token_input_source==TokenInputSource::inline_list) {
+            std::string error;
+            if(!parse_i64_list(token_input_value,o.tokens,error)) {
+                std::fprintf(stderr,"%s\n",error.c_str());return 2;
+            }
+        } else {
+            std::ifstream input(token_input_value);
+            if(!input) {std::fprintf(stderr,"cannot open token file\n");return 2;}
+            std::string text((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>());
+            if(input.bad()) {std::fprintf(stderr,"cannot read token file\n");return 2;}
+            std::string error;
+            if(text.find('\0')!=std::string::npos || !parse_i64_list(text.c_str(),o.tokens,error)) {
+                std::fprintf(stderr,"malformed token file: %s\n",error.c_str());return 2;
+            }
+        }
+    }
+    o.verified_inputs_active=!o.verified_input_manifest.empty()||!o.verified_input_sha256.empty()||
+        !o.verified_input_private_dir.empty()||o.verified_input_host_bytes||o.verified_input_disk_bytes;
+    if(o.verified_inputs_active && (!o.owned_session_lifetime || o.verified_input_manifest.empty() ||
+        o.verified_input_sha256.empty() || o.verified_input_private_dir.empty() ||
+        !o.verified_input_host_bytes || !o.verified_input_disk_bytes)) {
+        std::fprintf(stderr,"strata generate: verified inputs require all five options and --owned-session-lifetime\n");return 2;
+    }
+#if !defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.owned_model_lifetime) {
+        std::fprintf(stderr,"strata generate: --owned-model-lifetime requires STRATA_BUILD_WINDOW_STATE=ON\n");
+        return 2;
+    }
+#endif
+#if defined(STRATA_GPU_METAL)
+    if(o.owned_session_lifetime) {
+        std::fprintf(stderr,"strata generate: owned sessions require a private Metal reset implementation before enablement\n");
+        return 2;
+    }
+#endif
+    const bool owned_batch_requested=strata::core::native_owned_batch_serving::selected(
+        std::getenv("STRATA_OWNED_BATCH_ALLOCATION"));
+    const auto owned_batch_environment=[] {
+        return strata::core::native_owned_batch_serving::environment(
+            std::getenv("STRATA_OWNED_BATCH_ALLOCATION"),std::getenv("STRATA_OWNED_BATCH_SETUP_HOST_BYTES"),
+            std::getenv("STRATA_PREFILL_CPU_SHARE"),std::getenv("STRATA_PREFILL_HELP"),
+            std::getenv("STRATA_PREFILL_HELPER_SOURCE"));
+    };
+    if(owned_batch_requested &&
+       (!(o.vision?strata::core::native_owned_batch_serving::eligible_image(true,o,true):strata::core::native_owned_batch_serving::eligible(true,o,true))||!owned_batch_environment())){
+        std::fputs("strata serve: owned two-slot profile or explicit setup/prefill envelope refused\n",stderr);return 2;
+    }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+    if(owned_batch_requested&&(o.prefill_chunk!=16||o.prefill_auto)){
+        const auto config=strata::program::serving_thread_config();
+        if(!config.enabled||!config.valid){
+            std::fputs("strata serve: larger/auto owned foreground prefill requires explicit managed safe-unit policy and limits\n",stderr);return 2;
+        }
+    }
+#endif
+#if !defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+    if(owned_batch_requested){
+        std::fputs("strata serve: owned two-slot execution requires native suffix repair support\n",stderr);return 2;
+    }
+#endif
+    if(o.owned_session_lifetime && ((o.vision&&!owned_batch_requested) || o.kv_grow || (o.batch>0&&!owned_batch_requested) || o.pipeline_windows>0 ||
+        !o.mtp.empty() || !o.dump_halves.empty())) {
+        std::fprintf(stderr,"strata generate: owned session construction requires fixed KV/text and an explicit supported batch profile; pipeline/MTP/half dumps remain unqualified\n");
+        return 2;
+    }
+    if(o.owned_model_lifetime&&o.prefill_head_alias) {
+        std::fprintf(stderr,"strata generate: checked model ownership does not yet support mutable prefill head aliasing\n");
+        return 2;
+    }
+    if (o.owned_session_lifetime) {
+        if (const char* name = strata::core::native_owned_batch_serving::integration_environment_refusal(
+                [](const char* key) noexcept { return std::getenv(key); })) {
+            std::fprintf(stderr,"strata generate: owned profile does not admit %s before setup\n",name);return 2;
+        }
+        if (!strata::core::native_owned_batch_serving::integration_geometry_supported(
+                strata::core::kCompiledGeometry,strata::kernels::kVerifyMaxT)) {
+            std::fputs("strata generate: compiled geometry is outside the paid owned profile\n",stderr);return 2;
+        }
+    }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.owned_session_lifetime)owned_runtime=std::make_shared<DriverWindowRuntime>();
+#endif
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -3909,8 +6590,8 @@ int main(int argc, char** argv) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL) && !defined(_WIN32)
     // Linux CUDA, 2 or more batch slots: the exact parallel-request stack is the engine's own default (QUAL-PAR bit-exact; it was the launcher's
     // PARALLEL_STACK_ENV).  Each switch keeps =0 as its off switch and a value the user set is kept.  Before any engine code reads them.
-    strata::core::apply_parallel_defaults_cuda(true, o.batch);
-    strata::core::apply_gdn_defaults_cuda(true);   // STRATA_GDN_TC=1, STRATA_GDN_CONVL2=2 (owner yes 2026-11-07; was the launcher's GDN_STACK_CUDA)
+    strata::core::apply_parallel_defaults_cuda(!o.owned_session_lifetime, o.batch);
+    strata::core::apply_gdn_defaults_cuda(!o.owned_session_lifetime);   // STRATA_GDN_TC=1, STRATA_GDN_CONVL2=2 (owner yes 2026-11-07; was the launcher's GDN_STACK_CUDA)
 #endif
     if (!o.prefill_cap_warn.empty() && !o.prefill_cap_warn_skip)
         std::fprintf(stderr, "strata: WARNING --prefill %s: prompt chunks of 8192 tokens or more crashed the engine "
@@ -3930,7 +6611,12 @@ int main(int argc, char** argv) {
                 same = cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
                        cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess && m == m0 && n == n0;
             }
-            if (same) { strata::core::apply_nv_defaults(m0, n0); strata::core::apply_spec_adapt_default(m0, n0); }
+            if (same) {
+                if (strata::core::native_owned_batch_serving::integration_nv_defaults_allowed(
+                        o.owned_session_lifetime,strata::cc_major_of(m0),strata::cc_minor_of(n0)))
+                    strata::core::apply_nv_defaults(m0, n0);
+                strata::core::apply_spec_adapt_default(m0, n0);
+            }
             {   // round 0212: the K-quant MMQ prompt kernels, on by default for compute capability 8.0+ (STRATA_MMQ_KQ=0 or STRATA_NV_KQ_DEFAULT=0 turns them off); the lowest compute capability decides
                 int lo_m = m0, lo_n = n0;
                 for (int d = 1; d < nd; ++d) {
@@ -3938,7 +6624,8 @@ int main(int argc, char** argv) {
                     if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
                         cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess && (m < lo_m || (m == lo_m && n < lo_n))) { lo_m = m; lo_n = n; }
                 }
-                strata::core::apply_nv_kq_default(lo_m, lo_n);
+                if (strata::core::native_owned_batch_serving::integration_nv_kq_default_allowed(o.owned_session_lifetime))
+                    strata::core::apply_nv_kq_default(lo_m, lo_n);
             }
         }
         (void) cudaGetLastError();
@@ -4076,6 +6763,99 @@ int main(int argc, char** argv) {
             }
         }
     }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.verified_inputs_active) {
+        using namespace strata::core;
+        // Initial immutable-input capability: raw token IDs, declared native
+        // pack/shards only. Other profiles remain required future integration.
+        if(o.vision || !o.mtp.empty() || !o.draft_model.empty() || o.draft=="dflash2" ||
+           !o.cvec_files.empty() || o.suffix_draft || o.lookup_chain ||
+           !o.shared_expert_arena.empty() ||
+           (std::getenv("STRATA_ARENA_MMAP") && std::getenv("STRATA_ARENA_MMAP")[0]=='1')) {
+            std::fprintf(stderr,"strata generate: verified inputs currently require raw token IDs, no draft/lookup/vision/control-vector or shared arena\n");return 2;
+        }
+        if(!driver_input_retirement_slot().retry()) {
+            std::fprintf(stderr,"strata generate: previous verified input retirement still pending\n");return 2;
+        }
+        try {
+            StateDigest expected{};
+            if(o.verified_input_sha256.size()!=64)throw std::runtime_error("manifest SHA256 needs 64 lowercase hex digits");
+            auto digit=[](char c)->unsigned {
+                if(c>='0'&&c<='9')return unsigned(c-'0');
+                if(c>='a'&&c<='f')return unsigned(c-'a'+10);
+                throw std::runtime_error("invalid manifest SHA256 hex");
+            };
+            for(size_t i=0;i<expected.size();++i)
+                expected[i]=uint8_t(16*digit(o.verified_input_sha256[2*i])+digit(o.verified_input_sha256[2*i+1]));
+            const auto host=sample_host_memory();
+            if(!host || host->available>host->limit || o.verified_input_host_bytes>host->available)
+                throw std::runtime_error("verified input host envelope exceeds available telemetry");
+            WindowResources capacity{{0},o.verified_input_host_bytes,0,o.verified_input_disk_bytes,1,0};
+            // Dedicated fixed GGUF preflight source objects, not spare parse
+            // or inventory credit. Held for the input-budget lifetime, before
+            // any matcher/scan/result/report frame can be constructed.
+            if(NativeDense::inventory_preflight_setup_bytes()>o.verified_input_host_bytes){
+                std::fputs("verified input quota cannot cover GGUF preflight setup\n",stderr);return 2;
+            }
+            verified_inputs.budget=std::make_unique<WindowBudget>(capacity,
+                WindowResources{{0},NativeDense::inventory_preflight_setup_bytes()});
+            const VerifiedManifestParseLimits bounds{256*1024,4096,4096,4096};
+            auto result=ParsedVerifiedInputs::read(o.verified_input_manifest,expected,bounds,
+                *verified_inputs.budget,verified_inputs.plan);
+            if(!result)throw std::runtime_error(result.detail);
+            if(verified_inputs.plan->requires_running_executable_observation()) {
+                auto expected_engine=verified_inputs.plan->expected_running_executable(*verified_inputs.budget);
+                if(!expected_engine)throw std::runtime_error("running image expectation quota refused");
+                // Actual executing ELF only, before any model payload reads.
+                // The transient IO1/hash workspace releases on return; retained
+                // metadata cannot consume the following bundle loader's IO slot.
+                // This partial observation does not establish DSO/JIT identity
+                // or authorize managed window execution.
+                const RunningEngineLimits image_limits{2ull<<30,1ull<<20,1000000,30000};
+                std::string image_error;
+                if(!collect_running_engine(std::move(expected_engine),image_limits,*verified_inputs.budget,
+                    verified_inputs.running_engine,image_error))
+                    throw std::runtime_error("actual running image: "+image_error);
+            }
+            VerifiedDriverOverrides overrides{o.verified_original_paths};
+            if(o.no_ple) {
+                if(overrides.paths.count("ple"))throw std::runtime_error("conflicting explicit PLE options");
+                overrides.paths["ple"]={};
+            }
+            result=verified_inputs.plan->validate_overrides(overrides);
+            if(!result)throw std::runtime_error(result.detail);
+            // Preserve the native preset's required PLE contract, before any
+            // snapshot writes. A disabled optional head remains disabled.
+            VerifiedDriverOverrides disabled_ple;disabled_ple.paths["ple"]={};
+            if(verified_inputs.plan->validate_overrides(disabled_ple))
+                throw std::runtime_error("verified native preset requires manifest PLE binding");
+            result=verified_inputs.plan->prepare_bundle(o.verified_input_private_dir,*verified_inputs.budget,
+                overrides,verified_inputs.bundle);
+            if(!result)throw std::runtime_error(result.detail);
+            auto bindings=std::make_shared<VerifiedDriverBindings>();
+            result=verified_inputs.plan->bind(verified_inputs.bundle,overrides,*bindings);
+            if(!result)throw std::runtime_error(result.detail);
+            result=bindings->preflight_expert_profile(*verified_inputs.budget);
+            if(!result)throw std::runtime_error(result.detail);
+            if(bindings->frontend!=ProfileFrontend::raw_token_ids)throw std::runtime_error("unsupported input frontend");
+            // Complete every allocating replacement before touching Options.
+            auto pack=bindings->pack_path();auto native=bindings->native_primary.loader_path();
+            auto head=bindings->head_disabled?std::string{}:bindings->head_primary.loader_path();
+            auto embedding=bindings->embedding_from_native?std::string{}:bindings->embedding.loader_path();
+            auto profile=bindings->expert_profile_disabled?std::string{}:bindings->expert_profile.loader_path();
+            auto ple=bindings->ple.loader_path();auto natives=bindings->native_paths();
+            auto dense=bindings->dense_paths();auto heads=bindings->head_paths();
+            o.pack.swap(pack);o.native_preset.swap(native);o.native_head_gguf.swap(head);
+            o.embd_gguf.swap(embedding);o.ple_gguf.swap(ple);o.native_shards.swap(natives);
+            o.native_dense_gguf.swap(dense);o.native_head_shards.swap(heads);o.expert_profile.swap(profile);
+            verified_inputs.bindings=std::move(bindings);
+            std::fprintf(stderr,"strata generate: immutable verified inputs retained; raw token-ID frontend, conservative host carveout %llu bytes\n",
+                (unsigned long long)o.verified_input_host_bytes);
+        } catch(const std::exception& e) {
+            std::fprintf(stderr,"strata generate: verified inputs: %s\n",e.what());return 2;
+        }
+    }
+#endif
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -4119,7 +6899,7 @@ int main(int argc, char** argv) {
             return !out.empty();
         };
         split_auto = o.layer_split == "auto";
-        bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
+        bool ok = (o.serve || o.suffix_experiment_mode()) && (split_auto || ints(o.layer_split, split_at));
         if (ok && !o.split_device.empty()) ok = ints(o.split_device, split_devs);
         else if (ok)
             for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d) split_devs.push_back(d);
@@ -4408,11 +7188,14 @@ int main(int argc, char** argv) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
             // here: it used to be skipped, leaving a model with some tensors absent and a later error, or none.
-            o.native_shards = strata::gguf_split_paths(o.native_preset);
+            if(!o.verified_inputs_active)o.native_shards = strata::gguf_split_paths(o.native_preset);
             // a model family Strata recognises but has no engine path for yet (Qwen3.6-35B-A3B) is refused here,
             // with a message that says so, before anything else about the file is judged
             {
                 const strata::GgufFile meta(o.native_shards.front());
+                if(o.verified_inputs_active && strata::model_family(meta)!=strata::ModelFamily::Qwen4Exp) {
+                    std::fprintf(stderr,"strata generate: verified input profile currently requires qwen4exp\n");return 2;
+                }
                 const std::string why = strata::model_family_not_supported(strata::model_family(meta));
                 if (strata::model_family(meta) != strata::ModelFamily::Unknown && !why.empty()) {
                     std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), why.c_str());
@@ -4440,7 +7223,7 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
+        if (o.native_head_gguf.empty() && !o.verified_inputs_active) o.native_head_gguf = o.native_preset;
         if (o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
             // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
@@ -4578,7 +7361,7 @@ int main(int argc, char** argv) {
                              "session, which a layer split does not have; run them without --layer-split\n");
         return 2;
     }
-    if (!o.native_head_gguf.empty()) {
+    if (!o.native_head_gguf.empty() && !o.verified_inputs_active) {
         try {
             o.native_head_shards = o.native_head_gguf == o.native_preset ? o.native_shards
                                                                          : strata::gguf_split_paths(o.native_head_gguf);
@@ -4655,12 +7438,54 @@ int main(int argc, char** argv) {
     // Plan v0.3 P6: where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    std::shared_ptr<strata::core::ExpertLayoutCapture> expert_layout_capture;
+    if(o.verified_inputs_active) {
+        try {
+            using namespace strata::core;
+            if(!verified_inputs.budget || !verified_inputs.bindings ||
+               verified_inputs.bindings->pack_path()!=o.pack) {
+                std::fprintf(stderr,"strata generate: expert layout requires verified pack binding\n");return 1;
+            }
+            // Administrative limits; refuse overflow/quota instead of growing
+            // parser or receipt storage outside the early input ledger.
+            const ExpertInventoryLimits limits{1024,4096,1ull<<20,16ull<<20,64,1ull<<20};
+            uint64_t host_bytes=0;
+            if(!expert_inventory_host_bound(limits,host_bytes,err)) {
+                std::fprintf(stderr,"strata generate: expert layout admission: %s\n",err.c_str());return 1;
+            }
+            WindowResources charge;
+            charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+            charge.host_bytes=host_bytes;
+            auto reservation=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+            if(!reservation) {std::fprintf(stderr,"strata generate: expert layout metadata quota refused\n");return 1;}
+            const auto& bindings=*verified_inputs.bindings;
+            ExpertMetadataClaims claims{o.pack,!bindings.native_expert_layout_absent,!bindings.hadamard_absent};
+            std::unique_ptr<ExpertLayoutCapture> capture;
+            if(!ExpertLayoutCapture::create(limits,std::move(reservation.lease),verified_inputs.bindings,claims,capture,err)) {
+                std::fprintf(stderr,"strata generate: expert layout capture: %s\n",err.c_str());return 1;
+            }
+            expert_layout_capture=std::move(capture);
+        } catch(const std::bad_alloc&) {
+            std::fprintf(stderr,"strata generate: expert layout admission allocation failed\n");return 1;
+        }
+    }
+#endif
     {
         const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            ,expert_layout_capture.get()
+#endif
+        )) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(expert_layout_capture && !expert_layout_capture->completed_inventory()) {
+            std::fprintf(stderr,"strata generate: expert layout did not publish a current receipt\n");return 1;
+        }
+#endif
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
         // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
@@ -4878,8 +7703,17 @@ int main(int argc, char** argv) {
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu (STRATA_NO_IQ256 set)");
     // the compiled shape; a native model's file replaces it below with its own metadata (read_geometry), which a
     // pruned variant (GSQ-RCO Coder, fewer than 512 experts) differs from
-    strata::core::ModelGeometry g = strata::core::kCompiledGeometry;
-    strata::kernels::PleConsts ple_consts_run = strata::kernels::ple_artifact_consts();   // the model file's PLE hash constants when it has them
+    strata::core::ModelGeometry legacy_geometry = strata::core::kCompiledGeometry;
+    strata::core::ModelGeometry* geometry_address=&legacy_geometry;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(owned_runtime) {
+        auto geometry=std::make_shared<strata::core::ModelGeometry>(strata::core::kCompiledGeometry);
+        geometry_address=geometry.get();
+        owned_runtime->geometry_owner=std::move(geometry);
+    }
+#endif
+    strata::core::ModelGeometry& g=*geometry_address;
+    strata::kernels::PleConsts ple_consts_run = strata::kernels::ple_artifact_consts();
     int64_t K = g.n_expert_used;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
     // and `session_init` below builds the rope table from it and captures the kernels reading its constants
@@ -5012,15 +7846,68 @@ int main(int argc, char** argv) {
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
-    strata::core::NativeEmbed native_embed;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto admit_head_embed_inventory=[&](auto& loader, bool head)->bool {
+        if(!o.verified_inputs_active)return true;
+        try {
+            using namespace strata::core;
+            if(!verified_inputs.budget || !verified_inputs.bindings) {
+                err="head/embed inventory requires verified input bindings";return false;
+            }
+            const auto& bindings=*verified_inputs.bindings;
+            const auto sources=head ? o.native_head_shards :
+                (o.embd_gguf.empty()?o.native_shards:std::vector<std::string>{o.embd_gguf});
+            const auto expected=head ? bindings.head_paths() :
+                (bindings.embedding_from_native?bindings.native_paths():
+                    std::vector<std::string>{bindings.embedding.loader_path()});
+            if(sources.empty() || sources!=expected) {
+                err="head/embed inventory source bindings mismatch";return false;
+            }
+            const NativeInventoryLimits limits{uint64_t(sources.size()),1,4,4096};
+            uint64_t host_bytes=0;
+            if(!head_embed_inventory_host_bound(limits,host_bytes,err))return false;
+            WindowResources charge;
+            charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+            charge.host_bytes=host_bytes;
+            auto reservation=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+            if(!reservation) {err="verified input quota cannot admit head/embed inventory";return false;}
+            return loader.enable_inventory_capture(limits,std::move(reservation.lease),
+                verified_inputs.bindings,err);
+        } catch(const std::bad_alloc&) {
+            err.clear();
+            std::fprintf(stderr,"strata generate: head/embed inventory admission allocation failed\n");
+            return false;
+        }
+    };
+#endif
+    DriverModelObject<strata::core::NativeEmbed> embedding_storage(o.owned_model_lifetime);
+    auto& native_embed=embedding_storage.get();
+    if(owned_batch_requested){
+        if(!(o.vision?strata::core::native_owned_batch_serving::eligible_image(native_pack,o,true):strata::core::native_owned_batch_serving::eligible(native_pack,o,true))||!owned_batch_environment()){
+            std::fputs("strata serve: owned two-slot native profile changed before model setup\n",stderr);return 2;
+        }
+        o.native_owned_batch_serving=true;
+        std::fputs("strata serve: owned two-slot intent requested_spec=0 verifier_capacity=2 rows_per_slot=1\n",stderr);
+    }
     if (native_pack) {
-        if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
+        // Resolve after speculative adaptation defaults, preserving requested spec0 everywhere. Only verifier
+        // backing storage uses two rows; serial execution and both feature/cold admission keep zero drafts.
+        if(strata::core::native_serial_serving::eligible(native_pack,o)){
+            o.native_serial_serving=true;
+            std::fputs("strata serve: native serial intent requested_spec=0 verifier_capacity=2 execution_window=1\n",stderr);
+        }
+        if (o.native_preset.empty() || o.serving_verifier_capacity() < 2 || o.keep_canonical ||
             (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
             std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
         const auto embed_t0 = std::chrono::steady_clock::now();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(!admit_head_embed_inventory(native_embed,false)) {
+            std::fprintf(stderr,"strata generate: embedding inventory: %s\n",err.c_str());return 1;
+        }
+#endif
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g.n_embd,
                                g.n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -5264,7 +8151,38 @@ int main(int argc, char** argv) {
         load_t0 = t;
         return s;
     };
-    strata::core::WeightTable wt;
+    DriverModelObject<strata::core::WeightTable> weight_storage(o.owned_model_lifetime);
+    auto& wt=weight_storage.get();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto admit_canonical_inventory=[&](strata::core::WeightTable& loader)->bool {
+        if(!o.verified_inputs_active)return true;
+        try {
+        using namespace strata::core;
+        if(!verified_inputs.budget || !verified_inputs.bindings ||
+           verified_inputs.bindings->pack_path()!=o.pack) {
+            err="canonical inventory requires matching verified pack binding";return false;
+        }
+        const CanonicalInventoryLimits limits{4096,4096};
+        uint64_t host_bytes=0;
+        if(!canonical_inventory_host_bound(limits,host_bytes,err))return false;
+        WindowResources charge;
+        charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+        charge.host_bytes=host_bytes;
+        auto reservation=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+        if(!reservation) {err="verified input quota cannot admit canonical tensor inventory";return false;}
+        return loader.enable_inventory_capture(limits,std::move(reservation.lease),
+            verified_inputs.bindings,o.pack,err);
+        } catch(const std::bad_alloc&) {
+            // Keep refusal diagnostic allocation-free when host allocation failed.
+            err.clear();
+            std::fprintf(stderr,"strata generate: canonical inventory admission allocation failed\n");
+            return false;
+        }
+    };
+    if(!admit_canonical_inventory(wt)) {
+        std::fprintf(stderr,"strata generate: canonical inventory: %s\n",err.c_str());return 1;
+    }
+#endif
     if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
@@ -5280,8 +8198,50 @@ int main(int argc, char** argv) {
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
     mem_mark("the pack weights");
 
-    strata::core::NativeDense native_dense;
+    DriverModelObject<strata::core::NativeDense> native_storage(o.owned_model_lifetime);
+    auto& native_dense=native_storage.get();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    // Actual receipts are admitted from the early verified-input quota, before
+    // native allocations. The later model baseline cannot price them retroactively.
+    auto admit_native_inventory=[&](strata::core::NativeDense& loader,strata::core::WeightTable& table,const char* error_prefix)->bool {
+        if(!o.verified_inputs_active)return true;
+        try {
+        using namespace strata::core;
+        if(!verified_inputs.budget || !verified_inputs.bindings) {
+            err="native inventory requires matching verified input bindings";return false;
+        }
+        NativeInventoryLimits limits{uint64_t(o.native_dense_gguf.size()),4096,4,4096};
+        {
+            auto parsed=NativeDense::inventory_conversion_limits_admitted(o.native_dense_gguf,table,
+                o.native_ple_key,limits,*verified_inputs.budget,verified_inputs.bindings);
+            if(!parsed){parsed.report_error(error_prefix);err.clear();return false;}
+            limits=parsed.limits();
+        } // actual arena/error/result frees precede the independent inventory lease
+
+        uint64_t host_bytes=0;
+        if(!native_inventory_host_bound(limits,host_bytes,err))return false;
+        WindowResources charge;
+        charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+        charge.host_bytes=host_bytes;
+        auto reservation=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+        if(!reservation) {err="verified input quota cannot admit native tensor inventory";return false;}
+        return loader.enable_inventory_capture(limits,std::move(reservation.lease),
+            verified_inputs.bindings,err);
+        } catch(const std::bad_alloc&) {
+            // Keep refusal diagnostic allocation-free when host allocation failed.
+            err.clear();
+            std::fprintf(stderr,"strata generate: native inventory admission allocation failed\n");
+            return false;
+        }
+    };
+#endif
     if (!o.native_dense_gguf.empty()) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(!admit_native_inventory(native_dense,wt,"strata generate: native inventory: ")) {
+            if(!err.empty())std::fprintf(stderr,"strata generate: native inventory: %s\n",err.c_str());
+            return 1;
+        }
+#endif
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
@@ -5348,7 +8308,7 @@ int main(int argc, char** argv) {
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
-    if (o.vision) {
+    if (o.vision&&!owned_batch_requested) {
         const int64_t cells = o.max_context + 64;
         mrope_host.resize((size_t) cells * 3);
         for (int64_t c = 0; c < cells; ++c)
@@ -5378,7 +8338,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    strata::core::SessionState ss;
+    DriverModelObject<strata::core::SessionState> session_storage(o.owned_session_lifetime);
+    strata::core::SessionState& ss=session_storage.get();
     void* sbuf = nullptr;   // allocated after the layer-split search, sized to CUDA0's own layer range (the carve)
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
     // calls - `session_capture`, `session_replay`, `session_token` and `session_loop` - were handed `nullptr`,
@@ -5387,8 +8348,13 @@ int main(int argc, char** argv) {
     // on 10,240 floats being indistinguishable, which is a fixed per-launch cost and not execution.
     // `bench/micro/graph_node_cost.cu` measures the same kernels on a real stream at 3.63 us ungrapped and
     // 0.805 us inside a graph.  **That is an ~8x penalty on every launch in the engine.**
-    cudaStream_t main_stream = nullptr;
-    if (cudaStreamCreateWithFlags(&main_stream, cudaStreamNonBlocking) != cudaSuccess) {
+    cudaStream_t baseline_main_stream = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& main_stream=owned_runtime?owned_runtime->main_stream:baseline_main_stream;
+#else
+    auto& main_stream=baseline_main_stream;
+#endif
+    if (!create_driver_stream(primary_device,cudaStreamNonBlocking,main_stream)) {
         std::fprintf(stderr, "strata generate: cannot create the main stream\n");
         return 1;
     }
@@ -5418,12 +8384,17 @@ int main(int argc, char** argv) {
         ss.block.dump = half_stage;
     }
 
-    strata::core::Doorbell db;
-    if (strata::core::doorbell_init(g, K, db) == 0) {
+    strata::core::Doorbell baseline_db;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& db=owned_runtime?owned_runtime->doorbell:baseline_db;
+#else
+    auto& db=baseline_db;
+#endif
+    if (!o.owned_session_lifetime && strata::core::doorbell_init(g, K, db) == 0) {
         std::fprintf(stderr, "strata generate: doorbell_init failed\n");
         return 1;
     }
-    ss.db = &db;
+    if(!o.owned_session_lifetime)ss.db = &db;
 
     // ================================ THE PLE ================================
     //
@@ -5431,7 +8402,13 @@ int main(int argc, char** argv) {
     // module was built and parity-tested, and nothing called it.  Everything below is construction - the table
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
-    strata::kernels::PleTable ple_table;
+    std::shared_ptr<strata::kernels::PleTable> owned_ple_table;
+    strata::kernels::PleTable baseline_ple_table;
+    if(o.owned_session_lifetime)owned_ple_table=std::make_shared<strata::kernels::PleTable>();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(owned_runtime)owned_runtime->ple_table_owner=owned_ple_table;
+#endif
+    strata::kernels::PleTable& ple_table=owned_ple_table?*owned_ple_table:baseline_ple_table;
     bool ple_lock_by_policy = false;   // the table was locked in RAM by the residency policy (not by --ple-io ram): #4518 may give the lock back
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
@@ -5575,6 +8552,21 @@ int main(int argc, char** argv) {
                                  "(STRATA_SSD_KEEPALIVE=0 turns it off)\n", pio.keepalive_ms, pio.keepalive_window_s);
         else if (pio.mode == strata::kernels::PleIo::Direct)
             std::fprintf(stderr, "strata generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(o.verified_inputs_active) {
+            strata::kernels::PleResolvedTable resolved;
+            if(!owned_runtime || !verified_inputs.bindings || !verified_inputs.bindings->ple ||
+               verified_inputs.bindings->ple.loader_path()!=o.ple_gguf ||
+               !ple_table.resolved_table(resolved) || !std::isfinite(resolved.scale) || resolved.scale<=0 ||
+               !resolved.rows || !resolved.row_bytes || !resolved.source_bytes ||
+               resolved.source_offset>verified_inputs.bindings->ple.size() ||
+               resolved.source_bytes>verified_inputs.bindings->ple.size()-resolved.source_offset) {
+                std::fprintf(stderr,"strata generate: resolved PLE table lacks valid verified source/scale\n");return 1;
+            }
+            owned_runtime->ple_table_metadata=resolved;
+            owned_runtime->ple_table_metadata_valid=true;
+        }
+#endif
         const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
         const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
         const strata::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
@@ -5586,14 +8578,16 @@ int main(int argc, char** argv) {
                                  "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
             return 1;
         }
+        strata::core::PleRun validated_ple;
+        auto& ple_binding=o.owned_session_lifetime?validated_ple:ss.ple;
         // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
         // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
         if (!wk->quantized()) {
             // plan v0.3 P6: the IQ model files' BF16 key (the pack's extra.bin, raw BF16)
-            ss.ple.w.key_bf16 = (const uint16_t*) wk->data;
+            ple_binding.w.key_bf16 = (const uint16_t*) wk->data;
         } else if (wk->data != nullptr) {
-            ss.ple.w.key_codes = (const uint8_t*) wk->data;
-            ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
+            ple_binding.w.key_codes = (const uint8_t*) wk->data;
+            ple_binding.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
         }
         if (o.native_ple_key && wk->quantized()) {
             if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
@@ -5601,14 +8595,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
                 return 1;
             }
-            ss.ple.w.key_native_data = wk->native_data;
-            ss.ple.w.key_native_type = wk->native_type;
-            ss.ple.w.key_native_q8_1 = wk->native_q8_1;
+            ple_binding.w.key_native_data = wk->native_data;
+            ple_binding.w.key_native_type = wk->native_type;
+            ple_binding.w.key_native_q8_1 = wk->native_q8_1;
         }
-        ss.ple.w.value_bf16 = (const uint16_t*) wv->data;
-        ss.ple.w.norm_key = (const float*) wnk->data;
-        ss.ple.w.norm_query = (const float*) wnq->data;
-        ss.ple.w.norm_conv = (const float*) wnc->data;
+        ple_binding.w.value_bf16 = (const uint16_t*) wv->data;
+        ple_binding.w.norm_key = (const float*) wnk->data;
+        ple_binding.w.norm_query = (const float*) wnq->data;
+        ple_binding.w.norm_conv = (const float*) wnc->data;
         // The conv1d kernel reads F16, so this cast is a claim about the pack's storage.  A checkpoint that keeps
         // the tensor F32 (Q8_0, UD-Q4_K_XL) would hand the kernel the low halves of the f32 words - not an error,
         // a plausible wrong layer-1 routing.  tools/iq_pack.py narrows it (index kind 3); a pack that did not is
@@ -5623,8 +8617,8 @@ int main(int argc, char** argv) {
                          (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
             return 1;
         }
-        ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
-        ss.ple.consts = ple_consts_run;
+        ple_binding.w.conv1d_f16 = (const uint16_t*) wc->data;
+        ple_binding.consts = ple_consts_run;
         for (int h = 0; h < strata::kernels::PLE_N_HEADS; ++h) {   // the hash may only reach rows the table has
             if (ple_consts_run.offset[h] + ple_consts_run.vocab[h] > ple_table.rows()) {
                 std::fprintf(stderr, "strata generate: PLE head %d reaches row %llu but the table has %llu rows (the model file's hash constants do not fit its PLE table)\n",
@@ -5633,43 +8627,136 @@ int main(int argc, char** argv) {
             }
         }
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
-        ss.ple.table = &ple_table;
-        ss.ple.token = &ss.ple_token;
-        ss.ple.prev = ss.ple_prev;
-        // `ss.ple.hist` and the ready() check wait for `session_init`, which carves the history - the session is
+        ple_binding.table = &ple_table;
+        ple_binding.token = &ss.ple_token;
+        ple_binding.prev = ss.ple_prev;
+        // `ple_binding.hist` and the ready() check wait for `session_init`, which carves the history - the session is
         // now allocated after the layer-split search (see the carve), and the wiring lands there
-        ss.ple.emb_host = ple_emb_host.data();
-        if (cudaMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
-            cudaMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
-            std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
-            return 1;
+        ple_binding.emb_host = ple_emb_host.data();
+        if(!o.owned_session_lifetime) {
+            if (cudaMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
+                cudaMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
+                return 1;
+            }
+            ple_binding.emb_dev = ple_emb_dev;
+            ple_binding.scratch = ple_scratch;
         }
-        ss.ple.emb_dev = ple_emb_dev;
-        ss.ple.scratch = ple_scratch;
     } else {
         std::fprintf(stderr,
                      "strata generate: PLE OFF by explicit --no-ple diagnostic request.\n"
                      "  The tokens below are NOT this model's; this is only useful for A/B measurement.\n");
     }
 
-    float* d_parts = nullptr;
-    if (cudaMalloc(&d_parts, (size_t) K * g.n_embd * 4) != cudaSuccess ||
-        cudaMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != cudaSuccess) {
+    float* baseline_d_parts = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& d_parts=owned_runtime?owned_runtime->parts:baseline_d_parts;
+#else
+    auto& d_parts=baseline_d_parts;
+#endif
+    if (!o.owned_session_lifetime && (cudaMalloc(&d_parts, (size_t) K * g.n_embd * 4) != cudaSuccess ||
+        cudaMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != cudaSuccess)) {
         std::fprintf(stderr, "strata generate: the parts buffer failed\n");
         return 1;
     }
+
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto admit_expert_profile=[&](std::shared_ptr<strata::core::ExpertProfileCapture>& result) -> bool {
+        if(!o.verified_inputs_active)return true;
+        if(o.expert_profile.empty()) {
+            try {
+                using namespace strata::core;
+                if(!verified_inputs.budget || !verified_inputs.bindings ||
+                   !verified_inputs.bindings->confirms_expert_profile_disabled()) {
+                    std::fprintf(stderr,"strata generate: absent profile lacks verified disabled binding\n");return false;
+                }
+                WindowResources charge;
+                charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+                charge.host_bytes=expert_profile_disabled_host_bound();
+                auto admitted=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+                if(!admitted){std::fprintf(stderr,"strata generate: disabled profile metadata quota refused\n");return false;}
+                std::unique_ptr<ExpertProfileCapture> capture;
+                if(!ExpertProfileCapture::create_disabled(g.n_layers,g.n_expert,std::move(admitted.lease),
+                    verified_inputs.bindings,capture,err)) {
+                    std::fprintf(stderr,"strata generate: disabled profile capture: %s\n",err.c_str());return false;
+                }
+                result=std::move(capture);
+                return true;
+            } catch(const std::bad_alloc&) {
+                std::fprintf(stderr,"strata generate: disabled profile admission allocation failed\n");return false;
+            }
+        }
+#if defined(_WIN32)
+        std::fprintf(stderr,"strata generate: verified profile descriptor capture unsupported on Windows\n");return false;
+#else
+        try {
+            using namespace strata::core;
+            if(!verified_inputs.budget || !verified_inputs.bindings ||
+               verified_inputs.bindings->expert_profile_disabled ||
+               !verified_inputs.bindings->expert_profile ||
+               verified_inputs.bindings->expert_profile.loader_path()!=o.expert_profile) {
+                std::fprintf(stderr,"strata generate: profile capture requires verified profile binding\n");return false;
+            }
+            const auto& input=verified_inputs.bindings->expert_profile;
+            struct stat st{};
+            if(::fstat(input.readonly_fd(),&st)!=0 || st.st_size<0 ||
+               uint64_t(st.st_size)!=input.size()) {
+                std::fprintf(stderr,"strata generate: verified profile descriptor identity unavailable\n");return false;
+            }
+            // Bound from the verified file extent, not a second payload read.
+            const ExpertProfileLimits limits{std::max<uint64_t>(1,std::min<uint64_t>(1ull<<24,input.size()/4)),4096};
+            uint64_t host_bytes=0;
+            if(!expert_profile_inventory_host_bound(limits,host_bytes,err)) {
+                std::fprintf(stderr,"strata generate: profile admission: %s\n",err.c_str());return false;
+            }
+            WindowResources charge;
+            charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+            charge.host_bytes=host_bytes;
+            auto reservation=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+            if(!reservation) {std::fprintf(stderr,"strata generate: profile metadata quota refused\n");return false;}
+            ExpertProfileClaims claims{o.expert_profile,uint64_t(st.st_dev),uint64_t(st.st_ino),input.size()};
+            std::unique_ptr<ExpertProfileCapture> capture;
+            if(!ExpertProfileCapture::create(limits,std::move(reservation.lease),verified_inputs.bindings,claims,capture,err)) {
+                std::fprintf(stderr,"strata generate: profile capture: %s\n",err.c_str());return false;
+            }
+            result=std::move(capture);
+        } catch(const std::bad_alloc&) {
+            std::fprintf(stderr,"strata generate: profile admission allocation failed\n");return false;
+        }
+#endif
+        return true;
+    };
+#endif
 
     // ---- --split-skip-if-fits: before any later stage loads, does CUDA0 alone hold every profiled pair?  What it
     // still has to allocate on one GPU is the whole session (the KV of every layer), the drafter and the head
     // (kDrafterMib below), the verify windows and the reserve; the prompt path borrows from the cache.  If the
     // profile's pairs fit in what is left, a split would only add the hand-offs: run on CUDA0 alone.
     if (multi_gpu && split_auto && o.split_skip_if_fits) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        // Declared before parser output: reservation retires after its vector.
+        std::shared_ptr<strata::core::ExpertProfileCapture> sizing_profile_capture;
+#endif
         std::vector<std::pair<int32_t, int32_t>> prof;
         int64_t pslots = 0;
         std::string perr;
         const bool remote = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        // Independent short-lived admission for the sizing read. The final
+        // effective ranking below is captured separately and retained by owners.
+        if(!remote && !admit_expert_profile(sizing_profile_capture))return 1;
+#endif
         if (remote || o.expert_profile.empty() ||
-            !strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, prof, pslots, perr)) {
+            !strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, prof, pslots, perr
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                ,sizing_profile_capture.get()
+#endif
+            )) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(sizing_profile_capture) {
+                std::fprintf(stderr,"strata generate: verified profile sizing read failed: %s\n",perr.c_str());return 1;
+            }
+#endif
             std::fprintf(stderr, "strata generate: --split-skip-if-fits: %s; the split stays\n",
                          remote ? "remote expert caches are in use" : perr.empty() ? "no expert profile" : perr.c_str());
         } else {
@@ -5834,7 +8921,12 @@ int main(int argc, char** argv) {
     }
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
-    std::vector<std::unique_ptr<GpuStage>> stages;
+    std::vector<std::unique_ptr<GpuStage>> baseline_stages;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& stages=owned_runtime?owned_runtime->stages:baseline_stages;
+#else
+    auto& stages=baseline_stages;
+#endif
     // One stage's dense weights on its device (the caller has made it current): `trim` = only layers [lb, le).
     auto load_stage_weights = [&](GpuStage& st, int64_t lb, int64_t le, bool trim) -> bool {
         std::set<std::string> skip_s = skip_base;
@@ -5851,8 +8943,16 @@ int main(int argc, char** argv) {
         } else {
             skip_s = skip;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(!admit_canonical_inventory(st.wt)) {
+            std::fprintf(stderr,"strata generate: stage canonical inventory: %s\n",err.c_str());return false;
+        }
+#endif
         void* arena_s = nullptr;
-        if (cudaMalloc(&arena_s, pool_s) != cudaSuccess ||
+        const auto arena_status=cudaMalloc(&arena_s,pool_s);
+        st.weight_arena=arena_s;
+        st.weight_arena_bytes=arena_s?pool_s:0;
+        if (arena_status != cudaSuccess ||
             !st.wt.load(o.pack, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s)) {
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // #486: what that card had free
@@ -5871,16 +8971,25 @@ int main(int argc, char** argv) {
             }
             return false;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(!o.native_dense_gguf.empty() && !admit_native_inventory(st.dense,st.wt,"strata generate: stage native inventory: ")) {
+            if(!err.empty())std::fprintf(stderr,"strata generate: stage native inventory: %s\n",err.c_str());
+            return false;
+        }
+#endif
         if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
             return false;
         }
+        st.weight_arena=arena_s;
+        st.weight_arena_bytes=pool_s;
         return true;
     };
     for (size_t i = 0; multi_gpu && i < split_devs.size(); ++i) {
-        stages.push_back(std::make_unique<GpuStage>());
+        stages.push_back(std::make_unique<GpuStage>(o.owned_model_lifetime,o.owned_session_lifetime));
         GpuStage& st = *stages.back();
+        if(!configure_retirement(st.ver)||!configure_retirement(st.ver_b)||!configure_retirement(st.sp))return 1;
         st.dev = split_devs[i];
         double free_gib = 0;
         if (!strata::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
@@ -5898,9 +9007,9 @@ int main(int argc, char** argv) {
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its
         // LAYER RANGE (the carve - every stage used to hold all 48 layers' state whatever it ran), so the
         // sessions are allocated after the search below has set `st.lb`/`st.le`; the last stage's head follows.
-        if (cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaStreamCreateWithFlags(&st.adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaEventCreateWithFlags(&st.adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
+        if (!create_driver_stream(st.dev,cudaStreamNonBlocking,st.stream) ||
+            !create_driver_stream(st.dev,cudaStreamNonBlocking,st.adapt_stream) ||
+            !create_driver_event(st.dev,cudaEventDisableTiming,st.adapt_ev)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: its streams failed\n", st.dev);
             return 1;
         }
@@ -5911,7 +9020,7 @@ int main(int argc, char** argv) {
         }
         // --vision: this device's image-position table (the identity until a picture request), read by every rope
         // kernel its stage runs - set before any of its graphs is captured
-        if (o.vision) {
+        if (o.vision&&!owned_batch_requested) {
             if (cudaMalloc(&st.mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
                 cudaMemcpy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
@@ -5957,13 +9066,79 @@ int main(int argc, char** argv) {
         return e != nullptr && std::string(e) == "first";
     }();
 
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    std::shared_ptr<strata::core::ExpertProfileCapture> expert_profile_capture;
+    if(!admit_expert_profile(expert_profile_capture))return 1;
+#endif
     std::vector<std::pair<int32_t, int32_t>> profile;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto admit_effective_expert_policy=[&]() -> bool {
+        if(!o.verified_inputs_active)return true;
+        try {
+            using namespace strata::core;
+            if(!owned_runtime || !expert_profile_capture || !expert_profile_capture->completed_inventory() ||
+               !verified_inputs.budget || stages.size()>7 || g.n_layers<=0 || g.n_expert<=0 ||
+               g.n_layers>1024 || g.n_expert>65536 || profile.size()>(1ull<<24)) {
+                std::fprintf(stderr,"strata generate: effective expert policy admission bounds refused\n");return false;
+            }
+            const uint64_t pairs=profile.size(),geometry=uint64_t(g.n_layers)*uint64_t(g.n_expert);
+            std::array<ExpertPolicyTierIdentity,16> tiers{};
+            size_t tier_count=0;
+            tiers[tier_count++]={0,ExpertPolicyTierKind::primary};
+            for(size_t i=0;i<stages.size();++i)tiers[tier_count++]={i+1,ExpertPolicyTierKind::stage};
+            if(o.peer_device>=1)tiers[tier_count++]={256,ExpertPolicyTierKind::peer};
+            for(size_t i=0;i<3;++i)if(o.expert_cache_remote[i]>0)tiers[tier_count++]={512+i,ExpertPolicyTierKind::remote};
+            const ExpertPolicyLimits limits{tier_count,2*tier_count+2,
+                std::max<uint64_t>(1,pairs*(tier_count+2)+3*geometry),
+                std::max<uint64_t>(1,pairs*tier_count+3*geometry),
+                std::max<uint64_t>(1,geometry*tier_count)};
+            uint64_t receipt_bytes=0;
+            if(!expert_policy_inventory_host_bound(limits,receipt_bytes,err)) {
+                std::fprintf(stderr,"strata generate: effective policy bounds: %s\n",err.c_str());return false;
+            }
+            WindowResources charge;
+            charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+            charge.host_bytes=receipt_bytes;
+            auto receipt=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+            // Separate actual ranking-transform workspace: original/current
+            // orders, parallel ordinal buffers, stage copies and remote maps.
+            // Rank and partition pair+ordinal vectors may coexist at
+            // geometric capacities; include their simultaneous growth and
+            // seen/assigned/claimed bitmaps. Pending decisions are separate.
+            charge.host_bytes=65536+pairs*192+geometry*96;
+            auto workspace=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+            if(!receipt || !workspace) {
+                std::fprintf(stderr,"strata generate: effective policy metadata quota refused\n");return false;
+            }
+            std::unique_ptr<ExpertPolicyCapture> capture;
+            if(!ExpertPolicyCapture::create(limits,std::move(receipt.lease),expert_profile_capture,capture,err) ||
+               !capture->declare_tiers(tiers.data(),tier_count)) {
+                std::fprintf(stderr,"strata generate: effective policy capture refused\n");return false;
+            }
+            owned_runtime->expert_policy_workspace=std::move(workspace.lease);
+            owned_runtime->expert_policy=std::move(capture);
+            owned_runtime->profile_ordinals.resize(profile.size());
+            for(size_t i=0;i<profile.size();++i)owned_runtime->profile_ordinals[i]=i;
+            owned_runtime->stage_profile_ordinals.resize(stages.size()+1);
+        } catch(const std::bad_alloc&) {
+            std::fprintf(stderr,"strata generate: effective policy admission allocation failed\n");return false;
+        }
+        return true;
+    };
+#endif
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
-        if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
+        if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            ,expert_profile_capture.get()
+#endif
+        )) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(!admit_effective_expert_policy())return 1;
+#endif
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
         // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
         // every pair (issue #46: a card that holds more than the old 8,000 used to stop there), so it means auto.
@@ -5980,9 +9155,16 @@ int main(int argc, char** argv) {
             const size_t at = std::min(profile.size(), (size_t) (pa ? std::atoll(pa) : 8700));
             if (f > 0.0 && f < 1.0 && at > 0) {
                 std::vector<std::pair<int32_t, int32_t>> keep, moved;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                std::vector<uint64_t> keep_ordinals,moved_ordinals;
+#endif
                 for (size_t r = 0; r < at; ++r) {
                     const bool to_peer = (int64_t) ((double) (r + 1) * f) > (int64_t) ((double) r * f);
                     (to_peer ? moved : keep).push_back(profile[r]);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    if(owned_runtime && owned_runtime->expert_policy)
+                        (to_peer?moved_ordinals:keep_ordinals).push_back(owned_runtime->profile_ordinals[r]);
+#endif
                 }
                 const size_t n_moved = moved.size();
                 // the primary's share continues with the ranks after `at` until it is full; then the moved ones
@@ -5993,14 +9175,35 @@ int main(int argc, char** argv) {
                 out.insert(out.end(), profile.begin() + (long) at, profile.begin() + (long) fill);
                 out.insert(out.end(), moved.begin(), moved.end());
                 out.insert(out.end(), profile.begin() + (long) fill, profile.end());
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(owned_runtime && owned_runtime->expert_policy) {
+                    auto& original=owned_runtime->profile_ordinals;
+                    std::vector<uint64_t> order;order.reserve(original.size());
+                    order.insert(order.end(),keep_ordinals.begin(),keep_ordinals.end());
+                    order.insert(order.end(),original.begin()+at,original.begin()+fill);
+                    order.insert(order.end(),moved_ordinals.begin(),moved_ordinals.end());
+                    order.insert(order.end(),original.begin()+fill,original.end());
+                    original.swap(order);
+                }
+#endif
                 profile.swap(out);
                 std::fprintf(stderr, "strata generate: STRATA_PEER_HOT %.2f: %zu of the first %zu ranked pairs moved "
                                      "behind rank %zu (the peer's)\n", f, n_moved, at, fill);
             }
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(owned_runtime && owned_runtime->expert_policy &&
+           !owned_runtime->expert_policy->record_transform(strata::core::ExpertPolicyTransformKind::peer_order,0,
+               owned_runtime->profile_ordinals.data(),owned_runtime->profile_ordinals.size())) {
+            std::fprintf(stderr,"strata generate: peer ranking observation refused\n");return 1;
+        }
+#endif
         std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
     }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.expert_profile.empty() && !admit_effective_expert_policy())return 1;
+#endif
     // #477: the whole ranking as loaded, the prior of --expert-profile-save's order (a layer split keeps only
     // CUDA0's pairs in `profile` below).  Empty without --expert-profile-save.
     std::vector<std::pair<int32_t, int32_t>> profile_loaded;
@@ -6724,9 +9927,14 @@ int main(int argc, char** argv) {
     if (multi_gpu) {
         profile_all = profile;
         std::vector<std::pair<int32_t, int32_t>> mine;
-        for (const auto& pr : profile) {
+        for (size_t rank=0;rank<profile.size();++rank) {
+            const auto& pr=profile[rank];
             const int st = stage_of(pr.first);
             (st == 0 ? mine : stages[(size_t) st - 1]->profile).push_back(pr);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_runtime && owned_runtime->expert_policy)
+                owned_runtime->stage_profile_ordinals[size_t(st)].push_back(owned_runtime->profile_ordinals[rank]);
+#endif
         }
         profile.swap(mine);
         for (size_t i = 0; i < stages.size(); ++i) {
@@ -6734,6 +9942,19 @@ int main(int argc, char** argv) {
             stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
         }
     }
+
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(owned_runtime && owned_runtime->expert_policy) {
+        if(!multi_gpu)owned_runtime->stage_profile_ordinals[0]=owned_runtime->profile_ordinals;
+        for(size_t i=0;i<owned_runtime->stage_profile_ordinals.size();++i) {
+            const auto& order=owned_runtime->stage_profile_ordinals[i];
+            if(!owned_runtime->expert_policy->record_transform(strata::core::ExpertPolicyTransformKind::stage_partition,
+                i,order.data(),order.size())) {
+                std::fprintf(stderr,"strata generate: stage ranking observation refused\n");return 1;
+            }
+        }
+    }
+#endif
 
     // ---- `--layer-split auto` with the trim asked: THE STAGES' WEIGHTS, NOW THAT THE SPLIT IS KNOWN.  Each later card
     // loads the dense weights of the layers it runs and nothing else (before this they loaded in the loop above, a
@@ -6788,6 +10009,59 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(o.owned_session_lifetime) {
+            using namespace strata::core;
+            if(qsa_kv_elastic() || split_same || (multi_gpu && split_at[0]<=1)) {
+                std::fprintf(stderr,"strata generate: private session factory requires fixed KV and distinct-device stages with PLE on the primary stage\n");
+                return 2;
+            }
+            std::vector<NativeSessionRequest> requests{{primary_device,0,multi_gpu?split_at[0]:g.n_layers,
+                !o.ple_gguf.empty(),!o.ple_gguf.empty()&&o.native_ple_key&&wt.find("blk.1.ple_key.weight")->quantized()}};
+            size_t devices=size_t(primary_device)+1;
+            for(const auto& st:stages) {
+                requests.push_back({st->dev,st->lb,st->le,false,false});
+                devices=std::max(devices,size_t(st->dev)+1);
+            }
+            WindowResources capacity{std::vector<uint64_t>(devices),0,0,0,2*strata::kernels::PLE_N_HEADS,2};
+            // Native allocation prices one shadow per complete gang. The explicit
+            // future two-slot shape adds both slot gangs to today's main+private allowance.
+            if(o.batch==2){const char* slots=std::getenv("STRATA_OWNED_BATCH_ALLOCATION");
+                if(slots && std::strcmp(slots,"1")==0)
+                    { // main + two owned slots + at most two private repair gangs
+                        capacity.shadows=1+2*strata::program::OwnedBatchSlotSessions::capacity;
+                        capacity.io_slots=capacity.shadows*strata::kernels::PLE_N_HEADS;
+                    }
+            }
+            WindowResources baseline{std::vector<uint64_t>(devices),0,0,0,0,0};
+            for(const auto& request:requests) {
+                WindowDeviceScope device(request.device);size_t available=0,total=0;
+                if(!device.ok()||cudaMemGetInfo(&available,&total)!=cudaSuccess||available>total||!device.finish()) {
+                    std::fprintf(stderr,"strata generate: private session device telemetry unavailable\n");return 1;
+                }
+                capacity.device_bytes[size_t(request.device)]=total;
+                baseline.device_bytes[size_t(request.device)]=total-available;
+            }
+            const auto host=sample_host_memory();
+            if(!host||host->available>host->limit) {std::fprintf(stderr,"strata generate: private session host telemetry unavailable\n");return 1;}
+            // Full private input host quota is unavailable to model/session
+            // admission. Observed snapshot RSS is NOT credited back: deliberate
+            // conservative double count, not exact cross-ledger accounting.
+            if(o.verified_input_host_bytes>host->available) {
+                std::fprintf(stderr,"strata generate: verified input carveout exceeds session host headroom\n");return 1;
+            }
+            capacity.host_bytes=capacity.pinned_bytes=host->limit-o.verified_input_host_bytes;
+            baseline.host_bytes=baseline.pinned_bytes=host->limit-host->available;
+            model_budget=std::make_unique<WindowBudget>(capacity,baseline);
+            std::vector<std::unique_ptr<SessionState>> fresh;fresh.reserve(requests.size());
+            fresh.push_back(std::move(session_storage.owned));
+            for(auto& st:stages)fresh.push_back(std::move(st->session.owned));
+            if(!owned_runtime->initialize_sessions(g,o.max_context,K,requests,fresh,*model_budget,err)) {
+                std::fprintf(stderr,"strata generate: private runtime construction: %s\n",err.c_str());return 1;
+            }
+        } else
+#endif
+        {
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
@@ -6795,6 +10069,7 @@ int main(int argc, char** argv) {
         if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
+        }
         }
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
@@ -6805,12 +10080,12 @@ int main(int argc, char** argv) {
         ss.ple.hist = ss.ple_hist;
         // (#167) generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt
         // path or the verifier reads it (--serve zeroes it per request when nothing is reused)
-        strata::core::session_zero(ss, g, nullptr, main_cs);
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if(!o.owned_session_lifetime)strata::core::session_zero(ss, g, nullptr, main_cs);
+        if (!o.owned_session_lifetime && cudaDeviceSynchronize() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
             return 1;
         }
-        if (!o.ple_gguf.empty()) {
+        if (!o.ple_gguf.empty() && !o.owned_session_lifetime) {
             if (!ss.ple.ready()) {
                 std::fprintf(stderr, "strata generate: the PLE run is not ready after construction\n");
                 return 1;
@@ -6824,13 +10099,18 @@ int main(int argc, char** argv) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
         void* sbuf_s = nullptr;
-        if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
-            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
+        if (!o.owned_session_lifetime && (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
+            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
         const bool last = i + 1 == stages.size();
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(wo_s && last && !o.native_head_gguf.empty() && !admit_head_embed_inventory(st.head,true)) {
+            std::fprintf(stderr,"strata generate: stage head inventory: %s\n",err.c_str());return 1;
+        }
+#endif
         if (wo_s == nullptr ||
             (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s%s\n", st.dev,
@@ -7008,6 +10288,49 @@ int main(int argc, char** argv) {
                              "one group\n", o.batch_groups, o.batch);
         o.batch_groups = 1;
     }
+    // Allocation-only future dependency. Existing owned-session and native-serial
+    // admission still reject batching; this selector does not open those gates.
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    const char* owned_batch_selector=std::getenv("STRATA_OWNED_BATCH_ALLOCATION");
+    const bool owned_batch_allocation=o.owned_session_lifetime && o.batch>0 &&
+        owned_batch_selector && std::strcmp(owned_batch_selector,"1")==0;
+    if(o.owned_session_lifetime && o.batch>0 && !owned_batch_allocation){
+        std::fputs("owned batch allocations need explicit dependency selector; execution remains unsupported\n",stderr);return 2;
+    }
+    if(owned_batch_allocation){
+        if(o.batch!=2 || !owned_runtime || !model_budget){
+            std::fputs("owned batch allocation dependency requires two slots and the genuine owned runtime/budget\n",stderr);return 2;
+        }
+        std::vector<strata::core::NativeSessionRequest> slot_requests;
+        for(const auto& stage:owned_runtime->sessions.stages()){
+            if(!stage.session){std::fputs("owned batch main stage is absent\n",stderr);return 1;}
+            const bool ple_stage=!o.ple_gguf.empty()&&stage.session->layer_lo<=1&&1<stage.session->layer_hi;
+            const auto* key=wt.find("blk.1.ple_key.weight");
+            slot_requests.push_back({stage.device,stage.session->layer_lo,stage.session->layer_hi,ple_stage,
+                ple_stage&&o.native_ple_key&&key&&key->quantized()});
+        }
+        if(!owned_runtime->batch_slot_sessions.initialize(g,o.max_context,K,slot_requests,*model_budget,err)){
+            std::fprintf(stderr,"owned batch stage allocation refused: %s\n",err.c_str());return 1;
+        }
+        std::array<const strata::core::NativeSessionAllocation*,2> slot_allocations{};
+        std::array<strata::core::NativeBatchSlotToken,2> slot_tokens{};
+        for(size_t slot=0;slot<slot_allocations.size();++slot){
+            const auto token=owned_runtime->batch_slot_sessions.handle(slot);
+            slot_allocations[slot]=owned_runtime->batch_slot_sessions.allocation(token);
+            slot_tokens[slot]={token.incarnation,token.generation,token.slot};
+        }
+        strata::core::WindowResources metadata;
+        metadata.device_bytes.resize(model_budget->snapshot().capacity.device_bytes.size());
+        metadata.host_bytes=strata::core::NativeBatchSlotBindings::metadata_bytes();
+        auto binding_credit=model_budget->reserve(metadata,strata::core::ReservationPurpose::foreground);
+        if(!binding_credit){std::fputs("owned batch binding metadata admission refused\n",stderr);return 1;}
+        owned_runtime->batch_slot_bindings=strata::core::NativeBatchSlotBindings::create(slot_allocations,slot_tokens,
+            owned_runtime->geometry_owner,std::move(binding_credit.lease),err);
+        if(!owned_runtime->batch_slot_bindings){std::fprintf(stderr,"owned batch binding refused: %s\n",err.c_str());return 1;}
+        std::fprintf(stderr,"owned batch allocation dependency: two distinct slot gangs, %zu stages; execution admission remains closed\n",
+            owned_runtime->batch_slot_sessions.stage_count());
+    }else
+#endif
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
         int fit = o.batch;   // the slots every stage could carve
@@ -7065,6 +10388,25 @@ int main(int argc, char** argv) {
                          (double) bytes0 * o.batch / 1073741824.0);
         }
     }
+
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    std::array<strata::program::OwnedBatchSlotHandle,strata::program::OwnedBatchSlotSessions::capacity> batch_slot_handles{};
+    if(owned_batch_allocation)for(size_t slot=0;slot<batch_slot_handles.size();++slot)
+        batch_slot_handles[slot]=owned_runtime->batch_slot_sessions.handle(slot);
+#endif
+    auto batch_slot_stage_count=[&]() -> size_t {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(owned_batch_allocation)return owned_runtime->batch_slot_sessions.stage_count();
+#endif
+        return bslot_ss.size();
+    };
+    auto batch_slot_session=[&](size_t stage,size_t slot) -> strata::core::SessionState* {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(owned_batch_allocation)return owned_runtime->batch_slot_sessions.session(stage,
+            batch_slot_handles.at(slot));
+#endif
+        return bslot_ss.at(stage).at(slot).get();
+    };
 
     // STRATA_PIPED_MTP is decided again now that the slots that fit and the groups are final.  Recommend, never force: when
     // it cannot run it is said and left off, and --batch-mtp goes on as it would without it.
@@ -7308,14 +10650,14 @@ int main(int argc, char** argv) {
                 // pipeline goes on while it runs: the chain graphs carry the forcing kernel (a no-op here)
                 if (piped_mtp) d->set_force_capture(true);
                 // (mtp_first: the solo drafter is on the first stage's card, so slot b's is carved from its first-stage session)
-                strata::core::SessionState& slot_s = mtp_first ? *bslot_ss[0][(size_t) b] : *bslot_ss.back()[(size_t) b];
+                strata::core::SessionState& slot_s = mtp_first ? *batch_slot_session(0,(size_t)b) : *batch_slot_session(batch_slot_stage_count()-1,(size_t)b);
                 if (!d->load(o.mtp, draft_geometry, slot_s, o.spec, err, o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
                 }
                 d->set_max_drafts(piped_mtp ? pm_drafts : 1);   // the serial windows verify one proposal per slot
-                d->set_ple_session(bslot_ss[0][(size_t) b].get());
+                d->set_ple_session(batch_slot_session(0,(size_t)b));
                 slot_mtp.push_back(std::move(d));
             }
             if (!slot_mtp.empty()) {
@@ -7337,9 +10679,15 @@ int main(int argc, char** argv) {
     const strata::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
-    strata::core::NativeHead native_head;
+    DriverModelObject<strata::core::NativeHead> head_storage(o.owned_model_lifetime);
+    auto& native_head=head_storage.get();
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(!admit_head_embed_inventory(native_head,true)) {
+            std::fprintf(stderr,"strata generate: head inventory: %s\n",err.c_str());return 1;
+        }
+#endif
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s%s%s\n", err.c_str(), vram_free_note().c_str(), vram_batch_hint(err, o.batch).c_str());
             return 1;
@@ -7380,8 +10728,19 @@ int main(int argc, char** argv) {
         }
         return bytes;
     };
-    float* d_logits = nullptr;
-    if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
+    float* baseline_d_logits = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& d_logits=owned_runtime?owned_runtime->logits:baseline_d_logits;
+#else
+    auto& d_logits=baseline_d_logits;
+#endif
+    bool d_logits_allocated=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.owned_session_lifetime) d_logits_allocated=allocate_scratch(primary_device,(size_t) n_vocab * 4,reinterpret_cast<void**>(&d_logits));
+    else
+#endif
+    d_logits_allocated=cudaMalloc(&d_logits, (size_t) n_vocab * 4)==cudaSuccess;
+    if (!d_logits_allocated) {
         (void) cudaGetLastError();
         std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
         return 1;
@@ -7411,6 +10770,145 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --prefill-head-alias: the %llu-byte output head is prompt workspace\n",
                      (unsigned long long) native_head.weight_bytes());
     }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.owned_model_lifetime) {
+        const auto adopt_loaded_model = [&]() -> bool {
+            using namespace strata::core;
+            struct BorrowedStage {
+                int device;void* arena;uint64_t bytes;
+                DriverModelObject<WeightTable>* weights;
+                DriverModelObject<NativeDense>* native;
+                DriverModelObject<NativeHead>* head;
+            };
+            std::vector<BorrowedStage> inputs{{primary_device,arena,pool_bytes,&weight_storage,&native_storage,&head_storage}};
+            for(auto& st:stages)inputs.push_back({st->dev,st->weight_arena,st->weight_arena_bytes,&st->weights,&st->native,&st->output});
+            size_t devices=0;
+            for(size_t i=0;i<inputs.size();++i) {
+                if(inputs[i].device<0||!inputs[i].arena||!inputs[i].bytes){err="model stage allocation missing";return false;}
+                devices=std::max(devices,size_t(inputs[i].device)+1);
+                for(size_t j=0;j<i;++j)if(inputs[j].device==inputs[i].device){err="checked model gang requires distinct stage devices";return false;}
+            }
+            WindowResources total{std::vector<uint64_t>(devices),0,0,0,0,0};
+            std::vector<WindowResources> charges;
+            const auto add=[&](uint64_t& to,uint64_t amount) {
+                if(amount>UINT64_MAX-to){err="model allocation charge overflow";return false;}to+=amount;return true;
+            };
+            for(const auto& st:inputs) {
+                WindowResources charge{std::vector<uint64_t>(devices),0,0,0,0,0};
+                auto& bytes=charge.device_bytes[size_t(st.device)];
+                if(!add(bytes,st.bytes)||!add(bytes,st.native->get().allocated_bytes())||
+                   !add(bytes,st.weights->get().auxiliary_bytes())||
+                   (st.head->get().loaded()&&!add(bytes,st.head->get().allocated_bytes())))return false;
+                if(st.head->get().loaded()) {
+                    charge.host_bytes=st.head->get().allocated_host_bytes();
+                    charge.pinned_bytes=st.head->get().allocated_pinned_bytes();
+                    // Only actual existing mapped payload is removed from the
+                    // observed baseline. Future fixed spill control is admitted
+                    // in this SAME lease, never credited back as existing RSS.
+                    if(!add(total.host_bytes,charge.host_bytes)||!add(total.pinned_bytes,charge.pinned_bytes)||
+                       !add(charge.host_bytes,strata::core::NativeHead::spill_control_bytes()))return false;
+                }
+                total.device_bytes[size_t(st.device)]=bytes;charges.push_back(std::move(charge));
+            }
+            WindowResources embedding_charge{std::vector<uint64_t>(devices),0,0,0,0,0};
+            if(native_embed.ready_for_adoption()) {
+                const int d=native_embed.device();
+                if(d<0||size_t(d)>=devices){err="embedding device is outside model gang";return false;}
+                embedding_charge.device_bytes[size_t(d)]=native_embed.allocated_device_bytes();
+                embedding_charge.host_bytes=native_embed.allocated_host_bytes();
+                embedding_charge.pinned_bytes=native_embed.allocated_pinned_bytes();
+                if(!add(total.device_bytes[size_t(d)],embedding_charge.device_bytes[size_t(d)]))return false;
+                if(!add(total.host_bytes,embedding_charge.host_bytes)||
+                   !add(total.pinned_bytes,embedding_charge.pinned_bytes))return false;
+            }
+            WindowResources capacity{std::vector<uint64_t>(devices),0,0,0,0,0},baseline=capacity;
+            for(const auto& st:inputs) {
+                WindowDeviceScope device(st.device);size_t free=0,all=0;
+                if(!device.ok()||cudaMemGetInfo(&free,&all)!=cudaSuccess||!device.finish()||free>all||
+                   total.device_bytes[size_t(st.device)]>all-free){err="cannot reconcile model charge with device telemetry";return false;}
+                capacity.device_bytes[size_t(st.device)]=all;
+                baseline.device_bytes[size_t(st.device)]=all-free-total.device_bytes[size_t(st.device)];
+            }
+            const auto host=sample_host_memory();
+            if(!host||host->available>host->limit||total.host_bytes>host->limit-host->available){err="cannot reconcile model charge with host telemetry";return false;}
+            if(o.verified_input_host_bytes>host->available){err="verified input carveout exceeds model host headroom";return false;}
+            capacity.host_bytes=capacity.pinned_bytes=host->limit-o.verified_input_host_bytes;
+            baseline.host_bytes=host->limit-host->available-total.host_bytes;
+            // Conservatively charge unclassified existing host use against the
+            // pinned cap too. This bootstrap is not the later complete allocator
+            // inventory; no window work is admitted through it yet.
+            baseline.pinned_bytes=baseline.host_bytes;
+            if(model_budget) {
+                const auto reserved=model_budget->snapshot().reserved;
+                for(size_t d=0;d<baseline.device_bytes.size();++d) {
+                    if(reserved.device_bytes[d]>baseline.device_bytes[d]){err="reserved sessions exceed observed device use";return false;}
+                    baseline.device_bytes[d]-=reserved.device_bytes[d];
+                }
+                baseline.host_bytes=baseline.host_bytes>reserved.host_bytes?baseline.host_bytes-reserved.host_bytes:0;
+                baseline.pinned_bytes=baseline.host_bytes;
+                if(!model_budget->observe_baseline(baseline)){err="session/model baseline reconciliation refused";return false;}
+            } else model_budget=std::make_unique<WindowBudget>(capacity,baseline);
+            if(expert_layout_capture && !expert_layout_capture->completed_inventory()) {
+                err="expert layout receipt became stale before model adoption";return false;
+            }
+            ModelGangResources gang;gang.input_owner=verified_inputs.bindings;gang.expert_layout_owner=expert_layout_capture;gang.expert_profile_owner=expert_profile_capture;gang.stages.reserve(inputs.size());
+            for(size_t i=0;i<inputs.size();++i) {
+                auto& st=inputs[i];WindowDeviceScope device(st.device);
+                if(!device.ok()){err="cannot select model adoption device";return false;}
+                auto lease=model_budget->reserve(charges[i],ReservationPurpose::foreground);
+                if(!lease){err="model reservation refused";return false;}
+                ModelStageResources r;r.input_owner=verified_inputs.bindings;r.expert_layout_owner=expert_layout_capture;r.expert_profile_owner=expert_profile_capture;
+                r.device=st.device;r.arena=st.arena;r.arena_bytes=st.bytes;
+                r.weights=std::move(st.weights->owned);r.native=std::move(st.native->owned);
+                if(st.head->get().loaded())r.head=std::move(st.head->owned);
+                r.reservation=std::move(lease.lease);
+                std::shared_ptr<const OwnedModelStage> owner;
+                if(!adopt_model_stage(r,owner,err))return false;
+                gang.stages.push_back(std::move(owner));
+                if(!device.finish()){err="model adoption device restoration failed";return false;}
+            }
+            if(native_embed.ready_for_adoption()) {
+                auto lease=model_budget->reserve(embedding_charge,ReservationPurpose::foreground);
+                if(!lease){err="embedding reservation refused";return false;}
+                gang.embedding=std::move(embedding_storage.owned);gang.embedding_reservation=std::move(lease.lease);
+            }
+            return adopt_model_gang(gang,owned_model,err);
+        };
+        try {
+            if(!adopt_loaded_model()) {
+                std::fprintf(stderr,"strata generate: checked model ownership: %s\n",err.c_str());return 1;
+            }
+        } catch(const std::exception& e) {
+            std::fprintf(stderr,"strata generate: checked model ownership: %s\n",e.what());return 1;
+        }
+        if(owned_runtime)owned_runtime->model=owned_model;
+        if(o.verified_inputs_active) {
+            if(!owned_runtime || !verified_inputs.budget || !verified_inputs.bindings) {
+                std::fprintf(stderr,"strata generate: loader profile lacks retained verified owners\n");return 1;
+            }
+            owned_runtime->profile_bindings=verified_inputs.bindings;
+            // Actual receipt is collected only after final startup head placement.
+        }
+        if(o.owned_session_lifetime && !o.ple_gguf.empty()) {
+            if(!strata::core::bind_owned_private_ple(owned_runtime->sessions,0,owned_model->stages()[0],owned_ple_table,
+                o.native_ple_key&&wt.find("blk.1.ple_key.weight")->quantized(),strata::kernels::ple_artifact_consts(),*model_budget,err)) {
+                std::fprintf(stderr,"strata generate: private PLE binding: %s\n",err.c_str());return 1;
+            }
+        }
+        if(owned_batch_allocation&&!o.ple_gguf.empty())for(size_t slot=0;slot<2;++slot){
+            const auto* allocation=owned_runtime->batch_slot_sessions.allocation(batch_slot_handles[slot]);
+            if(!allocation){std::fputs("owned slot PLE allocation missing\n",stderr);return 1;}
+            for(size_t stage=0;stage<allocation->stages().size();++stage){const auto& native=allocation->stages()[stage];
+                if(native.session->layer_lo<=1&&1<native.session->layer_hi&&
+                   !strata::core::bind_owned_private_ple(*allocation,stage,owned_model->stages()[stage],owned_ple_table,
+                       o.native_ple_key&&wt.find("blk.1.ple_key.weight")->quantized(),strata::kernels::ple_artifact_consts(),*model_budget,err)){
+                    std::fprintf(stderr,"owned slot actual PLE context binding refused: %s\n",err.c_str());return 1;
+                }
+            }
+        }
+        std::fprintf(stderr,"strata generate: checked ownership retained for %zu model stages; window execution remains disabled\n",owned_model->stages().size());
+    }
+#endif
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
     for (int r = 1; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 && !early_remote) {
@@ -7443,7 +10941,39 @@ int main(int argc, char** argv) {
     // The earlier "the arena does not fit" conclusion was WRONG and is worth recording: the failure was a stale
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
-    strata::core::FileExpertSource src;
+    std::vector<int> expert_consumer_devices;
+    if(o.owned_session_lifetime) {
+        expert_consumer_devices.push_back(primary_device);
+        for(const auto& stage:stages)expert_consumer_devices.push_back(stage->dev);
+        for(int r=0;r<3;++r)if(o.expert_cache_remote[size_t(r)]>0)expert_consumer_devices.push_back(remote_dev[r]);
+        if(o.peer_device>=1)expert_consumer_devices.push_back(o.peer_device);
+        std::sort(expert_consumer_devices.begin(),expert_consumer_devices.end());
+        expert_consumer_devices.erase(std::unique(expert_consumer_devices.begin(),expert_consumer_devices.end()),expert_consumer_devices.end());
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        for(int device:expert_consumer_devices) {
+            std::string failure;
+            if(!owned_runtime->gpu_handles.declare_consumer_device(device,failure)) {
+                std::fprintf(stderr,"strata generate: owned GPU consumers: %s\n",failure.c_str());return 1;
+            }
+        }
+#endif
+    }
+    auto configure_expert_retirement=[&](auto& owner)->bool {
+        if(!o.owned_session_lifetime)return true;
+        std::string failure;
+        if(owner.set_strict_retirement(true,expert_consumer_devices,failure))return true;
+        std::fprintf(stderr,"strata generate: owned expert retirement: %s\n",failure.c_str());return false;
+    };
+    for(auto& stage:stages)if(!configure_expert_retirement(stage->cache))return 1;
+    DriverRuntimeObject<strata::core::FileExpertSource> src_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->source:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& src=src_storage.get();
+    if(!configure_expert_retirement(src))return 1;
     bool io_pf_by_default = false;   // the Linux file-tier defaults turned io prefetch on (no STRATA_IO_PREFETCH given)
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
@@ -7520,7 +11050,42 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    strata::core::ArenaExpertSource arena_src;
+    DriverRuntimeObject<strata::core::ArenaExpertSource> arena_src_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->arena_source:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& arena_src=arena_src_storage.get();
+    if(!configure_expert_retirement(arena_src))return 1;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto admit_expert_source_inventory=[&](auto& owner)->bool {
+        if(!o.verified_inputs_active)return true;
+        try {
+            using namespace strata::core;
+            if(!verified_inputs.budget || !verified_inputs.bindings || !expert_layout_capture ||
+               !expert_layout_capture->completed_inventory()) {
+                err="expert source requires current verified layout authority";return false;
+            }
+            const ExpertSourceInventoryLimits limits{
+                uint64_t(verified_inputs.bindings->native.size())+1, uint64_t(g.n_layers),4096,256};
+            uint64_t host_bytes=0;
+            if(!expert_source_inventory_host_bound(limits,host_bytes,err))return false;
+            WindowResources charge;
+            charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+            charge.host_bytes=host_bytes;
+            auto reservation=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+            if(!reservation) {err="verified input quota cannot admit expert source inventory";return false;}
+            std::shared_ptr<ExpertSourceCapture> capture;
+            if(!ExpertSourceCapture::create(limits,std::move(reservation.lease),
+                verified_inputs.bindings,expert_layout_capture,capture,err))return false;
+            return owner.enable_inventory_capture(std::move(capture),err);
+        } catch(const std::bad_alloc&) {
+            err.clear();std::fprintf(stderr,"strata generate: expert source inventory allocation failed\n");return false;
+        }
+    };
+#endif
     strata::core::ExpertSource* srcp = nullptr;
     // #4846 (owner 11-01): the arena first, and when the RAM is still short after the wait and the give-back, the --mmap-experts source
     // for this run (o.mmap_experts is set here, before anything below sizes the experts' tier from it; nothing was sized for the arena
@@ -7556,6 +11121,11 @@ int main(int argc, char** argv) {
         src.set_gguf(o.native_preset);
         if (const char* v = std::getenv("STRATA_FETCH_THREADS"); v != nullptr && std::atoi(v) > 0)
             src.set_fetch_threads(std::atoi(v));
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(!admit_expert_source_inventory(src)) {
+            std::fprintf(stderr,"strata generate: mapped expert inventory: %s\n",err.c_str());return 1;
+        }
+#endif
         if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
             if (ram_fallback_taken) {   // #4846: the file cannot be opened either; the arena, loaded the old way, is what is left
                 std::fprintf(stderr, "strata generate: the experts cannot be read from the file either (%s): loading the expert arena "
@@ -7570,6 +11140,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(o.verified_inputs_active && !src.completed_inventory()) {
+            std::fputs("strata generate: mapped experts lack current load receipt\n",stderr);return 1;
+        }
+#endif
         std::fprintf(stderr, "strata generate: experts via mmap (%s; %s)\n",
                      ram_fallback_taken ? "not enough RAM for the expert arena: the same source as --mmap-experts" : "--mmap-experts",
                      src.gguf_mode() ? "the GGUF shards in place, no experts.bin" : "the A/B arm of R2.1");
@@ -7754,6 +11329,11 @@ int main(int argc, char** argv) {
         // The arena pins until the OS refuses; on Windows that leaves no page-locked memory for the small buffers the
         // engine allocates after it (the verify window's staging: "mapped staging allocation failed", exit 1).  Keep a
         // reserve while the arena pins and hand it back after (pin_budget.hpp).
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(!admit_expert_source_inventory(arena_src)) {
+            std::fprintf(stderr,"strata generate: arena expert inventory: %s\n",err.c_str());return 1;
+        }
+#endif
         if (ple_lock_by_policy)   // #4846: the residency policy priced the table against the arena before the rest of the start took its RAM
             arena_src.give_back_ram = [&]() -> uint64_t {
                 if (!ple_table.locked()) return 0;
@@ -7819,6 +11399,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(o.verified_inputs_active && !arena_src.completed_inventory()) {
+            std::fprintf(stderr,"strata generate: arena experts lack current load receipt\n");return 1;
+        }
+#endif
         if (!pin_cand.empty()) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             uint64_t cand_b = 0, pin_b = 0;
@@ -7878,8 +11463,20 @@ int main(int argc, char** argv) {
 #endif
     if (o.pool_measure)
         o.pool_affinity = measure_pool_affinity(srcp, o.pool_workers, !o.no_host_worker, o.pool_tasks);
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
-                                        o.pool_affinity, o.pool_tasks);
+    DriverRuntimeObject<strata::kernels::cpu::ExpertPool> pool_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->pool:nullptr
+#else
+        nullptr
+#endif
+        ,o.pool_workers,true,!o.no_host_worker,o.pool_affinity,o.pool_tasks,
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        bool(owned_runtime)
+#else
+        false
+#endif
+        );
+    auto& pool=pool_storage.get();
     std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
                  o.pool_tasks ? o.pool_tasks : 3 * (pool.workers() + (pool.host_works() ? 1 : 0)),
                  o.pool_tasks ? " (capped by rows)" : " (automatic)",
@@ -7922,7 +11519,15 @@ int main(int argc, char** argv) {
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     mem_mark("the weights, the session and the drafter");
-    strata::core::ExpertCache xcache;
+    DriverRuntimeObject<strata::core::ExpertCache> xcache_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->cache:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& xcache=xcache_storage.get();
+    if(!configure_expert_retirement(xcache))return 1;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
@@ -8159,7 +11764,11 @@ int main(int argc, char** argv) {
         if (o.expert_cache == 0 && native_head.loaded() && !native_head.on_host() && !o.vram_reserve_given && !multi_gpu && stages.empty() &&
             std::getenv("STRATA_HEAD_HOST_OFF") == nullptr && std::getenv("STRATA_SPILL_OFF") == nullptr && spill_discrete_gpu()) {
             std::string herr;
-            if (native_head.to_host(herr)) {
+            if (
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                o.owned_model_lifetime ? owned_model->stages()[0]->spill_head_startup(*model_budget,herr) :
+#endif
+                native_head.to_host(herr)) {
                 free_b = strata::core::device_free_bytes();
                 strata::core::AutoCacheSlots a2 = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
                 int64_t s4 = a2.slots;
@@ -8485,6 +12094,21 @@ int main(int argc, char** argv) {
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(owned_runtime && owned_runtime->expert_policy && (profile.empty() || srcp==nullptr)) {
+        strata::core::ExpertPolicyTier tier;
+        tier.id=0;tier.kind=strata::core::ExpertPolicyTierKind::primary;
+        tier.disabled=xcache.slots()<=0;
+        tier.device=primary_device;tier.layer_end=multi_gpu?split_at[0]:g.n_layers;
+        tier.slots=uint64_t(std::max<int64_t>(0,xcache.slots()));
+        tier.slot_guard_bytes=uint64_t(xcache.slot_guard());tier.per_layer=xcache.per_layer_admission();
+        if(!owned_runtime->expert_policy->configure_tier(tier) ||
+           !owned_runtime->expert_policy->complete_tier(0,0,tier.disabled?
+               strata::core::ExpertPolicyTermination::disabled:strata::core::ExpertPolicyTermination::ranking_end)) {
+            std::fprintf(stderr,"strata generate: primary no-fill policy refused\n");return 1;
+        }
+    }
+#endif
     // STRATA_EXPERT_NIBBLE: each cache's converted slots (RECHECK reads them per request)
     NibbleCache nib_x;
     std::vector<NibbleCache> nib_st;
@@ -8495,6 +12119,22 @@ int main(int argc, char** argv) {
         const bool per_layer = xcache.per_layer_admission();
         const int64_t want = per_layer ? (int64_t) profile.size()
                                        : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto* policy=owned_runtime?owned_runtime->expert_policy.get():nullptr;
+        uint64_t policy_attempts=0;
+        bool policy_capacity_stop=false;
+        if(policy) {
+            strata::core::ExpertPolicyTier tier;
+            tier.id=0;tier.kind=strata::core::ExpertPolicyTierKind::primary;
+            tier.device=primary_device;tier.layer_begin=0;tier.layer_end=multi_gpu?split_at[0]:g.n_layers;
+            tier.slots=uint64_t(xcache.slots());tier.decision_limit=uint64_t(want);
+            tier.slot_guard_bytes=uint64_t(xcache.slot_guard());tier.per_layer=per_layer;
+            if(xcache.slots()<0 || want<0 || owned_runtime->stage_profile_ordinals[0].size()!=profile.size() ||
+               !policy->configure_tier(tier)) {
+                std::fprintf(stderr,"strata generate: primary policy capacity refused\n");return 1;
+            }
+        }
+#endif
         // #286: an unbuffered file tier reads the pairs in batches of 64, the next batch while this one is copied
         std::future<void> ahead;
         auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
@@ -8524,20 +12164,53 @@ int main(int argc, char** argv) {
                 if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
             }
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            const int32_t previous_policy_slot=policy?xcache.slot_of(profile[size_t(i)].first,profile[size_t(i)].second):-1;
+#endif
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == strata::core::kNotResident) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(policy) {
+                    ++policy_attempts;
+                    if(!policy->record_placement({0,owned_runtime->stage_profile_ordinals[0][size_t(i)],0,
+                        profile[size_t(i)].first,profile[size_t(i)].second,-1,strata::core::ExpertPolicyOutcome::skipped_full})) {
+                        std::fprintf(stderr,"strata generate: primary skipped placement refused\n");return 1;
+                    }
+                    if(!per_layer)policy_capacity_stop=true;
+                }
+#endif
                 if (per_layer) continue;
                 break;
             }
             const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
-            const bool nib_pair = nib_x.active() && nib::layer(profile[(size_t) i].first).on;   // STRATA_EXPERT_NIBBLE
-            if (b == nullptr || !(nib_pair ? nib_x.add(profile[(size_t) i].first, profile[(size_t) i].second, slot, b, err)
-                                           : xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first)))) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            uint64_t policy_copied_bytes=0;
+#endif
+            const bool nib_pair = nib_x.active() && nib::layer(profile[(size_t) i].first).on;
+            if (b == nullptr || !(nib_pair ? nib_x.add(profile[(size_t)i].first,profile[(size_t)i].second,slot,b,err) : xcache.fill_slot_blocking(slot, b, err,
+                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first)
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    ,policy?&policy_copied_bytes:nullptr
+#endif
+                    ))) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(policy)policy->fail();
+#endif
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(policy) {
+                ++policy_attempts;
+                if(!policy->record_placement({0,owned_runtime->stage_profile_ordinals[0][size_t(i)],
+                    policy_copied_bytes,
+                    profile[size_t(i)].first,profile[size_t(i)].second,slot,
+                    previous_policy_slot>=0?strata::core::ExpertPolicyOutcome::already_resident:strata::core::ExpertPolicyOutcome::copied})) {
+                    std::fprintf(stderr,"strata generate: primary copied placement refused\n");return 1;
+                }
+            }
+#endif
             fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
             ++prefilled;
         }
@@ -8554,9 +12227,18 @@ int main(int argc, char** argv) {
             !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob_stable(profile[0].first, profile[0].second), err,
                                 (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(policy)policy->fail();
+#endif
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(policy && !policy->complete_tier(0,policy_attempts,policy_capacity_stop?
+            strata::core::ExpertPolicyTermination::capacity_full:strata::core::ExpertPolicyTermination::ranking_end)) {
+            std::fprintf(stderr,"strata generate: primary policy completion refused\n");return 1;
+        }
+#endif
         if (nib_x.active() && nib_x.n > 0) {
             // STRATA_EXPERT_NIBBLE: the hottest converted pair read back (its hash, its down rows); every item and every
             // rebuilt GGUF block of every converted slot was already checked on the device
@@ -8614,8 +12296,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    for (auto& stp : stages) {
-        GpuStage& st = *stp;
+    for (size_t stage_index=0;stage_index<stages.size();++stage_index) {
+        GpuStage& st = *stages[stage_index];
         const auto& lay = strata::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
         // to hold back is the windows - and `free_b` has already lost the drafter.
@@ -8636,7 +12318,11 @@ int main(int argc, char** argv) {
             room < strata::program::split_walk::kWorkingCacheSlots * (int64_t) lay.max_blob) {
             std::string herr;
             const uint64_t head_mib = st.head.weight_bytes() >> 20;
-            if (st.head.to_host(herr)) {
+            if (
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                o.owned_model_lifetime ? owned_model->stages()[stage_index+1]->spill_head_startup(*model_budget,herr) :
+#endif
+                st.head.to_host(herr)) {
                 room = stage_room(st.dev, true, false);
                 std::fprintf(stderr, "strata generate: short of GPU memory: CUDA%d: the cache would have no room, so the output head (%llu MiB) moves to pinned host memory and is read over "
                                      "PCIe for every logits row: decode is slower; the room for experts is now %.2f GiB\n",
@@ -8683,6 +12369,23 @@ int main(int argc, char** argv) {
                          sized.empty() ? "no room" : err.c_str());
             return 1;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto* policy=owned_runtime?owned_runtime->expert_policy.get():nullptr;
+        const uint64_t tier_id=stage_index+1;
+        uint64_t policy_attempts=0;
+        bool policy_capacity_stop=false;
+        if(policy) {
+            strata::core::ExpertPolicyTier tier;
+            tier.id=tier_id;tier.kind=strata::core::ExpertPolicyTierKind::stage;
+            tier.device=st.dev;tier.layer_begin=st.lb;tier.layer_end=st.le;
+            tier.slots=uint64_t(st.cache.slots());tier.decision_limit=st.profile.size();
+            tier.slot_guard_bytes=uint64_t(st.cache.slot_guard());tier.per_layer=st.cache.per_layer_admission();
+            if(st.cache.slots()<0 || owned_runtime->stage_profile_ordinals[tier_id].size()!=st.profile.size() ||
+               !policy->configure_tier(tier)) {
+                std::fprintf(stderr,"strata generate: stage policy capacity refused\n");return 1;
+            }
+        }
+#endif
         int64_t filled = 0;
         NibbleCache& nib_c = nib_st.emplace_back();   // STRATA_EXPERT_NIBBLE: this stage's converted slots
         if (nib::any_on()) {
@@ -8693,18 +12396,55 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        for (const auto& pr : st.profile) {
-            if (filled >= st.cache.slots()) break;
+        for (size_t rank=0;rank<st.profile.size();++rank) {
+            const auto& pr=st.profile[rank];
+            if (filled >= st.cache.slots()) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                policy_capacity_stop=true;
+#endif
+                break;
+            }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            const int32_t previous_policy_slot=policy?st.cache.slot_of(pr.first,pr.second):-1;
+            uint64_t policy_copied_bytes=0;
+#endif
             const int32_t slot = st.cache.admit(pr.first, pr.second);
-            if (slot == strata::core::kNotResident) break;
+            if (slot == strata::core::kNotResident) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(policy) {
+                    ++policy_attempts;policy_capacity_stop=true;
+                    if(!policy->record_placement({tier_id,owned_runtime->stage_profile_ordinals[tier_id][rank],0,
+                        pr.first,pr.second,-1,strata::core::ExpertPolicyOutcome::skipped_full})) {
+                        std::fprintf(stderr,"strata generate: stage skipped placement refused\n");return 1;
+                    }
+                }
+#endif
+                break;
+            }
             const uint8_t* b = srcp->blob_stable(pr.first, pr.second);
-            const bool nib_pair = nib_c.active() && nib::layer(pr.first).on;   // STRATA_EXPERT_NIBBLE
-            if (b == nullptr || !(nib_pair ? nib_c.add(pr.first, pr.second, slot, b, err)
-                                           : st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first)))) {
+            const bool nib_pair = nib_c.active() && nib::layer(pr.first).on;
+            if (b == nullptr || !(nib_pair ? nib_c.add(pr.first,pr.second,slot,b,err) : st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first)
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                ,policy?&policy_copied_bytes:nullptr
+#endif
+                ))) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(policy)policy->fail();
+#endif
                 std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
                              st.dev, (long long) filled, err.c_str());
                 return 1;
             }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(policy) {
+                ++policy_attempts;
+                if(!policy->record_placement({tier_id,owned_runtime->stage_profile_ordinals[tier_id][rank],policy_copied_bytes,
+                    pr.first,pr.second,slot,previous_policy_slot>=0?strata::core::ExpertPolicyOutcome::already_resident:
+                    strata::core::ExpertPolicyOutcome::copied})) {
+                    std::fprintf(stderr,"strata generate: stage copied placement refused\n");return 1;
+                }
+            }
+#endif
             ++filled;
         }
         if (nib_c.active() && !nib_c.finish(err)) {
@@ -8716,10 +12456,19 @@ int main(int argc, char** argv) {
                             !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
                                                   srcp->blob_stable(st.profile[0].first, st.profile[0].second), err,
                                                   (int64_t) lay.blob_bytes(st.profile[0].first)))) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(policy)policy->fail();
+#endif
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
             return 1;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(policy && !policy->complete_tier(tier_id,policy_attempts,policy_capacity_stop?
+            strata::core::ExpertPolicyTermination::capacity_full:strata::core::ExpertPolicyTermination::ranking_end)) {
+            std::fprintf(stderr,"strata generate: stage policy completion refused\n");return 1;
+        }
+#endif
         if (nib_c.active() && nib_c.n > 0) {   // STRATA_EXPERT_NIBBLE: as CUDA0's above
             size_t c = 0;
             while (c < st.profile.size() && !nib::layer(st.profile[c].first).on) ++c;
@@ -8740,6 +12489,19 @@ int main(int argc, char** argv) {
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
     }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    // Startup is still exclusive. Adoption/PLE and both spill decisions retain
+    // their original order; no consumer has seen a loader receipt yet.
+    if(o.verified_inputs_active) {
+            // Explicit rejection ceilings. Collector admission prices actual
+            // bounded receipts before allocation, not every ceiling entry.
+            const strata::core::LoaderProfileLimits limits{8,65544,65536,8,4096,512ull<<20};
+            if(!strata::core::collect_window_loader_profile(owned_model,verified_inputs.bindings,
+                limits,*verified_inputs.budget,owned_runtime->loader_profile,err)) {
+                std::fprintf(stderr,"strata generate: actual loader profile: %s\n",err.c_str());return 1;
+            }
+    }
+#endif
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
     // THE LAYER SPLIT'S SPILL WALK, STEP 4: THE LOAN KEEPS 16.  A stage whose cache is too small to lend the prompt path a 256-token chunk and keep 128 slots behind makes the path
@@ -8847,9 +12609,22 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::array<strata::core::RemoteExperts, 3> remote_experts;
-    std::unique_ptr<strata::core::RemoteExpertOpt> remote_opt;
+    DriverRuntimeObject<std::array<strata::core::RemoteExperts,3>> remote_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->remote_experts:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& remote_experts=remote_storage.get();
+    std::unique_ptr<strata::core::RemoteExpertOpt> baseline_remote_opt;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& remote_opt=owned_runtime?owned_runtime->remote_opt:baseline_remote_opt;
+#else
+    auto& remote_opt=baseline_remote_opt;
+#endif
     if (o.remote_expert_opt && o.expert_cache_remote[0] > 0) remote_opt = std::make_unique<strata::core::RemoteExpertOpt>();
+    if (remote_opt && !configure_expert_retirement(*remote_opt)) return 1;
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
@@ -8858,10 +12633,25 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::vector<std::pair<int32_t, int32_t>> ranked = profile;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto* policy=owned_runtime?owned_runtime->expert_policy.get():nullptr;
+        std::vector<uint64_t> ranked_ordinals;
+        std::array<std::vector<uint64_t>,3> remote_ordinals;
+        if(policy)ranked_ordinals=owned_runtime->stage_profile_ordinals[0];
+#endif
         if (!stages.empty()) {   // a layer split: CUDA0's share of the profile, then the later stages' pairs no cache holds
-            for (auto& st : stages)
-                for (const auto& pr : st->profile)
-                    if (st->cache.slot_of(pr.first, pr.second) < 0) ranked.push_back(pr);
+            for (size_t st_index=0;st_index<stages.size();++st_index) {
+                const auto& st=stages[st_index];
+                for (size_t rank=0;rank<st->profile.size();++rank) {
+                    const auto& pr=st->profile[rank];
+                    if (st->cache.slot_of(pr.first, pr.second) < 0) {
+                        ranked.push_back(pr);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                        if(policy)ranked_ordinals.push_back(owned_runtime->stage_profile_ordinals[st_index+1][rank]);
+#endif
+                    }
+                }
+            }
         }
         if (multi_remote || std::any_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(),
                                         [](bool automatic) { return automatic; })) {
@@ -8874,8 +12664,12 @@ int main(int argc, char** argv) {
                     seen[(size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second] = 1;
             for (int64_t e = 0; e < g.n_expert; ++e)
                 for (int64_t l = 0; l < g.n_layers; ++l)
-                    if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e])
+                    if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e]) {
                         ranked.emplace_back((int32_t) l, (int32_t) e);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                        if(policy)ranked_ordinals.push_back(strata::core::expert_policy_synthetic_ordinal);
+#endif
+                    }
             std::fprintf(stderr, "strata generate: remote ranking: %zu profiled pairs, "
                                  "%zu other pairs to fill CUDA1..3\n", profile.size(), ranked.size() - profile.size());
         }
@@ -8886,7 +12680,8 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> assigned((size_t) g.n_layers * (size_t) g.n_expert, 0);
             const int devices = 1 + (o.expert_cache_remote[1] > 0) + (o.expert_cache_remote[2] > 0);
             int next = 0;
-            for (const auto& pair : ranked) {
+            for (size_t rank=0;rank<ranked.size();++rank) {
+                const auto& pair=ranked[rank];
                 if (pair.first < 0 || pair.first >= g.n_layers || pair.second < 0 || pair.second >= g.n_expert ||
                     xcache.slot_of(pair.first, pair.second) >= 0) continue;
                 const size_t index = (size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second;
@@ -8909,12 +12704,18 @@ int main(int argc, char** argv) {
                 }
                 assigned[index] = 1;
                 by_device[(size_t) target].push_back(pair);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(policy)remote_ordinals[size_t(target)].push_back(ranked_ordinals[rank]);
+#endif
                 next = (target + 1) % devices;
             }
             std::fprintf(stderr, "strata generate: remote ranks %s across %d CUDA devices\n",
                          o.expert_cache_remote_placement == "layer" ? "grouped by layer" : "striped", devices);
         } else {
             by_device[0] = std::move(ranked);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(policy)remote_ordinals[0]=std::move(ranked_ordinals);
+#endif
         }
         std::vector<uint8_t> claimed((size_t) g.n_layers * (size_t) g.n_expert, 0);
         for (auto& st : stages)   // a layer split: what a stage's cache holds is no helper's
@@ -8922,13 +12723,73 @@ int main(int argc, char** argv) {
                 if (st->cache.slot_of(pr.first, pr.second) >= 0)
                     claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
-            if (remote_opt) remote_opt->attach(remote_experts[(size_t) r]);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            DriverExpertOpenObservation remote_observation;
+            if(policy && (!verified_inputs.budget ||
+                remote_ordinals[size_t(r)].size()!=by_device[size_t(r)].size() ||
+                !policy->record_transform_pairs(strata::core::ExpertPolicyTransformKind::remote_order,512+uint64_t(r),
+                    remote_ordinals[size_t(r)].data(),by_device[size_t(r)].data(),remote_ordinals[size_t(r)].size()) ||
+                !remote_observation.prepare(owned_runtime->expert_policy,512+uint64_t(r),
+                    strata::core::ExpertPolicyTierKind::remote,remote_ordinals[size_t(r)],*verified_inputs.budget,err))) {
+                std::fprintf(stderr,"strata generate: remote policy admission: %s\n",err.c_str());return 1;
+            }
+#endif
+            // Configure the real helper and its nested cache before the first
+            // allocation/open attempt. Partial-open cleanup must obey the same
+            // checked retirement contract as the primary expert tiers.
+            if (!configure_expert_retirement(remote_experts[(size_t) r])) return 1;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            std::size_t observed_attach = 3;
+#endif
+            if (remote_opt) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if (owned_runtime) {
+                    // Complete all host validation before attach may change helper/optimizer.
+                    if (r < 0 || r >= 3 || owned_runtime->remote_attach_count >= 3 ||
+                        owned_runtime->remote_attach_sealed || !owned_runtime->remote_attach_valid ||
+                        (owned_runtime->remote_attached_optimizer &&
+                         owned_runtime->remote_attached_optimizer != remote_opt.get())) return 1;
+                    for (std::size_t j=0; j<owned_runtime->remote_attach_count; ++j)
+                        if (owned_runtime->remote_attach_observations[j].configured_slot == std::size_t(r)) return 1;
+                    // Leave validation refused until the actual checked attachment
+                    // has committed its owning record and borrowed backpointer.
+                    owned_runtime->remote_attach_valid = false;
+                    observed_attach = owned_runtime->remote_attach_count;
+                }
+#endif
+                if (o.owned_session_lifetime) {
+                    if (!remote_opt->attach_checked(remote_experts[std::size_t(r)], err)) {
+                        std::fprintf(stderr,"strata generate: checked remote optimizer attachment: %s\n",err.c_str());
+                        return 1;
+                    }
+                } else remote_opt->attach(remote_experts[std::size_t(r)]);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if (owned_runtime) {
+                    owned_runtime->remote_attached_optimizer = remote_opt.get();
+                    owned_runtime->remote_attach_observations[observed_attach] = {std::size_t(r),-1,false};
+                    ++owned_runtime->remote_attach_count;
+                    owned_runtime->remote_attach_valid = true;
+                }
+#endif
+            }
             if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
                      g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err,
-                     o.expert_cache_remote_auto[(size_t) r])) {
+                     o.expert_cache_remote_auto[(size_t) r]
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                     ,remote_observation.get()
+#endif
+                     )) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if (owned_runtime && remote_opt) {
+                if (observed_attach >= owned_runtime->remote_attach_count) return 1;
+                auto& observed = owned_runtime->remote_attach_observations[observed_attach];
+                observed.opened_device = remote_dev[r];
+                observed.open_completed = true;
+            }
+#endif
             std::fprintf(stderr, "strata generate: CUDA%d: %lld additional experts, %.2f GiB; "
                                  "results return through pinned host rows\n", remote_dev[r],
                          (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
@@ -8936,15 +12797,34 @@ int main(int argc, char** argv) {
     }
 
     // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
-    strata::core::PeerExperts peer;
+    DriverRuntimeObject<strata::core::PeerExperts> peer_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->peer:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& peer=peer_storage.get();
     if (o.peer_device >= 1) {
         if (profile.empty() || srcp == nullptr || o.expert_cache <= 0) {
             std::fprintf(stderr, "strata generate: --peer-device needs --expert-profile and the expert cache\n");
             return 1;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        DriverExpertOpenObservation peer_observation;
+        if(owned_runtime && owned_runtime->expert_policy &&
+           (!verified_inputs.budget || !peer_observation.prepare(owned_runtime->expert_policy,256,
+            strata::core::ExpertPolicyTierKind::peer,owned_runtime->stage_profile_ordinals[0],*verified_inputs.budget,err))) {
+            std::fprintf(stderr,"strata generate: peer policy admission: %s\n",err.c_str());return 1;
+        }
+#endif
         const auto tp0 = Clock::now();
         if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
-                       err)) {
+                       err
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                       ,peer_observation.get()
+#endif
+                       )) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -8954,8 +12834,30 @@ int main(int argc, char** argv) {
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
     }
 
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.verified_inputs_active) {
+        // Source open/fill has completed. This joins the actual retained source,
+        // not an independently supplied inventory. Policy/topology/engine joins
+        // remain incomplete; this does not enable managed window execution.
+        if(owned_runtime)owned_runtime->profile_source=srcp;
+        const strata::core::ExpertRuntimeProfileLimits limits{1024,65536,4096,512ull<<20};
+        if(!owned_runtime || !verified_inputs.budget ||
+           !strata::core::collect_expert_runtime_profile(owned_runtime,limits,
+               *verified_inputs.budget,expert_runtime_profile,err)) {
+            std::fprintf(stderr,"strata generate: actual expert source profile: %s\n",err.c_str());return 1;
+        }
+    }
+
+#endif
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
-    Drive drive;
+    DriverRuntimeObject<Drive> drive_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->drive:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& drive=drive_storage.get();
     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
     // #854), so an expert the helper's tier swaps in or out later is followed - never a copy taken at load.
@@ -8975,6 +12877,151 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto prepare_remote_completion_gate = [&](strata::core::Verifier& root)->bool {
+        using namespace strata::core;
+        if (!remote_policy_setup) return true;
+        if (!verified_inputs.budget || remote_policy_setup->completion_gate) return false;
+        WindowResources charge;
+        charge.device_bytes.resize(verified_inputs.budget->snapshot().capacity.device_bytes.size());
+        charge.host_bytes=VerifierCompletionGate::metadata_bytes();
+        auto admitted=verified_inputs.budget->reserve(charge,ReservationPurpose::foreground);
+        if (!admitted || !admitted.lease) return false;
+        return Verifier::prepare_serial_completion_gate(root,std::move(admitted.lease),
+            remote_policy_setup->completion_gate,err);
+    };
+#endif
+    auto run_serial_remote_unit = [&](strata::core::Verifier& target, int tokens,
+        const int32_t* input, int64_t position, strata::core::PoolMultiFn callback,
+        void* callback_owner, int32_t* output, std::string& error)->bool {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if (remote_policy) {
+            if (!remote_policy_setup || remote_policy_setup->publication.get()!=remote_policy ||
+                !remote_policy_setup->completion_gate) {
+                error="remote completion gate binding missing"; return false;
+            }
+            const auto& completion_gate=remote_policy_setup->completion_gate;
+            // This controller entry is synchronous: successful Verifier::run
+            // joins its launch work/callbacks and checks primary/copy completion
+            // across the stage chain. Helper::finish alone is insufficient.
+            std::array<strata::core::RemoteExperts*,3> helpers{};
+            if (!owned_runtime || !owned_runtime->remote_attach_valid ||
+                !owned_runtime->remote_attach_sealed ||
+                owned_runtime->remote_attach_count > helpers.size()) {
+                error = "remote routing runtime binding changed"; return false;
+            }
+            const auto count = owned_runtime->remote_attach_count;
+            for (size_t i=0;i<count;++i) {
+                const auto slot=owned_runtime->remote_attach_observations[i].configured_slot;
+                if (slot>=helpers.size() || !owned_runtime->remote_experts) {
+                    error = "remote routing helper binding changed"; return false;
+                }
+                helpers[i]=&(*owned_runtime->remote_experts)[slot];
+            }
+            if(!driver_owns_serial_remote_unit(owned_runtime,target,callback,callback_owner,
+                    std::span<strata::core::RemoteExperts* const>(helpers.data(),count))) {
+                error="serial remote verifier/dispatch/topology ownership mismatch";
+                return false;
+            }
+            strata::core::RemoteRoutingUnit unit;
+            const auto admission=unit.try_acquire(helpers.data(),count,owned_runtime);
+            if (admission!=strata::core::RemoteExperts::Admission::acquired) {
+                // Serial adaptation must already be joined. Never fall back to
+                // unguarded dispatch or block the reactor waiting for a writer.
+                error = "serial remote routing admission refused"; return false;
+            }
+            strata::core::VerifierCompletionGate::Token completion_token;
+            if (!completion_gate->try_begin(completion_token)) {
+                error="serial remote completion admission refused"; return false;
+            }
+            // Check the final device even when entry already equals target:
+            // nested or callback scopes must not silently leave this thread on
+            // another device. Inner strict scopes also propagate masked errors.
+            const int target_device=target.device();
+            if (target_device<0) strata::core::retirement_failed("remote unit invalid device");
+            int entry_device=-1;
+            strata::core::retirement_check(true,cudaGetDevice(&entry_device),"remote unit entry device");
+            strata::core::retirement_check(true,cudaSetDevice(target_device),"remote unit select device");
+            if (!unit.mark_attempted()) strata::core::retirement_failed("remote unit attempt ownership");
+            try {
+                const bool completed=target.run(tokens,input,position,callback,callback_owner,output,error);
+                const bool dispatch_healthy=!drive.d.failed;
+                // A false/throwing run may leave a doorbell graph alive. Do not
+                // unwind the holder, retry an OOM window, or infer a drain from
+                // its returned host status. Checked asynchronous recovery is a
+                // distinct controller path; this serial worker must terminate.
+                if (!completed || !dispatch_healthy)
+                    strata::core::retirement_failed("remote serial unit completion");
+                int completed_device=-1;
+                strata::core::retirement_check(true,cudaGetDevice(&completed_device),"remote unit completion device");
+                if (completed_device!=target_device)
+                    strata::core::retirement_failed("remote unit device drift");
+                strata::core::retirement_check(true,cudaSetDevice(entry_device),"remote unit restore device");
+                strata::core::VerifierCompletionGate::Cut committed;
+                if (!completion_gate->commit_after_checked_completion(completion_token,committed))
+                    strata::core::retirement_failed("remote completion publication raced release");
+                strata::core::RemoteRoutingUnit::CheckedCompletion cut;
+                cut.primary_and_helper_consumers_complete=completed;
+                cut.dispatch_healthy=dispatch_healthy;
+                cut.unit_host_callbacks_complete=completed;
+                cut.owning_device_restored=true; // checked restoration above
+                if (!unit.retire_after_checked_completion(cut))
+                    strata::core::retirement_failed("remote serial unit retirement");
+                return true;
+            } catch (...) {
+                strata::core::retirement_failed("remote serial unit exception");
+            }
+        }
+#endif
+        return target.run(tokens,input,position,callback,callback_owner,output,error);
+    };
+
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(owned_runtime && owned_runtime->expert_policy) {
+        // All configured tier loaders have completed at this serialized cut.
+        // Require every declared tier, including helpers, to have its actual
+        // successful capacity/fill receipt; never invent disabled completions.
+        if(!owned_runtime->expert_policy->publish_initial()) {
+            std::fprintf(stderr,"strata generate: initial expert tier receipt join refused\n");return 1;
+        }
+        if (remote_opt) {
+            // Candidate bindings are formed in this observed attach order, not by
+            // assuming compact i == configured slot r. Slots0,2 map tiers512,514.
+            std::array<strata::core::RemotePolicyPeerBinding,3> joined{};
+            const auto n = owned_runtime->remote_attach_count;
+            if (!owned_runtime->remote_attach_valid || n == 0 || n > joined.size()) return 1;
+            for (std::size_t i=0; i<n; ++i) {
+                const auto& observed = owned_runtime->remote_attach_observations[i];
+                if (!observed.open_completed || observed.configured_slot >= 3) return 1;
+                joined[i] = {&(*owned_runtime->remote_experts)[observed.configured_slot],
+                             512u + observed.configured_slot, observed.opened_device};
+            }
+            owned_runtime->remote_attach_sealed = true;
+            if (!driver_owns_remote_policy(*owned_runtime,*srcp,*remote_opt,
+                    std::span<const strata::core::RemotePolicyPeerBinding>(joined.data(),n))) {
+                owned_runtime->remote_attach_sealed = false;
+                owned_runtime->remote_attach_valid = false;
+                return 1;
+            }
+        }
+        if (remote_opt) {
+            const int requested_remote_swaps = o.adapt_swaps<0 ? o.adapt_swaps :
+                                              (o.adapt_every>0 ? o.adapt_swaps : 0);
+            if (!verified_inputs.budget ||
+                !driver_prepare_remote_policy(owned_runtime,srcp,remote_opt.get(),g,
+                    requested_remote_swaps,*verified_inputs.budget,remote_policy_setup,err)) {
+                std::fprintf(stderr,"strata generate: remote policy workspace/factory refused: %s\n",err.c_str());
+                return 1;
+            }
+        }
+        // This is only the initial placement join. Later setup and serving may
+        // mutate placement; until their transaction hooks are wired, do not let
+        // an initial-only receipt masquerade as current execution authority.
+        // The remote tracker is seeded here, but is not whole-policy authority.
+        // Its activation still requires every actual writer and reader join.
+        owned_runtime->expert_policy->begin_dynamic_change();
+    }
+#endif
     // P1.8 (PR 4972, re-checked as residency changes): when every routed expert sits in the GPU caches the decode reads nothing
     // from the file tier, and its Linux defaults (io prefetch, the decode gate) and the routing-aware prefetch only cost time.
     // Measured on 2x W7900D (gfx1100), IQ3_S experts.bin, a layer split holding 24576 of 24576: decode 57 -> 80 tok/s, the
@@ -9019,7 +13066,14 @@ int main(int argc, char** argv) {
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
     // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
-    strata::core::RouterLookahead lookahead;
+    DriverRuntimeObject<strata::core::RouterLookahead> lookahead_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->lookahead:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& lookahead=lookahead_storage.get();
     // #1348, one prefetch design: with the Foresight swap space on (STRATA_FS_SLOTS) the look-ahead also runs on the pinned-RAM
     // tiers, where there are no pages to warm, and feeds its predictions to the swap space (STRATA_FS_AHEAD=0: not)
     const bool fs_ahead = srcp != nullptr && [] { const char* v = std::getenv("STRATA_FS_SLOTS"); return v != nullptr && std::atoi(v) > 0; }() &&
@@ -9039,6 +13093,23 @@ int main(int argc, char** argv) {
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if (ok && owned_runtime) {
+            uint64_t snapshot_bytes=0;
+            if (!model_budget || !strata::core::RouterLookahead::residency_snapshot_bytes(
+                    routers.size(),g.n_expert,snapshot_bytes)) {
+                std::fprintf(stderr,"strata generate: lookahead snapshot geometry/quota unavailable\n");return 1;
+            }
+            strata::core::WindowResources snapshot_charge;
+            snapshot_charge.device_bytes.resize(model_budget->snapshot().capacity.device_bytes.size());
+            snapshot_charge.host_bytes=snapshot_bytes;
+            auto snapshot_admission=model_budget->reserve(snapshot_charge,strata::core::ReservationPurpose::foreground);
+            if (!snapshot_admission || !lookahead.configure_residency_snapshot(
+                    routers.size(),g.n_expert,snapshot_admission.lease)) {
+                std::fprintf(stderr,"strata generate: lookahead residency snapshot admission refused\n");return 1;
+            }
+        }
+#endif
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats)) {
             drive.d.lookahead = &lookahead;
             if (la_stats) lookahead.enable_stats(g.n_layers);
@@ -9102,15 +13173,44 @@ int main(int argc, char** argv) {
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.
-    void* hit_scratch = nullptr;
-    int32_t* d_hit_slot = nullptr;
-    int32_t* d_hit_dst = nullptr;
-    uint8_t* d_hit_q8 = nullptr;
-    float* d_hit_q8_scale = nullptr;   ///< R4.2h: the fp32 activation scales the CPU path also uses
-    float* d_hit_out = nullptr;
+    void* baseline_hit_scratch = nullptr;
+    int32_t* baseline_hit_slot = nullptr;
+    int32_t* baseline_hit_dst = nullptr;
+    uint8_t* baseline_hit_q8 = nullptr;
+    float* baseline_hit_q8_scale = nullptr;
+    float* baseline_hit_out = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& hit_scratch=owned_runtime?owned_runtime->hit_scratch:baseline_hit_scratch;
+    auto& d_hit_slot=owned_runtime?owned_runtime->hit_slots:baseline_hit_slot;
+    auto& d_hit_dst=owned_runtime?owned_runtime->hit_destinations:baseline_hit_dst;
+    auto& d_hit_q8=owned_runtime?owned_runtime->hit_q8:baseline_hit_q8;
+    auto& d_hit_q8_scale=owned_runtime?owned_runtime->hit_q8_scale:baseline_hit_q8_scale;
+    auto& d_hit_out=owned_runtime?owned_runtime->hit_output:baseline_hit_out;
+#else
+    auto& hit_scratch=baseline_hit_scratch;
+    auto& d_hit_slot=baseline_hit_slot;
+    auto& d_hit_dst=baseline_hit_dst;
+    auto& d_hit_q8=baseline_hit_q8;
+    auto& d_hit_q8_scale=baseline_hit_q8_scale;
+    auto& d_hit_out=baseline_hit_out;
+#endif
     if (o.expert_cache > 0 && !o.no_pool) {
         const uint64_t sb = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
-        if (cudaMalloc(&hit_scratch, (size_t) sb) != cudaSuccess ||
+        bool hit_allocated=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(o.owned_session_lifetime) {
+            // Keep every hit-path address and its reservation under the same
+            // runtime as the drive that borrows it. Partial failure retains
+            // already allocated buffers for checked retirement.
+            hit_allocated=allocate_scratch(primary_device,sb,&hit_scratch) &&
+                allocate_scratch(primary_device,uint64_t(K)*sizeof(int32_t),reinterpret_cast<void**>(&d_hit_slot)) &&
+                allocate_scratch(primary_device,uint64_t(K)*sizeof(int32_t),reinterpret_cast<void**>(&d_hit_dst)) &&
+                allocate_scratch(primary_device,uint64_t(g.n_embd/32)*34,reinterpret_cast<void**>(&d_hit_q8)) &&
+                allocate_scratch(primary_device,uint64_t(g.n_embd/32)*sizeof(float),reinterpret_cast<void**>(&d_hit_q8_scale)) &&
+                allocate_scratch(primary_device,uint64_t(K)*g.n_embd*4,reinterpret_cast<void**>(&d_hit_out));
+        } else
+#endif
+        hit_allocated=!(cudaMalloc(&hit_scratch, (size_t) sb) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_dst, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_q8, (size_t) (g.n_embd / 32) * 34) != cudaSuccess ||
@@ -9118,7 +13218,8 @@ int main(int argc, char** argv) {
             // while the CPU's misses use `ActQ::scale`, which is fp32 - a 4.761e-04 relative disagreement on
             // every chunk, and the reason enabling the cache changed the tokens.
             cudaMalloc((void**) &d_hit_q8_scale, (size_t) (g.n_embd / 32) * sizeof(float)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_out, (size_t) K * g.n_embd * 4) != cudaSuccess) {
+            cudaMalloc((void**) &d_hit_out, (size_t) K * g.n_embd * 4) != cudaSuccess);
+        if(!hit_allocated) {
             std::fprintf(stderr, "strata generate: the R4 hit path could not allocate its device buffers\n");
             return 1;
         }
@@ -9137,8 +13238,13 @@ int main(int argc, char** argv) {
         drive.d.d_slot = d_hit_slot;
         drive.d.d_dst = d_hit_dst;
         drive.d.h_slot.resize((size_t) K);
-        cudaEvent_t hit_done = nullptr;
-        if (cudaEventCreate(&hit_done) != cudaSuccess) {
+        cudaEvent_t baseline_hit_done = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& hit_done=owned_runtime?owned_runtime->hit_event:baseline_hit_done;
+#else
+        auto& hit_done=baseline_hit_done;
+#endif
+        if (!create_driver_event(primary_device,0,hit_done)) {
             std::fprintf(stderr, "strata generate: the hit path could not create its probe event\n");
             return 1;
         }
@@ -9223,7 +13329,20 @@ int main(int argc, char** argv) {
     // residual chain; the CPU term is answered by Phase 3's VRAM expert cache, not by this pipeline.
 
     // ---- the graphs
-    strata::core::SessionGraphs gr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(owned_runtime)owned_runtime->graph_device=primary_device;
+#endif
+    DriverRuntimeObject<strata::core::SessionGraphs> gr_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->session_graphs:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& gr=gr_storage.get();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    strata::core::WindowGraphGuard checked_session_graphs{owned_model,gr,primary_device,strata::core::session_graphs_free_checked};
+#endif
     if (!o.no_capture && !native_pack) {   // plan v0.3 P6: a native pack runs verify windows only
         // a layer split's CUDA0 session owns only [0, split_at[0]), so its graphs cover that range; the
         // whole-model replay paths (`session_loop`, the plain generate loop) refuse rather than read another
@@ -9275,8 +13394,19 @@ int main(int argc, char** argv) {
         return strata::core::lm_head_mix(wt, g, ss.block, stream, err) &&
                native_head.run(ss.block.mixed, d_logits, stream, err);
     };
-    float* d_emb = nullptr;
-    if (cudaMalloc(&d_emb, (size_t) g.n_embd * 4) != cudaSuccess) {
+    float* baseline_d_emb = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& d_emb=owned_runtime?owned_runtime->embedding_row:baseline_d_emb;
+#else
+    auto& d_emb=baseline_d_emb;
+#endif
+    bool d_emb_allocated=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.owned_session_lifetime) d_emb_allocated=allocate_scratch(primary_device,(size_t) g.n_embd * 4,reinterpret_cast<void**>(&d_emb));
+    else
+#endif
+    d_emb_allocated=cudaMalloc(&d_emb, (size_t) g.n_embd * 4)==cudaSuccess;
+    if (!d_emb_allocated) {
         std::fprintf(stderr, "strata generate: the embedding buffer failed\n");
         return 1;
     }
@@ -9284,8 +13414,19 @@ int main(int argc, char** argv) {
     // written on the device.  Passing `logits.data()` - the host vector - faults inside the kernel and the
     // error surfaces at the NEXT synchronising call, which here was the next token's `embed_row`, reporting an
     // illegal access on a weight plane.  Nothing in the parameter names said device.
-    int* d_next = nullptr;
-    if (cudaMalloc(&d_next, sizeof(int)) != cudaSuccess) {
+    int* baseline_d_next = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& d_next=owned_runtime?owned_runtime->sampled_token:baseline_d_next;
+#else
+    auto& d_next=baseline_d_next;
+#endif
+    bool d_next_allocated=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(o.owned_session_lifetime) d_next_allocated=allocate_scratch(primary_device,sizeof(int),reinterpret_cast<void**>(&d_next));
+    else
+#endif
+    d_next_allocated=cudaMalloc(&d_next, sizeof(int))==cudaSuccess;
+    if (!d_next_allocated) {
         std::fprintf(stderr, "strata generate: the sampler output buffer failed\n");
         return 1;
     }
@@ -9301,6 +13442,15 @@ int main(int argc, char** argv) {
             return false;
         }
         if (pos == 0) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_runtime) {
+                if(!strata::core::session_zero_checked(ss,g,d_emb,token_stream,err)) {
+                    owned_runtime->sessions.mark_unhealthy();
+                    std::fprintf(stderr,"strata generate: %s\n",err.c_str());
+                    return false;
+                }
+            } else
+#endif
             strata::core::session_zero(ss, g, d_emb, token_stream);
         } else {
             for (int64_t c = 0; c < g.hc; ++c)
@@ -9549,9 +13699,12 @@ int main(int argc, char** argv) {
         }
         std::printf("\n  compare `--gpu-only-full`, which replays the same work as TWO graphs per layer.  The\n");
         std::printf("  three sum slightly above it because each launch carries the driver's gap.\n");
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        checked_session_graphs.retire();
+#endif
         strata::core::session_graphs_free(gr);
-        strata::core::doorbell_free(db);
-        cudaFree(d_next);
+        if(!o.owned_session_lifetime)strata::core::doorbell_free(db);
+        if(!o.owned_session_lifetime)cudaFree(d_next);
         return 0;
     }
 
@@ -9657,14 +13810,32 @@ int main(int argc, char** argv) {
     }
     // Plan v0.3 P3: the whole token as ONE graph whenever nothing needs a host step between the ring and post[l]
     // (the VRAM expert tier and the per-layer dumps do).  `--no-token-graph` keeps two graphs per layer.
-    strata::core::TokenGraph tgraph;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    if(owned_runtime)owned_runtime->graph_device=primary_device;
+#endif
+    DriverRuntimeObject<strata::core::TokenGraph> tgraph_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->token_graph:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& tgraph=tgraph_storage.get();
     struct TokenGraphFree {
         strata::core::TokenGraph* p;
         ~TokenGraphFree() { strata::core::token_graph_free(*p); }
     } tgraph_free{&tgraph};
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    strata::core::WindowGraphGuard checked_token_graph{owned_model,tgraph,primary_device,strata::core::token_graph_free_checked};
+#endif
     // Plan v0.3 P4: with a PROFILE-filled cache the residency is static, so the hit decision moves onto the
     // device and the token graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
-    std::vector<int32_t> host_res;
+    std::vector<int32_t> baseline_host_res;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    auto& host_res=owned_runtime?owned_runtime->host_residency:baseline_host_res;
+#else
+    auto& host_res=baseline_host_res;
+#endif
     // The residency table is read by kernels on non-blocking streams, which do not wait for the legacy stream a plain
     // cudaMemcpy runs on, and a pageable copy can return before its DMA has landed: each upload waits for its own copy
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
@@ -10312,6 +14483,10 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         std::vector<std::pair<size_t, int32_t>> filled;   // (residency index, slot), resident once the copies landed
         size_t pi = 0;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        bool verified_copy_refused = false;
+        try {
+#endif
         for (int64_t s = lo0; s < kvg.lo; ++s) {
             const uint64_t room = xcache.slot_offset(s + 1) - xcache.slot_offset(s);
             for (; pi < profile.size(); ++pi) {
@@ -10320,18 +14495,47 @@ int main(int argc, char** argv) {
                 if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
                 const uint8_t* b = srcp->blob_stable(l, e);
                 if (b == nullptr) continue;
-                nib::guard_raw(l, "the elastic K/V's refill (kvg_trim)");
-                cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice,
-                                nullptr);
+                nib::guard_raw(l, "elastic KV refill");
+                const cudaError_t refill_submission = cudaMemcpyAsync(xcache.device_slot((int32_t) s), b,
+                    (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, nullptr);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(o.verified_inputs_active && refill_submission != cudaSuccess) {
+                    std::fprintf(stderr,"strata: verified expert refill submission failed: %s\n",
+                                 cudaGetErrorString(refill_submission));
+                    verified_copy_refused = true;
+                    break;
+                }
+#else
+                (void)refill_submission;
+#endif
                 filled.emplace_back(i, (int32_t) s);
                 ++pi;
                 break;
             }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(verified_copy_refused)break;
+#endif
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        } catch (...) {
+            if(!o.verified_inputs_active)throw;
+            // Recording an accepted copy (or fetching the next source blob) may
+            // throw after earlier submissions. Preserve failure, then use the
+            // common drain below before any residency publication or unwind.
+            std::fprintf(stderr,"strata: verified expert refill preparation failed after partial submission\n");
+            verified_copy_refused = true;
+        }
+#endif
+        // Even a refused submission may follow earlier successful async copies.
+        // Drain them before returning; a later successful sync cannot turn the
+        // refused copy into a completed expert placement.
         if (cudaDeviceSynchronize() != cudaSuccess) {
             std::fprintf(stderr, "strata: refilling the expert cache failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
         }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(verified_copy_refused)return false;
+#endif
         for (const auto& [i, s] : filled) host_res[i] = s;
         kvg.refilled += (int64_t) filled.size();
         // res_put waits for its copy: the next reader can be a verify window (a non-blocking stream) right away
@@ -10694,8 +14898,19 @@ int main(int argc, char** argv) {
                          ev, v.why.c_str());
         return false;
     };
-    if (o.serve) {
-        if (o.spec < 2 || o.prefill_chunk <= 0 ||
+    // Owned adaptation must not publish residency or retire pinned sources
+    // after an uncertain copy completion. Legacy wait/error behavior is kept.
+    auto adaptation_completed=[&](cudaEvent_t event,int device,bool wait) {
+        const strata::core::ExpertResourceDevice on(o.owned_session_lifetime,device);
+        const cudaError_t result=wait?cudaEventSynchronize(event):cudaEventQuery(event);
+        if(o.owned_session_lifetime && result!=cudaSuccess &&
+           (wait || result!=cudaErrorNotReady))
+            strata::core::retirement_failed("expert adaptation completion");
+        return wait || result==cudaSuccess;
+    };
+
+    if (o.serve || o.suffix_experiment_mode()) {
+        if (o.serving_verifier_capacity() < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
                                  "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
@@ -10707,6 +14922,14 @@ int main(int argc, char** argv) {
         // neither fires, plain one-token-per-round decoding - slower, never wrong: the verify window still
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
+        if(o.native_owned_batch_serving&&
+           (!(o.vision?strata::core::native_owned_batch_serving::eligible_image(native_pack,o,true):strata::core::native_owned_batch_serving::eligible(native_pack,o,true))||
+            !owned_batch_environment()||use_mtp||batch_mtp)){
+            std::fputs("strata serve: owned two-slot intent acquired an unsupported writer or setup\n",stderr);return 2;
+        }
+        if(o.native_serial_serving&&(!strata::core::native_serial_serving::eligible(native_pack,o)||use_mtp||batch_mtp)){
+            std::fputs("strata serve: native serial intent acquired a speculative or batch writer\n",stderr);return 2;
+        }
         // STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path may take a blob a helper's VRAM cache already
         // holds from that cache instead of reading the files again.  The helpers are idle while a prompt is read
         // (the serve path is serial: no batch slots), so the copy needs no ordering against their kernel streams.
@@ -10714,7 +14937,12 @@ int main(int argc, char** argv) {
         // decisions - is forwarded unchanged.  Default off: the prompt path's source is srcp, exactly as before.
         std::vector<strata::core::RemoteExperts*> prefill_helpers;
         for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
-        std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
+        std::unique_ptr<strata::core::RemotePrefillSource> baseline_prefill_helper_src;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& prefill_helper_src=owned_runtime?owned_runtime->prefill_helper_source:baseline_prefill_helper_src;
+#else
+        auto& prefill_helper_src=baseline_prefill_helper_src;
+#endif
         strata::core::ExpertSource* prefill_src = srcp;
         uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
         if (const char* hv = std::getenv("STRATA_PREFILL_HELPER_SOURCE"); hv != nullptr && std::atoi(hv) != 0 &&
@@ -10724,7 +14952,28 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the prompt path reads the experts a helper cache holds from that "
                                  "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
         }
-        strata::prefill::Prefill sp;
+        DriverRuntimeObject<strata::prefill::Prefill> sp_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->primary_prefill:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& sp=sp_storage.get();
+        if(!configure_retirement(sp))return 1;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        auto actual_prefix_policy = [&](uint64_t short_read) {
+            strata::program::PrefixReplayPolicy policy;
+            policy.configured_max=uint64_t(o.prefill_chunk);
+            policy.allocated_max=uint64_t(sp.replay_activity().allocated_chunk);
+            policy.automatic=o.prefill_auto;
+            policy.auto_requested_max=o.prefill_auto?uint64_t(o.prefill_auto_max):0;
+            policy.short_read=short_read;return policy;
+        };
+#endif
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        strata::core::WindowConsumerDrainGuard serve_prefill_consumers{owned_model};
+#endif
         // 149-prefetch STRATA_RAM_ADAPT2=1 (with STRATA_RAM_ADAPT=n, the promotions staged per window): see the window loop
         struct RamAdapt2 {
             bool on = false;
@@ -11251,6 +15500,58 @@ int main(int argc, char** argv) {
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+        auto admit_prefill_workspace = [&](strata::prefill::Prefill& consumer,const strata::core::SessionState& session,
+                                          strata::core::ExpertSource* source,bool borrowed,int device) -> strata::prefill::WorkspaceAdmission {
+            using Admission=strata::prefill::WorkspaceAdmission;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_batch_allocation){
+                if(!model_budget||device<0){err="owned prefill has no actual model ledger/device";return Admission::invalid;}
+                int current_device=-1;
+                if(!owned_runtime||!owned_runtime->sessions.healthy()||cudaGetDevice(&current_device)!=cudaSuccess||current_device!=device){
+                    err="owned prefill requires its healthy allocation on the current stage device";return Admission::invalid;
+                }
+                bool actual_session=false;
+                for(const auto& stage:owned_runtime->sessions.stages())
+                    if(stage.session==&session&&stage.device==device)actual_session=true;
+                if(!actual_session){err="owned prefill session is not the allocated stage";return Admission::invalid;}
+                return consumer.admit_owned_workspace(g,session,source,o.prefill_chunk,borrowed,
+                    [&](const strata::prefill::OwnedWorkspaceBytes& quote,std::shared_ptr<const void>& credit){
+                        const auto dimensions=model_budget->snapshot().capacity.device_bytes.size();
+                        if(size_t(device)>=dimensions)return Admission::invalid;
+                        strata::core::WindowResources resources;resources.device_bytes.resize(dimensions);
+                        resources.device_bytes[size_t(device)]=quote.device;resources.host_bytes=quote.host;resources.pinned_bytes=quote.pinned;
+                        auto admitted=model_budget->reserve(resources,strata::core::ReservationPurpose::foreground);
+                        if(!admitted){
+                            using Error=strata::core::ReservationError;
+                            switch(admitted.error){
+                                case Error::device_limit:case Error::host_limit:case Error::pinned_limit:
+                                    return Admission::budget_refused;
+                                default:return Admission::invalid;
+                            }
+                        }
+                        credit=std::move(admitted.lease);
+                        std::fprintf(stderr,"PREFILL_WORKSPACE v=1 phase=admitted device=%d capacity=%lld borrowed=%d device_quote=%llu host_quote=%llu pinned_quote=%llu\n",
+                            device,(long long)o.prefill_chunk,int(borrowed),(unsigned long long)quote.device,
+                            (unsigned long long)quote.host,(unsigned long long)quote.pinned);
+                        return Admission::ready;
+                    },err);
+            }
+#endif
+            return Admission::ready; // legacy/default-OFF allocation path remains unchanged
+        };
+        auto report_prefill_workspace=[&](const strata::prefill::Prefill& consumer,int expected_device,bool borrowed)->bool {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_batch_allocation){
+                const auto actual=consumer.replay_activity();
+                if(!actual.initialized||!actual.workspace_paid||actual.device!=expected_device||
+                   actual.allocated_chunk!=o.prefill_chunk||actual.chunk<=0||actual.ring_slots<=0){
+                    err="owned prefill resolved workspace/owner differs from actual admission";return false;}
+                std::fprintf(stderr,"PREFILL_WORKSPACE v=1 phase=ready device=%d capacity=%lld chunk=%lld ring=%lld borrowed=%d paid=1\n",
+                    actual.device,(long long)actual.allocated_chunk,(long long)actual.chunk,(long long)actual.ring_slots,int(borrowed));
+            }
+#endif
+            return true;
+        };
         // The path the room belongs to (set below): the one on the drafter's card, which is where the ring's slots
         // point into the drafter's expert block.  The room's LAYOUT is a start-up property - it costs nothing to
         // hold (no allocation, no VRAM: the slots ARE the drafter's bytes) - and a prompt takes it by moving that
@@ -11261,7 +15562,11 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                const strata::core::OnDevice on(st.dev,owned_batch_allocation);
+#else
                 const strata::core::OnDevice on(st.dev);
+#endif
                 void* sb = nullptr;              // this stage's own loan, out of its own cache
                 uint64_t sbb = 0;
                 // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
@@ -11275,11 +15580,15 @@ int main(int argc, char** argv) {
                 st.sp.set_ring_room(room_here ? mtp_room_slots : 0);
                 st.sp.set_ring_room_base(room_here ? mtp.experts_base() : nullptr, room_here ? mtp.experts_bytes() : 0);
                 if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
+                const auto workspace=admit_prefill_workspace(st.sp,st.ss,srcp,sb!=nullptr,st.dev);
+                if(workspace!=strata::prefill::WorkspaceAdmission::ready)
+                    return workspace==strata::prefill::WorkspaceAdmission::budget_refused?2:1;
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb, o.prefill_head_alias)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
                 }
+                if(!report_prefill_workspace(st.sp,st.dev,sb!=nullptr))return 1;
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
@@ -11289,9 +15598,21 @@ int main(int argc, char** argv) {
             if (room_here) room_path = &sp;
             sp.set_ring_room(room_here ? mtp_room_slots : 0);
             sp.set_ring_room_base(room_here ? mtp.experts_base() : nullptr, room_here ? mtp.experts_bytes() : 0);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            const strata::core::OnDevice owned_primary_prefill_device(owned_batch_allocation?primary_device:-1,owned_batch_allocation);
+#endif
+            const auto workspace=admit_prefill_workspace(sp,ss,prefill_src,borrow!=nullptr,primary_device);
+            if(workspace!=strata::prefill::WorkspaceAdmission::ready)
+                return workspace==strata::prefill::WorkspaceAdmission::budget_refused?2:1;
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_batch_allocation&&!sp.reserve_uploads(o.prefill_chunk)){
+                err="owned prefill stage upload rings are not paid/frozen at the resolved chunk";return 1;
+            }
+#endif
+            if(!report_prefill_workspace(sp,primary_device,borrow!=nullptr))return 1;
             if (mtp_room_slots > 0 && room_path == nullptr)   // the drafter's card holds none of the prompt paths
                 std::fprintf(stderr, "strata serve: prompt room: no prompt path runs on CUDA%d, the drafter's card: the "
                                      "prompt reads with its own ring\n", mtp.device());
@@ -11466,14 +15787,47 @@ int main(int argc, char** argv) {
         const size_t kHistSlots = (size_t) kPenaltyWindowCap *
             (size_t) (o.lookup_max_t > (int) strata::kernels::kVerifyNarrowT ? strata::kernels::kVerifyLongT
                       : o.batch > strata::kernels::kVerifyNarrowT ? strata::kernels::kVerifyMaxT : strata::kernels::kVerifyNarrowT);
-        int32_t* d_hist = nullptr;
-        std::vector<int32_t> hist_stage(kHistSlots, -1);
+        int32_t* baseline_d_hist = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& d_hist=owned_runtime?owned_runtime->penalty_history:baseline_d_hist;
+#else
+        auto& d_hist=baseline_d_hist;
+#endif
+        std::vector<int32_t> baseline_hist_stage;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& hist_stage=owned_runtime?owned_runtime->penalty_staging:baseline_hist_stage;
+#else
+        auto& hist_stage=baseline_hist_stage;
+#endif
+        hist_stage.assign(kHistSlots,-1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
-        if (const strata::core::OnDevice on_h(hist_dev); cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
+        bool history_allocated=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(o.owned_session_lifetime)
+            history_allocated=allocate_scratch(last_st?last_st->dev:primary_device,
+                kHistSlots*sizeof(int32_t),reinterpret_cast<void**>(&d_hist));
+        else
+#endif
+        {
+            const strata::core::OnDevice on_h(hist_dev);
+            history_allocated=cudaMalloc(&d_hist,kHistSlots*sizeof(int32_t))==cudaSuccess;
+        }
+        if (!history_allocated) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
-        strata::core::Verifier ver;
+        DriverRuntimeObject<strata::core::Verifier> ver_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->primary_verifier:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& ver=ver_storage.get();
+        if(!configure_retirement(ver))return 1;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        strata::core::WindowConsumerDrainGuard serve_verifier_consumers{owned_model};
+#endif
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
@@ -11497,13 +15851,45 @@ int main(int argc, char** argv) {
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
-        strata::core::Verifier ver_same;
-        SplitDrive split_drive;
+        DriverRuntimeObject<strata::core::Verifier> ver_same_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->same_device_verifier:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& ver_same=ver_same_storage.get();
+        if(!configure_retirement(ver_same))return 1;
+        DriverRuntimeObject<SplitDrive> split_drive_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->split_drive:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& split_drive=split_drive_storage.get();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        strata::core::WindowConsumerDrainGuard same_verifier_consumers{owned_model};
+#endif
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+        bool serial_gate_prepared=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if (remote_policy_setup) {
+            // Install the immutable owned chain before init publishes any stage
+            // to the watchdog registry. Default construction keeps its old order.
+            for (int st=0;st+1<n_stages;++st)
+                stage_ver(st).set_next(&stage_ver(st+1),&split_drive);
+            if (!prepare_remote_completion_gate(ver)) {
+                std::fprintf(stderr,"strata generate: remote completion gate preparation refused: %s\n",err.c_str());
+                return 1;
+            }
+            serial_gate_prepared=true;
+        }
+#endif
         // a layer split's hand-off buffers (and its pipelined windows) hold kVerifyMaxT rows: --lookup-max-t stops there
         if (n_stages > 1 && o.spec > strata::kernels::kVerifyNarrowT) {
             std::fprintf(stderr, "strata serve: --lookup-max-t %d: a layer split's windows stop at %d tokens\n",
@@ -11515,8 +15901,29 @@ int main(int argc, char** argv) {
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
         // stage: window K+1 follows window K through them one card behind, and only the last stage waits for K's verdict
         const bool pipe = o.pipeline_windows > 0 && n_stages >= 2 && !split_same && (int) stages.size() == n_stages - 1;
-        strata::core::Verifier ver_b;
-        SplitDrive split_drive_b;
+        if(o.native_serial_serving&&pipe){
+            std::fputs("strata serve: native serial intent acquired a pipelined writer\n",stderr);return 2;
+        }
+        DriverRuntimeObject<strata::core::Verifier> ver_b_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->odd_verifier:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& ver_b=ver_b_storage.get();
+        if(!configure_retirement(ver_b))return 1;
+        DriverRuntimeObject<SplitDrive> split_drive_b_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->split_drive_b:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& split_drive_b=split_drive_b_storage.get();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        strata::core::WindowConsumerDrainGuard odd_verifier_consumers{owned_model};
+#endif
         std::vector<cudaStream_t> pl_stream(pipe ? (size_t) n_stages : 0, nullptr);
         // stage st's verifier of one parity (0: the even windows, 1: the odd ones)
         auto stage_ver_p = [&](int st, int par) -> strata::core::Verifier& {
@@ -11549,11 +15956,26 @@ int main(int argc, char** argv) {
                                                          std::min<int>(o.batch, strata::kernels::kVerifyMaxT))
                                          : strata::kernels::kVerifyNarrowT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
-            std::vector<float*> hand((size_t) n_stages - 1, nullptr);
+            std::vector<float*> baseline_hand;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            auto& hand=owned_runtime?owned_runtime->verifier_handoffs:baseline_hand;
+#else
+            auto& hand=baseline_hand;
+#endif
+            if(!hand.empty()) {std::fputs("strata serve: handoffs already bound\n",stderr);return 1;}
+            hand.assign((size_t)n_stages-1,nullptr);
             for (float*& h : hand) {
                 float* hh = nullptr;
-                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
+                bool allocated=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(owned_runtime) allocated=allocate_scratch(primary_device,hb,
+                    reinterpret_cast<void**>(&hh),strata::core::WindowBufferMemory::mapped_host,
+                    reinterpret_cast<void**>(&h));
+                else
+#endif
+                allocated=cudaHostAlloc((void**) &hh,hb,cudaHostAllocMapped|cudaHostAllocPortable)==cudaSuccess &&
+                    cudaHostGetDevicePointer((void**) &h,hh,0)==cudaSuccess;
+                if(!allocated) {
                     std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
                     return 1;
                 }
@@ -11571,11 +15993,28 @@ int main(int argc, char** argv) {
             if (overlap_asked && o.pipeline_windows > 0)
                 std::fprintf(stderr, "strata serve: STRATA_SPLIT_OVERLAP is off beside --pipeline-windows %d "
                                      "(that loop overlaps the stages itself)\n", o.pipeline_windows);
-            std::vector<uint32_t*> hflag_h((size_t) n_stages - 1, nullptr), hflag_d((size_t) n_stages - 1, nullptr);
+            std::vector<uint32_t*> baseline_hflag_h,baseline_hflag_d;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            auto& hflag_h=owned_runtime?owned_runtime->handoff_flags_host:baseline_hflag_h;
+            auto& hflag_d=owned_runtime?owned_runtime->handoff_flags_device:baseline_hflag_d;
+#else
+            auto& hflag_h=baseline_hflag_h;
+            auto& hflag_d=baseline_hflag_d;
+#endif
+            if(!hflag_h.empty()||!hflag_d.empty()) {std::fputs("strata serve: handoff flags already bound\n",stderr);return 1;}
+            hflag_h.assign((size_t)n_stages-1,nullptr);hflag_d.assign((size_t)n_stages-1,nullptr);
             if (overlap)
                 for (size_t i = 0; i < hflag_h.size(); ++i) {
-                    if (cudaHostAlloc((void**) &hflag_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                        cudaHostGetDevicePointer((void**) &hflag_d[i], hflag_h[i], 0) != cudaSuccess) {
+                    bool allocated=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    if(owned_runtime) allocated=allocate_scratch(primary_device,64,
+                        reinterpret_cast<void**>(&hflag_h[i]),strata::core::WindowBufferMemory::mapped_host,
+                        reinterpret_cast<void**>(&hflag_d[i]));
+                    else
+#endif
+                    allocated=cudaHostAlloc((void**) &hflag_h[i],64,cudaHostAllocMapped|cudaHostAllocPortable)==cudaSuccess &&
+                        cudaHostGetDevicePointer((void**) &hflag_d[i],hflag_h[i],0)==cudaSuccess;
+                    if(!allocated) {
                         std::fprintf(stderr, "strata serve: the layer-split hand-off flag allocation failed\n");
                         return 1;
                     }
@@ -11604,7 +16043,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
+                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.serving_verifier_capacity(), std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
@@ -11621,7 +16060,7 @@ int main(int argc, char** argv) {
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     // (STRATA_PIPED_MTP: a group's window is its one slot's token and proposals, at most --spec rows,
                     // so the stage keeps the windows it has without --batch-mtp - the solo path's too)
-                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, batch_max_t(), err);
+                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, (o.native_owned_batch_serving ? std::max(o.serving_verifier_capacity(), std::min(o.batch,(int)strata::kernels::kVerifyMaxT)) : batch_max_t()), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -11631,7 +16070,8 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
+            if (!serial_gate_prepared)
+                for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
             std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
@@ -11669,7 +16109,7 @@ int main(int argc, char** argv) {
                 vs.blob = thits.blob;
                 vs.slot_off = gs.cache.slot_offsets();
                 vs.n_slots = gs.cache.slots();
-                if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err)) {
+                if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.serving_verifier_capacity(), err)) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA%d (stage %d): %s "
                                          "(raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n",
                                  gs.dev, st + 1, err.c_str());
@@ -11689,7 +16129,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.serving_verifier_capacity(), err)) {
                 std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
                                      "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
                 return 1;
@@ -11705,7 +16145,7 @@ int main(int argc, char** argv) {
         if (batch_df2) ver.set_batch_taps(true);
 #endif
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_max_t(), err) ||
+                      (o.native_owned_batch_serving ? std::max(o.serving_verifier_capacity(), std::min(o.batch,(int)strata::kernels::kVerifyMaxT)) : batch_max_t()), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -11871,17 +16311,107 @@ int main(int argc, char** argv) {
                 }
             }
         }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        // Exclusive controller startup: all main stage verifiers just returned
+        // from init. Graph/slot preparation and stdin/request/history work are
+        // below. Keep the earned owner and watermark for the real serving path.
+        std::shared_ptr<strata::program::ServingRawSession> serving_raw_session;
+        uint64_t serving_raw_cut = 0;   // serving cut identity: monotonic, never reused
+        if(o.native_owned_batch_serving){
+            if(!owned_batch_allocation||!owned_runtime||!model_budget){
+                std::fputs("owned startup lacks its actual native allocation/ledger\n",stderr);return 1;
+            }
+            std::vector<strata::core::Verifier*> vers;
+            vers.push_back(&ver);
+            for(auto& st:stages)vers.push_back(&st->ver);
+            if(!strata::program::ServingRawSession::open_owned_startup(g,owned_runtime->sessions,owned_runtime,
+                std::move(vers),*model_budget,uint64_t(o.max_context),o.suffix_cache_host_bytes,serving_raw_session,err)){
+                std::fprintf(stderr,"owned startup reset/drained owner refused: %s\n",err.c_str());return 1;
+            }
+            serving_raw_cut=serving_raw_session->cut().id;
+            std::array<strata::prefill::Prefill*,8> bank_prefills{};
+            if(stages.size()>=bank_prefills.size()){
+                std::fputs("owned position bank stage directory overflow\n",stderr);return 1;
+            }
+            bank_prefills[0]=&sp;
+            for(size_t i=0;i<stages.size();++i)bank_prefills[i+1]=&stages[i]->sp;
+            // Fixed enclosing construction precedes this admission under the
+            // inherited scoped limitation; this is NOT admission-before-entry.
+            // Appending the binding keeps each old type alignment unchanged.
+            // Cover new field extent and both possible padding boundaries.
+            static_assert(alignof(strata::core::Verifier)>=alignof(std::shared_ptr<const strata::program::OwnedPositionBankBinding>));
+            static_assert(alignof(strata::prefill::Prefill)>=alignof(std::shared_ptr<const strata::program::OwnedPositionBankBinding>));
+            static_assert(alignof(DriverRuntimeObject<strata::core::Verifier>)==alignof(strata::core::Verifier));
+            static_assert(alignof(DriverRuntimeObject<strata::prefill::Prefill>)==alignof(strata::prefill::Prefill));
+            const uint64_t v_delta=strata::core::Verifier::owned_position_fixed_growth_bound();
+            const uint64_t p_delta=strata::prefill::Prefill::owned_position_fixed_growth_bound();
+            // All THREE primary Verifier wrappers are constructed even when the
+            // alternate consumers are unused: inline optional AND owned heapT.
+            // One analogous primary Prefill wrapper. No Impl growth is charged
+            // here: actual sizeof(Impl) already belongs to its workspace quote.
+            const auto quote_add=[](uint64_t& total,uint64_t count,uint64_t bytes) {
+                if(count&&bytes>(UINT64_MAX-total)/count)return false;
+                total+=count*bytes;return true;
+            };
+            uint64_t primary=0,per_stage=0,enclosing=0;
+            // Every actual GpuStage embeds ver, ver_b, sp. Eight successive
+            // boundaries from ver through mrope bound incremental outer padding.
+            if(!quote_add(primary,6,v_delta)||!quote_add(primary,2,p_delta)||
+               !quote_add(primary,6,alignof(DriverRuntimeObject<strata::core::Verifier>))||
+               !quote_add(primary,2,alignof(DriverRuntimeObject<strata::prefill::Prefill>))||
+               !quote_add(per_stage,2,v_delta)||!quote_add(per_stage,1,p_delta)||
+               !quote_add(per_stage,8,alignof(GpuStage))||!quote_add(enclosing,1,primary)||
+               !quote_add(enclosing,uint64_t(stages.size()),per_stage)||
+               !quote_add(enclosing,1,sizeof(OwnedPositionBankRetirement))||
+               !quote_add(enclosing,1,strata::program::OwnedImageRequestDriver::choice_quote())||
+               !quote_add(enclosing,o.vision?1:0,strata::program::OwnedImageRequestDriver::reactor_quote())||
+               !quote_add(enclosing,1,sizeof(bank_prefills)+sizeof(quote_add)+
+                   sizeof(std::span<strata::prefill::Prefill* const>)+4*sizeof(uint64_t)+4*sizeof(void*))){
+                std::fputs("owned position bank enclosing quote overflow\n",stderr);return 1;
+            }
+            position_bank_retirement.runtime=owned_runtime;
+            if(!serving_raw_session->prepare_owned_position_banks(owned_runtime->batch_slot_bindings,
+                std::span<strata::prefill::Prefill* const>(bank_prefills.data(),stages.size()+1),
+                enclosing,position_bank_retirement.setup,err)){
+                std::fprintf(stderr,"owned position bank preparation refused: %s\n",err.c_str());return 1;
+            }
+
+        }
+#endif
         // each stage's verifier gets its stage's slot sessions
         if (o.batch > 0) {
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_batch_allocation){
+                const char* raw=std::getenv("STRATA_OWNED_BATCH_SETUP_HOST_BYTES");uint64_t host_bytes=0;
+                if(!raw||!*raw){std::fputs("owned batch setup requires explicit host setup capacity\n",stderr);return 1;}
+                const auto parsed=std::from_chars(raw,raw+std::strlen(raw),host_bytes);
+                if(parsed.ec!=std::errc{}||parsed.ptr!=raw+std::strlen(raw)||!host_bytes||
+                   !ver.prepare_owned_batch_slots(*model_budget,owned_runtime->batch_slot_bindings,host_bytes,err)){
+                    std::fprintf(stderr,"owned batch admitted graph setup refused: %s\n",err.c_str());return 1;
+                }
+            }
+#endif
+            for (size_t k = 0; k < batch_slot_stage_count(); ++k) {
                 std::vector<strata::core::SessionState*> ptrs;
-                for (auto& u : bslot_ss[k]) ptrs.push_back(u.get());
+                for (int b=0;b<o.batch;++b) ptrs.push_back(batch_slot_session(k,size_t(b)));
                 strata::core::Verifier& vk = k == 0 ? ver : stages[k - 1]->ver;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (!vk.init_slots(ptrs, err)) {
+                bool initialized=false;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                initialized=owned_batch_allocation;
+#endif
+                if (!initialized&&!vk.init_slots(ptrs, err)) {
                     std::fprintf(stderr, "strata serve: --batch, stage %zu: %s\n", k + 1, err.c_str());
                     return 1;
                 }
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(owned_batch_allocation)for(size_t slot=0;slot<2;++slot){
+                    if(!vk.inspect_owned_batch_slot(owned_runtime->batch_slot_bindings,
+                        owned_runtime->batch_slot_bindings->token(slot),k,owned_runtime->batch_slot_inspections[k*2+slot])){
+                        std::fprintf(stderr,"owned batch actual verifier slot binding refused at stage %zu slot %zu\n",k,slot);return 1;
+                    }
+                }
+#endif
                 // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
                 if (piped_mtp && bslot_ss.size() > 1 &&
                     !vk.init_deferred_commit(std::max<int>(strata::kernels::kVerifyNarrowT, (1 + pm_drafts) * o.batch), err)) {
@@ -11916,6 +16446,26 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE) && defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        if(o.suffix_experiment_mode()) {
+            // Post-normalization runtime revalidation, not a text-shape permit.
+            if(o.serve||o.suffix_experiment_requested_spec!=0||o.spec!=2||use_mtp||pipe||batch_mtp||
+               o.batch||o.pipeline_windows||o.suffix_draft||o.lookup_chain||o.vision||o.kv_grow||
+               o.adapt_every||o.adapt_async||remote_opt||drive.d.remote_count||
+               !owned_runtime||!model_budget) {
+                std::fputs("resolved suffix runtime differs from admitted no-draft profile\n",stderr);return 2;
+            }
+            // Ordinary serving binds this later, after prompt/cache setup. The
+            // dedicated branch returns before that point, so bind its actual
+            // verifier plan now rather than weakening runtime validation.
+            drive.d.plan=ver.plan_sink();
+            DriverSuffixExperimentContext experiment{o,g,owned_runtime,*model_budget,
+                sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+            // Mandatory return: no prompt_state/cache, adaptation jobs, READY,
+            // stdin reader or normal generation path is reached by this mode.
+            return strata::program::SuffixExperimentDriver::run(experiment,run_serial_remote_unit);
+        }
+#endif
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -12023,7 +16573,15 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on(mtp.device());
             cudaStreamSynchronize(mtp.stream());
         };
-        std::vector<int64_t> cur;
+        DriverRuntimeObject<DriverPromptState> prompt_state_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->prompt_state:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& prompt_state=prompt_state_storage.get();
+        auto& cur=prompt_state.cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
         // saved points; every one of them is a prefix of `live` (the loop drops the rest), so they form a chain -
@@ -12031,28 +16589,143 @@ int main(int argc, char** argv) {
         // chain's root is the deepest point every request so far shared (the end of the system prompt, in
         // practice); the retention policy pins it and rotates the rest LRU (conv_cache.hpp), so a NEW chat that
         // shares that prefix mounts through it instead of reading it again.
-        std::vector<int32_t> live;
-        std::vector<ImgKey> live_imgs, req_imgs;
-        bool live_ok = false;
+        auto& live=prompt_state.live;
+        auto& live_imgs=prompt_state.live_imgs;
+        auto& req_imgs=prompt_state.req_imgs;
+        auto& live_ok=prompt_state.live_ok;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
-        bool nan_flush = false;
+        auto& nan_flush=prompt_state.nan_flush;
         // #3465: the non-finite logits came in a window that reads the PROMPT's tail (the last few tokens, read through
         // the verify windows after the batched part).  The retry reads that tail batched (--short-read 0 for one request):
         // a reporter's prompts failed there every time and passed with --short-read 0.
-        bool nf_prompt_windows = false, short_read_off_once = false;
-        std::vector<ConvCheckpoint> checks;
-        // KVA: which prefixes of token ids a KVA read approximated, so the draft layer knows, for whatever state a request
-        // continues from, the first cell built from a real row (kva_floor.hpp).  Empty without KVA.
-        strata::prefill::KvaFloorRegistry kva_floors;
+        auto& nf_prompt_windows=prompt_state.nf_prompt_windows;
+        auto& short_read_off_once=prompt_state.short_read_off_once;
+        auto& checks=prompt_state.checks;
         // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused.  STRATA_SLOT_CKPT_MOVE turns it on too: a moved
         // checkpoint frees nothing at the next prune, so every save would fault in fresh pages (17 -> 40-60 ms)
         CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env(), ckpt_pool_cap_env());
-        uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
-        int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+        auto& check_clock=prompt_state.check_clock;   // the checkpoints' LRU clock; creation and every use advance it
+        auto& tail_ckpt_len=prompt_state.tail_ckpt_len;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+        strata::prefill::KvaFloorRegistry kva_floors;
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
         // checkpoints taken inside it
-        ConvCheckpoint::PromptPlan seg_plan;
-        bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        auto& seg_plan=prompt_state.seg_plan;
+        auto& cvec_cached=prompt_state.cvec_cached;   // the control vector's state the live session and the checkpoints were read with
+        // P12 suffix reuse: whether that state (and therefore what this session parks) is an approximate import
+        auto& live_approximate=prompt_state.live_approximate;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        // P12 suffix reuse: the private RAW transaction owner for THIS serving session.  It is real ownership
+        // (runtime shared_ptr, verifier vector, WindowBudget reference, its own setup credit). Owned two-slot
+        // startup already earned its empty cut; other modes still open lazily. Every RAW operation uses its fence.
+        strata::core::BundleHandle serving_donor;
+        // Two actual exact images, each retaining its own aggregate-H capture credit.
+        // This is independent of the legacy prompt cache and never describes main as holding a slot image.
+        std::array<strata::core::BundleHandle,2> owned_exact_donors;
+        size_t owned_exact_donor_next=0;
+        auto retain_owned_exact_donor=[&](const strata::core::BundleHandle& image) {
+            const auto* d=image.get();
+            if(!d||!d->approximation.empty()||d->cut.exact_frontier!=d->cut.forwarded||
+               d->cut.accepted!=d->cut.forwarded+1||d->accepted_tokens.size()!=d->cut.accepted||
+               d->pending_tokens.size()!=1||d->pending_tokens.front()!=d->accepted_tokens.back()||
+               d->cut.history!=strata::core::window_history_digest(d->accepted_tokens))return false;
+            for(const auto& old:owned_exact_donors)if(old.get()==d)return true;
+            owned_exact_donors[owned_exact_donor_next]=image;
+            owned_exact_donor_next=(owned_exact_donor_next+1)%owned_exact_donors.size();return true;
+        };
+        strata::core::StateCut serving_donor_cut{};
+        std::unique_ptr<strata::program::ServingSuffixRepairOperation::Outcome> serving_suffix_active;
+        // Retained repair across a response boundary (slice 2, OPT-IN ONLY): a window-keyed registry that holds a
+        // LIVE, unretired repair owner whose private debt is still open, moved out of the slot below at a
+        // certified yield instead of being drained-and-retired inside the request.  Neither number has a compiled
+        // default: STRATA_SERVING_REPAIR_OWNER_SLOTS names the slot bound and STRATA_SERVING_REPAIR_IDLE_UNIT_
+        // TOKENS names the per-tick private-unit cap in tokens; an absent or invalid selector leaves the registry
+        // null and the idle tick never runs, so the serving path stays exactly as it is today.  Nothing here is
+        // qualified or deployed.
+        using ServingRepairOwnerRegistryForServing = strata::program::ServingRepairOwnerRegistry<
+            strata::program::ServingSuffixRepairOperation::Outcome>;
+        std::unique_ptr<ServingRepairOwnerRegistryForServing> serving_repair_owners;
+        std::string serving_repair_owner_error;
+        const std::size_t serving_repair_idle_unit = strata::program::serving_repair_idle_unit_tokens();
+        const auto serving_repair_schedule=strata::program::serving_repair_scheduler_config();
+        const auto serving_threads_config=strata::program::serving_thread_config();
+        std::unique_ptr<strata::program::ServingThreadBridge> serving_threads;
+        std::shared_ptr<const strata::core::ReservationLease> serving_thread_metadata;
+        auto serving_thread_now_ms=[]() noexcept {
+            return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        };
+        if(!serving_threads_config.valid || (serving_threads_config.enabled&&
+           (!owned_batch_allocation||!o.suffix_cache||!serving_repair_schedule.enabled||!model_budget))){
+            std::fputs("strata serve: managed thread policy requires explicit bounded limits, owned two-slot serving, actual model budget and complete repair policy\n",stderr);return 2;
+        }
+        if(serving_threads_config.enabled){
+            auto charge=model_budget->reserve({std::vector<uint64_t>(model_budget->snapshot().capacity.device_bytes.size()),
+                serving_threads_config.limits.metadata_bytes,0,0,0,0},strata::core::ReservationPurpose::foreground);
+            if(!charge){std::fputs("strata serve: thread scheduler metadata quota refused\n",stderr);return 2;}
+            serving_thread_metadata=std::move(charge.lease);
+            const uint64_t scheduler_epoch=strata::program::serving_thread_epoch();
+            if(!scheduler_epoch){std::fputs("strata serve: nonblocking OS scheduler epoch unavailable\n",stderr);return 2;}
+            serving_threads=std::make_unique<strata::program::ServingThreadBridge>(scheduler_epoch,
+                serving_threads_config.limits,serving_thread_metadata);
+        }
+        if(!serving_repair_schedule.valid){
+            std::fputs("strata serve: incomplete or invalid experimental repair scheduling policy; all five age/weight/cap/seed selectors are required\n",stderr);
+            return 2;
+        }
+        uint64_t serving_repair_random_state=serving_repair_schedule.seed;
+        uint64_t serving_repair_consecutive_escalated=0;
+        if(serving_repair_schedule.enabled)
+            std::fprintf(stderr,"strata serve: REPAIR_POLICY v=1 age_ns=%llu live_weight=%llu foreground_weight=%llu max_escalated_units=%llu seed=%llu\n",
+                (unsigned long long)*serving_repair_schedule.policy.live_repair_age_escalation_ns,
+                (unsigned long long)serving_repair_schedule.live_weight,
+                (unsigned long long)serving_repair_schedule.foreground_weight,
+                (unsigned long long)serving_repair_schedule.max_consecutive,
+                (unsigned long long)serving_repair_schedule.seed);
+        if (const std::size_t serving_repair_owner_slots =
+                strata::program::serving_repair_owner_slots(); serving_repair_owner_slots > 0) {
+            serving_repair_owners = std::make_unique<ServingRepairOwnerRegistryForServing>(
+                serving_repair_owner_slots);
+            std::fprintf(stderr, "strata serve: suffix cache (repaired): opt-in retained repair owner registry, "
+                                 "slots=%zu from %s, idle private unit cap=%zu from %s (0 means no idle private "
+                                 "work; nothing is retained unless a certified yield succeeds)\n",
+                         serving_repair_owner_slots, strata::program::kServingRepairOwnerSlotsEnv,
+                         serving_repair_idle_unit, strata::program::kServingRepairIdleUnitEnv);
+        }
+#endif
+        // The repaired path's per-request plan, kept outside the build guard so the ordinary conversation bookkeeping
+        // below can always invalidate it: where the prompt read must stop so the exact prefix endpoint can be
+        // captured, the request-parameterized repair frontier, and the accepted history the import stands on.
+        int64_t serving_suffix_boundary = -1;
+        std::vector<uint64_t> serving_suffix_frontiers;
+        std::vector<int32_t> serving_suffix_accepted;
+        bool serving_raw_fence_running = false;   // a prefix read is inside a running RAW work phase
+        bool serving_suffix_applied = false;      // an import+repair installed state for this request
+        // The token the live session's device state was about to consume (its genuine pending token).  Only the
+        // normal completion path can certify it: every restore, slot hand-off, relabel or cancelled read leaves it
+        // unknown, and a donor without a valid pending token is refused rather than certified one row behind.
+        int32_t serving_pending_token = -1;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        // ---- slice 7: the certificate of the state this session ACTUALLY stands on -----------------------
+        // A retained owner is activated by first capturing the conversation that is live on the session, so the
+        // serving path has to know which accepted run the session's current cut certifies.  Carrying an earlier
+        // conversation's cut and history across another request's ordinary mutation does NOT: GDN/PLE recurrence,
+        // checkpoints and the native endpoint buffers are all rewritten by that request, so the recorded cut
+        // would describe a state the device no longer holds.  This is therefore tracked through the ordinary
+        // request's OWN begin/drain lifecycle (see the ORDINARY_FENCE block before the request's first restore and
+        // the ORDINARY_CERTIFY block after its last all-stage commit).  A request that mutates the session
+        // outside such a fence CLEARS the certificate, and a retained activation over a cleared certificate is a
+        // clean refusal - never a capture of a stale state.
+        strata::core::serving_raw::TrackedState serving_tracked_state;
+        // Provenance inherited by the next request: the age anchor and ancestor of the approximation the tracked
+        // state carries.  Meaningful only while the tracked state is inexact; a clean reset drops it.
+        strata::core::serving_raw::ApproximationProvenance serving_tracked_provenance;
+#endif
+        // One ordinal per request that reaches the suffix decision (serving is serial for the admitted shape).
+        // The repaired-path evidence is segmented by REQ_BEGIN lines: everything the engine writes between
+        // REQ_BEGIN(N) and REQ_BEGIN(N+1) belongs to request N, so attribution never depends on when the harness
+        // happens to read a buffered stderr line.
+        uint64_t serving_request_ordinal = 0;
+
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
         // #3493: no --conversation-cache-mib given: size the cache for agent use from the RAM that is free now that the model is
@@ -12397,11 +17070,17 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // P12: an approximate import must park as approximate, so the exact matcher (best()) refuses it and
+                // imported state can never be handed to another request as a guarantee.  The park line makes that
+                // provenance visible in the serving log, which is what the API-level acceptance test asserts on.
+                image.approximate = live_approximate;
+                const int approximate_flag = image.approximate ? 1 : 0;
                 const bool stored = conversations.put(std::move(image), held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu approximate=%d\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes,
+                             reused_bytes, approximate_flag);
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -12427,18 +17106,21 @@ int main(int argc, char** argv) {
                 return true;
             }
         };
-        int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
-        bool pp_tail_saved = false;
+        auto& pp_total=prompt_state.pp_total;
+        auto& pp_from=prompt_state.pp_from;
+        auto& pp_next_check=prompt_state.pp_next_check;
+        auto& pp_tail_saved=prompt_state.pp_tail_saved;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
         // mid-read reports as read, instead of the whole prompt
-        int64_t pp_reached = 0;
+        auto& pp_reached=prompt_state.pp_reached;
         // #1620: the session holds exactly the tokens [0, pp_reached) of the prompt (no chunk or window is in flight, none
         // failed): a request cancelled here keeps them as the live conversation instead of dropping what it restored
-        bool pp_exact = false;
-        Clock::time_point pp_t0 = Clock::now();
+        auto& pp_exact=prompt_state.pp_exact;
+        auto& pp_t0=prompt_state.pp_t0;
+        pp_t0=Clock::now();
         // #879: this request met a window whose head logits were not all finite (nonfinite_hit): it ends with
         // DONE ... nonfinite, emitting none of that window's tokens
-        bool nf_hit = false;
+        auto& nf_hit=prompt_state.nf_hit;
         auto nonfinite_hit = [&](const strata::core::Verifier& v, const char* what) -> bool {
             const int row = v.nonfinite_row();
             if (row < 0) return false;
@@ -12460,22 +17142,21 @@ int main(int argc, char** argv) {
         // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
         // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
         // every `prompt_cache_every` tokens from where the request resumed), and the last stage puts them together.
-        std::mutex part_mu;
-        std::map<int64_t, std::vector<ConvCheckpoint>> part_at;   // position -> one part per stage
-        std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
+        auto& part_mu=prompt_state.part_mu;
+        auto& part_at=prompt_state.part_at;   // position -> one part per stage
+        auto& part_next=prompt_state.part_next;
+        part_next.assign(stages.size()+1,INT64_MAX);
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
         // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
         // #613: why the last checkpoint_at failed - a failed device sync is the GPU itself (a hang Windows then resets),
         // not the checkpoint, and the error says so
-        std::string ckpt_why;
+        auto& ckpt_why=prompt_state.ckpt_why;
         // STRATA_TRACE: what each checkpoint cost - the device syncs, the copies into RAM (the vectors' first fill
         // included), the eviction that frees one - one line per checkpoint; with the prompt's read parts summed per
         // request for a batch admission's line (below, at BADM)
         const bool ckpt_trace = std::getenv("STRATA_TRACE") != nullptr;
-        struct ReqTimes {
-            int ckpts = 0;
-            double sync_ms = 0.0, save_ms = 0.0, evict_ms = 0.0, read_ms = 0.0, windows_ms = 0.0;
-        } req_times;
+        using ReqTimes=DriverPromptState::ReqTimes;
+        auto& req_times=prompt_state.req_times;
         auto gpu_sync_ok = [&]() -> bool {
             const cudaError_t e = cudaDeviceSynchronize();
             if (e == cudaSuccess) return true;
@@ -12505,6 +17186,7 @@ int main(int argc, char** argv) {
                 c.tails = std::move((*parts)[0].tails);
                 c.dead = std::move((*parts)[0].dead);
                 c.block_pos = std::move((*parts)[0].block_pos);
+                c.pending = std::move((*parts)[0].pending);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else if (ckpt_pool.on() || ckpt_threads_env()) {
                 // STRATA_CKPT_POOL / STRATA_CKPT_THREADS: the parts go into the vectors a pooled checkpoint already has
@@ -12655,6 +17337,9 @@ int main(int argc, char** argv) {
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        DriverPrefillCallbacks serve_callback_retirement{owned_model,sp,stages};
+#endif
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             // KVA: a chunk the late layers did not compute has no real final rows: its draft cells are neither built
             // nor read (the floor rises before the cells are built, so they are skipped)
@@ -12741,12 +17426,51 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        // Owned no-cache serving cannot retain references to this construction
+        // scope. MTP is already refused for owned sessions. The callback resolves
+        // its own runtime each time; expiration refuses progress, never borrows a
+        // replacement runtime. Cache-enabled legacy callbacks remain separate.
+        if(owned_runtime && o.prompt_cache<=0) {
+            // BEGIN owned prompt progress callback (CPU extraction test).
+            sp.on_chunk = [runtime=std::weak_ptr<DriverWindowRuntime>(owned_runtime),
+                           cache_every=o.prompt_cache_every]
+                (const float*,int64_t T,int64_t p0,std::string& e)->bool {
+                const auto owner=runtime.lock();
+                if(!owner || !owner->prompt_state) {
+                    e="owned prompt callback runtime expired";return false;
+                }
+                auto& state=*owner->prompt_state;
+                if(T<0 || p0<0 || p0>state.pp_total || T>state.pp_total-p0) {
+                    e="owned prompt callback extent invalid";return false;
+                }
+                const int64_t done=p0+T;
+                state.pp_reached=done;
+                const double ms=std::chrono::duration<double,std::milli>(Clock::now()-state.pp_t0).count();
+                std::printf("PP %lld %lld %.0f %.1f\n",(long long)done,(long long)state.pp_total,ms,
+                    ms>0.0?1000.0*double(done-state.pp_from)/ms:0.0);
+                strata::core::progress_at("reading the prompt (batched), done up to token",done);
+                strata::core::progress_beat();
+                std::fflush(stdout);
+                if(cache_every>0 && done>=state.pp_next_check)
+                    state.pp_next_check=done>INT64_MAX-cache_every?INT64_MAX:done+cache_every;
+                return true;
+            };
+            // END owned prompt progress callback.
+        }
+#endif
         if (multi_gpu) {   // the batched prompt is reported by its last stage (the drafter's rows are there)
             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
             sp.on_chunk = nullptr;
             for (size_t i = 0; i <= stages.size(); ++i) {
                 strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(owned_runtime && o.prompt_cache<=0) {
+                    stage_sp.on_stage_chunk=nullptr;
+                    continue;
+                }
+#endif
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
                     part_next[i] = done + o.prompt_cache_every;
@@ -12772,15 +17496,21 @@ int main(int argc, char** argv) {
         }
         drive.d.plan = ver.plan_sink();
         // Foresight swap space (STRATA_FS_SLOTS; unset = null and nothing changes)
-        std::unique_ptr<strata::core::ForesightSwap> fs_swap;
+        std::unique_ptr<strata::core::ForesightSwap> baseline_fs_swap;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& fs_swap=owned_runtime?owned_runtime->foresight:baseline_fs_swap;
+#else
+        auto& fs_swap=baseline_fs_swap;
+#endif
         {
             int main_dev = 0;
-            cudaGetDevice(&main_dev);
+            const auto device_status=cudaGetDevice(&main_dev);
+            if(o.owned_session_lifetime && device_status!=cudaSuccess)return 1;
             std::vector<int> devs{main_dev};
             for (auto& st : stages) devs.push_back(st->dev);
             std::vector<int> card((size_t) g.n_layers, 0);
             for (int64_t l = 0; l < g.n_layers; ++l) card[(size_t) l] = multi_gpu ? stage_of(l) : 0;
-            fs_swap.reset(strata::core::foresight_swap_from_env(g.n_layers, g.n_expert, card, devs));
+            fs_swap.reset(strata::core::foresight_swap_from_env(g.n_layers, g.n_expert, card, devs, o.owned_session_lifetime, expert_consumer_devices));
             drive.d.fs = fs_swap.get();
             if (fs_swap && drive.d.lookahead != nullptr) lookahead.set_foresight(fs_swap.get());
             src.set_foresight_swap(fs_swap.get());   // #2134: the exchanges hold the experts whose bytes they move
@@ -12790,8 +17520,17 @@ int main(int argc, char** argv) {
         struct FsDetach {
             strata::core::RouterLookahead* la;
             strata::core::FileExpertSource* src;
-            ~FsDetach() { la->set_foresight(nullptr); src->set_foresight_swap(nullptr); }
-        } fs_detach{&lookahead, &src};
+            strata::core::ExpertDispatch* dispatch;
+            bool owned;
+            ~FsDetach() {
+                // Later adaptation jobs have joined; lookahead detachment waits
+                // for an active prediction. Atomic source clearing alone is not
+                // a reader drain. The runtime retains swap storage past its pool.
+                la->set_foresight(nullptr);
+                src->set_foresight_swap(nullptr);
+                if(owned)dispatch->fs=nullptr;
+            }
+        } fs_detach{&lookahead, &src, &drive.d, o.owned_session_lifetime};
         // 0.2.10 (BW-MEASURE E26): PcieAuto starts from the pool size instead of the link-only 0.55 (0.15 on gfx12), so the first answers after a launch
         // do not run ~50 windows at a share the machine does not want.  The pool's expert-byte rate R is assumed to be min(65, 4.0 GB/s per worker)
         // (measured: 31-35 GB/s at 6-8 workers, 47-52 at 12, 55-60 at 16-30, 73-75 at 32) and the share is the refinement's own formula, link / (link +
@@ -12945,8 +17684,13 @@ int main(int argc, char** argv) {
                 heat.assign(drive.d.usage.size(), 0.0);
         }
         Clock::time_point profile_saved_at = Clock::now();
-        cudaStream_t adapt_stream = nullptr;
-        if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        cudaStream_t baseline_adapt_stream = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& adapt_stream=owned_runtime?owned_runtime->adaptation_stream:baseline_adapt_stream;
+#else
+        auto& adapt_stream=baseline_adapt_stream;
+#endif
+        if (!create_driver_stream(primary_device,cudaStreamNonBlocking,adapt_stream)) {
             std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
             return 1;
         }
@@ -12954,10 +17698,30 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
-        cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        cudaEvent_t baseline_adapt_ev = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& adapt_ev=owned_runtime?owned_runtime->adaptation_event:baseline_adapt_ev;
+#else
+        auto& adapt_ev=baseline_adapt_ev;
+#endif
+        if(o.owned_session_lifetime) {
+            if(!create_driver_event(primary_device,cudaEventDisableTiming,adapt_ev))return 1;
+        } else cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         // 0.1.43 STRATA_ADAPT_OVERLAP=1 (adapt_overlap above): the single-GPU, plain-RAM-arena decode loop only
-        strata::core::AdaptGate agate;
+        DriverRuntimeObject<strata::core::AdaptGate> agate_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->adapt_gate:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& agate=agate_storage.get();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        // Later JobThread objects join before this guard; its device drain runs
+        // before agate/pending/pinned-source locals are destroyed. A late gang
+        // destructor alone would be too late for stream callbacks into agate.
+        strata::core::WindowConsumerDrainGuard model_consumers{owned_model};
+#endif
         bool aflipped = false;   // the pending swaps are in the tables and their copies may still be landing
         bool aov = false;
         int64_t aov_flips = 0;
@@ -13031,9 +17795,29 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: adaptive overlap: off%s%s\n",
                          aov_why ? ": " : " (STRATA_ADAPT_OVERLAP=1 turns it on)", aov_why ? aov_why : "");
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
-        auto res_upload = [&]() -> cudaError_t {   // the first error, every table tried
-            cudaError_t r = d_res != nullptr ? res_put(d_res) : cudaSuccess;
+        auto res_upload = [&](bool checked_devices=false) -> cudaError_t {   // first actual error, every table tried
+            cudaError_t r=cudaSuccess;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(checked_devices){
+                strata::core::WindowDeviceScope device(primary_device);
+                if(!device.ok())return cudaErrorInvalidDevice;
+                r=d_res!=nullptr?res_put(d_res):cudaSuccess;
+                if(!device.finish()&&r==cudaSuccess)r=cudaErrorInvalidDevice;
+            }else
+#else
+            (void)checked_devices;
+#endif
+                r=d_res!=nullptr?res_put(d_res):cudaSuccess;
             for (auto& st : stages) {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(checked_devices){
+                    strata::core::WindowDeviceScope device(st->dev);
+                    if(!device.ok()){if(r==cudaSuccess)r=cudaErrorInvalidDevice;continue;}
+                    const auto e=res_put(st->d_res);if(r==cudaSuccess)r=e;
+                    if(!device.finish()&&r==cudaSuccess)r=cudaErrorInvalidDevice;
+                    continue;
+                }
+#endif
                 const strata::core::OnDevice on(st->dev);
                 const cudaError_t e = res_put(st->d_res);
                 if (r == cudaSuccess) r = e;
@@ -13041,7 +17825,7 @@ int main(int argc, char** argv) {
             return r;
         };
         auto apply_pending = [&](bool wait) {
-            if (peer.valid()) peer.apply_pending(wait);
+            if (peer.valid()) peer.apply_pending(wait,o.owned_session_lifetime);
             if (pending.empty()) {
                 // a round where only the peer swapped: its copies have landed (or, without the wait, are still in
                 // flight), and the gate closes with them
@@ -13051,12 +17835,10 @@ int main(int argc, char** argv) {
                 }
                 return;
             }
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            if (!adaptation_completed(adapt_ev,primary_device,wait)) return;
             for (auto& st : stages)
                 if (st->adapt_live) {
-                    if (wait) cudaEventSynchronize(st->adapt_ev);
-                    else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
+                    if (!adaptation_completed(st->adapt_ev,st->dev,wait)) return;
                 }
             for (auto& st : stages) st->adapt_live = false;
             unpin_blobs(pin_live);
@@ -13166,13 +17948,35 @@ int main(int argc, char** argv) {
             std::vector<std::unique_ptr<GpuStage>>& stages;
             strata::core::ExpertDispatch& d;
             int32_t* pairs;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            std::shared_ptr<const strata::core::OwnedModelGang> model;
+#endif
             ~PreLaunchOff() {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                // Later launch-capable jobs have joined. GPU patch kernels may
+                // still read pairs: drain before clearing captures or freeing it.
+                { strata::core::WindowConsumerDrainGuard drain{model}; }
+#endif
                 v.set_pre_launch(nullptr);
                 for (auto& st : stages) st->ver.set_pre_launch(nullptr);
                 d.dres_check = nullptr;
-                if (pairs != nullptr) cudaFreeHost(pairs);
+                if (pairs != nullptr) {
+                    const auto status=cudaFreeHost(pairs);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    if(model && status!=cudaSuccess) {
+                        std::fputs("strata: callback patch-buffer retirement failed; worker restart required\n",stderr);
+                        std::_Exit(1);
+                    }
+#else
+                    (void)status;
+#endif
+                }
             }
-        } pre_launch_off{ver, stages, drive.d, res_pairs};
+        } pre_launch_off{ver, stages, drive.d, res_pairs
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            ,owned_model
+#endif
+            };
         if (serial_windows && (drive.d.fetch_admit > 0 || drive.d.evict_sync || res_checking)) {
             ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(res_checking, e); });
             for (auto& st : stages) st->ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(false, e); });
@@ -13184,9 +17988,24 @@ int main(int argc, char** argv) {
         std::function<void()> adapt_fence;
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
-        auto adapt = [&]() -> bool {
+        auto adapt_body = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
-            if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            if (remote_opt) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if (remote_policy) { // Activated only by the completed owned controller join.
+                    if (!remote_policy_setup ||
+                        remote_policy_setup->publication.get() != remote_policy) return false;
+                    std::string remote_error; // Worker-local: never race the reactor's err.
+                    const auto result = remote_policy->adapt(drive.d.usage, host_res, pending,
+                        remote_policy_setup->call_swaps, remote_policy_setup->workspace, remote_error);
+                    if (result == strata::core::RemoteExpertOpt::AdaptResult::failed) return false;
+                    // Busy is not completion. Skip this entire tick, including the
+                    // primary tier's subsequent host scans; never wait or fall back.
+                    if (result == strata::core::RemoteExpertOpt::AdaptResult::deferred) return true;
+                } else
+#endif
+                if (!remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            }
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -13356,6 +18175,23 @@ int main(int argc, char** argv) {
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             return true;
+        };
+        auto adapt = [&]() -> bool {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if (remote_policy && drive.d.lookahead) {
+                if (!remote_policy_setup) return false;
+                auto& seal = remote_policy_setup->lookahead_drain;
+                const auto state = drive.d.lookahead->drain_submitted(seal);
+                if (state == strata::core::RouterLookahead::DrainResult::busy)
+                    return true; // Persistent seal survives; future units skip speculative submit.
+                if (state == strata::core::RouterLookahead::DrainResult::refused)
+                    return false;
+                const bool ok = adapt_body();
+                if (ok) seal.reset(); // Known completed/no-work writer. Failure retains seal.
+                return ok;
+            }
+#endif
+            return adapt_body();
         };
         // ---- --adapt-async 1: the asynchronous adaptive tier (opt-in; the resident RAM mode, see the checks where
         // the RAM copy is built).  adapt() runs a whole round - choose, copy the evicted slots back with a stream sync,
@@ -13795,6 +18631,14 @@ int main(int argc, char** argv) {
             a_pl_idle = nullptr;
             a_res_dirty = false;
         };
+        // The queued jobs borrow the helper closures above. Join before those
+        // closures unwind, not at ajob's earlier declaration. Device copies
+        // they enqueue are drained later by model_consumers before their targets.
+        struct AdaptJobRetirement {
+            std::unique_ptr<JobThread>& job;
+            bool enabled;
+            ~AdaptJobRetirement() { if (enabled) job.reset(); }
+        } adapt_job_retirement{ajob, o.owned_model_lifetime};
         // #477: write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).
         // A swap still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
         auto save_profile = [&](const char* why) {
@@ -13819,14 +18663,116 @@ int main(int argc, char** argv) {
         // 0.1.44: the reader is detached and may sit in read(2) past QUIT (the server writes more, or closes stdin, while
         // main returns and the process exits), so what it touches is shared with it, never main's locals: a line or
         // EOF after QUIT used to lock a destroyed mutex (undefined behaviour; an abort on macOS).
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        using StdinShared=strata::program::OwnedImageRequestDriver::Input;
+#else
         struct StdinShared {
+            bool owned_admission=false;
+            bool owned_cancel_diagnostics=false;
+            strata::program::OwnedAdmissionCancel admissions;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            bool managed_threads=false;
+            size_t max_control_lines=0,max_control_bytes=0;
+            std::deque<std::string> controls;
+            std::shared_ptr<const strata::core::ReservationLease> scheduler_reservation;
+#endif
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            // The detached reader retains its charge until its buffers and queue
+            // have retired, even after the serving stack has unwound.
+            std::shared_ptr<const strata::core::ReservationLease> reservation;
+#endif
+            size_t max_line_bytes=0, max_queue_lines=0;
+            std::atomic<bool> input_error{false};
             std::atomic<bool> stop_req{false};
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+            std::atomic<uint64_t> stop_sequence{0}; // advanced only by a real committed stdin STOP line
+#endif
             std::mutex mu;
             std::condition_variable cv;
             std::deque<std::string> lines;
             bool eof = false;
         };
+#endif
+        size_t input_max_line_bytes=0, input_max_queue_lines=0;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        std::shared_ptr<const strata::core::ReservationLease> input_reservation;
+        bool bounded_serving_input=o.verified_inputs_active||(owned_batch_allocation&&o.vision);
+        auto* serving_input_budget=verified_inputs.budget.get();
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        if(serving_threads){
+            bounded_serving_input=true;
+            // Managed scheduling needs a paid bounded reader, not P00's
+            // separate private-snapshot input loader or its model-path rewrite.
+            // That loader keeps its own original ledger whenever selected.
+            if(!o.verified_inputs_active)serving_input_budget=model_budget.get();
+        }
+#endif
+        if(bounded_serving_input) {
+            // These bounded serving modes accept raw token IDs. Twelve
+            // bytes per signed decimal ID plus bounded command/header space.
+            // Price overlapping reader/queued/consumer strings and geometric
+            // growth conservatively; this is a logical envelope, not an RSS cap.
+            constexpr uint64_t queue_lines=8, overhead=65536;
+            if(!serving_input_budget || o.max_context<=0 ||
+               uint64_t(o.max_context)>(UINT64_MAX-overhead)/12) {
+                std::fprintf(stderr,"strata serve: invalid verified input envelope\n");return 1;
+            }
+            const uint64_t line_bytes=uint64_t(o.max_context)*12+overhead;
+            constexpr uint64_t copies=4*(queue_lines+4);
+            const auto string_limit=std::string{}.max_size();
+            if(string_limit<4096 || line_bytes>string_limit-4096 ||
+               line_bytes>SIZE_MAX-4096 || line_bytes>(UINT64_MAX-overhead)/copies) {
+                std::fprintf(stderr,"strata serve: verified input envelope overflow\n");return 1;
+            }
+            strata::core::WindowResources charge;
+            charge.device_bytes.resize(serving_input_budget->snapshot().capacity.device_bytes.size());
+            charge.host_bytes=overhead+copies*line_bytes;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(owned_batch_allocation&&o.vision){
+                // The exact new typed control/maps/nodes have one payer: the
+                // startup root. Remove them from the legacy input overhead;
+                // keep all reader/queue strings and remaining overhead here.
+                const auto moved=strata::program::OwnedImageRequestDriver::reactor_control_quote();
+                if(!moved||moved>overhead){std::fputs("image input control profile refused\n",stderr);return 1;}
+                charge.host_bytes-=moved;
+            }
+#endif
+            auto admitted=serving_input_budget->reserve(charge,strata::core::ReservationPurpose::foreground);
+            if(!admitted){std::fprintf(stderr,"strata serve: verified input quota refused\n");return 1;}
+            input_reservation=std::move(admitted.lease);
+            input_max_line_bytes=size_t(line_bytes);input_max_queue_lines=queue_lines;
+        }
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        const auto in_shared = owned_batch_allocation&&o.vision
+            ?strata::program::OwnedImageRequestDriver::reactor(*serving_raw_session)
+            :std::make_shared<StdinShared>();
+#else
         const auto in_shared = std::make_shared<StdinShared>();
+#endif
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        in_shared->owned_admission=owned_batch_allocation;
+        const char* owned_cancel_trace=std::getenv("STRATA_HTTP_TWO_SLOT_RECEIPTS");
+        in_shared->owned_cancel_diagnostics=owned_batch_allocation&&owned_cancel_trace&&
+            std::strcmp(owned_cancel_trace,"1")==0;
+#endif
+        in_shared->max_line_bytes=input_max_line_bytes;in_shared->max_queue_lines=input_max_queue_lines;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        if(serving_threads){in_shared->managed_threads=true;
+            in_shared->max_control_lines=serving_threads->limits().max_control_lines;
+            in_shared->max_control_bytes=serving_threads->limits().max_frame_bytes;
+            in_shared->scheduler_reservation=serving_thread_metadata;
+        }
+#endif
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        in_shared->reservation=std::move(input_reservation);
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        if(owned_batch_allocation&&o.vision&&!strata::program::OwnedImageRequestDriver::bind(
+            *serving_raw_session,in_shared,serving_threads.get(),err)){
+            std::fprintf(stderr,"owned image reactor bind refused: %s\n",err.c_str());return 1;
+        }
+#endif
         std::atomic<bool>& stop_req = in_shared->stop_req;
         std::mutex& in_mu = in_shared->mu;
         std::condition_variable& in_cv = in_shared->cv;
@@ -13838,51 +18784,182 @@ int main(int argc, char** argv) {
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
             // std::exit) would hang in exit() on Linux, and the server would wait for it forever
-            std::string l, buf;
-            char chunk[4096];
-            auto getline_fd = [&](std::string& out) -> bool {
-                for (;;) {
-                    const size_t nlpos = buf.find('\n');
-                    if (nlpos != std::string::npos) {
-                        out.assign(buf, 0, nlpos);
-                        buf.erase(0, nlpos + 1);
-                        return true;
-                    }
-#if defined(_WIN32)
-                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
-#else
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
-                    if (n < 0 && errno == EINTR) continue;
-#endif
-                    if (n <= 0) {
-                        if (buf.empty()) return false;
-                        out.swap(buf);
-                        buf.clear();
-                        return true;
-                    }
-                    buf.append(chunk, (size_t) n);
+            auto fail_input=[&]() noexcept {
+                {
+                    std::lock_guard<std::mutex> lk(st->mu);
+                    st->input_error.store(true);st->stop_req.store(true);
+                    st->lines.clear();st->eof=true;st->cv.notify_all();
                 }
+                std::fprintf(stderr,"strata serve: verified input limit or allocation failed; input closed\n");
             };
-            while (getline_fd(l)) {
-                if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { st->stop_req.store(true); continue; }
+            auto read_input=[&]() {
+                std::string l, buf;
+                char chunk[4096];
+                auto getline_fd = [&](std::string& out) -> bool {
+                    for (;;) {
+                        const size_t nlpos = buf.find('\n');
+                        if (nlpos != std::string::npos) {
+                            if(st->max_line_bytes && nlpos>st->max_line_bytes){fail_input();return false;}
+                            out.assign(buf, 0, nlpos);
+                            buf.erase(0, nlpos + 1);
+                            return true;
+                        }
+                        if(st->max_line_bytes && buf.size()>st->max_line_bytes){fail_input();return false;}
+#if defined(_WIN32)
+                        const int n = _read(0, chunk, (unsigned) sizeof chunk);
+#else
+                        const ssize_t n = ::read(0, chunk, sizeof chunk);
+                        if (n < 0 && errno == EINTR) continue;
+#endif
+                        if(n<0 && st->max_line_bytes){fail_input();return false;}
+                        if (n <= 0) {
+                            if (buf.empty()) return false;
+                            // Verified commands are newline committed. A partial
+                            // frame at EOF/read failure is not an accepted request.
+                            if(st->max_line_bytes){fail_input();return false;}
+                            out.swap(buf);
+                            buf.clear();
+                            return true;
+                        }
+                        if(st->max_line_bytes && size_t(n)>st->max_line_bytes+sizeof chunk-buf.size()) {
+                            fail_input();return false;
+                        }
+                        buf.append(chunk, (size_t) n);
+                    }
+                };
+                while (getline_fd(l)) {
+                    if (!l.empty() && l.back() == '\r') l.pop_back();
+                    if (l == "STOP") {
+                        if(st->owned_admission)continue; // an unscoped STOP has no owned-admission authority
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                        if(st->stop_sequence.load()==UINT64_MAX){fail_input();return;}
+                        st->stop_sequence.fetch_add(1);
+#endif
+                        st->stop_req.store(true); continue;
+                    }
+                    std::unique_lock<std::mutex> lk(st->mu);
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(st->managed_threads&&l.starts_with("SCHED ")){
+                        if(l.size()>st->max_control_bytes||st->controls.size()>=st->max_control_lines){
+                            lk.unlock();fail_input();return;
+                        }
+                        st->controls.push_back(l);st->cv.notify_all();continue;
+                    }
+#endif
+                    if(st->owned_admission && l.starts_with("BCANCEL ")){
+                        int slot=-1;uint64_t request=0;bool active=false;
+                        if(strata::program::OwnedAdmissionCancel::parse(l,true,slot,request)&&
+                           st->admissions.cancel(slot,request,active)){
+                            if(active)st->stop_req.store(true);
+                            // Observation of the actual table transition while begin is excluded by this mutex.
+                            if(st->owned_cancel_diagnostics){
+                                std::printf("BOWN_ADMISSION_CANCEL {\"request\":\"%012llx\",\"slot\":%d,\"phase\":\"%s\"}\n",
+                                    (unsigned long long)(request-1),slot,active?"active":"queued");
+                                std::fflush(stdout);
+                            }
+                        }
+                        continue; // malformed/stale cleanup never targets another admission
+                    }
+                    if(st->owned_admission && l.starts_with("BICANCEL ")){
+                        int slot=-1;uint64_t request=0,incarnation=0;bool cancel=false,active=false;
+                        if(strata::program::OwnedAdmissionCancel::image_control(l,"BICANCEL ",slot,request,incarnation,cancel)&&
+                           cancel&&st->admissions.cancel_image(slot,request,incarnation,active)&&active)
+                            st->stop_req.store(true);
+                        continue; // an old incarnation never targets its replacement
+                    }
+                    if(st->owned_admission && (l.starts_with("BGEN ")||l.starts_with("BGENI ")||l.starts_with("BIPREP "))){
+                        int slot=-1;uint64_t request=0;
+                        const bool parsed=strata::program::OwnedAdmissionCancel::parse(l,false,slot,request);
+                        const bool accepted=parsed&&(l.starts_with("BIPREP ")?st->admissions.prepare_image(slot,request):
+                            l.starts_with("BGENI ")?st->admissions.deliver_image(slot,request):st->admissions.enqueue(slot,request));
+                        if(!accepted){lk.unlock();fail_input();return;}
+                    }
+                    if(st->max_queue_lines && st->lines.size()>=st->max_queue_lines) {
+                        lk.unlock();fail_input();return;
+                    }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(st->owned_admission&&l.starts_with("BGENI ")){
+                        int slot=-1;uint64_t request=0;
+                        if(!strata::program::OwnedAdmissionCancel::parse(l,false,slot,request)){lk.unlock();fail_input();return;}
+                        st->queue_image(l,slot,request);
+                    }else
+#endif
+                    st->lines.push_back(l);
+                    st->cv.notify_one();
+                }
                 std::lock_guard<std::mutex> lk(st->mu);
-                st->lines.push_back(l);
+                st->eof = true;
                 st->cv.notify_one();
-            }
-            std::lock_guard<std::mutex> lk(st->mu);
-            st->eof = true;
-            st->cv.notify_one();
+            };
+            if(st->max_line_bytes) {
+                try {read_input();}
+                catch(const std::bad_alloc&) {fail_input();}
+                catch(const std::length_error&) {fail_input();}
+            } else read_input();
         }).detach();
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        auto serving_process_controls=[&]() -> bool {
+            if(!serving_threads)return true;
+            try {
+                if(!serving_threads->refresh(serving_thread_now_ms())){
+                    in_shared->input_error.store(true);stop_req.store(true);return false;}
+                for(size_t n=0;n<serving_threads->limits().max_control_lines;++n){
+                    std::string command;
+                    {std::lock_guard<std::mutex> lock(in_mu);if(in_shared->controls.empty())break;
+                        command=std::move(in_shared->controls.front());in_shared->controls.pop_front();}
+                    const auto reply=serving_threads->command(command,serving_thread_now_ms()).json();
+                    std::printf("SCHED_REPLY %s\n",reply.data());std::fflush(stdout);
+                }
+                const bool refreshed=serving_threads->refresh(serving_thread_now_ms());
+                if(!refreshed){in_shared->input_error.store(true);stop_req.store(true);}
+                return refreshed;
+            }catch(const std::bad_alloc&){in_shared->input_error.store(true);stop_req.store(true);return false;}
+        };
+        // Reactor-only; never used by the detached input reader. Blocked queued
+        // operations retain their BGEN and cannot enter the first physical setup.
+        auto serving_choose_line=[&]() {
+            auto best=in_lines.end();std::optional<int64_t> priority;
+            for(auto it=in_lines.begin();it!=in_lines.end();++it){
+                if(!serving_threads||!(it->starts_with("BGEN ")||it->starts_with("BGENI ")||it->starts_with("BIPREP ")))return it;
+                int slot=-1;uint64_t request=0;
+                if(!strata::program::OwnedAdmissionCancel::parse(*it,false,slot,request))return it;
+                const auto* binding=serving_threads->binding(size_t(slot));
+                if(!binding||binding->request!=request||serving_threads->cancellation_pending(size_t(slot)))return it;
+                const auto rank=serving_threads->request_priority(size_t(slot),request);
+                if(rank&&(!priority||*rank>*priority)){best=it;priority=rank;}
+            }
+            const auto active=serving_threads?serving_threads->active_priority():std::optional<int64_t>{};
+            if(active&&priority&&*active>*priority)return in_lines.end();
+            return best;
+        };
+#endif
         auto next_line = [&](std::string& out) -> bool {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(serving_threads)for(;;){
+                if(!serving_process_controls())return false;
+                std::unique_lock<std::mutex> lk(in_mu);
+                if(in_shared->input_error.load())return false;
+                auto selected=serving_choose_line();
+                if(selected!=in_lines.end()){out=std::move(*selected);in_lines.erase(selected);return true;}
+                if(in_eof)return false;
+                if(!in_shared->controls.empty())continue;
+                const auto expiry=serving_threads->next_expiry();
+                if(expiry){const auto now=serving_thread_now_ms();
+                    if(*expiry<=now)continue;
+                    in_cv.wait_for(lk,std::chrono::milliseconds(std::min<uint64_t>(*expiry-now,uint64_t(INT64_MAX))));
+                }else in_cv.wait(lk);
+            }
+#endif
             std::unique_lock<std::mutex> lk(in_mu);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
-            if (in_lines.empty()) return false;
+            if (in_shared->input_error.load() || in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
+        // Prefill may retain the callback through consumer retirement. Retain
+        // shared input state itself, not a reference to this serving scope.
+        sp.should_stop = [input=in_shared] { return input->stop_req.load() || input->input_error.load(); };
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
         // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
@@ -14066,6 +19143,7 @@ int main(int argc, char** argv) {
                        std::string("mode ") + std::to_string(strata::core::dma_batch_mode()));
             }
         }
+        DriverWatchdog serve_watchdog;
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
         // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
@@ -14078,7 +19156,7 @@ int main(int argc, char** argv) {
             const char* wio = std::getenv("STRATA_WATCHDOG_IO_S");
             const int io_limit = wio ? std::atoi(wio) : limit * 10;
             if (limit > 0)
-                std::thread([limit, io_limit] {
+                serve_watchdog.start(o.owned_model_lifetime, [limit, io_limit](std::shared_ptr<DriverWatchdog::Stop> stop) {
                     strata::platform::name_this_thread("strata-watchdog");
                     strata::aux_cpus::pin_current_thread();
                     strata::core::Progress& p = strata::core::progress();
@@ -14089,7 +19167,7 @@ int main(int argc, char** argv) {
                     auto io_active_at = since;   // the last second the file tier was busy
                     bool io_noted = false;
                     for (;;) {
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        if (DriverWatchdog::wait_stop(stop, std::chrono::seconds(1))) return;
                         const auto now = std::chrono::steady_clock::now();
                         const uint64_t b = p.beats.load();
                         if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_active_at = now; io_noted = false; io_last = file_tier_activity(); continue; }
@@ -14124,16 +19202,26 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                         std::abort();
                     }
-                }).detach();
+                });
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        if(owned_batch_allocation&&o.vision&&position_bank_retirement.setup.ready())
+            std::printf("INFO owned_image_prepare=1 owned_image_control_bytes=%llu\n",
+                (unsigned long long)strata::program::OwnedImageRequestDriver::producer_control_quote());
+#endif
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        if(serving_threads)serving_threads->ready(stdout);
+#endif
         std::string line;
         int64_t rounds = 0;
-        const int S = o.spec;
+        const int S = o.native_owned_batch_serving
+            ? strata::core::native_owned_batch_serving::execution_rows_per_slot(o.spec,true)
+            : strata::core::native_serial_serving::execution_window(o.spec,o.native_serial_serving);
         const int S_mtp_wide = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         // --draft auto: a request that drafts with the MTP layer has its own widest window (the MTP loses to itself above 4 on Blackwell), the DFlash2 requests S_mtp_wide
         const int S_mtp_narrow = o.draft_auto ? std::min(S_mtp_wide, std::max(2, o.draft_mtp_spec)) : S_mtp_wide;
@@ -14313,6 +19401,22 @@ int main(int argc, char** argv) {
         };
         // ---- --batch: the slots of the batch windows
         struct BSlot {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            // Physical allocation generation only; future transaction/occupancy binding is separate.
+            strata::program::OwnedBatchSlotHandle owned_allocation;
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            std::shared_ptr<strata::program::ServingRawSession> owned_raw;
+            std::unique_ptr<strata::program::ServingSuffixRepairOperation::Outcome> owned_repair;
+            bool repair_finishing=false;
+            bool alignment_unpublished=false,alignment_observed=false;
+            uint64_t alignment_last_operation=0;
+            const char* alignment_phase="donor";
+            std::shared_ptr<const void> alignment_request_credit;
+            std::shared_ptr<const std::vector<int64_t>> alignment_request;
+            const char* owned_finish_reason="length";
+            std::string http_request;uint64_t http_leg=0;
+#endif
             bool active = false, stop = false;
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             std::array<int32_t, strata::kernels::kVerifyNarrowT> draft{}; ///< the slot's next MTP proposal
@@ -14344,6 +19448,9 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        if(owned_batch_allocation)for(size_t slot=0;slot<bs.size();++slot)bs[slot].owned_allocation=batch_slot_handles.at(slot);
+#endif
         // STRATA_BATCH_DF2_DEFER=0: every round drafts for every slot, spare rows or not (the first measurement's behaviour, for the A/B)
         // STRATA_BATCH_DF2_CONF=P (default: --draft-conf, else 0.35; 0 off): a slot's draft rows stop where the product of the selector's probabilities falls below P;
         // STRATA_BATCH_DF2_MAXX=N: at most N draft rows a slot and window (default kDrafts)
@@ -14364,6 +19471,7 @@ int main(int argc, char** argv) {
         // since the last timing line, its rounds, the experts it swapped in and the ms a window waited for it
         int64_t ba_window = 0, bt_adapt_rounds = 0, bt_adapt_swaps = 0;
         double bt_adapt_wait = 0;
+        std::function<bool()> owned_alignment_step;
         bool in_prompt_read = false;   // batch_step runs between a prompt's chunks: the adaptive tier stands still then
         double serve_adapt_drain_ms = 0.0;   // 149: the request's wait for the adaptive round in flight
         int64_t bt_a_rounds0 = 0, bt_a_swapped0 = 0;   // the asynchronous tier's counters when the timed windows began
@@ -14397,10 +19505,24 @@ int main(int argc, char** argv) {
         // says a slot holds its prompt; a declined or failed co-read says nothing and costs nothing.
         struct CoReq { int slot = -1; std::vector<int64_t> ids; };
         std::vector<CoReq> co_pending, co_set;
-        auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
+        auto batch_on = [&] { for (const BSlot& b : bs) {
+            if(b.active)return true;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(b.repair_finishing)return true;
+#endif
+        } return false; };
         auto try_next_line = [&](std::string& out) -> bool {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(serving_threads){
+                if(!serving_process_controls())return false;
+                std::lock_guard<std::mutex> lk(in_mu);
+                if(in_shared->input_error.load())return false;
+                auto selected=serving_choose_line();if(selected==in_lines.end())return false;
+                out=std::move(*selected);in_lines.erase(selected);return true;
+            }
+#endif
             std::lock_guard<std::mutex> lk(in_mu);
-            if (in_lines.empty()) return false;
+            if (in_shared->input_error.load() || in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
             return true;
@@ -14418,7 +19540,7 @@ int main(int argc, char** argv) {
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
                 bool ok = true;
-                for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                for (size_t k = 0; k < batch_slot_stage_count(); ++k) {
                     const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                     ok = cudaDeviceSynchronize() == cudaSuccess && ok;
                 }
@@ -14430,9 +19552,9 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             // STRATA_SLOT_COPY_BATCHSYNC: every copy is only queued, and the sync_all below is the one wait per device
             const bool queued = slot_copy_batchsync_env();
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+            for (size_t k = 0; k < batch_slot_stage_count(); ++k) {
                 strata::core::SessionState& main_ss = k == 0 ? ss : stages[k - 1]->ss;
-                strata::core::SessionState& slot_ss = *bslot_ss[k][(size_t) b];
+                strata::core::SessionState& slot_ss = *batch_slot_session(k,(size_t)b);
                 strata::core::SessionState& from = into_slot ? main_ss : slot_ss;
                 strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
@@ -14445,7 +19567,208 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
-        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        auto fresh_owned_slot = [&](size_t index,std::string& error,bool open_request=true) -> bool {
+            auto& slot=bs.at(index);
+            if(slot.active||slot.repair_finishing){error="owned slot remains pinned by its live request/repair";return false;}
+            if(slot.owned_repair){
+                if(!slot.owned_raw||!strata::program::ServingSuffixRepairOperation::retire_slot_controller(
+                    *slot.owned_raw,*slot.owned_repair,error))std::terminate();
+                slot.owned_repair.reset();
+            }
+            if(slot.owned_raw){
+                if(slot.owned_raw->phase()!=strata::program::ServingRawSession::Phase::drained)std::terminate();
+                if(slot.owned_raw->request_open()&&!slot.owned_raw->close_request(error))std::terminate();
+                if(slot.owned_raw->healthy()&&!slot.owned_raw->retire_owned_slot(error))std::terminate();
+                slot.owned_raw.reset();
+            }
+            if(!serving_raw_session||!serving_raw_session->healthy())return false;
+            std::vector<strata::core::Verifier*> verifiers;
+            std::vector<strata::core::NativeBatchSlotInspection> inspections;
+            for(size_t stage=0;stage<batch_slot_stage_count();++stage){
+                verifiers.push_back(stage==0?&ver:&stages[stage-1]->ver);
+                inspections.push_back(owned_runtime->batch_slot_inspections[stage*2+index]);
+            }
+            const auto* allocation=owned_runtime->batch_slot_sessions.allocation(batch_slot_handles.at(index));
+            if(!allocation)return false;
+            slot.owned_raw=strata::program::ServingRawSession::open_owned_slot(g,*allocation,owned_runtime,
+                std::move(verifiers),std::move(inspections),*model_budget,serving_raw_session->max_tokens(),
+                *serving_raw_session,error);
+            if(!slot.owned_raw)return false;
+            if(!open_request)return true;
+            if(!slot.owned_raw->open_request(error))return false;
+            if(serving_threads){const auto* binding=serving_threads->binding(index);
+                if(!binding||!serving_threads->attach(index,binding->request,slot.owned_raw->slot_occupancy_incarnation()))
+                    strata::core::retirement_failed("managed prealignment must bind actual occupancy before first known-input row");}
+            return true;
+        };
+        auto admit_owned_repair_slot = [&](size_t index,const strata::core::BundleHandle& donor_source,
+                const strata::core::BundleHandle& prefix_source,
+                strata::program::ServingSuffixRepairOperation::Facts incoming_facts,
+                const std::vector<int64_t>& validated_request,int64_t budget,
+                const strata::kernels::SamplerParams& sampling,std::string_view request_key,uint64_t request_leg,
+                std::string& error) -> bool {
+            if(serving_repair_idle_unit==0){error="owned repaired admission requires explicit bounded repair units";return false;}
+            if(!owned_batch_allocation||budget<1||!strata::program::serving_output_fits(
+                validated_request.size(),uint64_t(budget),uint64_t(o.max_context),0)||!fresh_owned_slot(index,error))return false;
+            auto& slot=bs.at(index);auto& actor=*slot.owned_raw;
+            slot.http_request=request_key;slot.http_leg=request_leg;
+            slot.alignment_observed=false;slot.alignment_last_operation=0;slot.alignment_phase="donor";
+            struct AlignmentFactsOwner {
+                std::shared_ptr<const void> credit; // released after target/facts storage
+                strata::program::ServingSuffixRepairOperation::Facts facts;
+                std::vector<int32_t> planned_accepted;
+            } fact_owner;
+            fact_owner.facts=std::move(incoming_facts);auto& facts=fact_owner.facts;
+            strata::core::BundleHandle donor,prefix;
+            // Both new operand captures come from the REAL destination after
+            // checked physical copies. Original source images keep their keys.
+            if(!donor_source.get()||!prefix_source.get()||
+               !actor.install_owned_slot_image(donor_source,donor_source.get()->key,false,error))return false;
+            const uint64_t original_forwarded=actor.cut().forwarded;
+            if(original_forwarded>UINT64_MAX-3){error="alignment frontier overflow";return false;}
+            const uint64_t aligned=((original_forwarded+3)/4)*4;
+            if(aligned!=original_forwarded){
+                if(!owned_alignment_step||aligned>=validated_request.size()||aligned>=actor.max_tokens()){
+                    error="partial donor has no authentic known tail through aligned pending";return false;
+                }
+                // Pay and copy immutable request before any additional native row. No
+                // ACCEPT/BT exists for this occupancy until the real import succeeds.
+                uint64_t bytes=0;
+                if(validated_request.size()>(UINT64_MAX-4096)/sizeof(int64_t))return false;
+                if(validated_request.size()>(UINT64_MAX-(1u<<20))/32)return false;
+                bytes=uint64_t(validated_request.size())*32+(1u<<20);
+                std::shared_ptr<const void> credit;
+                const auto claimed=actor.admit_host(bytes,credit);if(!claimed){error=claimed.detail;return false;}
+                fact_owner.credit=credit;
+                try{
+                    slot.alignment_request=std::make_shared<const std::vector<int64_t>>(validated_request);
+                    fact_owner.planned_accepted.reserve(size_t(aligned+1));
+                    for(size_t token=0;token<=size_t(aligned);++token)
+                        fact_owner.planned_accepted.push_back(int32_t(validated_request[token]));
+                }catch(...){slot.alignment_request.reset();error="alignment request/target allocation refused";return false;}
+                slot.alignment_request_credit=std::move(credit);slot.alignment_unpublished=true;
+                slot.p=int64_t(actor.cut().forwarded);slot.x=donor_source.get()->pending_tokens.front();
+                strata::program::report_prealignment_begin(slot.http_request,slot.http_leg,index,actor.slot_occupancy_incarnation(),
+                    uint64_t(budget),validated_request,donor_source.get()->cut,actor.cut(),prefix_source.get()->cut,aligned);
+                slot.alignment_observed=strata::program::http2_receipts_enabled();
+                while(actor.cut().forwarded<aligned){
+                    bool terminal=false;{std::lock_guard<std::mutex> lock(in_shared->mu);terminal=in_shared->eof;}
+                    if(stop_req.load()||in_shared->input_error.load()||terminal){
+                        slot.alignment_unpublished=false;slot.alignment_request.reset();slot.alignment_request_credit.reset();
+                        error="unpublished alignment admission canceled";return false;
+                    }
+                    if(!owned_alignment_step()){
+                        if(!actor.cancel_owned_alignment_known(error))std::terminate();
+                        slot.alignment_unpublished=false;slot.alignment_request.reset();slot.alignment_request_credit.reset();
+                        error="unpublished alignment cohort refused before dispatch";return false;
+                    }
+                }
+                slot.alignment_unpublished=false;slot.alignment_request.reset();slot.alignment_request_credit.reset();
+                bool terminal=false;{std::lock_guard<std::mutex> lock(in_shared->mu);terminal=in_shared->eof;}
+                if(stop_req.load()||in_shared->input_error.load()||terminal){error="alignment finished at canceled admission boundary";return false;}
+            }
+            if(actor.cut().forwarded!=aligned||actor.cut().accepted!=aligned+1){error="alignment did not land authentic pending endpoint";return false;}
+            if(!fact_owner.planned_accepted.empty())facts.accepted=std::span<const int32_t>(fact_owner.planned_accepted);
+            if(!actor.capture_owned_slot(donor)||
+               donor.get()->cut.forwarded!=aligned||donor.get()->cut.accepted!=facts.accepted.size())return false;
+            if(slot.alignment_observed)strata::program::report_prealignment_seal(slot.http_request,index,
+                actor.slot_occupancy_incarnation(),donor.get()->cut);
+            if(!actor.install_owned_slot_image(prefix_source,prefix_source.get()->key,true,error))return false;
+            slot.alignment_phase="prefix";
+            if(!actor.capture_owned_slot(prefix))return false;
+            if(actor.cut().id==UINT64_MAX)return false;
+            facts.cut_id=std::max(facts.cut_id,actor.cut().id+1);
+            facts.retain_foreground=true;facts.request_tokens=validated_request;facts.max_generated=uint64_t(budget);
+            auto operation=std::make_unique<strata::program::ServingSuffixRepairOperation::Outcome>();
+            const auto imported=strata::program::ServingSuffixRepairOperation::run(actor,owned_runtime,
+                std::move(donor),std::move(prefix),facts,*operation);
+            if(operation->mutated)slot.alignment_phase="imported";
+            if(!imported){
+                if(operation->controller&&!strata::program::ServingSuffixRepairOperation::retire_slot_controller(actor,*operation,error))std::terminate();
+                if(operation->mutated&&!actor.healthy())std::terminate();
+                error=imported.detail;return false;
+            }
+            if(!operation->controller||operation->published.pending_tokens.size()!=1||
+               operation->published.cut.forwarded>=validated_request.size())std::terminate();
+            // Ownership is transferred into the actual BSlot BEFORE the main
+            // admission scope can unwind its inputs/source/temporary callbacks.
+            slot.alignment_phase="imported";
+            slot.owned_repair=std::move(operation);slot.ids.clear();
+            slot.ids.reserve(size_t(actor.max_tokens()));
+            slot.ids.assign(slot.owned_repair->published.accepted_tokens.begin(),
+                slot.owned_repair->published.accepted_tokens.begin()+ptrdiff_t(slot.owned_repair->published.cut.forwarded));
+            slot.x=slot.owned_repair->published.pending_tokens.front();
+            slot.p=int64_t(slot.owned_repair->published.cut.forwarded);slot.produced=0;slot.max_new=budget;
+            slot.t0=Clock::now();slot.active=true;slot.cached=false;slot.stop=false;
+            slot.owned_allocation=batch_slot_handles.at(index);ver.set_slot_sampling(int(index),sampling);
+            return true;
+        };
+#endif
+        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e,
+                                std::optional<int32_t> pending_token=std::nullopt) -> bool {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(owned_batch_allocation){
+                if(!pending_token||!serving_raw_session||!serving_raw_session->healthy()||
+                   serving_raw_session->phase()!=strata::program::ServingRawSession::Phase::drained||
+                   serving_raw_session->cut().forwarded!=ids.size()||
+                   serving_raw_session->cut().accepted!=ids.size()+1||
+                   serving_raw_session->cut().exact_frontier!=serving_raw_session->cut().forwarded){
+                    e="owned BGEN admission requires a certified exact source with its real pending token; partial prompt give-way unsupported";return false;
+                }
+                auto& target_slot=bs.at(size_t(b));auto& destination=target_slot.owned_raw;
+                if(strata::program::OwnedImageRequestDriver::image(*serving_raw_session)){
+                    if(!destination||target_slot.owned_repair){e="image destination changed";return false;}
+                    std::vector<int32_t> accepted=ids;accepted.push_back(*pending_token);
+                    const auto metadata=strata::program::ServingRawSession::endpoint_metadata(
+                        serving_raw_session->key(),serving_raw_session->cut(),accepted);
+                    if(!strata::program::OwnedImageRequestDriver::transfer(*serving_raw_session,*destination,metadata,e))return false;
+                    if(serving_threads){const auto* binding=serving_threads->binding(size_t(b));
+                        if(!binding||!serving_threads->attach(size_t(b),binding->request,destination->slot_occupancy_incarnation()))std::terminate();}
+                    return true;
+                }
+                if(target_slot.owned_repair){
+                    if(!destination||!strata::program::ServingSuffixRepairOperation::retire_slot_controller(
+                        *destination,*target_slot.owned_repair,e))std::terminate();
+                    target_slot.owned_repair.reset();
+                }
+                if(destination){
+                    if(destination->phase()!=strata::program::ServingRawSession::Phase::drained)std::terminate();
+                    if(destination->request_open()&&!destination->close_request(e))std::terminate();
+                    if(destination->healthy()&&!destination->retire_owned_slot(e))std::terminate();
+                    destination.reset();
+                }
+                std::vector<strata::core::Verifier*> verifiers;
+                std::vector<strata::core::NativeBatchSlotInspection> inspections;
+                for(size_t stage=0;stage<batch_slot_stage_count();++stage){
+                    verifiers.push_back(stage==0?&ver:&stages[stage-1]->ver);
+                    inspections.push_back(owned_runtime->batch_slot_inspections[stage*2+size_t(b)]);
+                }
+                destination=strata::program::ServingRawSession::open_owned_slot(g,
+                    *owned_runtime->batch_slot_sessions.allocation(batch_slot_handles[size_t(b)]),
+                    owned_runtime,std::move(verifiers),std::move(inspections),*model_budget,
+                    serving_raw_session->max_tokens(),*serving_raw_session,e);
+                if(!destination)return false;
+                const bool source_was_open=serving_raw_session->request_open();
+                if(!source_was_open&&!serving_raw_session->open_request(e))return false;
+                std::vector<int32_t> accepted=ids;accepted.push_back(*pending_token);
+                const auto metadata=strata::program::ServingRawSession::endpoint_metadata(
+                    serving_raw_session->key(),serving_raw_session->cut(),accepted);
+                bool transferred=destination->open_request(e)&&destination->transfer_owned_slot_from(*serving_raw_session,metadata,e);
+                if(!source_was_open&&!serving_raw_session->close_request(e))std::terminate();
+                if(!transferred){
+                    if(destination->request_open()&&!destination->close_request(e))std::terminate();
+                    if(destination->healthy()&&!destination->retire_owned_slot(e))std::terminate();
+                    destination.reset();return false;
+                }
+                // Real BSlot owns the occupancy, request fence, source provenance
+                // and transaction until terminal response or explicit replacement.
+                if(serving_threads){const auto* binding=serving_threads->binding(size_t(b));
+                    if(!binding||!serving_threads->attach(size_t(b),binding->request,destination->slot_occupancy_incarnation()))
+                        strata::core::retirement_failed("managed exact request lost physical slot binding");}
+                return true;
+            }
+#endif
             const int64_t upto = (int64_t) ids.size();
 #if defined(STRATA_GPU_METAL)
             // the running state and the K/V of the Metal window, not the session's device buffers
@@ -14454,9 +19777,9 @@ int main(int argc, char** argv) {
             if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+            for (size_t k = 0; k < batch_slot_stage_count(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
-                strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
+                strata::core::SessionState& to = *batch_slot_session(k,(size_t)b);
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                 strata::core::ConversationCheckpoint ck;
@@ -14500,6 +19823,9 @@ int main(int argc, char** argv) {
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(owned_batch_allocation){e="owned slot cache continuation requires a certified reverse transfer";return false;}
+#endif
             // the main session's K/V is replaced by the slot's: K/V retained from a restore described the old one
             conversations.take_reuse();
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
@@ -14511,8 +19837,8 @@ int main(int argc, char** argv) {
             if (slot_copy_direct && at == nullptr) {
                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
             } else
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
+            for (size_t k = 0; k < batch_slot_stage_count(); ++k) {
+                strata::core::SessionState& from = *batch_slot_session(k,(size_t)b);
                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
@@ -14556,6 +19882,60 @@ int main(int argc, char** argv) {
             return true;
         };
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        std::optional<strata::program::ServingThreadSelection> serving_selected_thread;
+        std::optional<strata::program::ServingThreadUnit> serving_selected_thread_unit;
+        std::array<std::optional<strata::program::ServingThreadSelection>,2> serving_thread_cohort;
+        std::array<std::optional<strata::program::ServingThreadUnit>,2> serving_thread_cohort_units;
+        std::optional<strata::program::ServingThreadSelection> serving_prefill_peer_winner;
+        auto serving_ack_foreground_lane=[&](size_t slot){
+            if(!serving_threads)return;
+            auto& lane=bs.at(slot);
+            if(slot>=serving_thread_cohort.size()||!serving_thread_cohort[slot]||!serving_thread_cohort_units[slot]||
+               !serving_threads->acknowledge_unit(*serving_thread_cohort[slot],*serving_thread_cohort_units[slot],
+                    lane.owned_raw->slot_occupancy_incarnation(),lane.owned_raw->cut().id))
+                strata::core::retirement_failed("managed foreground member acknowledgement failed");
+            serving_repair_consecutive_escalated=0;
+        };
+        auto serving_release_thread_lane=[&](size_t slot,bool cancel) {
+            if(!serving_threads)return;
+            const auto* binding=serving_threads->binding(slot);if(!binding)return;
+            const auto saved=*binding;
+            // Called after actual RAW close + physical retirement, never BDONE.
+            if(!serving_threads->release(slot,saved.request,saved.occupancy,cancel,serving_thread_now_ms()))
+                strata::core::retirement_failed("managed thread binding could not retire after actual owned slot");
+        };
+        auto serving_foreground_only_cohort=[&]() {
+            std::array<strata::program::ServingThreadUnit,2> units{};size_t count=0;
+            for(size_t i=0;i<bs.size()&&i<2;++i){const auto& lane=bs[i];const auto* binding=serving_threads->binding(i);
+                if(!binding||!binding->occupancy||(!lane.active&&!lane.alignment_unpublished))continue;
+                if(!lane.owned_raw||binding->occupancy!=lane.owned_raw->slot_occupancy_incarnation())
+                    strata::core::retirement_failed("foreground boundary physical binding mismatch");
+                auto& u=units[count++];u.slot=i;u.request=binding->request;u.occupancy=binding->occupancy;
+                u.operation=binding->foreground;u.unit=strata::core::AdmissionUnit::decode;
+                u.demand=u.resource_ready=lane.owned_raw->healthy()&&lane.owned_raw->request_open();
+                u.class_weight=serving_repair_schedule.foreground_weight;
+            }
+            strata::program::ServingRepairSelectionBoundary boundary;
+            boundary.safe_boundary=true;boundary.max_candidates=2;
+            {std::lock_guard<std::mutex> lock(in_mu);boundary.terminal_input=in_shared->input_error.load()||in_eof;}
+            const auto now=serving_thread_now_ms();
+            auto selected=serving_prefill_peer_winner.value_or(strata::program::ServingThreadSelection{});
+            if(!serving_prefill_peer_winner){
+                selected=serving_threads->select(serving_repair_schedule.policy,boundary,
+                    std::span<const strata::program::ServingThreadUnit>(units.data(),count),now,0);
+                if(selected.total_weight){const auto ticket=strata::program::serving_repair_uniform_ticket(serving_repair_random_state,selected.total_weight);
+                    selected=serving_threads->select(serving_repair_schedule.policy,boundary,
+                        std::span<const strata::program::ServingThreadUnit>(units.data(),count),now,ticket);}
+            }
+            if(!selected.ready)return;
+            unsigned mask=0;
+            for(size_t i=0;i<count;++i){auto peer=serving_threads->foreground_peer(selected,units[i]);if(!peer.ready)continue;
+                serving_thread_cohort[units[i].slot]=std::move(peer);serving_thread_cohort_units[units[i].slot]=units[i];mask|=1u<<units[i].slot;}
+            std::fprintf(stderr,"SCHED_COHORT v=1 phase=prefill_or_alignment engine=%llu mask=%u priority=%lld\n",
+                (unsigned long long)serving_threads->engine(),mask,(long long)selected.effective_priority);
+        };
+#endif
         // What an idle slot holds (the conversation it decoded last: its sessions, its draft K/V and its checkpoints)
         // goes to the parked conversations before an admission overwrites it.  The main session was parked with that
         // conversation's prompt only (the admission's copy), so the reply the slot decoded lives nowhere else: without
@@ -14567,6 +19947,9 @@ int main(int argc, char** argv) {
         // allocation that ran out) are logged and the slot is overwritten as before.  Nothing here ends the request
         // or the engine.
         auto park_slot = [&](int b) {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if (owned_batch_allocation) return;
+#endif
             BSlot& sl = bs[(size_t) b];
             if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
             auto prefix_of = [&](const std::vector<int32_t>& whole) {
@@ -14619,7 +20002,249 @@ int main(int argc, char** argv) {
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
-        auto batch_step = [&]() -> bool {
+        auto accept_batch_stop = [&](const std::string& command) {
+            const int legacy_slot=std::atoi(command.c_str()+6);
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(owned_batch_allocation){
+                unsigned slot=0;uint64_t nonce=0;
+                const char* begin=command.data()+6;const char* end=command.data()+command.size();
+                const auto parsed_slot=std::from_chars(begin,end,slot);
+                constexpr std::string_view separator=" occupancy=";
+                if(parsed_slot.ec!=std::errc{}||std::string_view(parsed_slot.ptr,size_t(end-parsed_slot.ptr)).substr(0,separator.size())!=separator)return;
+                const char* nonce_begin=parsed_slot.ptr+separator.size();
+                const auto parsed_nonce=std::from_chars(nonce_begin,end,nonce);
+                if(parsed_nonce.ec!=std::errc{}||parsed_nonce.ptr!=end||slot>=bs.size()||nonce==0)return;
+                auto& lane=bs[slot];
+                if((!lane.active&&!lane.repair_finishing)||!lane.owned_raw||lane.owned_raw->slot_occupancy_incarnation()!=uint64_t(nonce))return;
+                // The serving thread accepts STOP only at a drained cohort boundary.
+                // Join its private owner before revoking the live physical occupancy.
+                const auto terminal_cut=lane.owned_raw->cut();
+                if(lane.owned_repair&&!strata::program::ServingSuffixRepairOperation::retire_slot_controller(
+                    *lane.owned_raw,*lane.owned_repair,err))std::terminate();
+                lane.owned_repair.reset();
+                if(!lane.owned_raw->close_request(err)||!lane.owned_raw->retire_owned_slot(err))std::terminate();
+                lane.active=false;lane.repair_finishing=false;lane.cached=false;lane.stop=true;
+                serving_release_thread_lane(slot,true);
+                strata::program::report_http2_stop(lane.http_request,slot,uint64_t(nonce),owned_runtime->batch_group_operation);
+                strata::program::report_http2_done(lane.http_request,slot,uint64_t(nonce),"cancel",terminal_cut);
+                std::printf("BDONE %u %lld cancel 0.0\n",slot,(long long)lane.produced);std::fflush(stdout);
+                return;
+            }
+#endif
+            if(legacy_slot>=0&&legacy_slot<int(bs.size()))bs[size_t(legacy_slot)].stop=true;
+        };
+        static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
+            auto shared_refill_issue = [&](PfPart& p, bool strict_prefix, std::string& e) -> bool {
+                tr("refill start", (long long) p.lent.size());
+                const strata::core::OnDevice on(p.dev);
+                if(strict_prefix){int current=-1;
+                    if(cudaGetDevice(&current)!=cudaSuccess||current!=(p.dev<0?primary_device:p.dev)){
+                        e="qualified prefix refill owning device selection failed";return false;}}
+                for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                    strata::core::BlobPart parts[3];
+                    const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
+                    if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
+                        if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
+                        host_res[(size_t) i] = slot;
+                        continue;
+                    }
+                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
+                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
+                        return false;
+                    if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
+                    host_res[(size_t) i] = slot;
+                }
+                return true;
+            };
+            auto shared_refill_wait = [&](PfPart& p, bool strict_prefix, std::string& e) -> bool {
+                const strata::core::OnDevice on(p.dev);
+                if(strict_prefix){int current=-1;
+                    if(cudaGetDevice(&current)!=cudaSuccess||current!=(p.dev<0?primary_device:p.dev)){
+                        e="qualified prefix refill wait owning device selection failed";return false;}}
+                if (!p.cache->sync_queued(e)) return false;
+#if defined(_WIN32)
+                // The copies have landed: the file pages touched by the loan need not stay in the working set.
+                for (const auto& [i, slot] : p.lent)
+                    srcp->release(i / g.n_expert, i % g.n_expert);
+#endif
+                p.lent.clear();
+                p.lent_chunk = 0;
+                return true;
+            };
+            auto shared_refill_one = [&](PfPart& p, bool strict_prefix, std::string& e) -> bool {
+                if (p.lent.empty()) return true;
+                return shared_refill_issue(p, strict_prefix, e) && shared_refill_wait(p, strict_prefix, e);
+            };
+            // #340: with several stages every stage's copies go out first (each card on its own link), then each is
+            // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
+            // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
+            static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
+            auto shared_prefix_refill = [&](bool strict_prefix, std::string& e) -> bool {
+                const auto t_rf = Clock::now();
+                int64_t n_lent = 0, n_parts = 0;
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+                if (n_parts > 1 && !refill_serial) {
+                    for (PfPart& p : pf_parts)
+                        if (!p.lent.empty() && !shared_refill_issue(p, strict_prefix, e)) return false;
+                    for (PfPart& p : pf_parts)
+                        if (!p.lent.empty() && !shared_refill_wait(p, strict_prefix, e)) return false;
+                } else {
+                    for (PfPart& p : pf_parts)
+                        if (!p.lent.empty() && !shared_refill_one(p, strict_prefix, e)) return false;
+                }
+                if (n_parts > 0) {
+                    const auto uploaded=res_upload(strict_prefix);
+                    if(strict_prefix&&uploaded!=cudaSuccess){e="qualified prefix original refill residency upload failed";return false;}
+                }
+                if(strict_prefix){int current=-1;
+                    if(cudaGetDevice(&current)!=cudaSuccess||current!=primary_device){e="qualified prefix refill caller device drift";return false;}}
+                if (trace && n_parts > 0) {
+                    std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
+                                 (long long) n_lent, (long long) n_parts,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                    std::fflush(stderr);
+                }
+                return true;
+            };
+            // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+            // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
+            // participant's own cache, and marking only that participant's own layers
+            auto shared_prefix_lend = [&](int64_t tokens, std::string& e, int64_t exact, bool strict_prefix, int64_t& seg_lend) -> bool {
+                seg_lend = 0;
+                if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+                const auto t_ln = Clock::now();
+                // what this segment needs, capped by the configured chunk: a request lends only what its own
+                // prompt needs, so a large chunk costs a short prompt nothing
+                const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
+                // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
+                const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
+                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
+                                                                                     : want_full;
+                // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
+                const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+                if (want <= 0) {
+                    e = "prefill: cannot lend buffers for an empty request segment";
+                    return false;
+                }
+                bool any = false;
+                for (PfPart& p : pf_parts) {
+                    if (p.first < 0) continue;
+                    if (!p.lent.empty()) {
+                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        // ONLY this participant's loan goes back: `refill` would return the other participants'
+                        // loans too, and their buffers are still laid out in their caches - marking those slots
+                        // resident again would hand the next window a prompt buffer in place of an expert
+                        if (!shared_refill_one(p, strict_prefix, e)) return false;
+                    }
+                    const strata::core::OnDevice on(p.dev);
+                    if(strict_prefix){int current=-1;
+                        if(cudaGetDevice(&current)!=cudaSuccess||current!=(p.dev<0?primary_device:p.dev)){
+                            e="qualified prefix loan owning device selection failed";return false;}}
+                    int64_t want_p = want;
+                    int32_t first = p.first_now;
+                    // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout
+                    if (!o.prefill_head_alias) {
+                        // #2090: the loan a chunk needs is NOT monotonic in the chunk: a chunk above the scan's small_max
+                        // lays out the byte-budget ring (199 slots at 5120), one at or below it 0.1.39's (384 at 4096), so
+                        // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
+                        // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
+                        // lent even then is halved until it can, instead of ending the engine.
+                        int64_t need_p = part_slots(p, want_p);
+                        while ((need_p <= 0 || need_p + (strict_prefix ? 128 : g_lend_keep) > p.cache->slots()) && want_p > 256) {
+                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
+                            need_p = part_slots(p, want_p);
+                        }
+                        if (need_p <= 0 || need_p + (strict_prefix ? 128 : g_lend_keep) > p.cache->slots()) {
+                            e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
+                            return false;
+                        }
+                        if (want_p != want)
+                            std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
+                                         "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
+                                         (long long) want_p);
+                        if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
+                            std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
+                                         "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
+                                         (long long) need_p, (long long) (p.cache->slots() - p.first));
+                        first = (int32_t) (p.cache->slots() - need_p);
+                    }
+                    if (want_p != p.sp->chunk() || first != p.first_now) {
+                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        p.first_now = first;
+                    }
+                    for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
+                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                            const size_t i = (size_t) (l * g.n_expert + ex);
+                            if (host_res[i] >= first) {
+                                p.lent.emplace_back((int32_t) i, host_res[i]);
+                                host_res[i] = strata::core::kNotResident;
+                                any = true;
+                            }
+                        }
+                    p.lent_chunk = want_p;
+                }
+                for (const PfPart& p : pf_parts)
+                    if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
+                if (any) {
+                    const auto uploaded=res_upload(strict_prefix);
+                    if(strict_prefix&&uploaded!=cudaSuccess){e="qualified prefix original loan residency upload failed";return false;}
+                }
+                if(strict_prefix){int current=-1;
+                    if(cudaGetDevice(&current)!=cudaSuccess||current!=primary_device){e="qualified prefix loan caller device drift";return false;}}
+                if (trace) {
+                    int64_t n_lent = 0;
+                    for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
+                    std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
+                                 (long long) want, std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
+                    std::fflush(stderr);
+                }
+                return true;
+            };
+
+        std::function<void(size_t)> owned_slot_numerical_oracle;
+        std::function<bool()> owned_slot_maintenance;
+        auto batch_step = [&](bool restricted_prefill=false,bool* deferred=nullptr) -> bool {
+            if(deferred)*deferred=false;
+            std::vector<int> keep(bs.size(),0); // allocate before any native work begins
+            if(in_shared->input_error.load())return false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(serving_threads){
+                serving_selected_thread.reset();serving_selected_thread_unit.reset();
+                for(auto& peer:serving_thread_cohort)peer.reset();
+                for(auto& peer:serving_thread_cohort_units)peer.reset();
+                if(!serving_prefill_peer_winner&&!serving_process_controls())return false;
+                bool input_ended=false;{std::lock_guard<std::mutex> lock(in_mu);input_ended=in_eof;}
+                if(restricted_prefill&&(input_ended||stop_req.load())){
+                    if(deferred)*deferred=true;return false;
+                }
+                for(size_t i=0;i<bs.size();++i){auto& lane=bs[i];
+                    if(lane.alignment_unpublished&&serving_threads->cancellation_pending(i)){
+                        if(restricted_prefill){if(deferred)*deferred=true;return false;}
+                        stop_req.store(true);return false; // admission owns real RAW retirement
+                    }
+                    if((lane.active||lane.repair_finishing)&&(input_ended||serving_threads->cancellation_pending(i))){
+                        if(restricted_prefill){if(deferred)*deferred=true;return false;}
+                        if(!lane.owned_raw)std::terminate();
+                        accept_batch_stop("BSTOP "+std::to_string(i)+" occupancy="+
+                            std::to_string(lane.owned_raw->slot_occupancy_incarnation()));
+                    }
+                }
+            }
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            const bool managed_main_fence=serving_threads&&serving_raw_session&&serving_raw_session->request_open()&&
+                serving_raw_session->phase()==strata::program::ServingRawSession::Phase::running;
+            if(owned_slot_maintenance&&!in_prompt_read&&!managed_main_fence&&owned_slot_maintenance())return true;
+            // Real prefill/alignment callers arrive after their previous piece
+            // drained. The main RAW fence remains open: only foreground peer
+            // rows may run here; never enter private-repair maintenance.
+            if(serving_threads&&(in_prompt_read||managed_main_fence))serving_foreground_only_cohort();
+#else
+            if(owned_slot_maintenance&&!in_prompt_read&&owned_slot_maintenance())return true;
+#endif
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
@@ -14684,7 +20309,12 @@ int main(int argc, char** argv) {
             }
             for (size_t offset = 0; offset < bs.size(); ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
-                if (!bs[(size_t) b].active) continue;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if (serving_threads && (size_t(b)>=serving_thread_cohort.size() || !serving_thread_cohort[size_t(b)])) continue;
+                if (!bs[(size_t)b].active && !bs[(size_t)b].alignment_unpublished) continue;
+#else
+                if (!bs[(size_t)b].active) continue;
+#endif
                 const int extra = batch_df2 ? (b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? df2_extra[b] : 0) : batch_mtp ? 1 : 0;
                 if (S + 1 + extra > win_cap) break;
                 BSlot& q = bs[(size_t) b];
@@ -14747,7 +20377,74 @@ int main(int argc, char** argv) {
                 ver.set_slot_history(rows[t], ps.ids.data() + from, (int64_t) ps.ids.size() - from);
             }
             const Clock::time_point w0 = Clock::now();
-            if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
+            bool ran_group=false,group_committed=false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            std::shared_ptr<const strata::core::NativeBatchGroupCompletion> owned_group_completion;
+            std::array<bool,2> owned_cohort_known{};
+#endif
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(owned_batch_allocation){
+                if(batch_mtp||o.spec||owned_runtime->batch_group_operation==UINT64_MAX)return false;
+                std::array<int,2> accepted{};for(int row=0;row<S;++row){
+                    if(rows[row]<0||rows[row]>=2||accepted[size_t(rows[row])])return false;
+                    accepted[size_t(rows[row])]=1;
+                }
+                auto snapshot=model_budget->snapshot();
+                auto metadata=model_budget->reserve({std::vector<uint64_t>(snapshot.capacity.device_bytes.size()),
+                    strata::core::NativeBatchGroupCompletion::metadata_bytes(),0,0,0,0},strata::core::ReservationPurpose::foreground);
+                if(!metadata)return false;
+                // Replace only after a complete successful actual operation; no
+                // native cut/certificate is derived from this physical receipt.
+                std::shared_ptr<const strata::core::NativeBatchGroupCompletion> completed;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                // All controllers prepare fallible ancestry/hash/metadata BEFORE
+                // either actual RAW fence begins or any cohort native work runs.
+                for(int row=0;row<S;++row){auto& slot=bs[size_t(rows[row])];
+                    if(!slot.owned_raw||!slot.owned_raw->healthy()||!slot.owned_raw->request_open())std::terminate();
+                    if(slot.alignment_unpublished){
+                        if(!slot.owned_raw->prepare_owned_alignment_known(slot.alignment_request,slot.alignment_request_credit,err)){
+                            for(int prior=0;prior<row;++prior){auto& prepared=bs[size_t(rows[prior])];
+                                if(prepared.alignment_unpublished&&!prepared.owned_raw->cancel_owned_alignment_known(err))std::terminate();
+                                if(prepared.owned_repair&&!strata::program::ServingSuffixRepairOperation::cancel_slot_cohort(
+                                    *prepared.owned_raw,*prepared.owned_repair,err))std::terminate();
+                            }
+                            return false;
+                        }
+                        tok[row]=slot.x;pos[row]=slot.p;
+                    }else if(slot.owned_repair){
+                        const auto* input=strata::program::ServingSuffixRepairOperation::prepare_slot_cohort(
+                            *slot.owned_raw,*slot.owned_repair,owned_cohort_known[size_t(rows[row])],err);
+                        if(!input){
+                            for(int prior=0;prior<row;++prior){auto& prepared=bs[size_t(rows[prior])];
+                                if(prepared.alignment_unpublished&&!prepared.owned_raw->cancel_owned_alignment_known(err))std::terminate();
+                                if(prepared.owned_repair&&!strata::program::ServingSuffixRepairOperation::cancel_slot_cohort(
+                                    *prepared.owned_raw,*prepared.owned_repair,err))std::terminate();
+                            }
+                            return false; // no RAW work began
+                        }
+                        tok[row]=input->token();pos[row]=int64_t(input->position());
+                    }
+                }
+                for(int row=0;row<S;++row){auto& owner=bs[size_t(rows[row])].owned_raw;
+                    if(!owner->begin_work(err))std::terminate();
+                }
+#else
+                std::fputs("owned batch RAW execution requires serving suffix-repair support\n",stderr);return false;
+#endif
+                ran_group=ver.run_owned_slot_group(owned_runtime->batch_slot_inspections.data(),batch_slot_stage_count(),
+                    ++owned_runtime->batch_group_operation,rows,S,tok,pos,accepted.data(),win_pool_fn,win_pool_user,outb,
+                    std::move(metadata.lease),completed,err);
+                if(ran_group&&!drive.d.failed){
+                    owned_runtime->batch_last_completion=completed;group_committed=true;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    strata::program::report_http2_group(*completed);
+                    owned_group_completion=std::move(completed);
+#endif
+                }else std::terminate(); // begun RAW owners cannot be abandoned on an uncertain group
+            }else
+#endif
+            ran_group=ver.run_slot_rows(rows,S,tok,pos,win_pool_fn,win_pool_user,outb,err);
+            if (!ran_group || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
@@ -14766,7 +20463,6 @@ int main(int argc, char** argv) {
             if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
                 adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
-            std::vector<int> keep(bs.size(), 0);
             for (int a = 0; a < A; ++a) {
                 const int b = active[a], i = first[a];
                 const BSlot& sl = bs[(size_t) b];
@@ -14779,7 +20475,7 @@ int main(int argc, char** argv) {
                     ++kp;
                 keep[b] = kp;
             }
-            if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
+            if (!group_committed&&!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
             }
@@ -14796,6 +20492,26 @@ int main(int argc, char** argv) {
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(owned_batch_allocation&&sl.alignment_unpublished){
+                    if(!owned_group_completion||!sl.owned_raw->complete_owned_alignment_known(*owned_group_completion,err))std::terminate();
+                    sl.p=int64_t(sl.owned_raw->cut().forwarded);
+                    sl.x=int32_t(sl.alignment_request->at(size_t(sl.p)));
+                    sl.alignment_last_operation=owned_group_completion->operation();
+                    strata::program::report_prealignment_known(sl.http_request,*owned_group_completion,size_t(b),sl.owned_raw->cut(),sl.x);
+                    serving_ack_foreground_lane(size_t(b));
+                    continue; // real known-input row, no response output or watermark delta
+                }
+                if(owned_batch_allocation&&sl.owned_repair&&owned_cohort_known[size_t(b)]){
+                    if(!owned_group_completion||!strata::program::ServingSuffixRepairOperation::complete_slot_cohort(
+                        *sl.owned_raw,*sl.owned_repair,*owned_group_completion,true,err))std::terminate();
+                    sl.ids.push_back(tok[first[t]]);sl.p=int64_t(sl.owned_repair->published.cut.forwarded);
+                    sl.x=sl.owned_repair->published.pending_tokens.front();
+                    strata::program::report_http2_known(sl.http_request,*owned_group_completion,size_t(b),sl.owned_raw->cut(),sl.x);
+                    serving_ack_foreground_lane(size_t(b));
+                    continue;
+                }
+#endif
                 bool nf = false;   // #879: a row of this slot held non-finite logits: the slot ends, nothing emitted
                 for (int r = first[t]; r < first[t] + (batch_mtp ? nrow[t] : 1); ++r) nf = nf || ver.nonfinite_in(r);
                 if (nf) {
@@ -14803,6 +20519,15 @@ int main(int argc, char** argv) {
                                          "(BDONE nonfinite) and the next request reads its prompt from token 0\n", b,
                                  (long long) pos[first[t]]);
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(owned_batch_allocation&&sl.owned_repair)std::terminate(); // prepared controller terminal abort is not a RAW old+1 fallback
+                    if(owned_batch_allocation){
+                        if(!sl.owned_raw||!owned_group_completion)std::terminate();
+                        const uint64_t occupancy=sl.owned_raw->slot_occupancy_incarnation();
+                        if(!sl.owned_raw->drain_owned_slot_group(*owned_group_completion,nullptr,err))std::terminate();
+                        strata::program::report_http2_done(sl.http_request,size_t(b),occupancy,"nonfinite",sl.owned_raw->cut());
+                    }
+#endif
                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
                     sl.active = false;
                     sl.cached = false;
@@ -14813,6 +20538,17 @@ int main(int argc, char** argv) {
                 for (int j = 0; j < keep[b]; ++j) {
                     const int32_t y = outb[first[t] + j];
                     sl.ids.push_back(tok[first[t] + j]);
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(owned_batch_allocation){
+                        if(!sl.owned_raw||!owned_group_completion)std::terminate();
+                        if(sl.owned_repair){
+                            if(!strata::program::ServingSuffixRepairOperation::complete_slot_cohort(
+                                *sl.owned_raw,*sl.owned_repair,*owned_group_completion,false,err))std::terminate();
+                        }else if(!sl.owned_raw->drain_owned_slot_group(*owned_group_completion,stdout,err))std::terminate();
+                        strata::program::report_http2_commit(sl.http_request,*owned_group_completion,size_t(b),sl.owned_raw->cut());
+                        serving_ack_foreground_lane(size_t(b));
+                    }else
+#endif
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -14823,6 +20559,12 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                        if(owned_batch_allocation){
+                            sl.repair_finishing=true;sl.owned_finish_reason=fin;
+                            sl.cached=false;
+                        }
+#endif
                         break;
                     }
                     sl.x = y;
@@ -14967,6 +20709,20 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        owned_alignment_step=[&](){
+            // BCANCEL is latched by the reader. Existing admitted peer nonce stops
+            // are serviced here at the same drained boundary, never unscoped STOP.
+            for(;;){std::string command;
+                {std::lock_guard<std::mutex> lock(in_shared->mu);
+                 if(in_shared->lines.empty()||in_shared->lines.front().rfind("BSTOP ",0)!=0)break;
+                 command=std::move(in_shared->lines.front());in_shared->lines.pop_front();}
+                accept_batch_stop(command);
+            }
+            const bool was_prompt=in_prompt_read;in_prompt_read=true;
+            const bool okay=batch_step();in_prompt_read=was_prompt;return okay;
+        };
+#endif
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
         const int n_pipe = (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
@@ -15203,7 +20959,16 @@ int main(int argc, char** argv) {
         // STRATA_P4_TIMING=1 / STRATA_P4_TRACE=PATH: where a pipelined window's time goes (pipe_probe.hpp; off: a branch)
         strata::program::PipeProbe p4(n_pipe, pg.size());
         // one turn: serve every running stage, hand finished groups on, start what can start
-        auto pump = [&](bool may_start) -> bool {
+        auto pump_step = [&](bool may_start) -> bool {
+            // A terminal input failure forbids new units; draining an already
+            // submitted pipeline group remains required and permitted.
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            // Owned admission is checked once by pump before uncertainty starts.
+            // Rechecking here could turn a clean racing rejection into an
+            // uncertain submission and prevent draining already admitted groups.
+            if(!o.owned_session_lifetime)
+#endif
+            if(may_start && in_shared->input_error.load())return false;
             ++pipe_tick;
             const strata::program::PipeProbe::PumpScope p4_scope(p4);
             if (p4.timing()) {
@@ -15454,17 +21219,629 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        bool pipe_completion_uncertain = false;
+        auto pump = [&](bool may_start) -> bool {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(o.owned_session_lifetime) {
+                if(pipe_completion_uncertain)return false;
+                // This rejection precedes any submitted-work effect. Keep
+                // pump(false) available to finish previously admitted groups.
+                if(may_start && in_shared->input_error.load())return false;
+                // Set before entering: exceptions and false results both make
+                // completion uncertain. Teardown must not retry their effects.
+                pipe_completion_uncertain = true;
+                const bool ok = pump_step(may_start);
+                if(ok)pipe_completion_uncertain = false;
+                return ok;
+            }
+#endif
+            return pump_step(may_start);
+        };
         auto pipe_drain = [&]() -> bool {
             while (pipe_inflight())
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        // Nested Doorbells scopes join and return service to pump first. Keep
+        // this guard inside pg/stage_group/callback lifetimes so device waits
+        // cannot replace the host service needed by already submitted groups.
+        strata::core::SubmittedWorkDrainGuard pipeline_retirement(
+            o.owned_session_lifetime && piped, pipe_completion_uncertain, pipe_drain);
+#endif
+        auto terminal_input = [&]() -> bool {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(owned_batch_allocation&&o.vision){
+                bool eof=false;{std::lock_guard<std::mutex> lock(in_mu);eof=in_eof;}
+                // A producer loses permission/completion proof by closing THIS
+                // captured input epoch. Keep startup/control/transport/native
+                // payments intact; fail-stop before any C++ ownership unwind.
+                // Never reinterpret EOF as producer-close or native completion.
+                if(eof||in_shared->input_error.load())
+                    strata::core::retirement_failed("owned image input closed without lifetime completion proof");
+            }
+#endif
+            if(!in_shared->input_error.load())return false;
+            // Submitted groups still need their host doorbells served. A
+            // destructor's device synchronization cannot replace pump(false).
+            if(piped && !pipe_drain())
+                std::fprintf(stderr,"strata serve: pipeline drain failed after verified input closed\n");
+            return true;
+        };
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        // Serialized request admission only: these observations are not a lock
+        // against concurrent global layout mutation during an executing request.
+        auto ple_authority_current=[&]() {
+            if(!o.verified_inputs_active)return true;
+            if(o.ple_gguf.empty())return verified_inputs.bindings && verified_inputs.bindings->ple_disabled;
+            if(!owned_runtime || !owned_ple_table || &ple_table!=owned_ple_table.get() ||
+               !owned_runtime->ple_table_metadata_valid)return false;
+            strata::kernels::PleResolvedTable now;
+            if(!owned_ple_table->resolved_table(now))return false;
+            const auto& admitted=owned_runtime->ple_table_metadata;
+            return now.generation==admitted.generation && now.format==admitted.format &&
+                now.mode==admitted.mode && now.scale==admitted.scale &&
+                now.row_bytes==admitted.row_bytes && now.rows==admitted.rows &&
+                now.source_offset==admitted.source_offset && now.source_bytes==admitted.source_bytes;
+        };
+        auto expert_authority_current=[&]() noexcept {
+            return !o.verified_inputs_active ||
+                (expert_layout_capture && expert_layout_capture->completed_inventory() &&
+                 (o.mmap_experts ? src.completed_inventory()!=nullptr :
+                                   arena_src.completed_inventory()!=nullptr));
+        };
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        // OPT-IN idle window (STRATA_SERVING_REPAIR_OWNER_SLOTS + STRATA_SERVING_REPAIR_IDLE_UNIT_TOKENS, slice
+        // 2; continuous per-unit demand recheck added by slice 3, D2): the selector offers one bounded private
+        // unit at a closed foreground boundary. The explicit experimental policy permits genuinely aged live
+        // repair to compete with queued input; without it, queued foreground always wins. Every unit retains
+        // the existing private-window, residency and controller evidence gates.
+        // The one input-demand observation of the idle window (slice 3, D2).  It reads the stdin queue under the
+        // queue's OWN mutex - the mutex the detached reader notifies under when it appends a line
+        // (generate.cpp:14661-14662) and the mutex the ordinary input read waits on (generate.cpp:14671) - so
+        // "nothing is waiting" is a statement about that queue, never a guess, and the idle loop needs no cadence
+        // constant, no sleep and no spin.  A STOP counts as demand even though the reader consumes it without
+        // queueing a line (generate.cpp:14650).
+        auto serving_idle_queue_signal = [&]() {
+            strata::program::ServingIdleQueueSignal signal;
+            {
+                std::lock_guard<std::mutex> queued_lock(in_mu);
+                signal.queued_input_lines = uint64_t(in_lines.size());
+                signal.input_error = in_shared->input_error.load();
+                signal.end_of_input = in_eof;
+            }
+            signal.stop_requested = stop_req.load();
+            return signal;
+        };
+        auto serving_select_repair = [&](const strata::program::ServingRepairSelectionBoundary& boundary,
+                std::span<const strata::program::ServingRepairSelectionCandidate> candidates,
+                const char* site) {
+            auto selected=strata::program::select_serving_repair_unit(
+                serving_repair_schedule.policy,boundary,candidates,0);
+            uint64_t ticket=0;
+            if(selected.status==strata::program::ServingRepairSelectionStatus::ready &&
+               serving_repair_schedule.enabled){
+                ticket=strata::program::serving_repair_uniform_ticket(serving_repair_random_state,selected.total_weight);
+                selected=strata::program::select_serving_repair_unit(
+                    serving_repair_schedule.policy,boundary,candidates,ticket);
+            }
+            if(selected.status==strata::program::ServingRepairSelectionStatus::ready){
+                if(selected.foreground)serving_repair_consecutive_escalated=0;
+                std::fprintf(stderr,"strata serve: REPAIR_SELECT v=1 site=%s foreground=%d candidate=%zu draw=%llu total=%llu reason=%s age_known=%d age_ns=%llu observed_ns=%llu ancestry_serial=%llu record=%llu\n",
+                    site,int(selected.foreground),selected.candidate,(unsigned long long)ticket,
+                    (unsigned long long)selected.total_weight,
+                    selected.foreground?"foreground":strata::program::repair_admission_reason_name(selected.admission.reason),
+                    int(selected.admission.oldest_unresolved_inherited_age_ns.has_value()),
+                    (unsigned long long)selected.admission.oldest_unresolved_inherited_age_ns.value_or(0),
+                    (unsigned long long)selected.observed_at_ns,(unsigned long long)selected.ancestry_serial,
+                    (unsigned long long)selected.record_version);
+            }
+            return selected;
+        };
+        owned_slot_numerical_oracle = [&](size_t selected_slot) {
+            auto& lane=bs.at(selected_slot);auto& out=*lane.owned_repair;
+            auto& admission=*out.owned_slot_qualification;auto& plan=admission.prefix;
+            if(!owned_batch_allocation||serving_raw_fence_running||in_prompt_read)std::terminate();
+            {std::lock_guard<std::mutex> lock(in_mu);if(!in_lines.empty()||in_eof||in_shared->input_error.load())std::terminate();}
+            for(const auto& current:bs)if(current.active)std::terminate();
+            const size_t required_peer=selected_slot==0?1:0;
+            if(required_peer>=bs.size()||!bs[required_peer].owned_raw||!bs[required_peer].owned_raw->request_open()||
+               !bs[required_peer].owned_raw->slot_occupancy_incarnation())
+                strata::core::retirement_failed("two-slot numerical qualification requires a genuine occupied quiet peer");
+            std::array<strata::core::BundleHandle,2> other_before;
+            std::array<std::shared_ptr<strata::program::OwnedImagePeerObservation>,2> image_before;
+            for(size_t i=0;i<bs.size();++i){auto& other=bs[i];if(i==selected_slot||!other.owned_raw||!other.owned_raw->request_open())continue;
+                if(strata::program::OwnedImageRequestDriver::image(*other.owned_raw)){
+                    if(!strata::program::OwnedImageRequestDriver::observe_peer(*other.owned_raw,image_before[i],err))std::terminate();
+                    continue;
+                }
+                if(other.owned_repair){auto meta=other.owned_repair->published;
+                    if(!other.owned_raw->capture(meta,other_before[i]))std::terminate();
+                }else if(!other.owned_raw->capture_owned_slot(other_before[i]))std::terminate();
+            }
+            const size_t peer_slot=selected_slot==0?1:0;
+            const uint64_t peer_occupancy=(other_before[peer_slot]||image_before[peer_slot])?bs[peer_slot].owned_raw->slot_occupancy_incarnation():0;
+            const auto selected_history=strata::program::SuffixExperimentDriver::qualification_hex(out.repaired_final.get()->cut.history);
+            auto report_oracle_boundary=[&](const char* phase){
+                const auto& cut=out.repaired_final.get()->cut;
+                std::fprintf(stderr,"owned_slot_qualification_%s req=%llu slot=%zu occupancy=%llu other_slot=%zu other_occupancy=%llu selected_cut=%llu history=%s forwarded=%llu accepted=%llu watermark=%llu binary=%s source=%s\n",
+                    phase,(unsigned long long)lane.http_leg,selected_slot,(unsigned long long)lane.owned_raw->slot_occupancy_incarnation(),peer_slot,
+                    (unsigned long long)peer_occupancy,(unsigned long long)cut.id,selected_history.data(),(unsigned long long)cut.forwarded,
+                    (unsigned long long)cut.accepted,(unsigned long long)cut.output_watermark,admission.binary.data(),admission.source.data());
+                std::fflush(stderr);
+            };
+            report_oracle_boundary("begin");
+            auto oracle_check = [&](const strata::program::PrefixReplayPlan& recorded,std::string& error)->bool {
+                if(&recorded!=&plan||!recorded.policy_matches(actual_prefix_policy(uint64_t(o.short_read)))||
+                   !recorded.origin_matches(serving_raw_session->edited_key(),owned_runtime->remote_policy_incarnation,0)||
+                   recorded.source!=srcp||recorded.runtime!=owned_runtime.get()||recorded.participant_count!=pf_parts.size()||
+                   recorded.pipe!=strata::prefill::Prefill::pipe_setting()||recorded.base!=host_res){error="owned-slot oracle authentic prefix base differs";return false;}
+                for(size_t i=0;i<pf_parts.size();++i){const auto& part=pf_parts[i];const auto& saved=recorded.participants[i];
+                    const auto activity=part.sp->replay_activity();const auto cpu=part.sp->cpu_share_policy();
+                    if(!part.lent.empty()||saved.cache!=part.cache||saved.prefill!=part.sp||saved.session!=part.ses||
+                       saved.offsets!=part.cache->slot_offsets()||saved.slots!=part.cache->slots()||saved.begin!=part.lb||saved.end!=part.le||
+                       saved.allocated_chunk!=activity.allocated_chunk||
+                       !activity.initialized||activity.session!=part.ses||activity.cache!=part.cache||activity.source!=srcp||
+                       activity.residency!=host_res.data()||activity.helper||activity.peer||activity.taps||activity.borrow_spill||activity.pending_force||
+                       !cpu.explicit_resolved||cpu.mode!=strata::core::NumericPolicyMode::disabled||cpu.dynamic_assignment||cpu.measured_ratios||cpu.measurement_pending||cpu.measured_gate){
+                        error="owned-slot oracle actual prefix participants/numerical policy differ";return false;
+                    }
+                }
+                return true;
+            };
+            int64_t replay_lend=0;
+            auto oracle_loans = [&](bool recording) -> bool {
+                if(!plan.active||plan.participant_count!=pf_parts.size())return false;
+                for(size_t i=0;i<pf_parts.size();++i){const auto& p=pf_parts[i];auto& saved=plan.participants[i];
+                    if(saved.cache!=p.cache||saved.prefill!=p.sp||saved.session!=p.ses||saved.offsets!=p.cache->slot_offsets()||
+                       saved.slots!=p.cache->slots()||saved.begin!=p.lb||saved.end!=p.le)return false;
+                    if(recording&&!saved.loan_seen){
+                        if(p.lent.size()>saved.loan.capacity())return plan.reject("prefix loan exceeds credited directory");
+                        saved.loan.assign(p.lent.begin(),p.lent.end());saved.first=p.first_now;
+                        saved.chunk=p.sp->chunk();saved.lent_chunk=p.lent_chunk;
+                        saved.ring_slots=p.sp->replay_activity().ring_slots;saved.loan_seen=true;
+                    }else if(!saved.loan_seen||saved.first!=p.first_now||saved.chunk!=p.sp->chunk()||
+                             saved.lent_chunk!=p.lent_chunk||saved.loan!=p.lent||
+                             saved.ring_slots!=p.sp->replay_activity().ring_slots)
+                        return plan.reject("prefix profile requires one identical actual loan shape per stage");
+                    for(const auto& pair:p.lent){
+                        if(pair.first<0||size_t(pair.first)>=plan.base.size()||
+                           int64_t(pair.first)<p.lb*g.n_expert||int64_t(pair.first)>=p.le*g.n_expert||
+                           pair.second<p.first_now||pair.second>=p.cache->slots()||
+                           plan.base[size_t(pair.first)]!=pair.second||host_res[size_t(pair.first)]!=strata::core::kNotResident)return false;
+                    }
+                }
+                return true;
+            }
+;
+            auto oracle_piece = [&](const strata::program::PrefixReplayEvent& event,
+                std::span<const int32_t> history,strata::program::PrefixReplayAbort abort,
+                strata::program::PrefixReplayProgress& progress,std::string& e) -> bool {
+                struct SavedCallbacks {
+                    strata::prefill::Prefill* sp=nullptr;
+                    decltype(sp->on_chunk) chunk;decltype(sp->on_stage_chunk) stage;
+                    decltype(sp->on_routes) routes;decltype(sp->should_stop) stop,yield;
+                };
+                std::array<SavedCallbacks,8> saved;
+                try {
+                    if(event.to>plan.tokens.size()||history.size()<event.to)return false;
+                    auto replay_loan=[&](){return shared_prefix_lend(event.lend_tokens,e,event.lend_exact,true,replay_lend)&&oracle_loans(false);};
+                    if(event.returned_before_lend){
+                        bool outstanding=false;for(const auto& p:pf_parts)outstanding=outstanding||!p.lent.empty();
+                        if(!outstanding&&!replay_loan())strata::core::retirement_failed("owned-slot prefix initial loan differs");
+                        for(uint64_t cycle=0;cycle<event.loan_cycles;++cycle)
+                            if(!shared_prefix_refill(true,e)||!replay_loan())
+                                strata::core::retirement_failed("owned-slot prefix recorded loan cycle failed");
+                    }else if(event.lend&&!replay_loan())
+                        strata::core::retirement_failed("prefix replay actual loan differs after mutation");
+                    for(uint64_t at=event.from;at<event.to;++at)plan.tokens[size_t(at)]=history[size_t(at)];
+                    for(size_t i=0;i<pf_parts.size();++i){auto& v=*pf_parts[i].sp;auto& old=saved[i];old.sp=&v;
+                        old.chunk=std::move(v.on_chunk);old.stage=std::move(v.on_stage_chunk);old.routes=std::move(v.on_routes);
+                        old.stop=std::move(v.should_stop);old.yield=std::move(v.stop_at_chunk);
+                        v.on_chunk=nullptr;v.on_routes=nullptr;
+                        v.on_stage_chunk=[&progress,i](int64_t done,std::string&){progress.stage_end[i]=uint64_t(done);return true;};
+                        v.should_stop=nullptr;v.stop_at_chunk=nullptr;
+                    }
+                    // should_stop skips Prefill's PLE epilogue. The graceful
+                    // primary-only break preserves it and drains issued rows.
+                    sp.stop_at_chunk=[abort]{return abort();};progress.stages=pf_parts.size();
+                    if(event.planned)sp.force_chunk(event.chunk,event.single,event.chunked);
+                    const bool ran=sp.run(plan.tokens.data()+event.from,int64_t(event.to-event.from),int64_t(event.from),e);
+                    progress.stopped_at=sp.stopped_at();
+                    if(!ran)strata::core::retirement_failed("prefix replay actual run or downstream join failed");
+                    // Keep moved callbacks alive through actual all-device
+                    // completion. No unwinding after an uncertain attempted run.
+                    for(const auto& p:pf_parts){strata::core::WindowDeviceScope device(p.dev<0?primary_device:p.dev);
+                        if(!device.ok()||cudaDeviceSynchronize()!=cudaSuccess||!device.finish())
+                            strata::core::retirement_failed("prefix replay callback device completion uncertain");}
+                    for(auto& old:saved)if(old.sp){auto& v=*old.sp;v.on_chunk=std::move(old.chunk);
+                        v.on_stage_chunk=std::move(old.stage);v.on_routes=std::move(old.routes);
+                        v.should_stop=std::move(old.stop);v.stop_at_chunk=std::move(old.yield);}
+                    return true;
+                }catch(...){strata::core::retirement_failed("prefix replay callback exception retains owners");}
+            }
+;
+            auto oracle_refill=[&](std::string& error){
+                if(!shared_prefix_refill(true,error))return false;
+                for(const auto& part:pf_parts){strata::core::WindowDeviceScope device(part.dev<0?primary_device:part.dev);
+                    if(!device.ok()||cudaDeviceSynchronize()!=cudaSuccess||!device.finish())return false;}
+                return true;
+            };
+            struct Adapter {decltype(oracle_check)* check;decltype(oracle_piece)* run;decltype(oracle_refill)* refill;};
+            Adapter adapter{&oracle_check,&oracle_piece,&oracle_refill};
+            strata::program::PrefixReplayCallbacks callbacks{&adapter,
+                [](void* value,const strata::program::PrefixReplayPlan& recorded,std::string& error){return (*static_cast<Adapter*>(value)->check)(recorded,error);},
+                [](void* value,const strata::program::PrefixReplayEvent& event,std::span<const int32_t> history,
+                   strata::program::PrefixReplayAbort abort,strata::program::PrefixReplayProgress& progress,std::string& error){return (*static_cast<Adapter*>(value)->run)(event,history,abort,progress,error);},
+                [](void* value,std::string& error){return (*static_cast<Adapter*>(value)->refill)(error);}};
+            const auto view=plan.active?strata::program::PrefixReplayView{&plan,&callbacks,plan.request}:strata::program::PrefixReplayView{};
+            std::vector<int32_t> prior_tokens;
+            if(serving_raw_session->cut().accepted){
+                if(serving_tracked_state.cut!=serving_raw_session->cut()||serving_tracked_state.accepted.size()!=serving_raw_session->cut().accepted)std::terminate();
+                prior_tokens=serving_tracked_state.accepted;
+            }
+            const auto prior=strata::program::ServingRawSession::endpoint_metadata(serving_raw_session->key(),serving_raw_session->cut(),prior_tokens);
+            DriverSuffixExperimentContext context{o,g,owned_runtime,*model_budget,sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+            auto serial=[](strata::core::Verifier& current,int count,const int32_t* tokens,int64_t position,
+                           strata::core::PoolMultiFn pool,void* user,int32_t* output,std::string& error){return current.run(count,tokens,position,pool,user,output,error);};
+            uint64_t next_cut=std::max(serving_raw_cut,serving_raw_session->cut().id)+1;
+            bool pass=strata::program::SuffixExperimentDriver::qualify_owned_slot_final(context,serial,*serving_raw_session,*lane.owned_raw,
+                lane.http_leg,admission,out.repaired_final,prior,next_cut,view);
+            serving_raw_cut=std::max(serving_raw_cut,next_cut);
+            for(size_t i=0;i<bs.size();++i)if(other_before[i]){
+                auto& other=bs[i];auto meta=*other_before[i].get();meta.devices.clear();strata::core::BundleHandle after;
+                if(!other.owned_raw->capture(meta,after))std::terminate();
+                strata::core::WindowStateLayout layout;
+                if(!strata::core::native_window_layout(other.owned_raw->geometry(),other.owned_raw->initial_config(),meta.key,meta.cut,
+                    other.owned_raw->max_tokens(),other.owned_raw->max_payload_bytes(),layout,false))std::terminate();
+                const bool preserved=strata::program::SuffixExperimentDriver::report_owned_slot_preserved(*other.owned_raw,admission,lane.http_leg,"other",int64_t(i),
+                    other.owned_raw->slot_occupancy_incarnation(),other_before[i],after);
+                pass=pass&&preserved;
+            }
+            for(size_t i=0;i<bs.size();++i)if(image_before[i]){
+                auto& other=bs[i];uint64_t tensors=0,bytes=0;
+                const bool preserved=strata::program::OwnedImageRequestDriver::compare_peer(
+                    *other.owned_raw,image_before[i],tensors,bytes,err);
+                std::fprintf(stderr,"owned_slot_preservation req=%llu role=other slot=%zu occupancy=%llu completed=1 equal=%u tensors=%llu bytes=%llu binary=%s source=%s oracle=private_image_actual_recapture\n",
+                    (unsigned long long)lane.http_leg,i,(unsigned long long)other.owned_raw->slot_occupancy_incarnation(),
+                    unsigned(preserved),(unsigned long long)tensors,(unsigned long long)bytes,admission.binary.data(),admission.source.data());
+                std::fflush(stderr);pass=pass&&preserved;
+            }
+            if(!pass)strata::core::retirement_failed("owned-slot independent native numerical/restoration oracle failed");
+            report_oracle_boundary("complete");
+        };
+
+        owned_slot_maintenance = [&]() -> bool {
+            if(!owned_batch_allocation||serving_raw_fence_running)return false;
+            if(serving_threads){
+                if(!serving_process_controls())return false;
+                // All members of the preceding shared window have now published
+                // and acknowledged actual cuts before any graph revision changes.
+                for(size_t i=0;i<bs.size();++i){auto& lane=bs[i];const auto* binding=serving_threads->binding(i);
+                    if(!binding||lane.active||lane.alignment_unpublished||!lane.repair_finishing)continue;
+                    const auto* fg=serving_threads->operation(binding->foreground);
+                    if(fg&&fg->state==strata::core::DependencyState::pending&&
+                       !serving_threads->foreground_finished(i,std::strcmp(lane.owned_finish_reason,"cancel")==0,serving_thread_now_ms()))
+                        strata::core::retirement_failed("managed foreground milestone completion failed");
+                }
+            }
+            bool generating=false;
+            for(const auto& lane:bs)generating=generating||lane.active;
+            const auto queued=serving_idle_queue_signal();
+            // Terminal input cannot leave a debt-bearing physical slot pinned forever.
+            if(queued.input_error||queued.end_of_input){
+                for(size_t i=0;i<bs.size();++i){auto& lane=bs[i];
+                    if(!lane.repair_finishing)continue;
+                    const uint64_t occupancy=lane.owned_raw->slot_occupancy_incarnation();
+                    const auto cut=lane.owned_raw->cut();
+                    if(lane.owned_repair&&!strata::program::ServingSuffixRepairOperation::retire_slot_controller(*lane.owned_raw,*lane.owned_repair,err))std::terminate();
+                    lane.owned_repair.reset();
+                    if(!lane.owned_raw->close_request(err)||!lane.owned_raw->retire_owned_slot(err))std::terminate();
+                    lane.repair_finishing=false;
+                    serving_release_thread_lane(i,true);
+                    strata::program::report_http2_done(lane.http_request,i,occupancy,"shutdown",cut);return true;
+                }
+                return false;
+            }
+            bool pending_slot_oracle=false;
+            for(const auto& lane:bs)pending_slot_oracle=pending_slot_oracle||bool(lane.owned_repair&&lane.owned_repair->owned_slot_qualification);
+            // Qualification pins a REAL sibling occupancy until the selected
+            // oracle observes its actual tensors. Terminal cleanup above always wins.
+            // Production without the selector retains its original retirement order.
+            for(size_t i=0;i<bs.size();++i){auto& lane=bs[i];
+                if(!lane.repair_finishing)continue;
+                if(pending_slot_oracle&&(!lane.owned_repair||!lane.owned_repair->owned_slot_qualification))continue;
+                if(!generating&&!queued.queued_input_lines&&!lane.owned_repair){
+                    const uint64_t occupancy=lane.owned_raw->slot_occupancy_incarnation();
+                    strata::core::BundleHandle donor;
+                    // Optional cache refusal leaves native state unchanged; release this slot truthfully.
+                    if(!lane.img&&!lane.tainted&&lane.owned_raw->capture_owned_slot(donor))retain_owned_exact_donor(donor);
+                    if(!lane.owned_raw->close_request(err)||!lane.owned_raw->retire_owned_slot(err))std::terminate();
+                    serving_release_thread_lane(i,std::strcmp(lane.owned_finish_reason,"cancel")==0);
+                    strata::program::report_http2_done(lane.http_request,i,occupancy,lane.owned_finish_reason,lane.owned_raw->cut());
+                    lane.repair_finishing=false;return true;
+                }
+                if(!generating&&!queued.queued_input_lines&&lane.owned_repair&&strata::program::ServingSuffixRepairOperation::exact_ready(*lane.owned_repair)){
+                    const uint64_t occupancy=lane.owned_raw->slot_occupancy_incarnation();
+                    const bool qualify=bool(lane.owned_repair->owned_slot_qualification);
+                    if(!strata::program::ServingSuffixRepairOperation::finish(*lane.owned_raw,*lane.owned_repair,err,qualify))std::terminate();
+                    if(qualify){
+                        if(!owned_slot_numerical_oracle)std::terminate();
+                        owned_slot_numerical_oracle(i);
+                        if(!strata::program::ServingSuffixRepairOperation::retire_slot_controller(*lane.owned_raw,*lane.owned_repair,err))std::terminate();
+                    }
+                    if(!retain_owned_exact_donor(lane.owned_repair->repaired_final))std::terminate();
+                    if(!lane.owned_raw->close_request(err)||!lane.owned_raw->retire_owned_slot(err))std::terminate();
+                    serving_release_thread_lane(i,std::strcmp(lane.owned_finish_reason,"cancel")==0);
+                    strata::program::report_http2_done(lane.http_request,i,occupancy,lane.owned_finish_reason,lane.owned_raw->cut());
+                    lane.owned_repair.reset();lane.repair_finishing=false;return true;
+                }
+            }
+            if(serving_repair_idle_unit==0)return false;
+            const auto now=strata::program::serving_repair_clock_now(owned_runtime->remote_policy_incarnation);
+            strata::program::ServingRepairSelectionBoundary boundary;
+            boundary.now_ns=now.ticks_ns;boundary.clock_domain=now.domain;boundary.safe_boundary=true;
+            boundary.terminal_input=queued.input_error||queued.end_of_input;
+            boundary.foreground.current_request_generating=generating;
+            boundary.foreground.queued_input_lines=queued.queued_input_lines;boundary.foreground.context_room=true;
+            boundary.consecutive_escalated_units=serving_repair_consecutive_escalated;
+            boundary.max_candidates=bs.size();boundary.foreground_weight=serving_repair_schedule.enabled?serving_repair_schedule.foreground_weight:1;
+            boundary.max_consecutive_escalated_units=serving_repair_schedule.max_consecutive;
+            std::array<strata::program::ServingRepairSelectionCandidate,2> candidates{};
+            for(size_t i=0;i<bs.size()&&i<candidates.size();++i){auto& lane=bs[i];
+                if(!lane.owned_repair||(!lane.active&&!lane.repair_finishing))continue;
+                const auto age=strata::program::ServingSuffixRepairOperation::repair_age(*lane.owned_repair,now);
+                auto& candidate=candidates[i];candidate.work.demand=age.age.token_debt>0;candidate.work.resource_ready=age.valid;
+                candidate.weight=serving_repair_schedule.enabled?serving_repair_schedule.live_weight:1;
+                candidate.age=age.age;candidate.observed_at_ns=now.ticks_ns;candidate.clock_domain=now.domain;
+                candidate.record_version=lane.owned_repair->published.cut.id;candidate.ancestry_serial=age.ancestry_serial;
+            }
+            if(serving_threads){
+                std::array<strata::program::ServingThreadUnit,4> units{};size_t count=0;
+                for(size_t i=0;i<bs.size()&&i<2;++i){const auto& lane=bs[i];
+                    const auto* binding=serving_threads->binding(i);
+                    if(!binding||!binding->occupancy||!lane.owned_raw)continue;
+                    if(binding->occupancy!=lane.owned_raw->slot_occupancy_incarnation())
+                        strata::core::retirement_failed("managed slot occupancy no longer matches physical owner");
+                    if(lane.active||lane.alignment_unpublished){auto& u=units[count++];
+                        u.slot=i;u.request=binding->request;u.occupancy=binding->occupancy;u.operation=binding->foreground;
+                        u.unit=strata::core::AdmissionUnit::decode;u.demand=true;
+                        u.resource_ready=lane.owned_raw->healthy()&&lane.owned_raw->request_open();
+                        u.class_weight=serving_repair_schedule.foreground_weight;
+                    }
+                    if(lane.owned_repair&&(lane.active||lane.repair_finishing)){auto& u=units[count++];
+                        u.slot=i;u.request=binding->request;u.occupancy=binding->occupancy;u.operation=binding->repair;
+                        u.unit=strata::core::AdmissionUnit::repair;u.repair=candidates[i];
+                        u.demand=candidates[i].work.demand;u.resource_ready=candidates[i].work.resource_ready;
+                        u.class_weight=serving_repair_schedule.live_weight;
+                    }
+                }
+                const auto now_ms=serving_thread_now_ms();
+                auto selected=serving_threads->select(serving_repair_schedule.policy,boundary,
+                    std::span<const strata::program::ServingThreadUnit>(units.data(),count),now_ms,0);
+                if(selected.total_weight){const auto ticket=strata::program::serving_repair_uniform_ticket(
+                        serving_repair_random_state,selected.total_weight);
+                    selected=serving_threads->select(serving_repair_schedule.policy,boundary,
+                        std::span<const strata::program::ServingThreadUnit>(units.data(),count),now_ms,ticket);}
+                if(!selected.ready){
+                    // Graph-blocked active slots are not physical work. Wait for
+                    // a control/input event or actual whole-registry expiry; no
+                    // nonempty blocked BGEN queue may cause a busy spin.
+                    std::unique_lock<std::mutex> lock(in_mu);
+                    if(!in_shared->controls.empty()||in_eof||in_shared->input_error.load()||
+                       serving_choose_line()!=in_lines.end())return false;
+                    const auto expiry=serving_threads->next_expiry();
+                    if(expiry){const auto time=serving_thread_now_ms();
+                        if(*expiry>time)in_cv.wait_for(lock,std::chrono::milliseconds(std::min<uint64_t>(*expiry-time,uint64_t(INT64_MAX))));
+                    }else in_cv.wait(lock);
+                    return false;
+                }
+                const auto& chosen=units[selected.candidate];
+                if(selected.operation.work_class==strata::core::DependencyWorkClass::foreground){
+                    unsigned mask=0;
+                    for(size_t i=0;i<count;++i){auto peer=serving_threads->foreground_peer(selected,units[i]);
+                        if(!peer.ready)continue;
+                        serving_thread_cohort[units[i].slot]=std::move(peer);
+                        serving_thread_cohort_units[units[i].slot]=units[i];mask|=1u<<units[i].slot;
+                    }
+                    std::fprintf(stderr,"SCHED_COHORT v=1 engine=%llu mask=%u priority=%lld selected_slot=%zu class_weight=%llu\n",
+                        (unsigned long long)serving_threads->engine(),mask,(long long)selected.effective_priority,
+                        chosen.slot,(unsigned long long)chosen.class_weight);
+                    serving_selected_thread=std::move(selected);serving_selected_thread_unit=chosen;
+                    return false; // batch_step submits exactly the eligible cohort mask
+                }
+                const auto before=serving_idle_queue_signal();
+                if(before.input_error||before.end_of_input||before.stop_requested||
+                   (selected.admission.reason==strata::program::RepairAdmissionReason::admitted_idle&&before.queued_input_lines))return false;
+                auto& lane=bs[chosen.slot];
+                std::fprintf(stderr,"SCHED_REPAIR_SELECT v=1 engine=%llu slot=%zu request=%012llx operation=%llu result=%llu priority=%lld class_weight=%llu reason=%s age_known=%d age_ns=%llu observed_ns=%llu clock_domain=%llu record=%llu ancestry_serial=%llu token_debt=%llu\n",
+                    (unsigned long long)serving_threads->engine(),chosen.slot,(unsigned long long)(chosen.request-1),
+                    (unsigned long long)chosen.operation.serial,(unsigned long long)chosen.operation.result_revision,
+                    (long long)selected.effective_priority,(unsigned long long)chosen.class_weight,
+                    strata::program::repair_admission_reason_name(selected.admission.reason),
+                    int(selected.admission.oldest_unresolved_inherited_age_ns.has_value()),
+                    (unsigned long long)selected.admission.oldest_unresolved_inherited_age_ns.value_or(0),
+                    (unsigned long long)chosen.repair.observed_at_ns,(unsigned long long)chosen.repair.clock_domain,
+                    (unsigned long long)chosen.repair.record_version,(unsigned long long)chosen.repair.ancestry_serial,
+                    (unsigned long long)chosen.repair.age.token_debt);
+                if(!strata::program::ServingSuffixRepairOperation::repair_unit(*lane.owned_repair,false,err,serving_repair_idle_unit))std::terminate();
+                const auto evidence=strata::program::ServingSuffixRepairOperation::owner_evidence(*lane.owned_repair);
+                if(!serving_threads->acknowledge_unit(selected,chosen,lane.owned_raw->slot_occupancy_incarnation(),evidence.private_cut().id))
+                    strata::core::retirement_failed("managed private unit acknowledgement failed");
+                if(selected.admission.reason==strata::program::RepairAdmissionReason::admitted_age_escalated)++serving_repair_consecutive_escalated;
+                return true;
+            }
+            const auto selected=serving_select_repair(boundary,std::span<const strata::program::ServingRepairSelectionCandidate>(candidates.data(),std::min(bs.size(),candidates.size())),"owned-slots");
+            if(selected.status!=strata::program::ServingRepairSelectionStatus::ready||selected.foreground)return false;
+            // A fresh foreground arrival closes an idle selection before dispatch.
+            const auto before=serving_idle_queue_signal();
+            if(before.input_error||before.end_of_input||before.stop_requested||
+               (selected.admission.reason==strata::program::RepairAdmissionReason::admitted_idle&&before.queued_input_lines))return false;
+            auto& lane=bs[selected.candidate];
+            if(!strata::program::ServingSuffixRepairOperation::repair_unit(*lane.owned_repair,false,err,serving_repair_idle_unit))std::terminate();
+            if(selected.admission.reason==strata::program::RepairAdmissionReason::admitted_age_escalated)++serving_repair_consecutive_escalated;
+            return true;
+        };
+        // One selection and at most ONE bounded private unit. Refresh queue, age and versions each time.
+        auto serving_repair_idle_tick = [&]() -> bool {
+            if (serving_repair_owners == nullptr || serving_repair_owners->size() == 0 ||
+                serving_repair_idle_unit == 0 || serving_raw_session == nullptr || serving_raw_fence_running)
+                return false;
+            const auto queued=serving_idle_queue_signal();
+            strata::program::ServingRepairSelectionBoundary boundary;
+            const auto now=strata::program::serving_repair_clock_now(owned_runtime->remote_policy_incarnation);
+            boundary.now_ns=now.ticks_ns;boundary.clock_domain=now.domain;
+            boundary.safe_boundary=serving_raw_session->healthy() &&
+                serving_raw_session->private_window_allowed() && !serving_raw_session->request_open();
+            boundary.terminal_input=queued.stop_requested || queued.end_of_input || queued.input_error;
+            boundary.other_lane_work=(piped && pipe_inflight()) || batch_on();
+            boundary.foreground.queued_input_lines=queued.queued_input_lines;
+            boundary.foreground.context_room=true; // individual publication capacity is checked below
+            boundary.max_candidates=serving_repair_owners->capacity();
+            boundary.foreground_weight=serving_repair_schedule.enabled?serving_repair_schedule.foreground_weight:1;
+            boundary.consecutive_escalated_units=serving_repair_consecutive_escalated;
+            boundary.max_consecutive_escalated_units=serving_repair_schedule.max_consecutive;
+            if(!boundary.foreground.decode_waiting())serving_repair_consecutive_escalated=0;
+            const auto identities=serving_repair_owners->parked_identities();
+            std::vector<strata::program::ServingRepairSelectionCandidate> candidates(identities.size());
+            for(size_t i=0;i<identities.size();++i){
+                strata::program::SuspendedOwnerFacts record;
+                if(!serving_repair_owners->entry_facts(identities[i],record))continue;
+                strata::program::ServingRepairAgeObservation observation;
+                const bool observed=serving_repair_owners->inspect_parked_owner(identities[i],
+                    [&](const strata::program::ServingSuffixRepairOperation::Outcome& payload){
+                        observation=strata::program::ServingSuffixRepairOperation::repair_age(payload,now);
+                        return observation.valid;
+                    });
+                auto& candidate=candidates[i];
+                candidate.work.demand=record.token_debt>0;
+                candidate.work.resource_ready=observed && !record.quarantined &&
+                    (!boundary.foreground.decode_waiting() || record.published_cut.forwarded<uint64_t(o.max_context));
+                candidate.weight=serving_repair_schedule.enabled?serving_repair_schedule.live_weight:1;
+                candidate.age=observation.age;candidate.observed_at_ns=observation.observed_at.ticks_ns;
+                candidate.clock_domain=observation.observed_at.domain;candidate.ancestry_serial=observation.ancestry_serial;
+                candidate.record_version=record.record_version;
+                if(observed)serving_repair_owners->observe_age(identities[i],observation.age);
+            }
+            const auto selected=serving_select_repair(boundary,candidates,"parked");
+            if(selected.status!=strata::program::ServingRepairSelectionStatus::ready || selected.foreground)return false;
+            const auto& parked=identities[selected.candidate];
+            strata::program::SuspendedOwnerFacts revalidated;
+            if(!serving_repair_owners->entry_facts(parked,revalidated) ||
+               revalidated.record_version!=selected.record_version)return false;
+            const auto before_unit=serving_idle_queue_signal();
+            if(before_unit.stop_requested || before_unit.end_of_input || before_unit.input_error)return false;
+            // A new arrival after an idle decision closes that idle window before any unit starts.
+            if(selected.admission.reason==strata::program::RepairAdmissionReason::admitted_idle &&
+               before_unit.queued_input_lines>0)return false;
+            bool advanced_any=false;
+            {
+                std::string window_error, unit_error;
+                if (!serving_raw_session->begin_private_window(window_error)) {
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): private work window refused (%s)\n",
+                                 window_error.c_str());
+                    return advanced_any;
+                }
+                uint64_t advanced = 0, tick_next_cut = 0;
+                strata::program::RepairOwnerEvidence after;
+                // The live expert-residency generation travels with the session facts, so the registry's own gate
+                // (`advance_parked_owner`) refuses a unit whose chain is bound to a different inventory, by name
+                // (slice 5, requirement 5). The check inside the unit callback below is kept as well: two guards,
+                // one spelling of the condition.
+                strata::program::LiveSessionFacts tick_session =
+                    strata::program::ServingSuffixRepairOperation::live_session_facts(*serving_raw_session);
+                tick_session.residency_generation = ajob ? uint64_t(a_swapped) : uint64_t(adapt_nswaps);
+                const bool advanced_owner = serving_repair_owners->advance_parked_owner(
+                    parked, tick_session,
+                    serving_repair_idle_unit,
+                    [&](strata::program::ServingSuffixRepairOperation::Outcome& payload, uint64_t& tokens,
+                        strata::program::RepairOwnerEvidence& after_evidence, std::string& error) -> bool {
+                        // The parked owner's private chain binds the expert-residency inventory uploaded when its
+                        // chain was initialised (resident_repair_dispatch.inc: initialize_private). A foreground
+                        // swap would leave further private units computing against a stale inventory, so the unit
+                        // is refused if residency moved at all since the owner was parked, and the same fixed
+                        // serial-dispatch preflight the operation passed must still hold.
+                        if (const char* refused = strata::program::resident_repair_detail::
+                                                      resident_service_refusal(*owned_runtime)) {
+                            error = refused;
+                            return false;
+                        }
+                        const uint64_t swaps_now = ajob ? uint64_t(a_swapped) : uint64_t(adapt_nswaps);
+                        if (swaps_now != payload.retained_residency_swaps) {
+                            error = "expert residency changed since this owner was parked";
+                            return false;
+                        }
+                        const bool done = strata::program::ServingSuffixRepairOperation::retained_private_unit(
+                            payload, serving_repair_idle_unit, tokens, after_evidence, error);
+                        tick_next_cut = payload.next_cut;
+                        return done;
+                    },
+                    after, advanced, unit_error);
+                if (!serving_raw_session->end_private_window(window_error)) {
+                    // A window left open would block every later request from opening a fence: this is the
+                    // deliberate failstop, never a silently stuck session.
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): FAILSTOP closing the private "
+                                         "work window: %s\n", window_error.c_str());
+                    strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,
+                        "a parked repair owner left the private work window open");
+                }
+                if (advanced_owner) {
+                    advanced_any = true;
+                    if(selected.admission.reason==strata::program::RepairAdmissionReason::admitted_age_escalated)
+                        ++serving_repair_consecutive_escalated;
+                    // The controller minted private cut ids: keep the serving cut identity monotonic across the
+                    // whole session, exactly as the in-request path does after finish().  The registry, not the
+                    // serving scope, holds the payload, so the record is what the log line reports.
+                    serving_raw_cut = std::max(serving_raw_cut, tick_next_cut);
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): idle private unit for a parked "
+                                         "repair owner: cut=%llu tokens=%llu certified_forwarded=%llu debt=%llu "
+                                         "units=%llu repaired_tokens=%llu\n", (unsigned long long)tick_next_cut,
+                                 (unsigned long long)advanced,
+                                 (unsigned long long)after.private_cut().forwarded,
+                                 (unsigned long long)after.token_debt(),
+                                 (unsigned long long)serving_repair_owners->units_advanced(),
+                                 (unsigned long long)serving_repair_owners->tokens_repaired());
+                    std::fflush(stderr);
+                } else if (!unit_error.empty())
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): idle private unit refused (%s)\n",
+                                 unit_error.c_str());
+            }
+            return advanced_any;
+        };
+#endif
         for (;;) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            if(!expert_authority_current() || !ple_authority_current()) {
+                std::fprintf(stderr,"strata serve: model provenance became stale before request admission\n");return 1;
+            }
+#endif
+            if(terminal_input())return 1;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // OPT-IN (slice 2; continuous idle advancement by slice 3, D2): the demand-aware idle window, in the
+            // scope before the next line is read.  Slice 2 ran the tick ONCE per outer-loop pass, so a genuinely
+            // idle process advanced one unit per parked owner and then stalled in the input read.  The idle period
+            // is now a loop: each pass re-observes demand (the tick re-reads it per owner, before EVERY unit) and
+            // admits at most one bounded unit per owner, and it ends as soon as a line, a STOP, EOF or other-lane
+            // work appears, or as soon as a pass advances nothing.  So a pass that returns false never repeats -
+            // there is no busy spin, no sleep loop and no compiled cadence or per-period unit count; the period
+            // is bounded by real demand and by each owner's own finite debt.  No new thread: this runs on the
+            // serving thread at exactly the point where it would otherwise block in the input read below, which
+            // is where the single-owner controller-thread identity rules (resident_repair_runtime.inc:153,
+            // resident_repair_dispatch.inc:32,92-93,130,147,189,229) already hold.  With the selectors absent the
+            // tick returns false at once and this loop is the reviewed path unchanged.
+            // The selector sees queued foreground too: only a known-aged live owner can compete with it.
+            // Each tick admits one bounded unit; the configured consecutive cap forces foreground return.
+            while (serving_repair_idle_tick()) {}
+#endif
             line_drain_ms = 0.0;
             strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(piped ? pump(true) : batch_step())) return 1;
+                    if (!(piped ? pump(true) : batch_step())) {
+                        (void)terminal_input();
+                        return 1;
+                    }
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
@@ -15487,16 +21864,115 @@ int main(int argc, char** argv) {
                     }
                 }
             } else if (!next_line(line)) {
+                if(terminal_input())return 1;
                 break;
             }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(owned_batch_allocation&&o.vision&&line.starts_with("BIPREP ")){
+                strata::program::OwnedImageRequestDriver::Preparation prepared;
+                bool okay=strata::program::OwnedImageRequestDriver::prepare_line(line,prepared);
+                if(okay&&serving_threads)okay=serving_process_controls()&&serving_threads->request_ready(size_t(prepared.slot),prepared.request);
+                if(okay)okay=fresh_owned_slot(size_t(prepared.slot),err,false);
+                if(okay)okay=strata::program::OwnedImageRequestDriver::prepare(*serving_raw_session,
+                    *bs[size_t(prepared.slot)].owned_raw,in_shared,serving_threads.get(),prepared,err);
+                if(!okay){
+                    {std::lock_guard<std::mutex> lock(in_mu);in_shared->admissions.finish(prepared.slot,prepared.request);}
+                    if(prepared.slot>=0&&prepared.slot<2){auto& rejected=bs[size_t(prepared.slot)];
+                        if(rejected.owned_raw&&!rejected.owned_raw->request_open()){
+                            if(!rejected.owned_raw->retire_owned_slot(err))std::terminate();rejected.owned_raw.reset();}
+                        if(serving_threads){const auto* binding=serving_threads->binding(size_t(prepared.slot));
+                            if(binding&&binding->request==prepared.request&&!binding->occupancy&&
+                               !serving_threads->release(size_t(prepared.slot),prepared.request,0,true,serving_thread_now_ms()))std::terminate();}
+                    }
+                    std::printf("BIPAY %d request=%012llx ok=0\n",prepared.slot,(unsigned long long)(prepared.request?prepared.request-1:0));std::fflush(stdout);
+                }
+                continue; // the actual reactor can run peers while producer fills
+            }
+            if(owned_batch_allocation&&o.vision&&line.starts_with("BICLOSE ")){
+                int slot=-1;uint64_t request=0,incarnation=0;bool cancel=false;
+                if(strata::program::OwnedAdmissionCancel::image_control(line,"BICLOSE ",slot,request,incarnation,cancel)){
+                    const int ready=strata::program::OwnedImageRequestDriver::producer_close(*serving_raw_session,
+                        size_t(slot),request,incarnation,cancel,in_shared,err);
+                    if(ready==0){auto& rejected=bs[size_t(slot)];
+                        if(rejected.owned_raw&&!rejected.owned_raw->request_open()){
+                            if(!rejected.owned_raw->retire_owned_slot(err))std::terminate();rejected.owned_raw.reset();}
+                        if(serving_threads){const auto* binding=serving_threads->binding(size_t(slot));
+                            if(binding&&binding->request==request&&!binding->occupancy&&
+                               !serving_threads->release(size_t(slot),request,0,true,serving_thread_now_ms()))std::terminate();}
+                    }
+                }
+                continue;
+            }
+            const bool owned_image_delivery=owned_batch_allocation&&o.vision&&line.starts_with("BGENI ");
+            strata::program::OwnedImageRequestDriver::ChoiceFrame owned_image_choice;
+            auto& owned_image_command=owned_image_choice.command;
+            if(owned_image_delivery&&!strata::program::OwnedImageRequestDriver::pin_choice(
+                owned_image_choice,*serving_raw_session,line)){
+                // No new buffer/capture is allowed without its actual paid
+                // source record. Never reopen a stale descriptor path.
+                std::fputs("ERR stale owned image delivery\n",stdout);std::fflush(stdout);continue;
+            }
+#endif
+            bool owned_image_active=false;
+            // Retire even a refused BGEN's pending identity on every scope exit.
+            struct OwnedAdmissionScope {
+                std::shared_ptr<StdinShared> input;int slot=-1;uint64_t request=0;
+                bool finish_cancelled(){
+                    std::lock_guard<std::mutex> lock(input->mu);
+                    const bool cancelled=input->stop_req.load();
+                    if(slot>=0){input->admissions.finish(slot,request);slot=-1;}
+                    return cancelled;
+                }
+                void finish(){if(slot>=0)(void)finish_cancelled();}
+                ~OwnedAdmissionScope(){finish();}
+            } owned_admission_scope{in_shared};
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            bool serving_pending_request_completed=false;
+#endif
+            if(in_shared->owned_admission && (line.starts_with("BGEN ")||line.starts_with("BGENI ")) &&
+               !strata::program::OwnedAdmissionCancel::parse(line,false,
+                    owned_admission_scope.slot,owned_admission_scope.request))return 1;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(serving_threads&&owned_admission_scope.slot>=0&&
+               (!owned_image_delivery||strata::program::OwnedImageRequestDriver::ready(
+                   *serving_raw_session,size_t(owned_admission_scope.slot),owned_admission_scope.request))){
+                if(!serving_process_controls())return 1;
+                const size_t slot=size_t(owned_admission_scope.slot);
+                bool input_ended=false;{std::lock_guard<std::mutex> lock(in_mu);input_ended=in_eof;}
+                if(input_ended||!serving_threads->request_ready(slot,owned_admission_scope.request)){
+                    if(owned_image_delivery&&strata::program::OwnedImageRequestDriver::discard(
+                        *serving_raw_session,slot,owned_admission_scope.request)){
+                        auto& empty=bs[slot].owned_raw;
+                        if(empty){if(empty->request_open()||!empty->retire_owned_slot(err))std::terminate();empty.reset();}
+                    }
+                    const auto* binding=serving_threads->binding(slot);
+                    if(binding&&binding->request==owned_admission_scope.request&&!binding->occupancy&&
+                       !serving_threads->release(slot,binding->request,0,true,serving_thread_now_ms()))
+                        strata::core::retirement_failed("cancelled managed queued request could not retire");
+                    std::printf("BADM %zu 0\n",slot);std::fflush(stdout);continue;
+                }
+            }
+#endif
+            if(terminal_input())return 1;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            // Recheck after a potentially blocking input wait, before commands
+            // can restore or execute state under a replaced model layout.
+            if(!expert_authority_current() || !ple_authority_current()) {
+                std::fprintf(stderr,"strata serve: model provenance changed while awaiting input\n");return 1;
+            }
+#endif
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
-                const int b = std::atoi(line.c_str() + 6);
-                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                accept_batch_stop(line);
                 continue;
             }
             if (line.rfind("BCO ", 0) == 0) {   // BCO <slot> <id,id,...>: kept for the next BGEN
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if (owned_batch_allocation) {
+                    std::puts("ERR owned batch does not admit coalesced prefill");std::fflush(stdout);continue;
+                }
+#endif
                 CoReq cr;
                 char* e1 = nullptr;
                 cr.slot = (int) std::strtol(line.c_str() + 4, &e1, 10);
@@ -15543,6 +22019,11 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(owned_batch_allocation&&((bimg&&!o.vision)||bs[size_t(b)].repair_finishing)){
+                    std::printf("ERR BGEN: unsupported owned request or pinned repair slot\n");std::fflush(stdout);continue;
+                }
+#endif
                 admit_slot = (int) b;
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;
@@ -15554,7 +22035,19 @@ int main(int argc, char** argv) {
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
-            if (line == "QUIT") break;
+            if (line == "QUIT") {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(owned_batch_allocation)for(auto& slot:bs)if(slot.owned_raw){
+                    if(slot.owned_repair&&!strata::program::ServingSuffixRepairOperation::retire_slot_controller(
+                        *slot.owned_raw,*slot.owned_repair,err))std::terminate();
+                    slot.owned_repair.reset();
+                    if(slot.owned_raw->request_open()&&!slot.owned_raw->close_request(err))std::terminate();
+                    if(slot.owned_raw->healthy()&&!slot.owned_raw->retire_owned_slot(err))std::terminate();
+                    serving_release_thread_lane(size_t(&slot-bs.data()),true);
+                }
+#endif
+                break;
+            }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {
@@ -15597,7 +22090,24 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            stop_req.store(false);   // a STOP that arrived between requests is stale
+            if(in_shared->owned_admission
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+               &&(!owned_image_delivery||strata::program::OwnedImageRequestDriver::ready(
+                   *serving_raw_session,size_t(admit_slot),owned_admission_scope.request))
+#endif
+               ){
+                bool already_cancelled=false;
+                std::lock_guard<std::mutex> lock(in_mu);
+                if(admit_slot<0||!in_shared->admissions.begin(admit_slot,
+                    owned_admission_scope.request,already_cancelled)){
+                    std::fputs("ERR owned serving requires a request-scoped BGEN\n",stdout);
+                    std::fflush(stdout);continue;
+                }
+                stop_req.store(already_cancelled); // queued cancellation survives request-start reset
+            }else stop_req.store(false);   // a legacy STOP that arrived between requests is stale
+            // input_error is a separate sticky terminal flag, never cleared by
+            // per-request STOP handling.
+            if(terminal_input())return 1;
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
@@ -15648,6 +22158,21 @@ int main(int argc, char** argv) {
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                // An edit that replaces the live session state lands on every parked owner's window.  The parked
+                // owner's own guards - the published serial, the WindowKey epochs (append/selection/provenance,
+                // revision), the recorded published cut against the session's current cut
+                // (`parked_owner_publishable`) and the controller's `resume_retained` live-coherence test - then
+                // refuse every route back, which would leave a LIVE controller parked over a conversation it no
+                // longer describes.  The honest shape in this pass is the refusal BEFORE any mutation, with the
+                // parked owners untouched: demoting or rebuilding a GPU-resident private gang is not implemented
+                // here, and a silently-unusable parked owner is not offered instead.
+                if (!save && serving_repair_owners != nullptr && serving_repair_owners->size() > 0) {
+                    refuse("RESTORE is refused while retained repair owners are parked: a parked owner is released "
+                           "only by an explicit retire, never by replacing its window's state under it");
+                    continue;
+                }
+#endif
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -15816,6 +22341,10 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     live = std::move(image.live.ids);
+                    // A session-file restore replaces the device state with one whose next token was never
+                    // serialized or verified: the pending fact goes unknown, so the next repaired request must
+                    // refuse this donor until a completed request re-establishes the pending token.
+                    serving_pending_token = -1;
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
@@ -15842,11 +22371,13 @@ int main(int argc, char** argv) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
             }
+            { // request-local source/borrow scopes: early owned-slot handoff exits this entire scope
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
             // penalty_last_n=N, penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N (text requests
             // only).  Absent keys keep today's behavior: greedy, no penalties.
+            std::string req_http_request;
             float req_temperature = 0.0f, req_top_p = 1.0f;
             int req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
             unsigned long long req_seed = 0;
@@ -15905,6 +22436,11 @@ int main(int argc, char** argv) {
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "prefill") req_prefill_only = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
+                    else if(key=="http_request"){
+                        const std::string_view val(tok.data()+eq+1,tok.size()-eq-1);
+                        req_http_request.clear();
+                        if(val.size()==12&&std::all_of(val.begin(),val.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');}))req_http_request=val;
+                    }
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -15946,6 +22482,12 @@ int main(int argc, char** argv) {
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(owned_batch_allocation&&(admit_slot<0||req_temperature!=0||req_penalty_last_n!=0||req_bias_present||
+                !strata::program::http2_request_key(req_http_request))){
+                std::printf("ERR owned batch requires neutral BGEN with request identity\n");std::fflush(stdout);continue;
+            }
+#endif
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
             bool req_df2 = use_df2;   // --draft auto: this request's drafter, decided once the prompt is parsed (below)
             std::vector<float> req_bias;
@@ -15968,6 +22510,47 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // The admission phase is GEN1, but physical slot output has the full
+            // BGEN budget. Refuse that full request before any input/state mutation.
+            if(owned_batch_allocation&&admit_slot>=0&&(admit_max_new<1||!strata::program::serving_output_fits(
+                ids.size(),uint64_t(admit_max_new),uint64_t(o.max_context),0))){
+                std::printf("ERR owned BGEN prompt/output exceeds context\n");std::fflush(stdout);continue;
+            }
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(owned_image_delivery){
+                const auto request=owned_admission_scope.request;
+                if(admit_slot<0||!strata::program::OwnedImageRequestDriver::parameters(*serving_raw_session,
+                    size_t(admit_slot),request,uint64_t(n),uint64_t(admit_max_new))){
+                    std::printf("BADM %d 0\n",admit_slot);std::fflush(stdout);continue;
+                }
+                if(!strata::program::OwnedImageRequestDriver::ready(*serving_raw_session,size_t(admit_slot),request)){
+                    (void)strata::program::OwnedImageRequestDriver::capture(*serving_raw_session,size_t(admit_slot),
+                        request,in_shared,owned_image_command,emb_path,ids,err);
+                    // The producer still owns its FD until it observes ACK and
+                    // closes. Keep the original entry/incarnation/rank pending.
+                    owned_admission_scope.slot=-1;
+                    continue;
+                }
+                if(!strata::program::OwnedImageRequestDriver::select(*serving_raw_session,size_t(admit_slot),request,in_shared,err)){
+                    if(strata::program::OwnedImageRequestDriver::discard(*serving_raw_session,size_t(admit_slot),request)){
+                        auto& rejected=bs[size_t(admit_slot)];
+                        if(rejected.owned_raw&&!rejected.owned_raw->retire_owned_slot(err))std::terminate();rejected.owned_raw.reset();
+                    }
+                    std::printf("BADM %d 0\n",admit_slot);std::fflush(stdout);continue;
+                }
+                std::array<strata::prefill::Prefill*,8> image_prefills{};image_prefills[0]=&sp;
+                for(size_t i=0;i<stages.size();++i)image_prefills[i+1]=&stages[i]->sp;
+                if(!strata::program::OwnedImageRequestDriver::prefill(*serving_raw_session,
+                    std::span<strata::prefill::Prefill* const>(image_prefills.data(),stages.size()+1),err))std::terminate();
+                owned_image_active=true;
+                // This exact actor was physically reset and certified empty by
+                // the private image fence; no generic token/cache donor survives.
+                live.clear();live_imgs.clear();checks.clear();serving_pending_token=-1;
+                serving_tracked_state.clear();live_approximate=false;serving_raw_cut=serving_raw_session->cut().id;
+            }
+#endif
             // --draft auto: this request's drafter.  Without the DFlash2 drafter loaded every request uses the MTP, as before.
             uint64_t bandit_key = 0;
             if (use_df2 && o.draft_auto) {
@@ -15999,7 +22582,7 @@ int main(int argc, char** argv) {
             }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
-            if (geni || !mrope_identity) {
+            if (!owned_image_active&&(geni || !mrope_identity)) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
                 row_ptr.assign((size_t) n, nullptr);
@@ -16091,8 +22674,17 @@ int main(int argc, char** argv) {
                 }
                 mrope_identity = !geni;
             }
-            sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
+            sp.embd_rows = geni&&!owned_image_active ? row_ptr.data() : nullptr;
+            bool request_over_context=false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // Only the resolved owned non-spec profile uses its exact logical
+            // full request capacity; legacy windows retain their eight-row slack.
+            if(owned_batch_allocation&&admit_slot>=0)request_over_context=admit_max_new<1||!strata::program::serving_output_fits(
+                uint64_t(n),uint64_t(admit_max_new),uint64_t(o.max_context),0);
+            else
+#endif
+                request_over_context=n+max_new+8>o.max_context;
+            if (request_over_context) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
                 continue;
@@ -16100,6 +22692,13 @@ int main(int argc, char** argv) {
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            strata::program::report_http_native_accept(serving_request_ordinal+1,ids,uint64_t(max_new),
+                !geni&&o.batch==0&&o.pipeline_windows==0&&o.spec==0&&o.lookup_chain==0&&o.suffix_draft==0&&
+                !o.adapt_every&&!o.adapt_async,req_temperature,req_top_p,req_top_k,req_min_p,req_penalty_last_n,
+                req_penalty_repeat,req_penalty_freq,req_penalty_present,uint64_t(req_seed),!req_bias.empty(),
+                strata::kernels::cvec().loaded());
+#endif
             std::array<int64_t, 3> remote_before{};
             std::array<int64_t, 3> launches_before{};
             std::array<uint64_t, 3> compact_before{}, full_before{};
@@ -16148,7 +22747,11 @@ int main(int argc, char** argv) {
                 if (!o.prefill_head_alias || native_head.loaded()) return 0;
                 sp.reset();
                 const auto head_t0 = Clock::now();
-                if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+                if (
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    !admit_head_embed_inventory(native_head,true) ||
+#endif
+                    !native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
                     std::printf("ERR restoring the native output head failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -16214,6 +22817,13 @@ int main(int argc, char** argv) {
                 live_ok = false;
                 checks.clear();
                 tail_ckpt_len = -1;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                // slice 7: the flush abandoned the state any prior-conversation certificate described, so nothing
+                // may capture it as the conversation standing on the session.  This request reads from token 0 and
+                // re-certifies if it owns its own RAW work fence.
+                serving_tracked_state.clear();
+                serving_tracked_provenance = strata::core::serving_raw::ApproximationProvenance{};
+#endif
                 const size_t n_parked = conversations.clear();
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
@@ -16336,6 +22946,110 @@ int main(int argc, char** argv) {
                 }
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            // P12 suffix reuse (--suffix-cache).  The donor is the conversation THIS session holds: with
+            // old = A + B + C already on the device and this request A + B' + C + D (|B| == |B'|, C at identical
+            // positions, both cuts page aligned), ordinary prefix reuse matches NOTHING at all - a stored run that
+            // is not an exact prefix of the prompt gives zero reuse today - and the whole prompt is read again.
+            // The suffix cache keeps the state for C (computed under B) and reads only D: the frontier moves to the
+            // stored length, NOT to |A|.  What it continues from is APPROXIMATE by construction, so it can never
+            // certify an exact reuse, and what this session later parks must say so.  The whole decision - flags,
+            // shape, eligibility and the exact-always-wins ordering - is the pure function in
+            // include/strata/core/suffix_import_policy.hpp, gated on CPU by tests/core/suffix_import_policy.
+            const int64_t sux_page = strata::kernels::qsa_real_shapes().page_size;
+            static bool sfx_inert_notice_done = false;
+            auto sux_resident_int8 = [&](int64_t cells) {
+                // the ONLY qualified pool shape: owned, fully mapped, unrotated native INT8 - the one the
+                // future-page canonicalization is proven for.  Everything else refuses rather than guessing.
+                // A shape probe on each session's representative QSA state (the pools are per session).
+                if (kvg.on || cells <= 0 || sux_page <= 0) return false;
+                strata::core::RawInt8RestoreClearPlan plan;
+                const auto& main_qsa = ss.qsa_states[ss.qsa_primary()];
+                if (!strata::core::raw_int8_restore_clear_plan(main_qsa, g, uint64_t(cells), sux_page, plan))
+                    return false;
+                for (auto& st : stages) {
+                    const strata::core::OnDevice on(st->dev);
+                    const auto& qsa = st->ss.qsa_states[st->ss.qsa_primary()];
+                    if (!strata::core::raw_int8_restore_clear_plan(qsa, g, uint64_t(cells), sux_page, plan))
+                        return false;
+                }
+                return true;
+            };
+            strata::core::SuffixImportShape sux_shape;
+            // The scoped feature is the repaired import. Until it exists, --suffix-cache alone admits NOTHING:
+            // the only import available today leaves the changed run unrepaired, so it is reachable solely
+            // through the explicit experiment flag, and the log says why the deployment flag is inert.
+            sux_shape.enabled = o.suffix_cache && o.suffix_cache_unrepaired_experiment;
+            if (o.suffix_cache && !o.suffix_cache_unrepaired_experiment && !sfx_inert_notice_done) {
+                sfx_inert_notice_done = true;
+                std::fprintf(stderr, "strata serve: suffix cache: repaired native serving enabled; supported edits "
+                             "use an explicitly approximate foreground phase before exact CURRENT catchup\n");
+            }
+            sux_shape.prompt_cache_on = o.prompt_cache > 0;
+            sux_shape.single_session = (bs.empty() && admit_slot < 0) || (o.native_owned_batch_serving && admit_slot>=0);
+            sux_shape.speculation_off = !use_mtp && o.spec == 0 && o.lookup_chain == 0 && o.suffix_draft == 0 &&
+                                       (!native_pack || o.native_serial_serving || o.native_owned_batch_serving);
+            sux_shape.images_absent = !owned_image_active && req_imgs.empty() && live_imgs.empty();
+            sux_shape.state_resumable = live_ok && !live.empty() &&
+                                        imgs_below(req_imgs, (int64_t) live.size()) == live_imgs;
+            sux_shape.cvec_matches = want_cvec == cvec_cached;
+            sux_shape.exact_reuse_available = parked.tokens > 0 || resume > 0 || slot_source >= 0;
+            sux_shape.donor_approximate = live_approximate;
+            sux_shape.page_size = sux_page;
+            sux_shape.resident_int8 = sux_resident_int8((int64_t) live.size());
+            // the attach/repair integration works through a private RAW transaction over the session allocation,
+            // which exists only for an owned private session; without one the feature refuses.  The owned runtime
+            // itself exists only in a window-state build, so a plain build can never admit the feature.
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // Open the owner once, lazily, and only when the feature could actually be used.  Opening admits setup
+            // host budget through the transaction's own ledger; it refuses (leaving the exact path untouched) on
+            // an unowned/unhealthy session, a missing verifier set or a budget refusal.
+            if (o.suffix_cache && serving_raw_session == nullptr && owned_runtime != nullptr && model_budget) {
+                std::vector<strata::core::Verifier*> vers;
+                vers.push_back(&ver);
+                for (auto& st : stages) vers.push_back(&st ? &st->ver : nullptr);
+                std::string owner_error;
+                serving_raw_session = strata::program::ServingRawSession::open(
+                    g, owned_runtime->sessions, owned_runtime, std::move(vers), *model_budget,
+                    static_cast<uint64_t>(o.max_context), o.suffix_cache_host_bytes, owner_error);
+                std::fprintf(stderr, "strata serve: suffix cache: private RAW session owner %s: %s "
+                             "host_cap=%llu\n", serving_raw_session ? "acquired" : "refused",
+                             owner_error.empty() ? "ok" : owner_error.c_str(),
+                             (unsigned long long)o.suffix_cache_host_bytes);
+            }
+            sux_shape.session_owned = serving_raw_session != nullptr && serving_raw_session->healthy();
+#else
+            sux_shape.session_owned = false;
+#endif
+            const auto sux = strata::core::suffix_import_plan(live, ids, sux_shape);
+            if (o.suffix_cache || o.suffix_reuse_report)
+                std::fprintf(stderr, "strata serve: suffix cache: %s exact_prefix=%lld changed=[%lld,%lld) "
+                             "reused_suffix=%lld frontier=%lld fresh=%lld approximate=%d exact_certificate=0 "
+                             "reason=%s\n",
+                             sux.proceed ? "APPROXIMATE-IMPORT" : "refused",
+                             (long long) (sux.proceed ? sux.exact_prefix : sux.span.prefix),
+                             (long long) sux.span.edit_from, (long long) sux.span.edit_to,
+                             (long long) (sux.proceed ? sux.reused_suffix : sux.span.suffix),
+                             (long long) sux.frontier, (long long) sux.fresh, sux.proceed ? 1 : 0,
+                             sux.reason ? sux.reason : "admitted");
+            if (o.suffix_reuse_report) {
+                // REPORTING ONLY for the OTHER donor shape: an edited prompt against a PARKED conversation this
+                // session is not holding.  Importing from a parked donor means restoring its whole endpoint image,
+                // which is not qualified here; this line only says what such a request would look like, restores
+                // nothing and certifies nothing.
+                const auto div = conversations.divergence_candidate(ids, want_cvec);
+                const strata::core::SavedConversation* edited = div.found ? conversations.find(div.serial) : nullptr;
+                if (edited != nullptr) {
+                    const auto span = strata::core::suffix_edit_span(
+                        edited->live.ids, ids, strata::kernels::qsa_real_shapes().page_size);
+                    std::fprintf(stderr, "strata serve: suffix reuse report: parked conversation %llu: exact_prefix=%lld "
+                                 "changed=[%lld,%lld) unchanged_suffix=%lld suffix_eligible=%d reason=%s "
+                                 "approximate=%d suffix_imported=0 (parked donors are not imported yet)\n",
+                                 (unsigned long long) div.serial, (long long) span.prefix,
+                                 (long long) span.edit_from, (long long) span.edit_to, (long long) span.suffix,
+                                 span.eligible ? 1 : 0, span.reason ? span.reason : "eligible",
+                                 edited->approximate ? 1 : 0);
+                }
+            }
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
@@ -16482,6 +23196,706 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            // Apply the approximate suffix import (decided above, after the outgoing conversation is parked with
+            // its OWN exact ids).  No copy runs: the session's device state already covers the stored run, which is
+            // exactly why this is cheaper than the prefix path - and why it is approximate.
+            // Every mutation below runs inside the transaction's phase fence.  A refusal to begin means the state
+            // is not safe to touch: log it and take the exact path (nothing has been mutated yet).
+            // slice 7: true when this request deliberately returned the session to a RESET (zeroed) state because
+            // the state it had reached was not describable.  The conversation bookkeeping further down must then
+            // not resurrect the run this request consumed, a partial prompt prefix, or a pending token for a
+            // device that no longer holds any of them.  Declared OUTSIDE the feature guard below because that
+            // bookkeeping runs in every build; it stays false where there is no owned private RAW session.
+            bool serving_session_discarded = false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            bool sux_apply = sux.proceed;
+            std::string sux_fence_error;
+            std::vector<int32_t> sux_donor_ids;   // the tokens the imported state ACTUALLY came from
+            // slice 7: this request's OWN RAW work fence, and whether any other RAW fence ran in this request.
+            // A request that already fenced part of its work (a donor capture, a fenced prefix read, an
+            // activation, an approximate import) is never double-fenced: its completion then leaves the live state
+            // uncertified instead of claiming a certificate for work that ran outside the drain.
+            bool serving_ordinary_fence = false;
+            bool serving_raw_fence_used_this_request = false;
+            // True when the prompt read stopped short of the prompt's end (a segment gave way, or a nonfinite hit):
+            // the session then does not stand on a whole number of forwarded rows, so no cut can describe it.
+            bool serving_read_gave_way = false;
+            // The start this request chose, captured before its own read moves `resume`: only a zeroed start makes
+            // the rows [0, forwarded) this request's own forwards, and an inherited state counts as exact only if
+            // it was itself certified exact at its own drained cut.
+            bool serving_start_zeroed = false;
+            bool serving_start_certified_exact = false;
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+            strata::program::SuffixExperimentDriver::ServingQualification sfx_activation_qualification;
+            bool serving_activation_selected=false,activation_admission_attempted=false;
+            strata::program::ServingSuffixRepairOperation::ActivationQualificationHooks activation_hooks;
+            auto retire_activation_refusal=[&](const char* reason){
+                const auto before=serving_raw_session?serving_raw_session->cut():strata::core::StateCut{};
+                const auto key=serving_raw_session?serving_raw_session->key():strata::core::WindowKey{};
+                std::string retire_error;
+                if(serving_repair_owners && !serving_repair_owners->retire_all(reason,
+                    strata::program::ServingSuffixRepairOperation::RetainRetire{},retire_error))
+                    strata::program::owner_registry_failstop("activation qualification refusal could not retire parked owners");
+                if(serving_raw_session && (serving_raw_session->request_open() ||
+                   serving_raw_session->cut()!=before || serving_raw_session->key()!=key))
+                    strata::program::owner_registry_failstop("activation refusal retirement changed the prior conversation");
+            };
+            if(strata::program::SuffixExperimentDriver::activation_qualification_selects(serving_request_ordinal+1)){
+                activation_hooks.request_ordinal=serving_request_ordinal+1;
+                if(!serving_raw_session||!model_budget||!o.native_serial_serving||o.prefill_chunk!=16||
+                   o.short_read!=64||o.prefill_auto||pipe||use_mtp||batch_mtp||
+                   std::getenv("STRATA_PIPELINE_SWITCH")||std::getenv("STRATA_CKPT_REREAD")||
+                   !req_imgs.empty()||req_temperature!=0||req_penalty_last_n!=0||!req_bias.empty()||
+                   max_new<1||max_new>64||stop_req.load()){
+                    std::fputs("activation qualification requires supported neutral prefix replay profile with short appended tail\n",stderr);
+                    retire_activation_refusal("activation qualification profile refusal");return 2;
+                }
+                serving_activation_selected=true;
+                activation_hooks.admit=[&](std::string& admission_error){
+                    activation_admission_attempted=true;
+                    DriverSuffixExperimentContext qc{o,g,owned_runtime,*model_budget,
+                        sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                    return strata::program::SuffixExperimentDriver::admit_activation_qualification(qc,*serving_raw_session,
+                        uint64_t(ids.size())+uint64_t(max_new),sfx_activation_qualification,admission_error);
+                };
+                activation_hooks.refuse_after_publication_restore=std::strcmp(
+                    strata::program::SuffixExperimentDriver::activation_qualification_mode(),"rollback")==0;
+                activation_hooks.before=[&](const strata::program::ServingSuffixRepairOperation::Outcome& owner,
+                    const strata::core::BundleHandle& prior){
+                    // A long origin requires the sealed actual batch transcript retained by this owner.
+                    // The appended A3 suffix stays in this qualification's short serial profile.
+                    const bool origin_ok=owner.boundary<=64 ||
+                        (owner.retained_prefix && owner.retained_prefix->boundary==owner.boundary &&
+                         owner.retained_prefix->request==2 &&
+                         owner.retained_prefix->origin_matches(owner.published.key,owned_runtime->remote_policy_incarnation,
+                             ajob?uint64_t(a_swapped):uint64_t(adapt_nswaps)) &&
+                         owner.retained_prefix->matches(owner.published.accepted_tokens,2,owner.published.cut.forwarded) );
+                    sfx_activation_qualification.required_origin_boundary=owner.boundary;
+                    return origin_ok&&ids.size()>=owner.published.cut.accepted&&
+                        ids.size()-owner.published.cut.accepted<=64&&prior&&
+                        prior.get()->approximation.empty()&&prior.get()->cut.exact_frontier==prior.get()->cut.forwarded;
+                };
+                activation_hooks.rollback=[&](const strata::core::BundleHandle& prior){
+                    DriverSuffixExperimentContext rc{o,g,owned_runtime,*model_budget,
+                        sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                    uint64_t next=serving_raw_cut+1;
+                    const bool pass=strata::program::SuffixExperimentDriver::qualify_activation_rollback(
+                        rc,run_serial_remote_unit,*serving_raw_session,activation_hooks.request_ordinal,sfx_activation_qualification,prior,next);
+                    serving_raw_cut=std::max(serving_raw_cut,next);return pass;
+                };
+            }
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // ---- slice 6: a parked retained repair owner gets its route back onto the live session ----
+            // Identity comes from the registry's own list, matched to the session's stable window (the parked key
+            // carries bumped append/selection epochs, and there is no per-prompt WindowKey to compare against).
+            // Everything here runs inside the existing owner-registry gate: with `STRATA_SERVING_REPAIR_OWNER_SLOTS`
+            // absent the registry is null and this block does nothing at all. A refusal anywhere in the sequence
+            // leaves the owner parked and charged, closes the fence, and the request continues on today's path
+            // unchanged; the donor import below then runs exactly as it does now.
+            const bool retained_activation_shape_admissible=
+                !geni&&!use_mtp&&!batch_mtp&&!o.batch&&bs.empty()&&admit_slot<0&&
+                o.native_serial_serving&&o.spec==0&&o.lookup_chain==0&&o.suffix_draft==0&&
+                !o.pipeline_windows&&!pipe&&!o.adapt_every&&!o.adapt_async&&!o.prefill_head_alias&&
+                req_imgs.empty()&&req_temperature==0&&req_penalty_last_n==0&&req_bias.empty()&&
+                max_new>=1&&max_new<=64&&!strata::kernels::cvec().loaded(); // no owner-bound steering identity exists yet
+            if (retained_activation_shape_admissible && serving_repair_owners != nullptr && serving_repair_owners->size() > 0 &&
+                serving_suffix_active == nullptr && serving_raw_session != nullptr &&
+                serving_raw_session->healthy() && !serving_raw_fence_running &&
+                !serving_raw_session->request_open() && !serving_raw_session->private_window_open() &&
+                strata::program::ServingRawSession::raw_phase(serving_raw_session->phase()) ==
+                    strata::core::serving_raw::Phase::drained) {
+                for (const strata::core::WindowKey& parked : serving_repair_owners->parked_identities()) {
+                    if (!strata::program::same_stable_window(parked, serving_raw_session->key())) continue;
+                    // F2: incoming-conversation identity gate. The parked owner belongs to a specific
+                    // conversation; a request whose prompt does not carry that conversation's published
+                    // history must not activate it (wrong-state serving).
+                    {
+                        strata::program::SuspendedOwnerFacts owner_facts;
+                        if (!serving_repair_owners->entry_facts(parked, owner_facts)) {
+                            std::fprintf(stderr, "strata serve: suffix cache (repaired): parked repair owner "
+                                         "activation skipped (entry_facts_unavailable): no record for this "
+                                         "identity: continuing on today's path\n");
+                            continue;
+                        }
+                        const uint64_t needed = owner_facts.published_cut.accepted;
+                        if (needed == 0 || ids.size() < static_cast<size_t>(needed)) {
+                            std::fprintf(stderr, "strata serve: suffix cache (repaired): parked repair owner "
+                                         "activation refused (incoming_prompt_identity): prompt shorter than "
+                                         "published history: continuing on today's path\n");
+                            continue;
+                        }
+                        std::vector<int32_t> req_prefix(ids.begin(),
+                                                        ids.begin() + static_cast<std::ptrdiff_t>(needed));
+                        if (!strata::program::incoming_prompt_identity_matches(
+                                req_prefix, owner_facts.published_cut)) {
+                            std::fprintf(stderr, "strata serve: suffix cache (repaired): parked repair owner "
+                                         "activation refused (incoming_prompt_identity): the incoming request's "
+                                         "prompt does not match this owner's published history: "
+                                         "continuing on today's path\n");
+                            continue;
+                        }
+                    }
+                    std::unique_ptr<strata::program::ServingSuffixRepairOperation::Outcome> activated;
+                    serving_raw_fence_used_this_request = true;   // the activation runs its own request fence
+                    if (!strata::program::ServingSuffixRepairOperation::activate_retained_owner(
+                            *serving_raw_session, *serving_repair_owners, parked, serving_tracked_state,
+                            ajob ? uint64_t(a_swapped) : uint64_t(adapt_nswaps), activated,
+                            serving_repair_owner_error
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                            ,serving_activation_selected?&activation_hooks:nullptr
+#else
+                            ,nullptr
+#endif
+                            ,ids,uint64_t(max_new))) {
+                        std::fprintf(stderr, "strata serve: suffix cache (repaired): parked repair owner was not "
+                                     "activated (%s): continuing on today's path\n",
+                                     serving_repair_owner_error.c_str());
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                        if(serving_activation_selected && activation_admission_attempted && !sfx_activation_qualification.admitted){
+                            std::fprintf(stderr,"activation qualification admission: %s\n",serving_repair_owner_error.c_str());
+                            retire_activation_refusal("activation qualification host admission refused");
+                            return 2;
+                        }
+#endif
+                        continue;
+                    }
+                    // The owner is live again and this request scope owns it: `sfx_fence_guard` and the finish /
+                    // retire paths below are what release it, exactly as before it was parked. The approximate
+                    // donor import for this request is skipped: the state the session stands on IS this
+                    // conversation's repaired publication.
+                    serving_suffix_active = std::move(activated);
+                    sux_apply = false;   // the session already stands on this conversation's repaired publication
+                    // Authoritative host state is now A's installed publication, never B's old resume plan.
+                    const auto& activated_state=serving_suffix_active->published;
+                    live.assign(activated_state.accepted_tokens.begin(),activated_state.accepted_tokens.begin()+
+                                std::ptrdiff_t(activated_state.cut.forwarded));
+                    serving_pending_token=activated_state.pending_tokens.front();
+                    live_imgs.clear();checks.clear();incoming.reset();borrow=false;slot_source=-1;slot_ck=nullptr;
+                    slot_tokens=0;lent_slot=-1;resume_plan={};resume_plan_at=resume_plan_end=-1;
+                    resume=int64_t(activated_state.cut.forwarded);from_live=true;live_ok=true;
+                    live_approximate=!activated_state.approximation.empty();cvec_cached=want_cvec;
+
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): activated a parked repair owner "
+                                 "at the drained boundary: cut=%llu forwarded=%llu activations=%llu\n",
+                                 (unsigned long long)serving_raw_session->cut().id,
+                                 (unsigned long long)serving_raw_session->cut().forwarded,
+                                 (unsigned long long)serving_repair_owners->activations_completed());
+                    break;
+                }
+            }
+#endif
+            if (sux_apply) {
+                bool opened = false;
+                if (serving_raw_session != nullptr) {
+                    opened = serving_raw_session->open_request(sux_fence_error);
+                    if (opened && !serving_raw_session->begin_work(sux_fence_error)) {
+                        std::string close_error;
+                        serving_raw_session->close_request(close_error);   // no work was started: safe to close
+                        opened = false;
+                    }
+                } else
+                    sux_fence_error = "no private RAW session owner";
+                if (!opened) {
+                    sux_apply = false;
+                    std::fprintf(stderr, "strata serve: suffix cache: refused before mutation (RAW work fence): %s\n",
+                                 sux_fence_error.c_str());
+                } else {
+                    sux_donor_ids = live;   // before any relabeling: the donor history this cut describes
+                    serving_raw_fence_used_this_request = true;
+                }
+            }
+#else
+            const bool sux_apply = false;   // a non-window build has no owned private session: never admit
+#endif
+            // The REPAIRED path (--suffix-cache alone): the scoped feature, and the metadata shortcut above stays
+            // gated on --suffix-cache-unrepaired-experiment, so this cannot activate it.  Admission is the SAME
+            // shape gate with the feature enabled (core::repaired_admission_enabled): no guard is relaxed, and the
+            // decision is a separate object.  What this block does is the donor half only: it certifies the donor
+            // endpoint at a real all-stage drain and captures it, then leaves the fence open at that drained cut so
+            // the prompt read can be certified at the reuse boundary (see the read loop below).
+            serving_suffix_boundary = -1;
+            serving_suffix_frontiers.clear();
+            serving_suffix_accepted.clear();
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            ++serving_request_ordinal;
+            if (o.suffix_cache)
+                std::fprintf(stderr, "strata serve: suffix cache (repaired): REQ_BEGIN req=%llu consumed=%llu "
+                             "pending=%d\n", (unsigned long long) serving_request_ordinal, (long long) live.size(),
+                             (int) serving_pending_token);
+            const strata::core::SuffixCacheFlags sux_modes{o.suffix_cache, o.suffix_cache_unrepaired_experiment};
+            strata::core::SuffixImportShape repaired_shape = sux_shape;
+            repaired_shape.enabled = strata::core::repaired_admission_enabled(sux_modes);
+            const strata::core::BundleHandle* selected_owned_donor=nullptr;
+            auto sux_repaired = strata::core::suffix_import_plan(live, ids, repaired_shape);
+            if(owned_batch_allocation&&!owned_image_active&&admit_slot>=0&&req_imgs.empty()&&!strata::kernels::cvec().loaded()){
+                auto image_shape=repaired_shape;
+                // The policy's reusable-storage prerequisite is backed by these real owned images,
+                // not by legacy prompt_cache/live_ok flags or an invented main-session descriptor.
+                image_shape.prompt_cache_on=true;image_shape.state_resumable=true;
+                image_shape.images_absent=true;image_shape.cvec_matches=true;
+                image_shape.donor_approximate=false;image_shape.exact_reuse_available=false;
+                for(const auto& image:owned_exact_donors){const auto* d=image.get();
+                    if(!d||d->cut.forwarded>=ids.size()||ids[size_t(d->cut.forwarded)]!=d->pending_tokens.front())continue;
+                    const std::span<const int32_t> consumed(d->accepted_tokens.data(),size_t(d->cut.forwarded));
+                    auto actual_shape=image_shape;
+                    actual_shape.resident_int8=sux_resident_int8(int64_t(d->cut.forwarded));
+                    const auto plan=strata::core::suffix_import_plan(consumed,ids,actual_shape);
+                    const uint64_t f=d->cut.forwarded;
+                    // Eligibility only; an actual destination recapture must prove U.
+                    const bool alignable=f<=UINT64_MAX-3&&((f+3)/4)*4<ids.size()&&
+                        ((f+3)/4)*4<serving_raw_session->max_tokens();
+                    if(plan.proceed&&alignable&&(!selected_owned_donor||plan.reused_suffix>sux_repaired.reused_suffix)){
+                        selected_owned_donor=&image;sux_repaired=plan;
+                    }
+                }
+            }
+            const auto* owned_donor_descriptor=selected_owned_donor?selected_owned_donor->get():nullptr;
+            const uint64_t repaired_donor_forwarded=owned_donor_descriptor?owned_donor_descriptor->cut.forwarded:uint64_t(live.size());
+            const int32_t repaired_donor_pending=owned_donor_descriptor?owned_donor_descriptor->pending_tokens.front():serving_pending_token;
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+            strata::program::SuffixExperimentDriver::ServingQualification sfx_qualification;
+            std::unique_ptr<strata::program::SuffixExperimentDriver::ServingQualification> sfx_owned_slot_oracle;
+            // Slice 4 (D3): the RETAINED-YIELD oracle admission. Separate from sfx_qualification: the strict
+            // final_*/live_* oracle is untouched, and a yield arm runs with STRATA_SUFFIX_REPAIR_QUALIFY absent
+            // (harness/retained_yield_oracle.py refuses it on), so the yield's own certificate needs its own
+            // pinned identity and scratch. Admitted only when a yield is otherwise admissible.
+            strata::program::SuffixExperimentDriver::ServingQualification sfx_yield_oracle;
+#endif
+            if (strata::core::repaired_admission_enabled(sux_modes) &&
+                !strata::core::shortcut_admission_enabled(sux_modes))
+                std::fprintf(stderr, "strata serve: suffix cache (repaired): %s exact_prefix=%lld changed=[%lld,%lld) "
+                             "reused_suffix=%lld donor_consumed=%lld pending=%d reason=%s\n",
+                             sux_repaired.proceed ? "admitted" : "refused",
+                             (long long) (sux_repaired.proceed ? sux_repaired.exact_prefix : sux_repaired.span.prefix),
+                             (long long) sux_repaired.span.edit_from, (long long) sux_repaired.span.edit_to,
+                             (long long) (sux_repaired.proceed ? sux_repaired.reused_suffix : sux_repaired.span.suffix),
+                             (long long) live.size(), (int) serving_pending_token,
+                             sux_repaired.reason ? sux_repaired.reason : "admitted");
+            if (sux_repaired.proceed && serving_raw_session != nullptr && serving_raw_session->healthy() &&
+                serving_raw_cut != UINT64_MAX && repaired_donor_forwarded>0 && sux_page > 0) {
+                // The donor snapshot must describe the device state as it IS: `live` is the CONSUMED history (the
+                // rows actually forwarded), so the certified cut is forwarded = live.size(), accepted =
+                // live.size() + 1, and its last entry is the genuine pending token the state was about to consume.
+                // Guessing that token, or certifying one row behind the real state, is refused here.
+                const uint64_t page = uint64_t(sux_page);
+                const uint64_t boundary = uint64_t(sux_repaired.span.edit_to);
+                const uint64_t donor_forwarded = repaired_donor_forwarded;
+                const std::vector<uint64_t> frontiers{boundary + page};
+                std::vector<int32_t> donor_history;
+                std::string donor_refusal;
+                if (!strata::program::ServingSuffixRepairOperation::exact_first() && strata::kernels::cvec().loaded())
+                    donor_refusal="retained suffix repair requires an owner-bound steering identity before loaded cvec is supported";
+                else if (!strata::program::ServingSuffixRepairOperation::exact_first() &&
+                    (max_new<1 || req_temperature>0 || req_penalty_last_n>0 ||
+                     !req_bias.empty() || o.prefill_head_alias || o.adapt_every || o.adapt_async ||
+                     o.pipeline_windows || pipe ||
+                     uint64_t(ids.size())>serving_raw_session->max_tokens() ||
+                     uint64_t(max_new)>serving_raw_session->max_tokens()-uint64_t(ids.size())))
+                    donor_refusal="retained suffix repair requires neutral greedy output and admitted finite prompt/output capacity";
+                else if (repaired_donor_pending < 0)
+                    donor_refusal = "no certified pending token for the session's endpoint";
+                else if (uint64_t(ids.size()) <= donor_forwarded || ids[size_t(donor_forwarded)] != repaired_donor_pending)
+                    donor_refusal = "this prompt's token at the donor endpoint is not the donor's pending token";
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                else if (strata::program::SuffixExperimentDriver::serving_qualification_enabled() &&
+                         (!strata::program::SuffixExperimentDriver::serving_qualification_limit(
+                              sfx_qualification.token_limit) ||
+                          donor_forwarded >= sfx_qualification.token_limit))
+                    donor_refusal = "the donor exceeds the bounded qualification replay ceiling";
+#endif
+                else {
+                    if(owned_donor_descriptor)donor_history=owned_donor_descriptor->accepted_tokens;
+                    else {donor_history.assign(live.begin(),live.end());donor_history.push_back(repaired_donor_pending);}
+                }
+                // Planned U is eligibility only. No rounded cut/image is published.
+                const uint64_t planned_donor_forwarded=owned_batch_allocation&&owned_donor_descriptor&&page==4&&
+                    donor_forwarded<=UINT64_MAX-3?((donor_forwarded+3)/4)*4:donor_forwarded;
+                if(planned_donor_forwarded!=donor_forwarded&&
+                   (planned_donor_forwarded>=ids.size()||planned_donor_forwarded>=serving_raw_session->max_tokens()))
+                    donor_refusal="partial-page donor lacks authentic next-known tail";
+                const strata::core::serving_raw::RepairPlanFacts plan_facts{
+                    uint64_t(sux_repaired.span.edit_from), uint64_t(sux_repaired.span.edit_to), boundary,
+                    planned_donor_forwarded, owned_donor_descriptor?planned_donor_forwarded+1:uint64_t(donor_history.size()), std::span<const uint64_t>(frontiers), 0, page};
+                strata::core::serving_raw::RepairPlanRefusal plan_why =
+                    strata::core::serving_raw::RepairPlanRefusal::none;
+                if (!donor_refusal.empty())
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): donor refused (%s); reading the "
+                                 "prompt exactly\n", donor_refusal.c_str());
+                else if (!strata::core::serving_raw::repair_plan_acceptable(plan_facts, plan_why))
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): plan refused (%s): boundary=%llu "
+                                 "donor_forwarded=%llu frontier=%llu; reading the prompt exactly\n",
+                                 strata::core::serving_raw::repair_plan_reason(plan_why), (unsigned long long) boundary,
+                                 (unsigned long long) donor_forwarded, (unsigned long long) frontiers.front());
+                else {
+                    std::string fence_error;
+                    bool ready = false;
+                    bool qualification_ready = true;
+                    const bool request_opened = serving_raw_session->open_request(fence_error);
+                    if (request_opened) serving_raw_fence_used_this_request = true;   // slice 7: not an ordinary request
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    if(request_opened&&owned_batch_allocation&&strata::program::SuffixExperimentDriver::owned_slot_qualification_selected(serving_request_ordinal)){
+                        DriverSuffixExperimentContext context{o,g,owned_runtime,*model_budget,sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                        qualification_ready=strata::program::SuffixExperimentDriver::admit_owned_slot_qualification(context,*serving_raw_session,
+                            uint64_t(ids.size())+uint64_t(admit_max_new),boundary,serving_request_ordinal,sfx_qualification,fence_error);
+                        if(qualification_ready)try{sfx_owned_slot_oracle=std::make_unique<strata::program::SuffixExperimentDriver::ServingQualification>();}
+                            catch(...){qualification_ready=false;fence_error="pre-admitted slot oracle holder allocation refused";}
+                    }
+                    if (request_opened && strata::program::SuffixExperimentDriver::serving_qualification_enabled()) {
+                        DriverSuffixExperimentContext qualification_context{o,g,owned_runtime,*model_budget,
+                            sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                        uint64_t prefix_quote=0;
+                        sfx_qualification.prefix.boundary=boundary;
+                        sfx_qualification.prefix.request=serving_request_ordinal;
+                        qualification_ready = g.n_layers>0&&g.n_expert>0&&
+                            uint64_t(g.n_layers)<=UINT64_MAX/uint64_t(g.n_expert)&&
+                            strata::program::PrefixReplayPlan::quote(boundary,uint64_t(g.n_layers)*uint64_t(g.n_expert),prefix_quote);
+                        if(!qualification_ready)fence_error="prefix transcript admission quote overflow";
+                        qualification_ready = qualification_ready&&strata::program::SuffixExperimentDriver::admit_serving_qualification(
+                            qualification_context, *serving_raw_session,
+                            strata::program::ServingSuffixRepairOperation::exact_first()?donor_forwarded+1:
+                                uint64_t(ids.size())+uint64_t(max_new),
+                            sfx_qualification, fence_error,prefix_quote);
+                    }
+#endif
+#if defined(STRATA_SERVING_FAULT_QUALIFICATION_AVAILABLE)
+                    if(request_opened&&qualification_ready&&serving_fault_qualification.target(serving_request_ordinal))
+                        qualification_ready=serving_fault_qualification.prepare(serving_request_ordinal,
+                            sfx_qualification.credit,sfx_qualification.binary,sfx_qualification.source,fence_error);
+#endif
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    if(request_opened && qualification_ready && boundary>64 && serving_request_ordinal==2 &&
+                       strata::program::SuffixExperimentDriver::activation_qualification_mode()) {
+                        DriverSuffixExperimentContext origin_context{o,g,owned_runtime,*model_budget,
+                            sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                        qualification_ready=strata::program::SuffixExperimentDriver::admit_activation_prefix_origin(
+                            origin_context,*serving_raw_session,uint64_t(ids.size())+uint64_t(max_new),boundary,
+                            serving_request_ordinal,sfx_qualification,fence_error);
+                    }
+#endif
+                    if (request_opened && qualification_ready &&
+                        (owned_donor_descriptor||serving_raw_session->begin_work(fence_error))) {
+                        const strata::core::StateCut donor_cut=owned_donor_descriptor?owned_donor_descriptor->cut:strata::core::StateCut{
+                            serving_raw_cut + 1, donor_forwarded + 1, donor_forwarded, donor_forwarded, 0,
+                            strata::core::window_history_digest(donor_history)};
+                        if (owned_donor_descriptor||serving_raw_session->drain_work(true, donor_cut, fence_error)) {
+                            const auto captured=[&]() {
+                                if(owned_donor_descriptor){serving_donor=*selected_owned_donor;return strata::program::SuffixRawResult{strata::program::SuffixRawStatus::ok,{},{}};}
+                                ++serving_raw_cut;
+                                const auto donor_metadata=strata::program::ServingRawSession::endpoint_metadata(serving_raw_session->key(),donor_cut,donor_history);
+                                return serving_raw_session->capture(donor_metadata,serving_donor);
+                            }();
+                            if (captured) {
+                                serving_donor_cut = donor_cut;
+                                serving_suffix_boundary = int64_t(boundary);
+                                serving_suffix_frontiers = frontiers;
+                                // The TARGET history is this request's own truncated prompt (A + B' + C + the
+                                // donor's pending token), never the donor's old ids: with the donor's ids in it the
+                                // changed run would be absent and the native changed-run check would refuse (or
+                                // worse, accept a splice that re-imports the old path).
+                                // The work phase covers everything the request mutates from here on (its restores,
+                                // slot copies, checkpoint rewinds and the prefix read up to the reuse boundary):
+                                // the fenced phase must describe the actual device work, not just the last segment.
+                                std::string begin_error;
+                                if (serving_raw_session->begin_work(begin_error)) {
+                                    serving_raw_fence_running = true;
+                                    // The harness's synchronisation point: the fence is open and the prefix read is
+                                    // the next thing this request does, so a cancellation asked for AFTER this line
+                                    // is a stop inside the fenced phase - not a guess from timing.
+                                    std::fprintf(stderr, "strata serve: suffix cache (repaired): PREFIX_PHASE_OPEN "
+                                                 "boundary=%llu cut=%llu consumed=%llu\n",
+                                                 (unsigned long long) boundary,
+                                                 (unsigned long long) (serving_raw_cut + 1),
+                                                 (unsigned long long) donor_forwarded);
+                                    std::fflush(stderr);
+                                }
+                                else {
+                                    serving_donor = strata::core::BundleHandle{};
+                                    serving_donor_cut = {};
+                                    serving_suffix_boundary = -1;
+                                    std::string close_error;
+                                    if (!serving_raw_session->healthy() ||
+                                        !serving_raw_session->close_request(close_error)) {
+                                        std::fflush(stderr);
+                                        serving_raw_session->abandon();
+                                        serving_raw_session.reset();
+                                    } else
+                                        std::fprintf(stderr, "strata serve: suffix cache (repaired): no prefix phase "
+                                                     "(%s): reading the prompt exactly\n", begin_error.c_str());
+                                }
+                                std::vector<int32_t> target_history;
+                                target_history.reserve(donor_history.size());
+                                for (size_t k = 0; k < donor_history.size(); ++k)
+                                    target_history.push_back((int32_t) ids[k]);
+                                bool edited = false;
+                                for (uint64_t k = uint64_t(sux_repaired.span.edit_from);
+                                     k < uint64_t(sux_repaired.span.edit_to) && k < donor_history.size(); ++k)
+                                    if (target_history[size_t(k)] != donor_history[size_t(k)]) edited = true;
+                                if (target_history.size() != donor_history.size() || !edited) {
+                                    fence_error = "target history is not the request's own edited run through the "
+                                                  "donor's pending token";
+                                } else {
+                                    serving_suffix_accepted = std::move(target_history);
+                                    ready = true;
+                                }
+                            } else fence_error = captured.detail;
+                        }
+                    }
+                    if (!ready) {
+                        std::fprintf(stderr, "strata serve: suffix cache (repaired): donor phase refused (%s); "
+                                     "reading the prompt exactly\n", fence_error.c_str());
+                        // Exact fallback is only safe on a fence that is KNOWN drained and closed.  healthy()
+                        // alone does not prove that: an invalid-cut refusal, or a begin that never completed, can
+                        // leave the transaction running.  Anything else is the contract's failstop.
+                        const bool settled = serving_raw_session != nullptr && serving_raw_session->healthy() &&
+                                             (serving_raw_session->phase() ==
+                                                  strata::program::ServingRawSession::Phase::drained ||
+                                              (!qualification_ready && serving_raw_session->phase() ==
+                                                  strata::program::ServingRawSession::Phase::idle));
+                        std::string close_error;
+                        const bool closed = settled && serving_raw_session->close_request(close_error);
+                        if (!closed) {
+                            std::fflush(stderr);
+                            if (serving_raw_session != nullptr) serving_raw_session->abandon();
+                            serving_raw_session.reset();   // ~SuffixRawSession terminates on an uncertain fence
+                        } else {
+                            serving_donor = strata::core::BundleHandle{};
+                            serving_donor_cut = {};
+                        }
+                    }
+                }
+            }
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // Belt and braces for the twelve early exits between the donor capture and the read loop: an open work
+            // fence may not be unwound as an ordinary local, so leaving this scope with one still running is the
+            // contract's failstop.  When the fence was closed normally the guard does nothing.
+            // Set only by the certified yield below, when a retained owner leaves this request's slot for the
+            // registry; the guard uses it to tell "handed over" from "lost".
+            std::optional<strata::core::WindowKey> serving_retained_identity;
+            // The guard's rule, extended for retained owners (slice 2).  The reviewed rule is unchanged: a request
+            // scope may not unwind holding a live controller.  The new rule is that a request scope may also not
+            // unwind having LOST an owner it retained: at scope exit such an owner must be either retired or
+            // registered somewhere that can retire it.  The decision table is the shared `owner_scope_escape`
+            // (serving_repair_owners.hpp), so the CPU cell exercises the same rule the server applies, and a
+            // legitimately registered owner keeps the guard inert.
+            struct SfxOpenFenceGuard {
+                bool* running;
+                std::shared_ptr<strata::program::ServingRawSession>* owner;
+                std::unique_ptr<strata::program::ServingSuffixRepairOperation::Outcome>* active;
+                const ServingRepairOwnerRegistryForServing* owners;
+                const std::optional<strata::core::WindowKey>* retained;
+                bool* ordinary;
+                ~SfxOpenFenceGuard() {
+                    if (ordinary != nullptr && *ordinary) {
+                        // slice 7: the request unwound while its OWN work fence was still open. The transaction is
+                        // running over work no drain certified, so this is the same failstop the fenced prefix read
+                        // already applies: destroying the owner terminates; clearing token or checkpoint metadata
+                        // is not recovery from possibly half-written device state.
+                        std::fprintf(stderr, "strata serve: suffix cache (retained): the request unwound with its "
+                                     "own RAW work fence open: failing stop instead of continuing on uncertain "
+                                     "state\n");
+                        std::fflush(stderr);
+                        std::fflush(stdout);
+                        if (owner != nullptr && *owner != nullptr) {
+                            (*owner)->abandon();
+                            owner->reset();   // ~SuffixRawTransaction terminates: the established failstop
+                        }
+                        return;
+                    }
+                    strata::program::OwnerScopeFacts scope;
+                    scope.active_holds_owner = active != nullptr && *active != nullptr;
+                    scope.active_holds_controller = scope.active_holds_owner && (*active)->controller != nullptr;
+                    scope.retention_recorded = retained != nullptr && retained->has_value();
+                    if (scope.retention_recorded) scope.recorded_identity = **retained;
+                    scope.registry_holds_record = owners != nullptr && scope.retention_recorded &&
+                                                  owners->contains(scope.recorded_identity);
+                    switch (strata::program::owner_scope_escape(scope)) {
+                        case strata::program::OwnerScopeEscape::inert: break;
+                        case strata::program::OwnerScopeEscape::failstop_live_unregistered:
+                            if (owner != nullptr && *owner != nullptr)
+                                strata::program::ServingSuffixRepairOperation::failstop(**owner,
+                                    "serving request left retained suffix controller before explicit exact retirement");
+                            strata::core::retirement_failed("retained suffix controller lost its RAW adapter");
+                            break;
+                        case strata::program::OwnerScopeEscape::failstop_retained_lost:
+                            if (owner != nullptr && *owner != nullptr)
+                                strata::program::ServingSuffixRepairOperation::failstop(**owner,
+                                    "serving request lost a retained repair owner: neither retired nor registered");
+                            strata::core::retirement_failed(
+                                "retained suffix controller was neither retired nor registered");
+                            break;
+                    }
+                    if (running == nullptr || owner == nullptr || !*running) return;
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): the request left an open RAW work "
+                                 "fence: failing stop instead of unwinding it\n");
+                    std::fflush(stderr);
+                    if (*owner != nullptr) (*owner)->abandon();
+                    owner->reset();   // ~SuffixRawTransaction terminates on running/poisoned: the failstop
+                }
+            } sfx_fence_guard{&serving_raw_fence_running, &serving_raw_session, &serving_suffix_active,
+                              serving_repair_owners.get(), &serving_retained_identity, &serving_ordinary_fence};
+#endif
+            if (sux_apply) {
+                resume = sux.frontier;          // the imported state covers this many prompt tokens
+                from_live = true;               // read on from the session's own state: nothing is restored
+                // a checkpoint deeper than the edit describes the OLD path: it is not a prefix of this prompt, and
+                // mounting it later would present old-path state as this conversation's
+                auto stale_past_edit = [&](const ConvCheckpoint& c) {
+                    return (int64_t) c.ids.size() > sux.span.edit_from;
+                };
+                if (ckpt_pool.on()) ckpt_pool.erase_if(checks, stale_past_edit);
+                else checks.erase(std::remove_if(checks.begin(), checks.end(), stale_past_edit), checks.end());
+                // the session's tokens become THIS prompt's; the rows below the frontier stay the donor's, and the
+                // recurrent/indexer/PLE endpoint stays old-conditioned.  That is the approximation, stated plainly.
+                live.assign(ids.begin(), ids.begin() + (size_t) sux.frontier);
+                serving_pending_token = -1;
+                live_imgs = req_imgs;           // empty: the shape gate requires no pictures either side
+                live_approximate = true;
+                std::fprintf(stderr, "strata serve: suffix cache: continuing APPROXIMATELY at %lld tokens: "
+                             "reused_suffix=%lld exact_prefix_would_reuse=%lld fresh=%lld changed=[%lld,%lld) "
+                             "approximate=1 exact_certificate=0 repaired=0\n",
+                             (long long) resume, (long long) sux.reused_suffix, (long long) sux.exact_prefix,
+                             (long long) sux.fresh, (long long) sux.span.edit_from, (long long) sux.span.edit_to);
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                // Close the fence with the ACTUAL cut this request stands on, at the real history digest.
+                // exact_frontier stays 0: nothing here is certified exact, and the protocol must not upgrade an
+                // approximation into a certificate. The adapter builds the per-stage cut vector itself, so no
+                // empty/mismatched span can reach the transaction.
+                if (serving_raw_session != nullptr) {
+                    std::string fence_error;
+                    bool closed = false;
+                    if (serving_raw_cut == UINT64_MAX)
+                        fence_error = "serving RAW cut identity exhausted";
+                    else {
+                        // The cut's history is the digest of the DONOR token run this state was actually built
+                        // from - not of the relabeled ids - so the certification attempt names real executed
+                        // history. Binding that history to each stage's actual verifier work is the controller's
+                        // job in step 3; this call site cannot establish it alone.
+                        const strata::core::StateCut cut{serving_raw_cut + 1, (uint64_t) resume, (uint64_t) resume,
+                                                         0, 0, strata::core::window_history_digest(sux_donor_ids)};
+                        closed = serving_raw_session->drain_work(true, cut, fence_error);
+                        if (closed) {
+                            ++serving_raw_cut;
+                            // The relabel below leaves the session standing on a state whose suffix came from
+                            // `sux_donor_ids`: that is an unresolved approximation from this moment on, anchored at
+                            // the real time it was introduced and named by the digest of the state actually reused.
+                            // The certificate itself stays empty: this request's own conversation run was never
+                            // forwarded whole, so no accepted run of it certifies this cut.
+                            serving_tracked_state.clear();
+                            serving_tracked_provenance = strata::core::serving_raw::ApproximationProvenance{
+                                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count()),
+                                strata::core::window_history_digest(sux_donor_ids)};
+                            std::string close_error;
+                            if (!serving_raw_session->close_request(close_error)) {
+                                fence_error = close_error;
+                                closed = false;
+                            }
+                        }
+                    }
+                    if (!closed) {
+                        // Either our cut was not acceptable (caught before the transaction moved) or the RAW
+                        // contract poisoned the transaction. Both end here: an open driver-work fence cannot be
+                        // closed safely, and the transaction's own destructor terminates on running/poisoned state
+                        // (suffix_raw_runtime.cpp:96-98). Destroying the owner IS the failstop. Clearing token or
+                        // checkpoint metadata is NOT recovery from possibly half-written device state, so nothing
+                        // here keeps serving from this session.
+                        std::fprintf(stderr, "strata serve: suffix cache: RAW completion refused (%s); failing "
+                                     "stop on the open fence instead of continuing on uncertain state\n",
+                                     fence_error.c_str());
+                        std::fflush(stderr);
+                        serving_raw_session->abandon();
+                        serving_raw_session.reset();
+                        live_ok = false;
+                        live.clear();
+                        serving_pending_token = -1;
+                        live_imgs.clear();
+                        checks.clear();
+                        live_approximate = false;
+                    }
+                }
+#endif
+            }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // ---- slice 7: the ordinary request's OWN RAW work fence --------------------------------------
+            // Everything below - the slot hand-off, the borrowed/parked restores, the zero-or-checkpoint start,
+            // the prompt read and the decode windows - mutates THIS session.  With a parked retained owner waiting
+            // for its route back, the state that work leaves must be certified by an actual all-stage drain of
+            // that same work, or nothing may claim to know what the device holds.  So the request opens its own
+            // fence here, BEFORE any of that runs, and drains it after its last commit (see ORDINARY_CERTIFY).
+            // Refusing to OPEN the fence is not a failure: the request then runs today's path with no certificate,
+            // and a retained activation over no certificate is a clean refusal. An uncertified inherited start is
+            // excluded before opening: metadata refusal cannot otherwise close a running work phase.
+            // Inherit only the certificate of the very state this request will continue. Restores carry no
+            // tracked certificate; an older main-session cut cannot certify a slot or checkpoint's provenance.
+            const bool ordinary_inherits_certificate =
+                serving_raw_session != nullptr && slot_source < 0 && !borrow && !incoming && from_live &&
+                resume > 0 && uint64_t(resume) == serving_tracked_state.cut.forwarded &&
+                live.size() == uint64_t(resume) &&
+                strata::core::serving_raw::accepted_run_certifies_cut(
+                    serving_tracked_state.cut, serving_raw_session->cut(), serving_tracked_state.accepted) &&
+                std::equal(live.begin(), live.end(), serving_tracked_state.accepted.begin());
+            const bool ordinary_start_certifiable =
+                (resume == 0 && slot_source < 0 && !borrow && !incoming) || ordinary_inherits_certificate;
+            const bool ordinary_fence_shape_ok =
+                // The same regime the reviewed donor gate admits its work in (`retained suffix repair requires
+                // neutral greedy output, 1..64 outputs and admitted prompt/output capacity`): no pipeline-windows
+                // parity (the odd-parity windows launch and commit through the verifier's `_b` gang, which the
+                // session's own verifier set cannot witness in a drain), no adapt/prefill-head churn, and a prompt
+                // and output that fit the owned session's capacity.
+                serving_raw_session != nullptr &&
+                !o.pipeline_windows && !pipe && !o.adapt_every && !o.adapt_async && !o.prefill_head_alias &&
+                max_new >= 1 && max_new <= 64 && req_temperature == 0 && req_penalty_last_n == 0 &&
+                req_bias.empty() && uint64_t(ids.size()) <= serving_raw_session->max_tokens() &&
+                uint64_t(max_new) <= serving_raw_session->max_tokens() - uint64_t(ids.size());
+            const bool ordinary_fence_admissible =
+                ((serving_repair_owners != nullptr && !serving_repair_owners->parked_identities().empty()) ||
+                 (owned_batch_allocation&&admit_slot>=0)) &&
+                serving_raw_session != nullptr && serving_raw_session->healthy() &&
+                ordinary_fence_shape_ok && ordinary_start_certifiable &&
+                !serving_raw_fence_used_this_request && !serving_raw_fence_running &&
+                serving_suffix_active == nullptr && (!serving_raw_session->request_open()||owned_image_active) &&
+                !serving_raw_session->private_window_open() &&
+                (serving_raw_session->phase() == strata::program::ServingRawSession::Phase::idle ||
+                 serving_raw_session->phase() == strata::program::ServingRawSession::Phase::drained) &&
+                serving_raw_cut != UINT64_MAX && req_imgs.empty() && live_imgs.empty();
+            if (ordinary_fence_admissible) {
+                std::string fence_error;
+                const bool opened = owned_image_active?serving_raw_session->request_open():serving_raw_session->open_request(fence_error);
+                const bool begun = opened && serving_raw_session->begin_work(fence_error);
+                if (begun) {
+                    serving_ordinary_fence = true;
+                    serving_start_zeroed = resume == 0;   // the start this request chose, before its read moves it
+                    serving_start_certified_exact = ordinary_inherits_certificate &&
+                        serving_tracked_state.cut.exact_frontier == serving_tracked_state.cut.forwarded;
+                    std::fprintf(stderr, "strata serve: suffix cache (retained): ORDINARY_FENCE_OPEN req=%llu "
+                                 "cut=%llu resume=%lld live=%lld\n", (unsigned long long) serving_request_ordinal,
+                                 (unsigned long long) (serving_raw_cut + 1), (long long) resume,
+                                 (long long) live.size());
+                    std::fflush(stderr);
+                } else if (!opened) {
+                    // Nothing was opened: the request reads on with no certificate, exactly as it does today.
+                    std::fprintf(stderr, "strata serve: suffix cache (retained): no ordinary RAW fence: %s\n",
+                                 fence_error.c_str());
+                } else {
+                    // The request fence opened but no work phase began.  A plain refusal leaves the phase as it
+                    // was, and the fence closes cleanly; a poison is the contract's failstop.
+                    std::string close_error;
+                    if (!serving_raw_session->healthy() ||
+                        !serving_raw_session->close_request(close_error)) {
+                        std::fprintf(stderr, "strata serve: suffix cache (retained): the ordinary RAW fence could "
+                                     "not be opened (%s): failing stop on an uncertain fence\n",
+                                     fence_error.c_str());
+                        std::fflush(stderr);
+                        serving_raw_session->abandon();
+                        serving_raw_session.reset();
+                    } else
+                        std::fprintf(stderr, "strata serve: suffix cache (retained): no ordinary RAW fence: %s\n",
+                                     fence_error.c_str());
+                }
+            }
+#endif
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
                 const auto t0 = Clock::now();
@@ -16507,6 +23921,7 @@ int main(int argc, char** argv) {
                         bs[(size_t) slot_source].partial = false;
                         bs[(size_t) slot_source].partial_plan = {};
                     }
+                    serving_pending_token = -1;
                     // the slot's checkpoints come along (the one continued from, and any shorter one: prefixes of what
                     // was copied back, their K/V cells with it), so the chain keeps its branch points and the parked
                     // copies of this conversation a turn back - whose deepest checkpoint the chain holds again - go
@@ -16561,6 +23976,7 @@ int main(int argc, char** argv) {
                         if (move_cks) moved_in = ck_len;
                     } else {
                         live = bs[(size_t) slot_source].ids;
+                serving_pending_token = -1;
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
@@ -16598,6 +24014,7 @@ int main(int argc, char** argv) {
                     if ((int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs)) checks.push_back(c);
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == parked.tokens) { live = c.ids; live_imgs = c.imgs; }
+                serving_pending_token = -1;
                 cvec_cached = donor->cvec;
                 resume = parked.tokens;
                 from_live = false;
@@ -16643,6 +24060,7 @@ int main(int argc, char** argv) {
                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                 }
                 live = std::move(incoming->live.ids);
+                serving_pending_token = -1;
                 live_imgs = std::move(incoming->live.imgs);
                 if (stages.empty()) {
                     checks = std::move(incoming->checkpoints);
@@ -16653,6 +24071,7 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
+                live_approximate = incoming->approximate;   // a restored conversation keeps its own provenance
                 resume = parked.tokens;
                 from_live = parked.live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
@@ -16697,6 +24116,15 @@ int main(int argc, char** argv) {
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(owned_runtime) {
+                    if(!owned_runtime->reset_sessions(g,err)) {
+                        std::fprintf(stderr,"strata serve: %s\n",err.c_str());
+                        return 1;
+                    }
+                } else
+#endif
+                {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
                 for (auto& st : stages) {
@@ -16704,7 +24132,9 @@ int main(int argc, char** argv) {
                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                     cudaStreamSynchronize(st->stream);
                 }
+                }
                 checks.clear();
+                live_approximate = false;   // a zeroed session holds nobody's state: the provenance goes with it
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
@@ -16721,12 +24151,22 @@ int main(int argc, char** argv) {
                     // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    if(owned_runtime) {
+                        if(!owned_runtime->reset_sessions(g,err)) {
+                            std::fprintf(stderr,"strata serve: %s\n",err.c_str());
+                            return 1;
+                        }
+                    } else
+#endif
+                    {
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     cudaStreamSynchronize(main_stream);
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
                         strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                         cudaStreamSynchronize(st->stream);
+                    }
                     }
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
@@ -16856,7 +24296,7 @@ int main(int argc, char** argv) {
                                      "whole prompt through the batched path, none of it through the verify windows\n");
             }
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > req_short_read) return false;
+                if (no_short || b - a > req_short_read || sp.owned_image_rows_present(a,b)) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -17029,7 +24469,7 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
+                    if (!run_serial_remote_unit(ver, T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
@@ -17081,160 +24521,182 @@ int main(int argc, char** argv) {
             // (split in two halves so a layer split can queue every stage's copies before it waits for any: #340)
             // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
             // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
-            static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
-            auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
-                tr("refill start", (long long) p.lent.size());
-                const strata::core::OnDevice on(p.dev);
-                for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    strata::core::BlobPart parts[3];
-                    const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
-                    if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
-                        if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
-                        host_res[(size_t) i] = slot;
-                        continue;
-                    }
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                    if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
-                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
-                        return false;
-                    if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
-                    host_res[(size_t) i] = slot;
-                }
-                return true;
-            };
-            auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
-                const strata::core::OnDevice on(p.dev);
-                if (!p.cache->sync_queued(e)) return false;
-#if defined(_WIN32)
-                // The copies have landed: the file pages touched by the loan need not stay in the working set.
-                for (const auto& [i, slot] : p.lent)
-                    srcp->release(i / g.n_expert, i % g.n_expert);
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            const bool sfx_prefix_origin_replay=serving_activation_selected && serving_suffix_active &&
+                bool(serving_suffix_active->retained_prefix);
+            auto& sfx_prefix_plan=sfx_prefix_origin_replay?*serving_suffix_active->retained_prefix:sfx_qualification.prefix;
+            const bool sfx_prefix_recording=sfx_qualification.admitted && !sfx_prefix_origin_replay;
+            const bool sfx_prefix_mode=(sfx_prefix_recording||sfx_prefix_origin_replay)&&sfx_prefix_plan.boundary>64;
+            bool sfx_prefix_replaying=false;
+#else
+            constexpr bool sfx_prefix_mode=false;
 #endif
-                p.lent.clear();
-                p.lent_chunk = 0;
-                return true;
+            auto refill = [&](std::string& e){return shared_prefix_refill(sfx_prefix_mode,e);};
+            int64_t seg_lend=0;
+            auto lend = [&](int64_t tokens,std::string& e,int64_t exact){return shared_prefix_lend(tokens,e,exact,sfx_prefix_mode,seg_lend);};
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            const bool sfx_prefix_reset_from_zero=read_from==0&&resume==0&&reread_to<=0&&resume_plan.chunk<=0;
+            auto sfx_prefix_policy = [&]() -> const char* {
+                auto zero=[](const char* name){const char* v=std::getenv(name);return v&&std::strcmp(v,"0")==0;};
+                auto absent_or_zero=[](const char* name){const char* v=std::getenv(name);return !v||std::strcmp(v,"0")==0;};
+                if((!sfx_prefix_reset_from_zero&&!sfx_prefix_origin_replay)||!req_imgs.empty()||
+                   ((!o.native_owned_batch_serving)&&(o.prefill_chunk!=16||o.prefill_auto))||
+                   !actual_prefix_policy(uint64_t(req_short_read)).valid()||o.short_read!=64||req_short_read!=64||
+                   (!o.native_serial_serving&&!o.native_owned_batch_serving)||(o.batch&&!o.native_owned_batch_serving)||pipe||pl_pw||o.pipeline_windows||use_mtp||batch_mtp||
+                   !std::isfinite(strata::prefill::Prefill::pipe_setting())||strata::prefill::Prefill::pipe_setting()<0||
+                   !zero("STRATA_PREFILL_CPU_SHARE")||!absent_or_zero("STRATA_PREFILL_HELP")||
+                   !absent_or_zero("STRATA_PREFILL_HELPER_SOURCE")||
+                   std::getenv("STRATA_PIPELINE_SWITCH")||std::getenv("STRATA_CKPT_REREAD")||
+                   peer.valid()||o.peer_device>=0||remote_caches||remote_opt||fs_swap||ram_adapt2.on||
+                   pf_parts.size()!=size_t(n_stages)||pf_parts.empty()||pf_parts.size()>8)
+                    return "batched qualification requires fixed prefill16/short64 reset-from0 with CPU/helper/peer/observer writers disabled";
+                for(size_t i=0;i<pf_parts.size();++i){const auto& p=pf_parts[i];
+                    const auto a=p.sp->replay_activity();const auto cpu=p.sp->cpu_share_policy();
+                    const auto* next=i+1<pf_parts.size()?pf_parts[i+1].sp:nullptr;
+                    const int device=p.dev<0?primary_device:p.dev;
+                    if(!a.initialized||a.session!=p.ses||a.cache!=p.cache||a.source!=srcp||
+                       a.residency!=host_res.data()||a.device!=device||a.begin!=p.lb||a.end!=p.le||a.next!=next||
+                       a.helper||a.peer||a.taps||a.borrow_spill||a.pending_force||p.sp->embd_rows||p.sp->on_routes||
+                       (o.native_owned_batch_serving&&!a.workspace_paid)||
+                       !cpu.explicit_resolved||cpu.mode!=strata::core::NumericPolicyMode::disabled||
+                       cpu.dynamic_assignment||cpu.measured_ratios||cpu.measurement_pending||cpu.measured_gate)
+                        return "actual Prefill activity is outside fixed prefix replay profile";
+                }
+                return nullptr;
             };
-            auto refill_one = [&](PfPart& p, std::string& e) -> bool {
-                if (p.lent.empty()) return true;
-                return refill_issue(p, e) && refill_wait(p, e);
+            auto sfx_prefix_prepare = [&]() -> bool {
+                auto& plan=sfx_prefix_plan;
+                if(plan.active)return !plan.refused;
+                if(const char* why=sfx_prefix_policy())return plan.reject(why);
+                for(const auto& p:pf_parts)if(!p.lent.empty())return plan.reject("base prefix cache has an outstanding loan");
+                try {
+                    if(!plan.bind_policy(actual_prefix_policy(uint64_t(req_short_read)))||
+                       !plan.prepare(sfx_qualification.credit,host_res))return false;
+                    plan.source=srcp;plan.runtime=owned_runtime.get();plan.participant_count=pf_parts.size();
+                    plan.pipe=strata::prefill::Prefill::pipe_setting();
+                    for(size_t i=0;i<pf_parts.size();++i){const auto& p=pf_parts[i];auto& saved=plan.participants[i];
+                        saved.cache=p.cache;saved.prefill=p.sp;saved.session=p.ses;saved.offsets=p.cache->slot_offsets();
+                        saved.device=p.dev<0?primary_device:p.dev;saved.begin=p.lb;saved.end=p.le;saved.slots=p.cache->slots();
+                        saved.allocated_chunk=p.sp->replay_activity().allocated_chunk;
+                        saved.loan.reserve(size_t(p.le-p.lb)*size_t(g.n_expert));
+                    }
+                    return true;
+                }catch(...){return plan.reject("pre-admitted prefix transcript allocation refused before loan");}
             };
-            // #340: with several stages every stage's copies go out first (each card on its own link), then each is
-            // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
-            // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
-            static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
-            auto refill = [&](std::string& e) -> bool {
-                const auto t_rf = Clock::now();
-                int64_t n_lent = 0, n_parts = 0;
-                for (PfPart& p : pf_parts)
-                    if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
-                if (n_parts > 1 && !refill_serial) {
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_issue(p, e)) return false;
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_wait(p, e)) return false;
-                } else {
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_one(p, e)) return false;
-                }
-                if (n_parts > 0) res_upload();
-                if (trace && n_parts > 0) {
-                    std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
-                                 (long long) n_lent, (long long) n_parts,
-                                 std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
-                    std::fflush(stderr);
-                }
-                return true;
-            };
-            // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
-            // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
-            // participant's own cache, and marking only that participant's own layers
-            int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
-            auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
-                seg_lend = 0;
-                if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
-                const auto t_ln = Clock::now();
-                // what this segment needs, capped by the configured chunk: a request lends only what its own
-                // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
-                // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
-                const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
-                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
-                                                                                     : want_full;
-                // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
-                const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
-                if (want <= 0) {
-                    e = "prefill: cannot lend buffers for an empty request segment";
-                    return false;
-                }
-                bool any = false;
-                for (PfPart& p : pf_parts) {
-                    if (p.first < 0) continue;
-                    if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
-                        // ONLY this participant's loan goes back: `refill` would return the other participants'
-                        // loans too, and their buffers are still laid out in their caches - marking those slots
-                        // resident again would hand the next window a prompt buffer in place of an expert
-                        if (!refill_one(p, e)) return false;
+            auto sfx_prefix_loans = [&](bool recording) -> bool {
+                auto& plan=sfx_prefix_plan;
+                if(!plan.active||plan.participant_count!=pf_parts.size())return false;
+                for(size_t i=0;i<pf_parts.size();++i){const auto& p=pf_parts[i];auto& saved=plan.participants[i];
+                    if(saved.cache!=p.cache||saved.prefill!=p.sp||saved.session!=p.ses||saved.offsets!=p.cache->slot_offsets()||
+                       saved.slots!=p.cache->slots()||saved.begin!=p.lb||saved.end!=p.le)return false;
+                    if(recording&&!saved.loan_seen){
+                        if(p.lent.size()>saved.loan.capacity())return plan.reject("prefix loan exceeds credited directory");
+                        saved.loan.assign(p.lent.begin(),p.lent.end());saved.first=p.first_now;
+                        saved.chunk=p.sp->chunk();saved.lent_chunk=p.lent_chunk;
+                        saved.ring_slots=p.sp->replay_activity().ring_slots;saved.loan_seen=true;
+                    }else if(!saved.loan_seen||saved.first!=p.first_now||saved.chunk!=p.sp->chunk()||
+                             saved.lent_chunk!=p.lent_chunk||saved.loan!=p.lent||
+                             saved.ring_slots!=p.sp->replay_activity().ring_slots)
+                        return plan.reject("prefix profile requires one identical actual loan shape per stage");
+                    for(const auto& pair:p.lent){
+                        if(pair.first<0||size_t(pair.first)>=plan.base.size()||
+                           int64_t(pair.first)<p.lb*g.n_expert||int64_t(pair.first)>=p.le*g.n_expert||
+                           pair.second<p.first_now||pair.second>=p.cache->slots()||
+                           plan.base[size_t(pair.first)]!=pair.second||host_res[size_t(pair.first)]!=strata::core::kNotResident)return false;
                     }
-                    const strata::core::OnDevice on(p.dev);
-                    int64_t want_p = want;
-                    int32_t first = p.first_now;
-                    // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout.
-                    // (STRATA_MTP_ROOM_MIN's room is not one: its slots are the drafter's own bytes, so a roomed
-                    // request lends and is laid out exactly as any other - a relayout re-carves the room with it.)
-                    if (!o.prefill_head_alias) {
-                        // #2090: the loan a chunk needs is NOT monotonic in the chunk: a chunk above the scan's small_max
-                        // lays out the byte-budget ring (199 slots at 5120), one at or below it 0.1.39's (384 at 4096), so
-                        // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
-                        // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
-                        // lent even then is halved until it can, instead of ending the engine.
-                        int64_t need_p = part_slots(p, want_p);
-                        while ((need_p <= 0 || need_p + g_lend_keep > p.cache->slots()) && want_p > 256) {
-                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
-                            need_p = part_slots(p, want_p);
-                        }
-                        if (need_p <= 0 || need_p + g_lend_keep > p.cache->slots()) {
-                            e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
-                            return false;
-                        }
-                        if (want_p != want)
-                            std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
-                                         "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
-                                         (long long) want_p);
-                        if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
-                            std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
-                                         "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
-                                         (long long) need_p, (long long) (p.cache->slots() - p.first));
-                        first = (int32_t) (p.cache->slots() - need_p);
-                    }
-                    if (want_p != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
-                        p.first_now = first;
-                    }
-                    for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
-                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
-                            const size_t i = (size_t) (l * g.n_expert + ex);
-                            if (host_res[i] >= first) {
-                                p.lent.emplace_back((int32_t) i, host_res[i]);
-                                host_res[i] = strata::core::kNotResident;
-                                any = true;
-                            }
-                        }
-                    p.lent_chunk = want_p;
-                }
-                for (const PfPart& p : pf_parts)
-                    if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
-                if (any) res_upload();
-                if (trace) {
-                    int64_t n_lent = 0;
-                    for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
-                    std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
-                                 (long long) want, std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
-                    std::fflush(stderr);
                 }
                 return true;
             };
+            auto sfx_prefix_base = [&](const strata::program::PrefixReplayPlan& plan,std::string& e) -> bool {
+                if(const char* why=sfx_prefix_policy()){e=why;return false;}
+                if(sfx_prefix_origin_replay && (!serving_suffix_active ||
+                   !plan.origin_matches(serving_suffix_active->published.key,owned_runtime->remote_policy_incarnation,
+                       ajob?uint64_t(a_swapped):uint64_t(adapt_nswaps)))){
+                    e="retained prefix runtime/content/residency origin differs";return false;}
+                if(!plan.policy_matches(actual_prefix_policy(uint64_t(req_short_read)))||
+                   plan.source!=srcp||plan.runtime!=owned_runtime.get()||plan.participant_count!=pf_parts.size()||
+                   plan.pipe!=strata::prefill::Prefill::pipe_setting()||plan.base!=host_res){e="actual full prefix base mapping/owner differs";return false;}
+                for(size_t i=0;i<pf_parts.size();++i){const auto& p=pf_parts[i];const auto& saved=plan.participants[i];
+                    if(!p.lent.empty()||saved.cache!=p.cache||saved.prefill!=p.sp||saved.session!=p.ses||
+                       saved.offsets!=p.cache->slot_offsets()||saved.slots!=p.cache->slots()||
+                       saved.device!=(p.dev<0?primary_device:p.dev)||saved.begin!=p.lb||saved.end!=p.le||
+                       saved.allocated_chunk!=p.sp->replay_activity().allocated_chunk||
+                       (saved.loan_seen&&(saved.first!=p.first_now||saved.chunk!=p.sp->chunk()))){
+                        e="actual prefix base has outstanding loan or changed cache/layout";return false;}}
+                return true;
+            };
+            // A borrowed callback scope never escapes this request. The driver
+            // owns RAW authority; these closures only reuse actual numeric calls.
+            auto sfx_prefix_replay_piece = [&](const strata::program::PrefixReplayEvent& event,
+                std::span<const int32_t> history,strata::program::PrefixReplayAbort abort,
+                strata::program::PrefixReplayProgress& progress,std::string& e) -> bool {
+                auto& plan=sfx_prefix_plan;
+                struct SavedCallbacks {
+                    strata::prefill::Prefill* sp=nullptr;
+                    decltype(sp->on_chunk) chunk;decltype(sp->on_stage_chunk) stage;
+                    decltype(sp->on_routes) routes;decltype(sp->should_stop) stop,yield;
+                };
+                std::array<SavedCallbacks,8> saved;
+                try {
+                    if(event.to>plan.tokens.size()||history.size()<event.to)return false;
+                    auto replay_loan=[&](){return shared_prefix_lend(event.lend_tokens,e,event.lend_exact,true,seg_lend)&&sfx_prefix_loans(false);};
+                    if(event.returned_before_lend){
+                        bool outstanding=false;for(const auto& p:pf_parts)outstanding=outstanding||!p.lent.empty();
+                        if(!outstanding&&!replay_loan())strata::core::retirement_failed("prefix replay initial loan differs");
+                        for(uint64_t cycle=0;cycle<event.loan_cycles;++cycle)
+                            if(!shared_prefix_refill(true,e)||!replay_loan())
+                                strata::core::retirement_failed("prefix replay recorded loan cycle failed");
+                    }else if(event.lend&&!replay_loan())
+                        strata::core::retirement_failed("prefix replay actual loan differs after mutation");
+                    for(uint64_t at=event.from;at<event.to;++at)plan.tokens[size_t(at)]=history[size_t(at)];
+                    for(size_t i=0;i<pf_parts.size();++i){auto& v=*pf_parts[i].sp;auto& old=saved[i];old.sp=&v;
+                        old.chunk=std::move(v.on_chunk);old.stage=std::move(v.on_stage_chunk);old.routes=std::move(v.on_routes);
+                        old.stop=std::move(v.should_stop);old.yield=std::move(v.stop_at_chunk);
+                        v.on_chunk=nullptr;v.on_routes=nullptr;
+                        v.on_stage_chunk=[&progress,i](int64_t done,std::string&){progress.stage_end[i]=uint64_t(done);return true;};
+                        v.should_stop=nullptr;v.stop_at_chunk=nullptr;
+                    }
+                    // should_stop skips Prefill's PLE epilogue. The graceful
+                    // primary-only break preserves it and drains issued rows.
+                    sp.stop_at_chunk=[abort]{return abort();};progress.stages=pf_parts.size();
+                    if(event.planned)sp.force_chunk(event.chunk,event.single,event.chunked);
+                    sfx_prefix_replaying=true;
+                    const bool ran=sp.run(plan.tokens.data()+event.from,int64_t(event.to-event.from),int64_t(event.from),e);
+                    progress.stopped_at=sp.stopped_at();
+                    if(!ran)strata::core::retirement_failed("prefix replay actual run or downstream join failed");
+                    // Keep moved callbacks alive through actual all-device
+                    // completion. No unwinding after an uncertain attempted run.
+                    for(const auto& p:pf_parts){strata::core::WindowDeviceScope device(p.dev<0?primary_device:p.dev);
+                        if(!device.ok()||cudaDeviceSynchronize()!=cudaSuccess||!device.finish())
+                            strata::core::retirement_failed("prefix replay callback device completion uncertain");}
+                    for(auto& old:saved)if(old.sp){auto& v=*old.sp;v.on_chunk=std::move(old.chunk);
+                        v.on_stage_chunk=std::move(old.stage);v.on_routes=std::move(old.routes);
+                        v.should_stop=std::move(old.stop);v.stop_at_chunk=std::move(old.yield);}
+                    sfx_prefix_replaying=false;return true;
+                }catch(...){strata::core::retirement_failed("prefix replay callback exception retains owners");}
+            };
+            auto sfx_prefix_checked_refill = [&](std::string& e) -> bool {
+                if(!refill(e))return false;
+                for(const auto& p:pf_parts){strata::core::WindowDeviceScope device(p.dev<0?primary_device:p.dev);
+                    if(!device.ok()||cudaDeviceSynchronize()!=cudaSuccess||!device.finish())return false;}
+                return true;
+            };
+            struct PrefixAdapter {
+                decltype(sfx_prefix_base)* check;decltype(sfx_prefix_replay_piece)* run;decltype(sfx_prefix_checked_refill)* refill;
+            } sfx_prefix_adapter{&sfx_prefix_base,&sfx_prefix_replay_piece,&sfx_prefix_checked_refill};
+            strata::program::PrefixReplayCallbacks sfx_prefix_callbacks{&sfx_prefix_adapter,
+                [](void* p,const strata::program::PrefixReplayPlan& plan,std::string& e){return (*static_cast<PrefixAdapter*>(p)->check)(plan,e);},
+                [](void* p,const strata::program::PrefixReplayEvent& event,std::span<const int32_t> h,
+                   strata::program::PrefixReplayAbort abort,strata::program::PrefixReplayProgress& progress,std::string& e){
+                    return (*static_cast<PrefixAdapter*>(p)->run)(event,h,abort,progress,e);},
+                [](void* p,std::string& e){return (*static_cast<PrefixAdapter*>(p)->refill)(e);}};
+            auto sfx_prefix_view = [&](){return sfx_prefix_plan.active?
+                strata::program::PrefixReplayView{&sfx_prefix_plan,&sfx_prefix_callbacks,
+                    sfx_prefix_origin_replay?sfx_prefix_plan.request:0}:strata::program::PrefixReplayView{};};
+            int64_t sfx_prefix_lend_tokens=0,sfx_prefix_lend_exact=0;
+            bool sfx_prefix_first_piece=false,sfx_prefix_returned_before_lend=false;
+            uint64_t sfx_prefix_loan_cycles=0;
+#endif
             // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
             // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
             // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
@@ -17245,6 +24707,88 @@ int main(int argc, char** argv) {
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
             }();
             bool batch_fatal = false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // The request owns this paid known-prefix scratch across segments.
+            // Endpoints below are written ONLY by successful joined stage callbacks.
+            std::shared_ptr<const void> prefill_turn_credit;
+            std::vector<int32_t> prefill_turn_history;
+            std::shared_ptr<strata::program::ServingRawSession> prefill_turn_credit_main,prefill_joined_main;
+            strata::core::WindowKey prefill_joined_key{};
+            strata::core::StateDigest prefill_joined_history{};
+            uint64_t prefill_turn_max=0,prefill_joined_request=0;
+            bool prefill_turn_unavailable=false;
+            std::array<int64_t,64> prefill_joined_stage_end{};
+            prefill_joined_stage_end.fill(-1);
+            uint64_t prefill_joined_end=UINT64_MAX;
+            auto admit_prefill_turn_scratch=[&](const auto& main)->bool {
+                if(prefill_turn_credit)return prefill_turn_credit_main.get()==main.get()&&
+                    ids.size()==prefill_turn_max&&prefill_turn_history.capacity()>=prefill_turn_max;
+                const uint64_t requested_max=ids.size();
+                uint64_t bytes=sizeof(prefill_turn_history)+2*sizeof(strata::core::WindowKey);
+                const auto& key=main->key();
+                for(const auto* text:{&key.session_id,&key.thread_id,&key.window_id}){
+                    if(text->size()>(UINT64_MAX-bytes)/2)return false;
+                    bytes+=2*text->size();
+                }
+                if(requested_max>(UINT64_MAX-bytes)/sizeof(int32_t))return false;
+                bytes+=requested_max*sizeof(int32_t);
+                std::shared_ptr<const void> temporary;
+                if(auto admitted=main->admit_host(bytes,temporary);!admitted)return false;
+                if(!temporary||ids.size()!=requested_max)return false;
+                try{prefill_turn_history.reserve(size_t(requested_max));}catch(...){return false;}
+                prefill_turn_credit=std::move(temporary);prefill_turn_max=requested_max;prefill_turn_credit_main=main;
+                return true;
+            };
+            auto serving_prefill_safe_turn = [&](uint64_t endpoint,auto&& dispatch,std::string& e) -> bool {
+                prefill_turn_unavailable=false;
+                auto main=serving_raw_session;
+                if(!serving_threads||!main||!main->healthy()||
+                   !main->request_open()||main->phase()!=strata::program::ServingRawSession::Phase::running||
+                   stages.size()>=prefill_joined_stage_end.size()||stages.size()>=size_t(SplitDrive::kMax)||
+                   live_approximate||endpoint>ids.size()||serving_raw_cut==UINT64_MAX||serving_raw_cut<main->cut().id){
+                    e="prefill turn lacks its exact running MAIN owner";return false;}
+                if(prefill_joined_end!=endpoint||prefill_joined_main.get()!=main.get()||
+                   prefill_joined_request!=owned_admission_scope.request||prefill_joined_key!=main->key()){
+                    e="prefill turn has no authenticated joined endpoint for this MAIN/request";return false;}
+                for(size_t i=0;i<=stages.size();++i)if(prefill_joined_stage_end[i]!=int64_t(endpoint)){
+                    e="prefill turn stage endpoints disagree";return false;}
+                if(prefill_turn_credit&&(prefill_turn_credit_main.get()!=main.get()||ids.size()!=prefill_turn_max||
+                   prefill_turn_history.capacity()<prefill_turn_max)){
+                    e="prefill turn credited owner/history maximum changed";return false;}
+                if(!admit_prefill_turn_scratch(main)){prefill_turn_unavailable=true;return false;}
+                if(endpoint>prefill_turn_max||prefill_turn_history.capacity()<endpoint){
+                    e="prefill turn exceeds its credited immutable history maximum";return false;}
+                prefill_turn_history.clear();
+                for(size_t i=0;i<size_t(endpoint);++i)prefill_turn_history.push_back(int32_t(ids[i]));
+                const auto history=strata::core::window_history_digest(prefill_turn_history);
+                if(history!=prefill_joined_history){e="prefill turn actual joined history changed";return false;}
+                const auto prior=main->cut();
+                const auto owner=main->key();
+                const bool prior_fence=serving_raw_fence_running;
+                const bool prior_ordinary_fence=serving_ordinary_fence;
+                // Return ALL actual cache loans and complete original-map uploads;
+                // a CUDA join alone grants neither this cut nor a private turn.
+                if(!shared_prefix_refill(true,e))strata::core::retirement_failed("prefill turn strict loan return failed");
+                const strata::core::StateCut cut{serving_raw_cut+1,endpoint,endpoint,endpoint,prior.output_watermark,
+                    history};
+                if(!main->drain_work(true,cut,e)||!main->close_request(e))
+                    strata::core::retirement_failed("prefill turn MAIN common cut/close failed");
+                serving_raw_cut=cut.id;serving_raw_fence_running=false;
+                // Only the caller's restricted peer/repair_unit(false) dispatch
+                // is permitted here. It cannot capture/reset/restore MAIN scratch.
+                bool okay=false;
+                try{okay=dispatch();}catch(...){strata::core::retirement_failed("prefill turn dispatch exception retains MAIN owner");}
+                if(serving_raw_session.get()!=main.get()||!main->healthy()||main->key()!=owner||main->cut()!=cut||main->request_open()||
+                   main->phase()!=strata::program::ServingRawSession::Phase::drained||serving_raw_cut!=cut.id||
+                   serving_raw_fence_running||serving_ordinary_fence!=prior_ordinary_fence||
+                   prefill_turn_history.size()!=endpoint||strata::core::window_history_digest(prefill_turn_history)!=history)
+                    strata::core::retirement_failed("prefill turn changed preserved MAIN ownership/cut");
+                if(!main->open_request(e)||!main->begin_work(e))
+                    strata::core::retirement_failed("prefill turn MAIN reopen failed");
+                serving_raw_fence_running=prior_fence;
+                return okay;
+            };
+#endif
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
             int64_t yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
@@ -17301,6 +24845,16 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(serving_threads&&plan.chunk<=0){
+                    // Keep the ORIGINAL whole segment's flags even when pipe
+                    // planning is disabled. Repeated short run() calls must not
+                    // silently turn a multi-chunk segment into single_chunk.
+                    plan.chunk=std::max<int64_t>(1,sp.chunk());plan.from=a0;plan.to=b0;
+                    plan.single=b0-a0<=plan.chunk;plan.chunked=false;
+                    plan.pipe=strata::prefill::Prefill::pipe_setting();
+                }
+#endif
                 const bool planned = plan.chunk > 0;
                 const bool plan_single = planned && plan.single;
                 if (b0 - a0 > req_chunk_len) {
@@ -17308,6 +24862,19 @@ int main(int argc, char** argv) {
                     req_chunk = planned ? std::min(plan.chunk, b0 - a0) : std::min(sp.chunk(), b0 - a0);
                 }
                 seg_plan = plan;   // the checkpoints taken inside it keep it; cleared when the segment is done
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(serving_threads&&admit_slot>=0){const auto* owner=serving_threads->binding(size_t(admit_slot));
+                    if(owner&&owner->request==owned_admission_scope.request){
+                        const auto actual=sp.replay_activity();
+                        std::fprintf(stderr,"SCHED_PREFILL_PLAN v=1 engine=%llu slot=%d request=%012llx operation=%llu result=%llu configured_max=%lld allocated_max=%lld chunk=%lld ring=%lld auto_mode=%d auto_max=%lld from=%lld to=%lld planned=%d single=%d chunked=%d stages=%zu\n",
+                            (unsigned long long)serving_threads->engine(),admit_slot,(unsigned long long)(owner->request-1),
+                            (unsigned long long)owner->foreground.serial,(unsigned long long)owner->foreground.result_revision,
+                            (long long)o.prefill_chunk,(long long)actual.allocated_chunk,(long long)(planned?plan.chunk:actual.chunk),
+                            (long long)actual.ring_slots,int(o.prefill_auto),(long long)(o.prefill_auto?o.prefill_auto_max:0),
+                            (long long)a0,(long long)b0,int(planned),int(plan_single),int(plan.chunked),stages.size()+1);
+                    }
+                }
+#endif
                 struct SegPlanScope {
                     ConvCheckpoint::PromptPlan& p;
                     ~SegPlanScope() { p = {}; }
@@ -17374,22 +24941,286 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - tco).count());
                     return true;
                 };
-                bool conc_read = false;   // run_conc: the slots decode beside the read, so the share stays off for all of it
-                auto run = [&](int64_t q, int64_t r) -> bool {
+                bool managed_prefill = false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                managed_prefill = bool(serving_threads);
+#endif
+                bool conc_read = false;
+                auto run_piece = [&](int64_t q, int64_t r) -> bool {
+                    if(in_shared->input_error.load()){e="verified input closed";return false;}
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(sfx_prefix_recording&&uint64_t(q)<sfx_prefix_plan.boundary){int current=-1;
+                        if(cudaGetDevice(&current)!=cudaSuccess||current!=primary_device)
+                            strata::core::retirement_failed("actual qualified prefix prefill caller device drift");}
+#endif
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
-                    if (!conc_read) share_gate();   // STRATA_PREFILL_CPU_SHARE_BATCH: re-decided for every run (a piece beside decoding slots too)
-                    bool run_ok;
-                    if (!co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty()) {
-                        co_tried = true;
-                        run_ok = co_run(q, r, e);
-                    } else {
-                        run_ok = sp.run(ids.data() + q, r - q, q, e);
-                    }
-                    if (run_ok && q == 0 && sp.kva_floor() > 0) {   // KVA approximated the start of this prompt: remember which tokens
-                        kva_floors.note(ids.data(), sp.kva_floor());
+                    if (!conc_read) share_gate();
+                    bool ran;
+                    if (!managed_prefill && !co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty()) {
+                        co_tried = true; ran = co_run(q,r,e);
+                    } else ran=sp.run(ids.data() + q, r - q, q, e);
+                    if (ran && q == 0 && sp.kva_floor() > 0) {
+                        kva_floors.note(ids.data(),sp.kva_floor());
                         if (use_mtp && mtp.cell_floor_enabled()) mtp.set_cell_floor(sp.kva_floor());
                     }
-                    return run_ok;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(sfx_prefix_recording&&!sfx_prefix_replaying&&uint64_t(q)<sfx_prefix_plan.boundary){
+                        strata::program::PrefixReplayEvent event;event.kind=strata::program::PrefixReplayEvent::Kind::prefill;
+                        event.from=uint64_t(q);event.to=uint64_t(r);event.chunk=plan.chunk;
+                        event.planned=planned;event.single=plan_single;event.chunked=plan.chunked;
+                        event.lend=sfx_prefix_first_piece;event.lend_tokens=sfx_prefix_lend_tokens;event.lend_exact=sfx_prefix_lend_exact;
+                        event.returned_before_lend=sfx_prefix_returned_before_lend;
+                        event.loan_cycles=sfx_prefix_loan_cycles;
+                        if(!ran||sp.stopped_at()>=0)sfx_prefix_plan.reject("actual prefix prefill did not finish its recorded piece");
+                        else if(!sfx_prefix_plan.refused)sfx_prefix_plan.record(event);
+                        sfx_prefix_first_piece=false;sfx_prefix_returned_before_lend=false;sfx_prefix_loan_cycles=0;
+                    }
+#endif
+                    return ran;
+                };
+                auto run = [&](int64_t q,int64_t r) -> bool {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(serving_threads){
+                        // Each call returns through Prefill::run's real
+                        // drain_pipeline (including host joins) before reactor
+                        // control processing. No registry mutation on a stage
+                        // callback, worker or detached stdin thread.
+                        const int64_t quantum=planned?plan.chunk:std::max<int64_t>(1,sp.chunk());
+                        if(!serving_raw_session||(!serving_raw_fence_running&&!serving_ordinary_fence)||!serving_raw_session->request_open()||
+                           serving_raw_session->phase()!=strata::program::ServingRawSession::Phase::running){
+                            e="managed prefill requires its actual admitted RAW request fence";return false;}
+                        for(int64_t at=q;at<r;){
+                            if(!serving_process_controls()){e="scheduler control failed";return false;}
+                            if(!serving_raw_session->healthy()||!serving_raw_session->request_open()||
+                               serving_raw_session->phase()!=strata::program::ServingRawSession::Phase::running){
+                                e="managed prefill owner lost its actual running fence";return false;}
+                            {std::lock_guard<std::mutex> lock(in_mu);if(in_eof||in_shared->input_error.load()){
+                                stop_req.store(true);e="cancelled";return false;}}
+                            const auto* binding=serving_threads->binding(size_t(admit_slot));
+                            if(!binding||binding->request!=owned_admission_scope.request||
+                               !serving_threads->request_ready(size_t(admit_slot),binding->request)||stop_req.load()){
+                                stop_req.store(true);e="cancelled";return false;
+                            }
+                            strata::program::ServingThreadUnit current;
+                            current.slot=size_t(admit_slot);current.request=binding->request;current.operation=binding->foreground;
+                            current.unit=strata::core::AdmissionUnit::prefill;current.demand=current.resource_ready=true;
+                            current.class_weight=serving_repair_schedule.foreground_weight;
+                            strata::program::ServingRepairSelectionBoundary boundary;
+                            boundary.safe_boundary=true;boundary.max_candidates=3;
+                            boundary.foreground.context_room=true;
+                            boundary.foreground.current_request_generating=true;
+                            boundary.foreground_weight=serving_repair_schedule.foreground_weight;
+                            boundary.max_consecutive_escalated_units=serving_repair_schedule.max_consecutive;
+                            std::array<strata::program::ServingThreadUnit,3> candidates{};size_t count=1;candidates[0]=current;
+                            const bool can_turn=!live_approximate&&prefill_joined_end==uint64_t(at);
+                            auto collect=[&](bool repairs){
+                                count=1;candidates={};candidates[0]=current;
+                                const auto now=strata::program::serving_repair_clock_now(owned_runtime->remote_policy_incarnation);
+                                boundary.now_ns=now.ticks_ns;boundary.clock_domain=now.domain;
+                                boundary.consecutive_escalated_units=serving_repair_consecutive_escalated;
+                                for(size_t i=0;i<bs.size()&&i<2;++i){
+                                    if(i==size_t(admit_slot))continue;
+                                    const auto& lane=bs[i];const auto* peer=serving_threads->binding(i);
+                                    if(!peer||!peer->occupancy||!lane.owned_raw)continue;
+                                    if(peer->occupancy!=lane.owned_raw->slot_occupancy_incarnation())
+                                        strata::core::retirement_failed("prefill peer occupancy changed");
+                                    if(lane.active){auto& u=candidates[count++];u.slot=i;u.request=peer->request;
+                                        u.occupancy=peer->occupancy;u.operation=peer->foreground;u.unit=strata::core::AdmissionUnit::decode;
+                                        u.demand=true;u.resource_ready=lane.owned_raw->healthy()&&lane.owned_raw->request_open();
+                                        u.class_weight=serving_repair_schedule.foreground_weight;
+                                    }
+                                    if(repairs&&serving_repair_idle_unit&&lane.owned_repair&&(lane.active||lane.repair_finishing)){
+                                        const auto age=strata::program::ServingSuffixRepairOperation::repair_age(*lane.owned_repair,now);
+                                        auto& u=candidates[count++];u.slot=i;u.request=peer->request;u.occupancy=peer->occupancy;
+                                        u.operation=peer->repair;u.unit=strata::core::AdmissionUnit::repair;
+                                        u.demand=age.age.token_debt>0;u.resource_ready=age.valid&&lane.owned_raw->healthy();
+                                        u.class_weight=serving_repair_schedule.live_weight;
+                                        u.repair.work.demand=u.demand;u.repair.work.resource_ready=u.resource_ready;
+                                        u.repair.work.work_class=strata::core::DependencyWorkClass::live_repair;
+                                        u.repair.work.unit=strata::core::AdmissionUnit::repair;
+                                        u.repair.age=age.age;u.repair.observed_at_ns=now.ticks_ns;u.repair.clock_domain=now.domain;
+                                        u.repair.record_version=lane.owned_repair->published.cut.id;u.repair.ancestry_serial=age.ancestry_serial;
+                                    }
+                                }
+                            };
+                            collect(can_turn);
+                            bool competing=false;
+                            const auto* current_op=serving_threads->operation(current.operation);
+                            for(size_t i=1;current_op&&i<count;++i){const auto& u=candidates[i];const auto* op=serving_threads->operation(u.operation);
+                                if(!strata::program::ServingThreadBridge::runnable(op)||!u.demand||!u.resource_ready||
+                                   op->effective_priority<current_op->effective_priority)continue;
+                                if(u.unit==strata::core::AdmissionUnit::decode||
+                                   strata::program::serving_repair_selection_admission(serving_repair_schedule.policy,boundary,u.repair,true).admitted())
+                                    competing=true;
+                            }
+                            strata::program::ServingThreadSelection selected;
+                            auto turn_main=serving_raw_session;
+                            auto report_turn=[&](const char* phase){
+                                const auto& cut=turn_main->cut();const auto digest=strata::program::SuffixExperimentDriver::qualification_hex(cut.history);
+                                std::fprintf(stderr,"SCHED_PREFILL_TURN v=1 phase=%s engine=%llu slot=%d request=%012llx operation=%llu result=%llu window=%llu cut=%llu forwarded=%llu accepted=%llu watermark=%llu history=%s stages=%zu\n",
+                                    phase,(unsigned long long)serving_threads->engine(),admit_slot,(unsigned long long)(current.request-1),
+                                    (unsigned long long)current.operation.serial,(unsigned long long)current.operation.result_revision,
+                                    (unsigned long long)turn_main->key().window_generation,(unsigned long long)cut.id,
+                                    (unsigned long long)cut.forwarded,(unsigned long long)cut.accepted,
+                                    (unsigned long long)cut.output_watermark,digest.data(),stages.size()+1);
+                            };
+                            bool other_serviced=false,deferred_peer=false;
+                            auto choose_and_service=[&](bool restricted)->bool {
+                                if(!serving_process_controls()){e="scheduler control failed";return false;}
+                                {std::lock_guard<std::mutex> lock(in_mu);if(in_eof||in_shared->input_error.load()){
+                                    stop_req.store(true);e="terminal input before prefill turn";return false;}}
+                                if(stop_req.load()||!serving_threads->request_ready(size_t(admit_slot),current.request)){
+                                    stop_req.store(true);e="cancelled";return false;}
+                                collect(restricted);
+                                const auto time=serving_thread_now_ms();
+                                selected=serving_threads->select(serving_repair_schedule.policy,boundary,
+                                    std::span<const strata::program::ServingThreadUnit>(candidates.data(),count),time,0);
+                                if(selected.total_weight){const auto ticket=strata::program::serving_repair_uniform_ticket(serving_repair_random_state,selected.total_weight);
+                                    selected=serving_threads->select(serving_repair_schedule.policy,boundary,
+                                        std::span<const strata::program::ServingThreadUnit>(candidates.data(),count),time,ticket);}
+                                if(!selected.ready){stop_req.store(true);e="cancelled";return false;}
+                                if(selected.candidate==0)return true;
+                                const auto chosen=candidates[selected.candidate];other_serviced=true;
+                                if(chosen.unit==strata::core::AdmissionUnit::repair){
+                                    auto& lane=bs[chosen.slot];
+                                    if(!restricted||selected.admission.reason!=strata::program::RepairAdmissionReason::admitted_age_escalated||
+                                       !strata::program::ServingSuffixRepairOperation::private_cache_restored(*lane.owned_repair))
+                                        strata::core::retirement_failed("prefill private turn lacks aged entitlement/original cache map");
+                                    {std::lock_guard<std::mutex> lock(in_mu);if(in_eof||in_shared->input_error.load()){
+                                        stop_req.store(true);e="terminal input before private dispatch";return false;}}
+                                    if(!strata::program::ServingSuffixRepairOperation::repair_unit(*lane.owned_repair,false,e,serving_repair_idle_unit))
+                                        strata::core::retirement_failed("prefill private bounded unit failed");
+                                    const auto evidence=strata::program::ServingSuffixRepairOperation::owner_evidence(*lane.owned_repair);
+                                    if(!serving_threads->acknowledge_unit(selected,chosen,lane.owned_raw->slot_occupancy_incarnation(),evidence.private_cut().id))
+                                        strata::core::retirement_failed("prefill private actual cut acknowledgement failed");
+                                    std::fprintf(stderr,"SCHED_PREFILL_SERVICE v=1 kind=private engine=%llu request=%012llx main_window=%llu main_cut=%llu slot=%zu occupancy=%llu operation=%llu result=%llu graph=%llu native_cut=%llu original_map_equal=1 age_ns=%llu observed_ns=%llu clock_domain=%llu\n",
+                                        (unsigned long long)serving_threads->engine(),(unsigned long long)(current.request-1),
+                                        (unsigned long long)turn_main->key().window_generation,(unsigned long long)turn_main->cut().id,
+                                        chosen.slot,(unsigned long long)chosen.occupancy,(unsigned long long)chosen.operation.serial,
+                                        (unsigned long long)chosen.operation.result_revision,(unsigned long long)selected.graph_revision,
+                                        (unsigned long long)evidence.private_cut().id,
+                                        (unsigned long long)selected.admission.oldest_unresolved_inherited_age_ns.value_or(0),
+                                        (unsigned long long)chosen.repair.observed_at_ns,(unsigned long long)chosen.repair.clock_domain);
+                                    ++serving_repair_consecutive_escalated;return true;
+                                }
+                                const auto before=owned_runtime->batch_group_operation;
+                                serving_prefill_peer_winner=selected;
+                                const bool was_prompt=in_prompt_read;in_prompt_read=true;
+                                const bool peer_ran=batch_step(restricted,&deferred_peer);in_prompt_read=was_prompt;
+                                serving_prefill_peer_winner.reset();
+                                if(deferred_peer)return true;
+                                if(!peer_ran){e="peer foreground unit failed";return false;}
+                                if(owned_runtime->batch_group_operation>before){
+                                    serving_repair_consecutive_escalated=0;
+                                    std::fprintf(stderr,"SCHED_PREFILL_SERVICE v=1 kind=peer engine=%llu request=%012llx main_window=%llu main_cut=%llu slot=%zu occupancy=%llu operation=%llu result=%llu graph=%llu native_group=%llu\n",
+                                        (unsigned long long)serving_threads->engine(),(unsigned long long)(current.request-1),
+                                        (unsigned long long)turn_main->key().window_generation,(unsigned long long)turn_main->cut().id,
+                                        chosen.slot,(unsigned long long)chosen.occupancy,(unsigned long long)chosen.operation.serial,
+                                        (unsigned long long)chosen.operation.result_revision,(unsigned long long)selected.graph_revision,
+                                        (unsigned long long)owned_runtime->batch_group_operation);
+                                }
+                                return true;
+                            };
+                            if(can_turn&&competing){
+                                auto loan_digest=[&](){strata::core::WindowHasher hash;
+                                    for(const auto& p:pf_parts){const auto activity=p.sp->replay_activity();
+                                        hash.update(&p.first_now,sizeof(p.first_now));hash.update(&p.lent_chunk,sizeof(p.lent_chunk));
+                                        hash.update(&activity.chunk,sizeof(activity.chunk));hash.update(&activity.ring_slots,sizeof(activity.ring_slots));
+                                        for(const auto& pair:p.lent){hash.update(&pair.first,sizeof(pair.first));hash.update(&pair.second,sizeof(pair.second));}}
+                                    return hash.digest();};
+                                const auto original_loan=loan_digest();const int64_t original_lend=seg_lend;
+                                bool had_loan=false;for(const auto& p:pf_parts)had_loan=had_loan||!p.lent.empty();
+                                const bool turned=serving_prefill_safe_turn(uint64_t(at),[&](){
+                                    report_turn("closed");return choose_and_service(true);},e);
+                                if(!turned){
+                                    if(!prefill_turn_unavailable||!choose_and_service(false))return false;
+                                }else{
+                                report_turn("reopened");
+                                if(!shared_prefix_lend(b0-a0,e,original_lend,true,seg_lend)||loan_digest()!=original_loan)
+                                    strata::core::retirement_failed("prefill turn did not restore identical actual loan shape");
+                                if(had_loan&&sfx_prefix_recording&&uint64_t(at)<sfx_prefix_plan.boundary){
+                                    sfx_prefix_first_piece=true;sfx_prefix_returned_before_lend=true;
+                                    if(sfx_prefix_loan_cycles==UINT64_MAX)strata::core::retirement_failed("prefill loan cycle counter exhausted");
+                                    ++sfx_prefix_loan_cycles;
+                                    sfx_prefix_lend_tokens=b0-a0;sfx_prefix_lend_exact=original_lend;
+                                    if(!sfx_prefix_loans(true))strata::core::retirement_failed("prefill turn relend differs from qualified prefix");
+                                }
+                                const auto loan_hash=strata::program::SuffixExperimentDriver::qualification_hex(original_loan);
+                                std::fprintf(stderr,"SCHED_PREFILL_LOAN v=1 phase=relent engine=%llu slot=%d request=%012llx window=%llu cut=%llu endpoint=%lld had_loan=%d equal=1 digest=%s prefix_cycles=%llu\n",
+                                    (unsigned long long)serving_threads->engine(),admit_slot,(unsigned long long)(current.request-1),
+                                    (unsigned long long)turn_main->key().window_generation,(unsigned long long)turn_main->cut().id,
+                                    (long long)at,int(had_loan),loan_hash.data(),(unsigned long long)sfx_prefix_loan_cycles);
+                                if(deferred_peer){
+                                    const bool was_prompt=in_prompt_read;in_prompt_read=true;
+                                    const bool handled=batch_step();in_prompt_read=was_prompt;
+                                    if(!handled){e="deferred prefill peer control failed";return false;}
+                                }
+                                }
+                            }else if(!choose_and_service(false))return false;
+                            if(other_serviced)continue;
+                            const int64_t end=at+std::min<int64_t>(quantum,r-at);
+                            if(stages.size()>=64||stages.size()>=size_t(SplitDrive::kMax))
+                                strata::core::retirement_failed("prefill priority stage observation cap exceeded");
+                            std::array<int64_t,64> stage_forwarded{};stage_forwarded.fill(-1);
+                            using Callback=decltype(sp.on_stage_chunk);
+                            std::array<Callback,64> prior;
+                            size_t prepared=0;
+                            struct RestoreStageCallbacks {
+                                strata::prefill::Prefill& primary;std::vector<std::unique_ptr<GpuStage>>& stages;
+                                std::array<Callback,64>& prior;size_t& prepared;
+                                ~RestoreStageCallbacks(){for(size_t i=0;i<prepared;++i)
+                                    (i?stages[i-1]->sp:primary).on_stage_chunk=std::move(prior[i]);}
+                            } restore{sp,stages,prior,prepared};
+                            for(size_t i=0;i<=stages.size();++i){auto& stage=i?stages[i-1]->sp:sp;
+                                prior[i]=std::move(stage.on_stage_chunk);++prepared;
+                                stage.on_stage_chunk=[&,i](int64_t done,std::string& error){
+                                    if(prior[i]&&!prior[i](done,error))return false;
+                                    stage_forwarded[i]=done;return true;
+                                };
+                            }
+                            bool ran=false;
+                            try {ran=run_piece(at,end);}
+                            catch(...){strata::core::retirement_failed("managed prefill unit threw before joined completion");}
+                            for(size_t i=0;i<=stages.size();++i){strata::core::WindowDeviceScope device(i?stages[i-1]->dev:primary_device);
+                                if(!device.ok()||cudaDeviceSynchronize()!=cudaSuccess||!device.finish())
+                                    strata::core::retirement_failed("managed prefill stage completion uncertain");}
+                            if(!ran)return false;
+                            strata::program::ServingThreadPrefillBoundary proof;
+                            proof.source_window_generation=serving_raw_session->key().window_generation;
+                            proof.source_cut=serving_raw_session->cut().id;proof.from=uint64_t(at);proof.to=uint64_t(end);
+                            proof.request_fence_open=(serving_raw_fence_running||serving_ordinary_fence)&&serving_raw_session->request_open();
+                            proof.source_bootstrap=proof.source_cut==0&&serving_raw_cut==0&&serving_ordinary_fence&&serving_start_zeroed;
+                            proof.stage_forwarded=std::span<const int64_t>(stage_forwarded.data(),stages.size()+1);
+                            proof.pipeline_joined=true;proof.devices_drained=true;
+                            if(!serving_threads->acknowledge_prefill(selected,current,proof))
+                                strata::core::retirement_failed("managed prefill actual endpoint acknowledgement failed");
+                            // Bind the real joined observation only after its
+                            // successful executor ACK. Scratch refusal disables
+                            // optional turns, never the admitted foreground.
+                            prefill_joined_end=UINT64_MAX;prefill_joined_main.reset();
+                            auto joined_main=serving_raw_session;
+                            if(joined_main&&joined_main->healthy()&&admit_prefill_turn_scratch(joined_main)){
+                                if(uint64_t(end)>prefill_turn_max||prefill_turn_history.capacity()<size_t(end))
+                                    strata::core::retirement_failed("joined prefill exceeds its paid history maximum");
+                                prefill_turn_history.clear();
+                                for(size_t i=0;i<size_t(end);++i)prefill_turn_history.push_back(int32_t(ids[i]));
+                                try{
+                                    auto key=joined_main->key();
+                                    prefill_joined_history=strata::core::window_history_digest(prefill_turn_history);
+                                    prefill_joined_key=std::move(key);prefill_joined_request=owned_admission_scope.request;
+                                    prefill_joined_main=std::move(joined_main);
+                                    for(size_t i=0;i<=stages.size();++i)prefill_joined_stage_end[i]=stage_forwarded[i];
+                                    prefill_joined_end=uint64_t(end);
+                                }catch(...){prefill_joined_main.reset();prefill_joined_end=UINT64_MAX;}
+                            }
+                            serving_repair_consecutive_escalated=0;
+                            at=end;
+                            if(!serving_process_controls()){e="scheduler control failed";return false;}
+                        }
+                        return true;
+                    }
+#endif
+                    return run_piece(q,r);
                 };
                 // STRATA_BATCH_CONCURRENT_READ=1 (opt-in, one GPU, --batch with --no-prefill-borrow): the prompt is read on a
                 // thread of its own while this thread keeps the slots' batch windows going, so the decoding slots do not
@@ -17401,7 +25232,7 @@ int main(int argc, char** argv) {
                     return v != nullptr && std::atoi(v) != 0;
                 }();
                 auto run_conc = [&](int64_t q, int64_t r) -> bool {
-                    if (!conc1 || piped || !stages.empty() || o.batch <= 0 || !o.no_prefill_borrow || !batch_on() ||
+                    if (managed_prefill || !conc1 || piped || !stages.empty() || o.batch <= 0 || !o.no_prefill_borrow || !batch_on() ||
                         !req_imgs.empty() || kvg.on)
                         return run(q, r);
                     std::atomic<bool> done{false};
@@ -17692,8 +25523,15 @@ int main(int argc, char** argv) {
                         std::thread reader([&] {
                             conc_thread_cpus();
                             try {   // (an exception leaving a std::thread ends the process: a failed read instead)
-                                if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
-                                read_ok = sp.run(ids.data() + q0, b0 - q0, q0, read_err);
+                                // This threaded call bypasses the local run
+                                // adapter; apply the same terminal-input gate
+                                // before Prefill::run performs setup.
+                                if(in_shared->input_error.load()) {
+                                    read_ok=false;read_err="verified input closed";
+                                } else {
+                                    if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
+                                    read_ok = sp.run(ids.data() + q0, b0 - q0, q0, read_err);
+                                }
                             } catch (const std::exception& x) {
                                 read_ok = false;
                                 read_err = std::string("the prompt read failed: ") + x.what();
@@ -17718,19 +25556,21 @@ int main(int argc, char** argv) {
                         bool pump_ok = true;
                         size_t seen = 0;   // in_lines' length after the last look: a line that comes wakes the wait
                         while (!done.load(std::memory_order_acquire)) {
+                            if(in_shared->input_error.load())pump_ok=false;
                             const bool decoding = pump_ok && (batch_on() || pipe_inflight());
                             if (decoding) pump_ok = pump(true);
                             std::unique_lock<std::mutex> lk(in_mu);
-                            if (!decoding)   // nothing to pump: until the read ends or a line comes (both notify)
+                            if(in_shared->input_error.load())
+                                in_cv.wait_for(lk,std::chrono::milliseconds(2),[&]{return done.load(std::memory_order_acquire);});
+                            else if (!decoding)   // nothing to pump: until the read ends or a line comes (both notify)
                                 in_cv.wait_for(lk, std::chrono::milliseconds(2), [&] {
-                                    return done.load(std::memory_order_acquire) || in_lines.size() != seen;
+                                    return done.load(std::memory_order_acquire) || in_lines.size() != seen || in_shared->input_error.load();
                                 });
                             // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD ends the read at
                             // its next chunk
-                            for (auto it = in_lines.begin(); it != in_lines.end();) {
+                            for (auto it = in_lines.begin(); !in_shared->input_error.load() && it != in_lines.end();) {
                                 if (it->rfind("BSTOP ", 0) == 0) {
-                                    const int b = std::atoi(it->c_str() + 6);
-                                    if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                    accept_batch_stop(*it);
                                     it = in_lines.erase(it);
                                 } else if (it->rfind("BYIELD ", 0) == 0 && want_yield.load() < 0) {
                                     want_yield.store(std::atoi(it->c_str() + 7), std::memory_order_release);
@@ -17744,7 +25584,10 @@ int main(int argc, char** argv) {
                         reader.join();   // (a failed window leaves the read to finish: it is not stopped mid-run)
                         sp.stop_at_chunk = nullptr;
                         in_prompt_read = false;
-                        if (!pump_ok || !pipe_drain()) {
+                        // A terminal input error stops new groups, but must not
+                        // short-circuit retirement of groups already submitted.
+                        const bool prompt_drained=(pump_ok || in_shared->input_error.load()) && pipe_drain();
+                        if (!pump_ok || !prompt_drained) {
                             batch_fatal = true;
                             e = "a pipelined batch window failed";
                             return false;
@@ -17806,6 +25649,7 @@ int main(int argc, char** argv) {
                     in_prompt_read = true;
                     do {
                         if (!pump(true)) {
+                            (void)terminal_input();
                             in_prompt_read = false; batch_fatal = true; err = "a pipelined batch window failed";
                             return false;
                         }
@@ -17855,10 +25699,9 @@ int main(int argc, char** argv) {
                     int ys = -1;
                     {   // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD is for this read
                         std::lock_guard<std::mutex> lk(in_mu);
-                        for (auto it = in_lines.begin(); it != in_lines.end();) {
+                        for (auto it = in_lines.begin(); !in_shared->input_error.load() && it != in_lines.end();) {
                             if (it->rfind("BSTOP ", 0) == 0) {
-                                const int b = std::atoi(it->c_str() + 6);
-                                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                accept_batch_stop(*it);
                                 it = in_lines.erase(it);
                             } else if (it->rfind("BYIELD ", 0) == 0) {
                                 ys = std::atoi(it->c_str() + 7);
@@ -17888,6 +25731,11 @@ int main(int argc, char** argv) {
                                      std::chrono::duration<double, std::milli>(Clock::now() - td).count());
                         continue;
                     }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    // The next managed piece re-enters the joint quantum selector;
+                    // a new peer-only burst would omit the runnable current prefill.
+                    if(serving_threads)continue;
+#endif
                     if (decode_share <= 0.0 || !batch_on()) continue;
                     const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
@@ -17969,6 +25817,9 @@ int main(int argc, char** argv) {
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            bool retained_exact_cleanup_completed=false; // set only after actual exact finish/retirement/close
+#endif
             tr("prompt start", n - 1);
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
@@ -18037,6 +25888,123 @@ int main(int argc, char** argv) {
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
+            // The repaired path stops the read at the reuse boundary so the exact prefix endpoint can be captured
+            // there and the import+repair can run BEFORE any of the reused suffix is read again.  It is its own cut:
+            // a user pin is never repurposed, and no conversation checkpoint is claimed at it.
+            int64_t sfx_repair_at = -1;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            auto sfx_release_donor = [&]() {
+                // Safe to drop the operand only on a fence that is healthy and closed; anything else is the
+                // contract's failstop (destroying an uncertain fence terminates; the supervisor restores serving).
+                std::string close_error;
+                const bool settled = serving_raw_session != nullptr && serving_raw_session->healthy() &&
+                                     serving_raw_session->close_request(close_error);
+                if (!settled) {
+                    std::fflush(stderr);
+                    if (serving_raw_session != nullptr) serving_raw_session->abandon();
+                    serving_raw_session.reset();
+                } else {
+                    serving_donor = strata::core::BundleHandle{};
+                    serving_donor_cut = {};
+                }
+            };
+            auto sfx_resume_exact = [&](const std::shared_ptr<strata::program::ServingRawSession>& main,
+                                        const strata::core::StateCut& prefix_cut) {
+                if(!serving_threads){sfx_release_donor();return;}
+                // Refusal did not install a suffix. Continue the SAME admitted
+                // request from its genuinely joined exact prefix, without closing
+                // its request fence or bypassing managed prefill admission.
+                if(!main||serving_raw_session.get()!=main.get()||!main->healthy()||
+                   !main->request_open()||main->phase()!=strata::program::ServingRawSession::Phase::drained||
+                   main->cut()!=prefix_cut||prefix_cut.forwarded!=prefix_cut.accepted||
+                   prefix_cut.exact_frontier!=prefix_cut.forwarded||serving_raw_cut!=prefix_cut.id||
+                   serving_raw_fence_running||serving_ordinary_fence||serving_suffix_active)
+                    strata::core::retirement_failed("exact prefix refusal lost its admitted RAW owner/cut");
+                std::string begin_error;
+                if(!main->begin_work(begin_error))
+                    strata::core::retirement_failed("exact prefix refusal could not resume actual RAW work");
+                serving_ordinary_fence=true;
+                serving_start_certified_exact=true;
+                serving_donor=strata::core::BundleHandle{};serving_donor_cut={};
+            };
+            // Only after the synchronous prefill producer has returned. Discard
+            // the interrupted MAIN gang, never either independent occupied slot.
+            auto settle_owned_admission_cancel = [&]() -> bool {
+                if(!owned_batch_allocation||admit_slot<0||!stop_req.load()||
+                   !serving_raw_fence_running)return false;
+                std::string cancel_error;
+                if(!owned_runtime||!serving_raw_session||serving_raw_cut==UINT64_MAX||
+                   serving_suffix_active||cudaPeekAtLastError()!=cudaSuccess)
+                    strata::core::retirement_failed("owned admission cancellation lost healthy main authority");
+                const auto deadline=Clock::now()+std::chrono::seconds(10);
+                for(;;){
+                    const auto drained=ver.poll_snapshot_drain(cancel_error);
+                    if(drained==strata::core::Verifier::SnapshotDrain::drained)break;
+                    if(drained!=strata::core::Verifier::SnapshotDrain::pending||Clock::now()>=deadline)
+                        strata::core::retirement_failed("owned admission cancellation main drain failed");
+                    std::this_thread::yield();
+                }
+                if(!owned_runtime->reset_sessions(g,cancel_error))
+                    strata::core::retirement_failed("owned admission cancellation main reset failed");
+                const strata::core::StateCut empty{serving_raw_cut+1,0,0,0,0,
+                    strata::core::window_history_digest(std::vector<int32_t>{})};
+                if(!serving_raw_session->drain_work(true,empty,cancel_error)||
+                   !serving_raw_session->close_request(cancel_error))
+                    strata::core::retirement_failed("owned admission cancellation reset certificate failed");
+                ++serving_raw_cut;serving_raw_fence_running=false;
+                serving_session_discarded=true;serving_read_gave_way=true;
+                live_ok=false;live.clear();live_imgs.clear();checks.clear();live_approximate=false;
+                serving_pending_token=-1;serving_tracked_state.clear();serving_tracked_provenance={};
+                serving_donor={};serving_donor_cut={};serving_suffix_boundary=-1;sfx_repair_at=-1;
+                if(strata::program::http2_receipts_enabled()) {
+                    std::fprintf(stderr,"strata serve: suffix cache (retained): ORDINARY_RESET_CERTIFY req=%llu cut=%llu reason=owned admission cancellation settled\n",
+                        (unsigned long long)serving_request_ordinal,(unsigned long long)serving_raw_cut);
+                    std::fflush(stderr);
+                }
+                return true;
+            };
+            auto settle_current_admission_cancel = [&]() -> bool {
+                if(!owned_image_active)return settle_owned_admission_cancel();
+                if(!stop_req.load())return false;
+                if(!strata::program::OwnedImageRequestDriver::cancel(*serving_raw_session,err))std::terminate();
+                serving_raw_cut=serving_raw_session->cut().id;
+                serving_ordinary_fence=false;serving_raw_fence_running=false;owned_image_active=false;
+                serving_session_discarded=true;serving_read_gave_way=true;
+                live_ok=false;live.clear();live_imgs.clear();checks.clear();live_approximate=false;
+                serving_pending_token=-1;serving_tracked_state.clear();serving_tracked_provenance={};
+                auto& unused=bs[size_t(admit_slot)].owned_raw;
+                if(unused){if(unused->request_open()||!unused->retire_owned_slot(err))std::terminate();unused.reset();}
+                if(strata::program::http2_receipts_enabled()){
+                    std::fprintf(stderr,"strata serve: suffix cache (retained): ORDINARY_RESET_CERTIFY req=%llu cut=%llu reason=owned image admission cancellation settled\n",
+                        (unsigned long long)serving_request_ordinal,(unsigned long long)serving_raw_cut);std::fflush(stderr);
+                }
+                return true;
+            };
+            auto sfx_failstop_if_running = [&]() {
+                if (!serving_raw_fence_running) return;
+                std::fprintf(stderr, "strata serve: suffix cache (repaired): the fenced prefix read did not "
+                             "complete: an open RAW fence cannot be unwound, so this process fails stop\n");
+                std::fflush(stderr);
+                std::fflush(stdout);
+                if (serving_raw_session != nullptr) serving_raw_session->abandon();
+                serving_raw_session.reset();   // ~SuffixRawTransaction terminates: the established failstop
+            };
+            if (serving_suffix_boundary >= 0 && serving_donor && !serving_suffix_accepted.empty()) {
+                if (serving_suffix_boundary > read_from && serving_suffix_boundary < n - 1) {
+                    sfx_repair_at = serving_suffix_boundary;
+                    cuts.push_back(sfx_repair_at);
+                    std::sort(cuts.begin(), cuts.end());
+                } else {
+                    std::fprintf(stderr, "strata serve: suffix cache (repaired): the reuse boundary %lld is not "
+                                 "inside this read (resumed at %lld, prompt %lld): reading the prompt exactly\n",
+                                 (long long) serving_suffix_boundary, (long long) read_from, (long long) n);
+                    serving_suffix_boundary = -1;
+                    serving_suffix_frontiers.clear();
+                    serving_suffix_accepted.clear();
+                    sfx_release_donor();
+                }
+            }
+#endif
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
             // holds the last prompt token alone).  Only where every window row is the same in any window: a batch
@@ -18044,6 +26012,7 @@ int main(int argc, char** argv) {
             // and the serial loop with nothing else reading its windows
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
+                if(o.native_serial_serving||o.native_owned_batch_serving)return -1; // preserve single-token execution
                 if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
                 if (hist_n > 0 && !pen_prompt) return -1;   // #4590: the merged window's prompt rows would join the reply-only penalty window
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
@@ -18060,7 +26029,29 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(serving_suffix_active){
+                auto& resumed=*serving_suffix_active;
+                while(resumed.published.cut.forwarded+1<resumed.request_tokens.size()){
+                    if(stop_req.load()){cancelled=true;break;}
+                    if(!strata::program::ServingSuffixRepairOperation::forward_known(resumed,err))
+                        strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"activated request known tail failed");
+                }
+                at=int64_t(resumed.published.cut.forwarded);pp_reached=at;
+                serving_raw_cut=std::max(serving_raw_cut,resumed.next_cut);
+                std::fprintf(stderr,"strata serve: ACTIVATED_REQUEST_TAIL req=%llu known=%llu forwarded=%llu accepted=%llu\n",
+                    (unsigned long long)serving_request_ordinal,(unsigned long long)resumed.known_forwarded,
+                    (unsigned long long)resumed.published.cut.forwarded,(unsigned long long)resumed.published.cut.accepted);
+            }
+#endif
             for (const int64_t to : cuts) {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(owned_batch_allocation&&stop_req.load()){
+                    (void)settle_current_admission_cancel();
+                    cancelled=true;serving_read_gave_way=true;break;
+                }
+                if(serving_suffix_active)break; // retained controller already consumed its known request tail
+#endif
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
@@ -18072,16 +26063,33 @@ int main(int argc, char** argv) {
                 // another, and the loan decides which experts are read in place: bits)
                 const int64_t plan_lend = resume_plan.chunk > 0 && at == resume_plan_at && to == resume_plan_end
                                               ? resume_plan.lend : 0;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                const bool sfx_record_piece=sfx_prefix_recording&&serving_raw_fence_running&&at<sfx_repair_at;
+                if(sfx_record_piece&&!win&&!sfx_prefix_plan.refused){
+                    sfx_prefix_prepare();sfx_prefix_lend_tokens=to-at;sfx_prefix_lend_exact=plan_lend;sfx_prefix_first_piece=true;
+                }
+#endif
                 if (!win && !lend(to - at, err, plan_lend)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(sfx_record_piece&&!win&&!sfx_prefix_plan.refused&&!sfx_prefix_loans(true))
+                    sfx_prefix_plan.reject("actual prefix loan provenance differs");
+#endif
                 if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)
                 const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
                 const auto tsp = Clock::now();
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
                 if (sp_ok) pp_exact = true;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(sfx_record_piece&&win&&!sfx_prefix_plan.refused){
+                    strata::program::PrefixReplayEvent event;event.from=uint64_t(at);event.to=uint64_t(read_to);
+                    if(sp_ok)sfx_prefix_plan.record(event);
+                    else sfx_prefix_plan.reject("actual prefix window did not finish");
+                }
+#endif
                 if (trace) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
                     (win ? req_times.windows_ms : req_times.read_ms) += ms;
@@ -18093,6 +26101,9 @@ int main(int argc, char** argv) {
                     std::fflush(stderr);
                 }
                 if (!sp_ok && nf_hit) {   // #879: DONE nonfinite (the lent slots are refilled below)
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    serving_read_gave_way = true;   // slice 7: the state past the last whole row is not describable
+#endif
                     cancelled = true;
                     break;
                 }
@@ -18103,6 +26114,12 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
                 if (!sp_ok) {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(!batch_fatal && stop_req.load())(void)settle_current_admission_cancel();
+                    // A cancelled or failed segment leaves the session between two rows: with a fenced prefix read
+                    // in flight the transaction is uncertain, and the RAW contract's answer is the failstop.
+                    sfx_failstop_if_running();
+#endif
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
@@ -18115,6 +26132,9 @@ int main(int argc, char** argv) {
                         }
                         return 1;
                     }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    serving_read_gave_way = true;   // slice 7: stopped between rows: no cut describes this state
+#endif
                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
                     break;
                 }
@@ -18133,7 +26153,268 @@ int main(int argc, char** argv) {
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if (to == sfx_repair_at && serving_raw_fence_running) {
+                    std::string fence_error;
+                    const uint64_t boundary = uint64_t(to);
+                    const std::vector<int32_t> prefix_ids(ids.begin(), ids.begin() + (size_t) to);
+                    const strata::core::StateCut prefix_cut{
+                        serving_raw_cut + 1, boundary, boundary, boundary, 0,
+                        strata::core::window_history_digest(prefix_ids)};
+                    const auto prefix_main=serving_raw_session;
+                    strata::core::BundleHandle prefix;
+                    if (!serving_raw_session->drain_work(true, prefix_cut, fence_error)) {
+                        sfx_failstop_if_running();
+                        std::fprintf(stderr, "strata serve: suffix cache (repaired): prefix cut refused (%s): "
+                                     "%s\n", fence_error.c_str(),
+                                     serving_raw_fence_running ? "failing stop" : "no import for this request");
+                        if (serving_raw_fence_running) {
+                            std::fflush(stderr);
+                            if (serving_raw_session != nullptr) serving_raw_session->abandon();
+                            serving_raw_session.reset();
+                        } else sfx_release_donor();
+                        sfx_repair_at = -1;
+                        serving_suffix_boundary = -1;
+                    } else {
+                        ++serving_raw_cut;
+                        serving_raw_fence_running = false;
+                        if(sfx_prefix_recording){
+                            auto& plan=sfx_prefix_plan;
+                            if(sfx_qualification.durable_prefix){
+                                plan.origin_runtime_incarnation=owned_runtime->remote_policy_incarnation;
+                                plan.origin_residency_generation=ajob?uint64_t(a_swapped):uint64_t(adapt_nswaps);
+                                plan.origin_key=serving_raw_session->edited_key();
+                                plan.origin_binary=sfx_qualification.binary;plan.origin_source=sfx_qualification.source;
+                            }
+                            if(plan.active)if(const char* why=sfx_prefix_policy())plan.reject(why);
+                            if(sfx_qualification.durable_prefix && !plan.active)
+                                plan.reject("long activation origin requires actual recorded batched prefix");
+                            if(!plan.seal(prefix_ids)){
+                                std::fprintf(stderr,"strata serve: suffix cache (repaired): prefix schedule refused before install (%s); reading exactly\n",plan.reason?plan.reason:"unsealed prefix transcript");
+                                sfx_repair_at=-1;serving_suffix_boundary=-1;sfx_resume_exact(prefix_main,prefix_cut);continue;
+                            }
+                        }
+                        const auto prefix_metadata = strata::program::ServingRawSession::endpoint_metadata(
+                            serving_raw_session->edited_key(), prefix_cut, prefix_ids);
+                        if (auto got = serving_raw_session->capture(prefix_metadata, prefix); !got) {
+                            std::fprintf(stderr, "strata serve: suffix cache (repaired): prefix capture refused "
+                                         "(%s): reading the prompt exactly\n", got.detail.c_str());
+                            sfx_repair_at = -1;
+                            serving_suffix_boundary = -1;
+                            sfx_resume_exact(prefix_main,prefix_cut);
+                        } else {
+                            strata::program::ServingSuffixRepairOperation::Facts facts;
+                            facts.accepted = serving_suffix_accepted;
+                            facts.frontiers = serving_suffix_frontiers;
+                            facts.foreground_between = 0;
+                            facts.cut_id = serving_raw_cut + 1;
+                            facts.first_unresolved_unix_ms = (uint64_t) std::chrono::duration_cast<
+                                std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            facts.first_unresolved_birth = strata::program::serving_repair_clock_now(
+                                owned_runtime->remote_policy_incarnation);
+                            facts.retain_foreground=!strata::program::ServingSuffixRepairOperation::exact_first();
+                            if(facts.retain_foreground){
+                                facts.request_tokens=ids;
+                                facts.max_generated=uint64_t(max_new);
+                            }
+                            if(!refill(err)){
+                                strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"retained suffix execution cannot continue after failure");
+                            }
+                            if(sfx_prefix_plan.active&&!sfx_prefix_base(sfx_prefix_plan,err)){
+                                std::fprintf(stderr,"strata serve: suffix cache (repaired): prefix base refused before install (%s); reading exactly\n",err.c_str());
+                                sfx_repair_at=-1;serving_suffix_boundary=-1;sfx_resume_exact(prefix_main,prefix_cut);continue;
+                            }
+                            if(owned_batch_allocation&&admit_slot>=0){
+                                const size_t target=size_t(admit_slot);
+                                const bool admitted=admit_owned_repair_slot(target,serving_donor,prefix,facts,
+                                    ids,admit_max_new,req_sp,req_http_request,serving_request_ordinal,err);
+                                strata::core::StateCut reset;
+                                if(!strata::program::ServingSuffixRepairOperation::reset_main_after_slot_handoff(
+                                    *serving_raw_session,owned_runtime,reset,err))std::terminate();
+                                serving_raw_cut=std::max(serving_raw_cut,reset.id);serving_ordinary_fence=false;
+                                serving_raw_fence_running=false;serving_pending_token=-1;serving_tracked_state.clear();
+                                serving_tracked_provenance={};live_ok=false;live.clear();live_imgs.clear();checks.clear();live_approximate=false;
+                                serving_suffix_boundary=-1;sfx_repair_at=-1;
+                                const bool canceled=owned_admission_scope.finish_cancelled();
+                                if(!admitted||canceled){
+                                    auto& slot=bs[target];slot.active=false;
+                                    if(slot.owned_repair&&!strata::program::ServingSuffixRepairOperation::retire_slot_controller(
+                                        *slot.owned_raw,*slot.owned_repair,err))std::terminate();
+                                    slot.owned_repair.reset();
+                                    if(slot.owned_raw){
+                                        const auto retired_admission_cut=slot.owned_raw->cut();
+                                        const auto retired_admission_occupancy=slot.owned_raw->slot_occupancy_incarnation();
+                                        if(slot.owned_raw->request_open()&&!slot.owned_raw->close_request(err))std::terminate();
+                                        if(slot.owned_raw->healthy()&&!slot.owned_raw->retire_owned_slot(err))std::terminate();
+                                        slot.owned_raw.reset(); // release actual prealignment operands/credit only after proven retirement
+                                        if(slot.alignment_observed)strata::program::report_prealignment_abort(slot.http_request,target,
+                                            retired_admission_occupancy,slot.alignment_last_operation,canceled?"cancel":"refusal",slot.alignment_phase,retired_admission_cut);
+                                        slot.alignment_observed=false;
+                                    }
+                                    slot.alignment_unpublished=false;slot.alignment_request.reset();slot.alignment_request_credit.reset();
+                                    serving_release_thread_lane(target,true);
+                                }
+                                if(admitted&&!canceled){
+                                    auto& slot=bs[target];slot.http_request=req_http_request;slot.http_leg=serving_request_ordinal;
+                                    if(sfx_owned_slot_oracle){
+                                        if(!sfx_qualification.admitted||!sfx_qualification.owned_slot_oracle||!sfx_prefix_plan.sealed||sfx_prefix_plan.refused)
+                                            strata::core::retirement_failed("slot oracle origin was not genuinely sealed");
+                                        *sfx_owned_slot_oracle=std::move(sfx_qualification);
+                                        slot.owned_repair->owned_slot_qualification=std::move(sfx_owned_slot_oracle);
+                                    }
+                                    strata::program::report_http2_accept(slot.http_request,slot.http_leg,target,
+                                        slot.owned_raw->slot_occupancy_incarnation(),uint64_t(admit_max_new),ids,slot.owned_raw->cut());
+                                    slot.alignment_observed=false;
+                                    std::printf("BADM %d 1\n",admit_slot);std::fflush(stdout);
+                                }else{
+                                    if(!admitted&&!canceled)std::printf("ERR owned BGEN repair admission refused: %s\n",err.c_str());
+                                    std::printf("BADM %d 0\n",admit_slot);std::fflush(stdout);
+                                }
+                                goto owned_batch_request_done;
+                            }
+                            auto operation=std::make_unique<strata::program::ServingSuffixRepairOperation::Outcome>();
+                            auto& outcome=*operation;
+                            const auto result = strata::program::ServingSuffixRepairOperation::run(
+                                *serving_raw_session, owned_runtime, std::move(serving_donor), std::move(prefix), facts, outcome);
+                            const uint64_t installed = outcome.published.cut.forwarded;
+                            if (result && outcome.repaired && installed + 1 == serving_suffix_accepted.size() &&
+                                outcome.published.accepted_tokens.size() == serving_suffix_accepted.size()) {
+                                serving_raw_cut = std::max(serving_raw_cut, outcome.next_cut);
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                                if (!facts.retain_foreground && strata::program::SuffixExperimentDriver::serving_qualification_enabled()) {
+                                    // The private controller is retired. Drop obsolete payloads before their
+                                    // charges and before admitting the independent cold capture/restore peaks.
+                                    serving_donor = {};
+                                    prefix = {};
+                                    outcome.repaired_catchup = {};
+                                    outcome.splice = {};
+                                    outcome.splice_credit.reset();
+                                    if (!outcome.retired || !outcome.certified_exact || !refill(err)) {
+                                        std::fprintf(stderr, "strata serve: suffix cache (repaired): FAILSTOP "
+                                                     "qualification retirement/refill: %s\n", err.c_str());
+                                        serving_raw_session->abandon();
+                                        serving_raw_session.reset();
+                                    }
+                                    DriverSuffixExperimentContext qualification_context{o,g,owned_runtime,*model_budget,
+                                        sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                                    uint64_t oracle_next_cut = serving_raw_cut + 1;
+                                    const bool qualified = strata::program::SuffixExperimentDriver::qualify_serving_frontier(
+                                        qualification_context, run_serial_remote_unit, *serving_raw_session,
+                                        serving_request_ordinal, sfx_qualification, outcome.repaired_final,
+                                        oracle_next_cut, [&] { return stop_req.load(); },"certified_frontier","continuation",0
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                                        ,nullptr
+#endif
+                                        ,sfx_prefix_view());
+                                    serving_raw_cut = std::max(serving_raw_cut, oracle_next_cut);
+                                    if (!qualified) {
+                                        // The oracle restored a drained frontier, but a failed qualification is
+                                        // terminal for this campaign and cannot publish a successful import.
+                                        std::string close_error;
+                                        if (!serving_raw_session->close_request(close_error)) {
+                                            serving_raw_session->abandon();
+                                            serving_raw_session.reset();
+                                        }
+                                        std::fputs("strata serve: suffix cache (repaired): qualification failed\n", stderr);
+                                        return 2;
+                                    }
+                                }
+#endif
+                                at = int64_t(installed);        // the read continues from the installed endpoint
+                                resume = at;                    // what this prompt already has on the device
+                                serving_suffix_applied = true;
+                                live.assign(serving_suffix_accepted.begin(),
+                                            serving_suffix_accepted.begin() + (size_t) installed);
+                                live_imgs.clear();              // the shape gate admits no pictures at all
+                                live_approximate = !outcome.certified_exact;
+                                serving_pending_token = outcome.published.pending_tokens.front();
+                                std::fprintf(stderr, "strata serve: suffix cache (repaired): IMPORTED boundary=%llu "
+                                             "frontier=%llu installed_forwarded=%lld exact_certificate=%d "
+                                             "reused_suffix=%lld fresh_after=%lld cut=%llu\n",
+                                             (unsigned long long) boundary,
+                                             (unsigned long long) serving_suffix_frontiers.front(),
+                                             (long long) installed, (int) outcome.certified_exact,
+                                             (long long) (serving_donor_cut.forwarded - boundary),
+                                             (long long) (n - 1 - installed),
+                                             (unsigned long long) outcome.published.cut.id);
+                                std::fflush(stderr);
+                                sfx_repair_at = -1;
+                                serving_suffix_boundary = -1;
+                                serving_donor = strata::core::BundleHandle{};   // the donor's job is done
+                                serving_donor_cut = {};
+                                if(facts.retain_foreground){
+                                    serving_suffix_active=std::move(operation);
+#if defined(STRATA_SERVING_FAULT_QUALIFICATION_AVAILABLE)
+                                    if(serving_fault_qualification.target(serving_request_ordinal))
+                                        strata::program::ServingSuffixRepairOperation::arm_serving_fault(outcome,serving_fault_qualification.binding());
+#endif
+                                    pp_exact=false;
+                                    strata::program::ServingSuffixRepairOperation::progress(outcome,serving_request_ordinal,"import");
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                                    if(!serving_cancel_qualification.wait(
+                                        strata::program::ServingSuffixCancelQualification::Site::import,
+                                        strata::program::ServingSuffixRepairOperation::cancel_facts(outcome,serving_request_ordinal),
+                                        stop_req,in_shared->stop_sequence,in_shared->input_error,err))
+                                        strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,err.c_str());
+#endif
+                                    // Initial restore and controller own their immutable ancestry. No consumer needs
+                                    // the large temporary splice payload after its checked installation.
+                                    outcome.splice={};outcome.splice_credit.reset();prefix={};
+                                    while(outcome.published.cut.forwarded+1<uint64_t(ids.size())){
+                                        if(stop_req.load()){cancelled=true;break;}
+                                        if(!strata::program::ServingSuffixRepairOperation::forward_known(outcome,err)){
+                                            std::fprintf(stderr,"strata serve: suffix cache (repaired): FAILSTOP known continuation: %s\n",err.c_str());
+                                            strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"retained suffix execution cannot continue after failure");
+                                        }
+                                    }
+                                    at=int64_t(outcome.published.cut.forwarded);
+                                    pp_reached=at;
+                                }
+                                // The fence is drained and its operands are handled: close the REQUEST before the
+                                // ordinary remainder forwards, or the next request's open_request would refuse.
+                                std::string close_error;
+                                if (!facts.retain_foreground && !serving_raw_session->close_request(close_error)) {
+                                    std::fprintf(stderr, "strata serve: suffix cache (repaired): FAILSTOP closing "
+                                                 "the drained fence: %s\n", close_error.c_str());
+                                    std::fflush(stderr);
+                                    std::fflush(stdout);
+                                    serving_raw_session->abandon();
+                                    serving_raw_session.reset();
+                                }
+                            } else if (result.status == strata::program::SuffixRawStatus::poisoned ||
+                                       outcome.mutated) {
+                                std::fprintf(stderr, "strata serve: suffix cache (repaired): FAILSTOP after the "
+                                             "splice was installed: %s\n", result.detail.c_str());
+                                std::fflush(stderr);
+                                std::fflush(stdout);
+                                serving_raw_session->abandon();
+                                serving_raw_session.reset();   // terminates: never exact replay over that state
+                            } else {
+                                std::fprintf(stderr, "strata serve: suffix cache (repaired): refused before the "
+                                             "install (%s): reading the rest of the prompt exactly\n",
+                                             result.detail.c_str());
+                                sfx_repair_at = -1;
+                                serving_suffix_boundary = -1;
+                                sfx_release_donor();
+                            }
+                        }
+                    }
+                }
+#endif
             }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // A fence still open here (a break out of the read) is an unclosed work phase: the contract's answer is
+            // the failstop, never "clear the cache and keep serving".  A donor that never reached its boundary is
+            // released on a settled fence instead.
+            sfx_failstop_if_running();
+            if (serving_suffix_boundary >= 0) {
+                serving_suffix_boundary = -1;
+                serving_suffix_frontiers.clear();
+                serving_suffix_accepted.clear();
+                sfx_release_donor();
+            }
+#endif
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
@@ -18223,6 +26504,7 @@ int main(int argc, char** argv) {
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
+            int32_t last_sampled = -1;   // the window's last output: it is the NEXT x, so it is not in the session
             double keep_ms = 0;   // --draft auto: host time spent queueing the idle drafter's upkeep
             bool keep_pending = false;
             auto keep_sync = [&]() -> bool {   // the queued upkeep is done: the verifier may rewrite the taps / residual rows now
@@ -18265,6 +26547,12 @@ int main(int argc, char** argv) {
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
             pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
+            if(in_shared->owned_admission&&stop_req.load()){
+                cancelled=true;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                serving_read_gave_way=true; // discard MAIN before admitting any slot after cancellation
+#endif
+            }
             if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
             // Stage 0 (the first card) runs window K+1 while stage 1 verifies window K, on the guess that K is accepted
@@ -18539,8 +26827,11 @@ int main(int argc, char** argv) {
                     }
                 };
                 const Clock::time_point pl_t0 = Clock::now();
-                for (int st = 0; st < 2; ++st)
-                    for (int par = 0; par < 2; ++par) g_pl_diag.v[st][par] = PV[st][par];
+                {
+                    std::lock_guard<std::mutex> lock(g_pl_diag_pointers);
+                    for (int st = 0; st < 2; ++st)
+                        for (int par = 0; par < 2; ++par) g_pl_diag.v[st][par] = PV[st][par];
+                }
                 strata::core::diag_pipeline_fn().store(&pl_diag_print);
                 auto pw_bits = [](const PW& w) {
                     return (w.ready ? 1 : 0) | (w.launched ? 2 : 0) | (w.finished ? 4 : 0) | (w.com != 0 ? 8 : 0) |
@@ -18928,6 +27219,484 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            bool serving_suffix_exact_handoff=false;
+            if(serving_suffix_active){
+                pl_ran=true; // this owner's generation is the actual verifier work; never run the legacy loop too
+                auto& operation=*serving_suffix_active;
+                while(!cancelled && produced_n<max_new && operation.published.cut.forwarded<uint64_t(o.max_context)){
+                    if(stop_req.load()){finish="cancel";break;}
+                    int32_t token=-1;
+                    if(!strata::program::ServingSuffixRepairOperation::generate_one(operation,token,err)){
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): FAILSTOP retained generation: %s\n",err.c_str());
+                        strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"retained suffix execution cannot continue after failure");
+                    }
+                    last_sampled=token;++produced_n;++rounds;++dec_windows;++dec_T;
+                    std::printf("T %d\n",int(token));strata::core::progress_beat();std::fflush(stdout);
+                    if(produced_n==1&&strata::program::SuffixExperimentDriver::serving_qualification_enabled()){
+                        DriverSuffixExperimentContext qualification_context{o,g,owned_runtime,*model_budget,
+                            sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                        const auto receipt=strata::program::ServingSuffixRepairOperation::qualification_first_receipt(operation);
+                        strata::program::SuffixExperimentDriver::capture_serving_first_output(qualification_context,
+                            *serving_raw_session,serving_request_ordinal,sfx_qualification,operation.published,receipt);
+                    }
+                    if(produced_n==1)strata::program::ServingSuffixRepairOperation::progress(operation,serving_request_ordinal,"first_output");
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                    if(produced_n==1&&!serving_cancel_qualification.wait(
+                        strata::program::ServingSuffixCancelQualification::Site::first_output,
+                        strata::program::ServingSuffixRepairOperation::cancel_facts(operation,serving_request_ordinal),
+                        stop_req,in_shared->stop_sequence,in_shared->input_error,err))
+                        strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,err.c_str());
+#endif
+                    const bool eos=std::find(o.eos_ids.begin(),o.eos_ids.end(),int64_t(token))!=o.eos_ids.end();
+                    if(eos){finish="stop";break;}
+                    if(stop_req.load()){finish="cancel";break;}
+                    const uint64_t selection=operation.published.key.selection_epoch;
+                    bool repair_admitted=true; // absent owner-slot opt-in preserves the existing request path
+                    if(serving_repair_owners!=nullptr){
+                    // This receipt completed foreground work. Young/unknown repair must not delay the next
+                    // admitted token; only a freshly observed aged owner may compete at this coherent boundary.
+                    serving_repair_consecutive_escalated=0;
+                    const auto repair_now=strata::program::serving_repair_clock_now(owned_runtime->remote_policy_incarnation);
+                    const auto repair_age=strata::program::ServingSuffixRepairOperation::repair_age(operation,repair_now);
+                    strata::program::ServingRepairSelectionBoundary repair_boundary;
+                    repair_boundary.now_ns=repair_now.ticks_ns;repair_boundary.clock_domain=repair_now.domain;
+                    repair_boundary.safe_boundary=repair_age.valid;
+                    const auto repair_queue=serving_idle_queue_signal();
+                    repair_boundary.terminal_input=repair_queue.stop_requested || repair_queue.input_error || repair_queue.end_of_input;
+                    repair_boundary.other_lane_work=(piped && pipe_inflight()) || batch_on();
+                    repair_boundary.foreground.current_request_generating=produced_n<max_new;
+                    repair_boundary.foreground.queued_input_lines=repair_queue.queued_input_lines;
+                    repair_boundary.foreground.context_room=operation.published.cut.forwarded<uint64_t(o.max_context);
+                    repair_boundary.max_candidates=1;
+                    repair_boundary.foreground_weight=serving_repair_schedule.enabled?serving_repair_schedule.foreground_weight:1;
+                    repair_boundary.max_consecutive_escalated_units=serving_repair_schedule.max_consecutive;
+                    strata::program::ServingRepairSelectionCandidate repair_candidate;
+                    repair_candidate.work.demand=repair_age.age.token_debt>0;
+                    repair_candidate.work.resource_ready=repair_age.valid;
+                    repair_candidate.weight=serving_repair_schedule.enabled?serving_repair_schedule.live_weight:1;
+                    repair_candidate.age=repair_age.age;repair_candidate.observed_at_ns=repair_now.ticks_ns;
+                    repair_candidate.clock_domain=repair_now.domain;repair_candidate.record_version=operation.published.cut.id;
+                    repair_candidate.ancestry_serial=repair_age.ancestry_serial;
+                    const auto repair_selected=serving_select_repair(repair_boundary,
+                        std::span<const strata::program::ServingRepairSelectionCandidate>(&repair_candidate,1),"active");
+                    repair_admitted=repair_selected.status==strata::program::ServingRepairSelectionStatus::ready &&
+                        !repair_selected.foreground;
+                    }
+                    if(repair_admitted &&
+                       !strata::program::ServingSuffixRepairOperation::repair_unit(operation,true,err)){
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): FAILSTOP retained repair unit: %s\n",err.c_str());
+                        strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"retained suffix execution cannot continue after failure");
+                    }
+                    if(selection!=operation.published.key.selection_epoch)
+                        strata::program::ServingSuffixRepairOperation::progress(operation,serving_request_ordinal,"attachment");
+                    // The actual CURRENT cut is now caught, possibly before max_new. Freeze here, publish and
+                    // retire through the same exact path below, then resume only from its certified pending.
+                    if(strata::program::ServingSuffixRepairOperation::exact_ready(operation))break;
+                }
+                // A handoff is only coherent when the ordinary loop could actually keep generating: output still
+                // admitted, room below the context limit, and the frozen single-token profile the retained request
+                // already runs under (no MTP chain, no suffix/lookup draft, no merged first window). Otherwise the
+                // existing retire-and-close path is taken unchanged.
+                const bool live_handoff_requested=!cancelled&&!stop_req.load()&&produced_n<max_new&&
+                    std::strcmp(finish,"length")==0&&operation.published.cut.forwarded<uint64_t(o.max_context)&&
+                    !use_mtp&&o.suffix_draft<=0&&o.lookup_chain<=0&&
+                    strata::program::ServingSuffixRepairOperation::exact_ready(operation);
+                // ---- OPT-IN (STRATA_SERVING_REPAIR_OWNER_SLOTS): the certified yield at RESPONSE COMPLETION ----
+                // (slice 3, D1).  Today the only coherent way to release the foreground slot is exact_ready (zero
+                // debt): the drain below loops until the private checkpoint catches the published cut, then
+                // finish() publishes the exact CURRENT state and retires.  Once the response HAS produced
+                // everything it asked for (the length limit) or ended at a stop token, and the selector is present,
+                // the yield instead certifies the controller's OWN private cut (the one its committed all-stage
+                // witness covers), captures that state as a real frozen image, and parks the LIVE unretired owner
+                // under its WindowKey so the next conversation runs without this owner's drain.  Generation is
+                // never ended early: this sits after the token loop and is an ALTERNATIVE to the drain below, not
+                // a truncation.  Slice 2 gated it on produced_n<max_new and live context room - a conjunction no
+                // loop exit can satisfy, so a one-token response always drained (SLICE2-DEFECTS-CONFIRMED D1).
+                // The predicate is now the shared production gate in serving_repair_owners.hpp, built here from
+                // these same locals, so the CPU reachability cell drives the rule the server runs.  A response
+                // that stopped for another reason (the context limit) keeps today's drain path.  Slice 4 (D3)
+                // removed the blanket exclusion of the qualification arm: a yield there is admitted only once the
+                // dedicated retained-yield oracle is admitted, and it stands only if that oracle compares the
+                // certified private cut against an independent clean recomputation with zero mismatches.  A
+                // refused yield mutates nothing, and the
+                // drain below then runs exactly as it does today.
+                bool serving_retained_yield=false;
+                strata::program::ServingYieldGateFacts yield_facts;
+                yield_facts.registry_present=serving_repair_owners!=nullptr;
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                // Numerical activation qualification must reach the existing full exact finish below.
+                // Normal requests keep repeated-yield policy; this explicit oracle work is not latency evidence.
+                const bool force_activation_final_oracle=serving_activation_selected && !activation_hooks.refuse_after_publication_restore;
+#else
+                constexpr bool force_activation_final_oracle=false;
+#endif
+                if(force_activation_final_oracle)
+                    std::fputs("strata serve: activation final oracle requires exact finish; qualification overhead included\n",stderr);
+                yield_facts.cancelled=cancelled;
+                yield_facts.stop_requested=stop_req.load();
+                yield_facts.produced_tokens=uint64_t(produced_n);
+                yield_facts.max_new_tokens=uint64_t(max_new);
+                yield_facts.ended_at_length_limit=std::strcmp(finish,"length")==0;
+                yield_facts.ended_at_stop_token=std::strcmp(finish,"stop")==0;
+                yield_facts.mtp_chain_active=use_mtp;
+                yield_facts.suffix_draft=o.suffix_draft>0;
+                yield_facts.lookup_chain=o.lookup_chain>0;
+                yield_facts.qualification_arm=strata::program::SuffixExperimentDriver::serving_qualification_enabled();
+                yield_facts.debt_open=!strata::program::ServingSuffixRepairOperation::exact_ready(operation);
+                // ---- slice 5 (requirement 4): admit the capacity BEFORE the yield/DONE decision ----
+                // A retained owner is only worth parking if it can later be published and activated, so its slot
+                // AND the concrete resources that activation will need (the frozen image, the capture of the live
+                // session's prior conversation state, and the restore) are reserved here, before the gate consults
+                // them. The charges come from the REAL ledger: `WindowBudget::reserve` over the serving session's
+                // own budget, parented by the private gang's own `private_work` lease that the controller reports
+                // through the operation's trusted friend boundary (`ServingSuffixRepairOperation::retained_charge`;
+                // `ResidentRepairController::retained_charge` itself stays private), and their purposes are read
+                // back from the leases. The quote is the
+                // transaction's own per-copy payload cap (`max_payload_bytes`), i.e. a bound, not a measurement.
+                // With no registry (the selector absent) nothing is admitted and the path stays byte-identical.
+                strata::program::RetainedCapacityTicket serving_retained_ticket;
+                strata::program::RetainedActivationResources serving_retained_resources;
+                if(serving_repair_owners!=nullptr&&!force_activation_final_oracle){
+                    std::string reserve_error;
+                    const uint64_t activation_quote=serving_raw_session->max_payload_bytes();
+                    // Dimension device_bytes to match the budget's stage count (capture is host-memory
+                    // but the ledger requires per-device entries, even if zero-valued).
+                    const auto budget_snap = serving_raw_session->budget().snapshot();
+                    const size_t n_devices = budget_snap.capacity.device_bytes.size();
+                    strata::core::WindowResources charge;
+                    charge.host_bytes = activation_quote;
+                    charge.device_bytes.resize(n_devices, 0);  // host-side capture: zero per-device
+                    std::shared_ptr<const strata::core::ReservationLease> gang_lease;
+                    std::string lease_error;
+                    if(!operation.controller||
+                       !strata::program::ServingSuffixRepairOperation::retained_charge(
+                            operation,gang_lease,lease_error))
+                        reserve_error=lease_error.empty()?"the private gang reports no reservation to parent":
+                                                          lease_error;
+                    else {
+                        auto pin=[&](strata::core::ReservationPurpose purpose,
+                                     std::shared_ptr<const void>& credit,strata::core::ReservationPurpose& read_back,
+                                     uint64_t& quoted,const char*what)->bool{
+                            // foreground_return: null parent, requires a WindowReturnObligation.
+                            // private_attachment: requires gang_lease as parent.
+                            std::shared_ptr<const strata::core::ReservationLease> parent;
+                            strata::core::WindowReturnObligation obligation;
+                            const strata::core::WindowReturnObligation* obl = nullptr;
+                            if(purpose == strata::core::ReservationPurpose::foreground_return) {
+                                obligation.identity = "retained-activation-foreground-return";
+                                obligation.required = charge;  // must be covered by the charge
+                                obl = &obligation;
+                            } else {
+                                parent = gang_lease;
+                            }
+                            const auto lease=serving_raw_session->budget().reserve(charge,purpose,parent,obl);
+                            if(!lease||!lease.lease){
+                                reserve_error=std::string(what)+" ledger admission refused";
+                                std::fprintf(stderr, "strata serve: suffix cache (repaired): retained capacity "
+                                             "reservation detail: what=%s purpose=%d error=%d charge_host=%llu "
+                                             "charge_devices=%zu cap_host=%llu baseline_host=%llu reserved_host=%llu\n",
+                                             what, static_cast<int>(purpose),
+                                             static_cast<int>(lease.error),
+                                             (unsigned long long)charge.host_bytes,
+                                             charge.device_bytes.size(),
+                                             (unsigned long long)budget_snap.capacity.host_bytes,
+                                             (unsigned long long)budget_snap.baseline.host_bytes,
+                                             (unsigned long long)budget_snap.reserved.host_bytes);
+                                return false;}
+                            read_back=lease.lease->purpose();
+                            credit=std::shared_ptr<const void>(lease.lease);
+                            quoted=activation_quote;
+                            return true;
+                        };
+                        if(!pin(strata::core::ReservationPurpose::private_attachment,
+                                serving_retained_resources.image_charge,
+                                serving_retained_resources.image_purpose,serving_retained_resources.image_bytes,
+                                "retained image")||
+                           !pin(strata::core::ReservationPurpose::foreground_return,
+                                serving_retained_resources.prior_capture_charge,
+                                serving_retained_resources.prior_capture_purpose,
+                                serving_retained_resources.prior_capture_bytes,"prior conversation capture")||
+                           !pin(strata::core::ReservationPurpose::private_attachment,
+                                serving_retained_resources.restore_charge,
+                                serving_retained_resources.restore_purpose,serving_retained_resources.restore_bytes,
+                                "activation restore"))
+                            serving_retained_resources=strata::program::RetainedActivationResources{};
+                        else if(!serving_repair_owners->reserve_retained_capacity(operation.published.key,
+                                              serving_retained_resources,serving_retained_ticket,reserve_error)){
+                            serving_retained_resources=strata::program::RetainedActivationResources{};
+                            // The three pins above die with this scope: a refused reservation charges nothing.
+                        }
+                    }
+                    yield_facts.activation_capacity_reserved=serving_retained_ticket.issued();
+                    if(!reserve_error.empty())
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): retained activation capacity "
+                                     "refused (%s): this response will not yield\n",reserve_error.c_str());
+                }
+                // ---- D3: the yield's OWN oracle, in the order the contract requires ----
+                // (a) the registry selector, unchanged and first; (b) the retained-yield oracle, admitted only
+                // for a request the gate otherwise admits, so with the selector absent nothing is admitted and
+                // today's path stays byte-identical; (c) every other conjunct unchanged. In the strict-qualification
+                // arm `refused_qualification_arm` now means "this yield would be uncertified": it is refused until
+                // the dedicated comparator is admitted, and the comparator's verdict (below) is what lets the
+                // yield stand. An uncertified yield remains possible only in an arm that never runs the strict
+                // oracle and pins no source manifest, and the harness's yield cell refuses such a transcript.
+                if(!force_activation_final_oracle){
+                auto yield_refusal=strata::program::serving_certified_yield_gate(yield_facts);
+                DriverSuffixExperimentContext yield_oracle_context{o,g,owned_runtime,*model_budget,
+                    sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                if(yield_refusal==strata::program::ServingYieldRefusal::none||
+                   yield_refusal==strata::program::ServingYieldRefusal::refused_qualification_arm) {
+                    std::string yield_admission_error;
+                    if(strata::program::SuffixExperimentDriver::admit_serving_yield_oracle(
+                           yield_oracle_context,*serving_raw_session,sfx_yield_oracle,yield_admission_error)) {
+                        yield_facts.yield_oracle_admitted=sfx_yield_oracle.yield_oracle;
+                        yield_refusal=strata::program::serving_certified_yield_gate(yield_facts);
+                    } else
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): retained-yield oracle refused "
+                                     "admission (%s)\n",yield_admission_error.c_str());
+                }
+                if(yield_refusal!=strata::program::ServingYieldRefusal::none&&
+                   serving_retained_ticket.issued()&&serving_repair_owners!=nullptr){
+                    // The yield was refused after the capacity was admitted: give the slot and the three pins back
+                    // so a later response can use them, then take today's drain path unchanged.
+                    std::string release_error;
+                    serving_repair_owners->release_retained_capacity(serving_retained_ticket,release_error);
+                    serving_retained_ticket=strata::program::RetainedCapacityTicket{};
+                    serving_retained_resources=strata::program::RetainedActivationResources{};
+                }
+                if(yield_refusal==strata::program::ServingYieldRefusal::none){
+                    std::string yield_error;
+                    // Slice 6: the image an activation must restore onto the live transaction is the publication
+                    // cut the session stands on RIGHT NOW (the controller's own pre-mutation boundary insists
+                    // `live_.cut_ == published_->metadata.cut`). Capture it here, inside the open request fence at
+                    // the drained cut, and BEFORE `yield_retained` suspends the controller: a refused capture is a
+                    // clean pre-mutation refusal, so this response takes today's drain path unchanged and no owner
+                    // is parked that could never be activated.
+                    strata::core::BundleHandle publication_image;
+                    const auto publication_capture =
+                        serving_raw_session->capture(operation.published, publication_image);
+                    if(!publication_capture){
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): retained yield refused before "
+                                     "it was taken: no publication image to restore at activation (%s)\n",
+                                     publication_capture.detail.c_str());
+                        if(serving_retained_ticket.issued()&&serving_repair_owners!=nullptr){
+                            std::string release_error;
+                            serving_repair_owners->release_retained_capacity(serving_retained_ticket,
+                                                                             release_error);
+                            serving_retained_ticket=strata::program::RetainedCapacityTicket{};
+                            serving_retained_resources=strata::program::RetainedActivationResources{};
+                        }
+                    }
+                    else if(strata::program::ServingSuffixRepairOperation::yield_retained(operation,yield_error)){
+                        operation.retained_publication=std::move(publication_image);
+                        serving_retained_yield=true;
+                        serving_retained_identity=operation.published.key;
+                        operation.retained_residency_swaps=ajob?uint64_t(a_swapped):uint64_t(adapt_nswaps);
+                        strata::program::ServingSuffixRepairOperation::progress(operation,serving_request_ordinal,
+                            strata::program::kServingYieldProgressPhase,true);
+                        // The certificate for the cut just yielded and reported: compare the retained all-stage
+                        // image at the controller's private cut against an independent clean recomputation of the
+                        // same accepted history, in the same session, under the still-open request fence. The pair
+                        // and its restoration are emitted in the order the harness gate requires, and the live
+                        // session is left standing on its own CURRENT cut. A comparison that does not come out
+                        // clean resumes this owner and takes today's drain path unchanged: the debt stays, the
+                        // owner stays unsuspended, and nothing is marked exact.
+                        if(sfx_yield_oracle.yield_oracle){
+                            strata::program::ServingYieldRecordFacts yield_records;
+                            uint64_t yield_oracle_next_cut=serving_raw_cut+1;
+                            strata::program::SuffixExperimentDriver::qualify_serving_yield_frontier(
+                                yield_oracle_context,run_serial_remote_unit,*serving_raw_session,
+                                serving_request_ordinal,sfx_yield_oracle,operation.retained_exact,
+                                operation.published,yield_oracle_next_cut,[&]{return stop_req.load();},
+                                yield_records,sfx_prefix_view());
+                            serving_raw_cut=std::max(serving_raw_cut,yield_oracle_next_cut);
+                            const auto yield_record_decision=
+                                strata::program::serving_yield_record_decision(yield_records);
+                            if(yield_record_decision!=strata::program::ServingYieldRecordRefusal::none){
+                                // REVIEW CONSTRAINT 3: no recovery here. The comparison already ran, so the
+                                // established failstop/poison semantics apply exactly as they do for the strict
+                                // final_*/live_* oracle (whose internal failures and failed verdicts end the
+                                // request); the admissibility decision was taken BEFORE any of this mutated the
+                                // session or the controller. There is deliberately no resume-and-drain path.
+                                std::fprintf(stderr,"strata serve: suffix cache (repaired): retained-yield oracle "
+                                             "%s (published_cut=%llu private_cut=%llu debt=%llu): failstop, a "
+                                             "comparison that already ran is not recoverable\n",
+                                             strata::program::serving_yield_record_refusal_name(yield_record_decision),
+                                             (unsigned long long)yield_records.published_cut,
+                                             (unsigned long long)yield_records.certified_cut,
+                                             (unsigned long long)strata::program::serving_yield_record_debt(
+                                                 yield_records));
+                                strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,
+                                    "retained-yield oracle refused the certified private cut after the comparison");
+                            }
+                        }
+                    }else
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): certified yield refused (%s): "
+                                     "draining per today's path\n",yield_error.c_str());
+                }
+                } // qualification-only final oracle bypasses yield selection/admission, not factual observations
+                if(serving_retained_yield){
+                    // The response completes on the state the session actually stands on.  Nothing here claims the
+                    // debt was exact: pp_exact stays false, live_approximate stays true, and the exact-continuation
+                    // path cannot see this outcome (exact_continuation_metadata requires out.controller==null).
+                    std::string close_error;
+                    if(!serving_raw_session->close_request(close_error)){
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): FAILSTOP closing retained-yield request: %s\n",close_error.c_str());
+                        strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"retained yield cannot continue after a refused request close");
+                    }
+                    const auto& yielded=operation.published;
+                    pp_exact=false;pp_reached=int64_t(yielded.cut.forwarded);
+                    consumed.assign(yielded.accepted_tokens.begin(),yielded.accepted_tokens.begin()+std::ptrdiff_t(yielded.cut.forwarded));
+                    last_sampled=yielded.pending_tokens.front();p=int64_t(yielded.cut.forwarded);
+                    live_approximate=true;
+                    if(sfx_qualification.durable_prefix){
+                        if(!strata::program::retain_recorded_prefix_origin(sfx_qualification.durable_prefix,sfx_prefix_plan,
+                            operation.published.accepted_tokens,serving_request_ordinal,operation.published.cut.forwarded,
+                            operation.published.key,owned_runtime->remote_policy_incarnation,operation.retained_residency_swaps))
+                            strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,
+                                "durable origin prefix differs before park");
+                        operation.retained_prefix=std::move(sfx_qualification.durable_prefix);
+                        const auto schedule=strata::program::SuffixExperimentDriver::qualification_hex(operation.retained_prefix->digest);
+                        std::fprintf(stderr,"suffix_activation_prefix_origin req=%llu boundary=%llu schedule=%s retained=1\n",
+                            (unsigned long long)operation.retained_prefix->request,
+                            (unsigned long long)operation.retained_prefix->boundary,schedule.data());
+                    }
+                    strata::program::ParkOwnerFacts park;
+                    park.owner=strata::program::ServingSuffixRepairOperation::owner_evidence(operation);
+                    park.session=strata::program::ServingSuffixRepairOperation::live_session_facts(*serving_raw_session);
+                    park.session.residency_generation=operation.retained_residency_swaps;
+                    park.capacity=serving_retained_ticket;
+                    park.resources=serving_retained_resources;
+                    if(!serving_repair_owners->park_retained_owner(*serving_retained_identity,serving_suffix_active,
+                                                                  park,serving_repair_owner_error)){
+                        // A refusal is never a silent drop and never a drain deferred into the next request: the
+                        // controller is retired deliberately here, and a refused retirement is the deliberate
+                        // failstop (the alternative is the terminal controller destructor).
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): retained owner registry refused "
+                                     "the parked owner (%s): retiring it deliberately\n",
+                                     serving_repair_owner_error.c_str());
+                        std::string retire_error;
+                        if(!strata::program::ServingSuffixRepairOperation::RetainRetire{}(operation,retire_error))
+                            strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,
+                                "retained repair owner could not be retired after a refused retention");
+                        serving_retained_identity.reset();  // retired, not lost: the scope guard must stay inert
+                        std::string release_error;          // the capacity was never consumed: give it back
+                        serving_repair_owners->release_retained_capacity(serving_retained_ticket,release_error);
+                    }
+                    serving_suffix_active.reset();   // a no-op once the registry moved the payload out
+                }else{
+                    // Freeze the actual accepted sequence, including immutable emitted picks. Every call advances at
+                    // most four exact tokens; STOP never causes extra sampling or drops an already committed receipt.
+                    while(!strata::program::ServingSuffixRepairOperation::exact_ready(operation)){
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                        const auto private_before=strata::program::ServingSuffixRepairOperation::cancel_facts(
+                            operation,serving_request_ordinal).private_after;
+#endif
+                        if(!strata::program::ServingSuffixRepairOperation::repair_unit(operation,false,err)){
+                            std::fprintf(stderr,"strata serve: suffix cache (repaired): FAILSTOP final repair unit: %s\n",err.c_str());
+                            strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"retained suffix execution cannot continue after failure");
+                        }
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                        if(!serving_cancel_qualification.witness(serving_request_ordinal)&&
+                           !serving_cancel_qualification.wait(
+                            strata::program::ServingSuffixCancelQualification::Site::private_unit,
+                            strata::program::ServingSuffixRepairOperation::cancel_facts(operation,serving_request_ordinal,private_before),
+                            stop_req,in_shared->stop_sequence,in_shared->input_error,err))
+                            strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,err.c_str());
+#endif
+                    }
+                    if(!strata::program::ServingSuffixRepairOperation::finish(*serving_raw_session,operation,err)){
+                        std::fprintf(stderr,"strata serve: suffix cache (repaired): FAILSTOP final exact publication/retirement: %s\n",err.c_str());
+                        strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"retained suffix execution cannot continue after failure");
+                    }
+                    strata::program::ServingSuffixRepairOperation::progress(operation,serving_request_ordinal,"exact_finish");
+                    strata::program::ServingSuffixRepairOperation::progress(operation,serving_request_ordinal,"retired");
+                    serving_raw_cut=std::max(serving_raw_cut,operation.next_cut);
+                    const auto& final=operation.published;
+                    pp_exact=true;pp_reached=int64_t(final.cut.forwarded);
+                    consumed.assign(final.accepted_tokens.begin(),final.accepted_tokens.begin()+std::ptrdiff_t(final.cut.forwarded));
+                    last_sampled=final.pending_tokens.front();p=int64_t(final.cut.forwarded);
+                    live_approximate=false;
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    bool qualified=true;
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                    const auto* stopped=serving_cancel_qualification.witness(serving_request_ordinal);
+                    if(stopped&&!serving_cancel_qualification.final_history(
+                        strata::program::ServingSuffixRepairOperation::cancel_facts(operation,serving_request_ordinal),
+                        stop_req,in_shared->stop_sequence,in_shared->input_error,err))
+                        strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,err.c_str());
+                    const bool post_stop=stopped!=nullptr;
+#else
+                    constexpr bool post_stop=false;
+#endif
+                    if((post_stop||(!cancelled&&!stop_req.load()))&&strata::program::SuffixExperimentDriver::serving_qualification_enabled()){
+                        DriverSuffixExperimentContext qualification_context{o,g,owned_runtime,*model_budget,
+                            sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                        uint64_t oracle_next_cut=serving_raw_cut+1;
+                        qualified=strata::program::SuffixExperimentDriver::qualify_serving_frontier(
+                            qualification_context,run_serial_remote_unit,*serving_raw_session,serving_request_ordinal,
+                            sfx_qualification,operation.repaired_final,oracle_next_cut,[&]{
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                                if(stopped)return stopped->abort(in_shared->stop_sequence,in_shared->input_error);
+#endif
+                                return stop_req.load();
+                            },post_stop?"cancelled_frontier":(live_handoff_requested?"live_frontier":"final_frontier"),
+                            post_stop?"cancelled_continuation":(live_handoff_requested?"live_continuation":"final_continuation"),
+                            operation.generated
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                            ,stopped
+#endif
+                            ,sfx_prefix_view());
+                        serving_raw_cut=std::max(serving_raw_cut,oracle_next_cut);
+                    }
+                    if(serving_activation_selected&&!activation_hooks.refuse_after_publication_restore&&!live_handoff_requested){
+                        DriverSuffixExperimentContext ac{o,g,owned_runtime,*model_budget,
+                            sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                        uint64_t next=serving_raw_cut+1;
+                        qualified=!cancelled&&!stop_req.load()&&strata::program::SuffixExperimentDriver::qualify_activation_final(
+                            ac,run_serial_remote_unit,*serving_raw_session,serving_request_ordinal,
+                            sfx_activation_qualification,operation.repaired_final,next,[&]{return stop_req.load();},sfx_prefix_view());
+                        serving_raw_cut=std::max(serving_raw_cut,next);
+                    }
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                    if(stopped){
+                        if(!qualified||!serving_cancel_qualification.oracle_complete(serving_request_ordinal,
+                            in_shared->stop_sequence,in_shared->input_error,err))
+                            strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,
+                                "retained post-STOP oracle failed or was interrupted");
+                        finish="cancel"; // the witnessed STOP remains latched; the oracle never emits/samples output
+                    }
+#endif
+#endif
+#if defined(__linux__) && !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    // Unchanged from the reviewed path: a failed or interrupted oracle ends the request here, so no
+                    // exact continuation is started and no further token is sampled from a state the oracle rejected.
+                    if(!qualified){std::fputs("strata serve: suffix cache (repaired): retained qualification failed\n",stderr);return 2;}
+#endif
+                    if(live_handoff_requested&&!stop_req.load()&&std::strcmp(finish,"length")==0){
+                        // The early oracle restored exactly final, including this pending token. Never start the
+                        // legacy loop from its original prompt x or a merged first window. Its T1 commits remain
+                        // inside this SAME RAW request; the end-of-request oracle below certifies their actual tail.
+                        // Those windows carry the PLE sequence state too: the loop below advances `ple_token` per
+                        // window while the verifier's commit shifts `ple_prev` (see the handoff guard there).
+                        x=last_sampled;first_window=false;
+                        operation.repaired_final={};operation.repaired_catchup={};
+                        if(!serving_raw_session->begin_work(err))
+                            strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"exact continuation RAW begin refused");
+                        serving_raw_fence_running=true;serving_suffix_exact_handoff=true;pl_ran=false;
+                        strata::program::ServingSuffixRepairOperation::progress(operation,serving_request_ordinal,"exact_handoff");
+                    }else{
+                        std::string close_error;
+                        if(!serving_raw_session->close_request(close_error)){
+                            std::fprintf(stderr,"strata serve: suffix cache (repaired): FAILSTOP closing retained request: %s\n",close_error.c_str());
+                            strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"retained suffix execution cannot continue after failure");
+                        }
+                        serving_suffix_active.reset();retained_exact_cleanup_completed=true;
+                    }
+                }
+            }
+#endif
 #if defined(STRATA_HAVE_DFLASH2)
 #if defined(STRATA_GPU_METAL)
             const int df2_skip_min = strata::spec::df2_lookup_skip_min(8);
@@ -18975,6 +27744,9 @@ int main(int argc, char** argv) {
 #endif
             if (df2_trace != nullptr) std::fprintf(df2_trace, "# request prompt %lld df2 %d spec %d\n", (long long) n, req_df2 ? 1 : 0, S_mtp);
             while (!pl_ran && !cancelled && produced_n < max_new) {
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if (serving_suffix_exact_handoff && stop_req.load()) { finish="cancel"; break; }
+#endif
                 int T = 1;
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
@@ -19268,9 +28040,26 @@ int main(int argc, char** argv) {
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
                 else if (strata::spec::mtp_q_applies(use_mtp, req_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp)) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);   // only candidates the MTP drew
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
-                exit_if_gpu_fatal("");   // (the test hook counts windows here)
-                if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
-                    exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                // THE PLE CURRENT TOKEN IS THE DRIVER'S, EVERYWHERE (include/strata/core/session.hpp: it is
+                // "advanced by the DRIVER, once per token").  `Verifier::commit` shifts `ple_prev` only
+                // (src/core/verify.cpp:3767-3771); `ple_token` is written by whoever feeds the token - the
+                // retained controller's foreground service (src/program/resident_repair_dispatch.inc:205), the
+                // oracle's replay (src/program/suffix_experiment_execution.inc:190-191), the legacy generate
+                // loop (src/program/generate.cpp:20776).  A live handoff feeds its T1 windows through THIS
+                // loop, so a loop that skipped it captured a frontier whose `ple_current_token`
+                // (core::StatePartKind::ple_current_token, layer -1) stayed at the last pre-retirement token
+                // while `ple_prev` ran ahead - and the exact-replay oracle refused it.  The handoff profile is
+                // already admitted as single-token (`!use_mtp`, no suffix/lookup draft, `first_window=false`),
+                // so `window[0]` is the one token this window commits; the predicate matches the stage that
+                // owns layer 1, as every other driver path does.
+                if (serving_suffix_exact_handoff && T == 1)
+                    for (int ple_st = 0; ple_st < n_stages; ++ple_st) {
+                        strata::core::SessionState& ple_ss = ple_st == 0 ? ss : stages[(size_t) ple_st - 1]->ss;
+                        if (ple_ss.layer_lo <= 1 && 1 < ple_ss.layer_hi) ple_ss.ple_token = window[0];
+                    }
+#endif
+                if (!run_serial_remote_unit(ver, T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
@@ -19325,9 +28114,27 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                // ver.run finished before this serial scope. A two-window fence
+                // would need caller-driven progress and must never use this join.
+                if(o.owned_session_lifetime && adapt_fence) {
+                    std::fputs("strata: serial adaptation retains a pipeline fence; worker restart required\n",stderr);
+                    std::_Exit(1);
+                }
+                strata::core::JoinedThreadScope adapt_join(o.owned_session_lifetime,adapt_thr);
+#endif
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
-                    adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+                    adapt_thr = std::thread([&] {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    if(o.owned_session_lifetime) {
+                        try { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok=adapt(); }
+                        catch(...) { adapt_ok=false; }
+                        return;
+                    }
+#endif
+                    strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok=adapt();
+                });
                 if (!ver.commit(a + 1, err)) {
                     exit_if_gpu_fatal(err);
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -19351,6 +28158,7 @@ int main(int argc, char** argv) {
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                if (a >= 0 && a < T) last_sampled = outv[(size_t) a];   // the last output stays out of the session
 #if defined(STRATA_HAVE_DFLASH2)
                 if (use_df2) df2.note_rows(window.data(), a + 1, p);
                 // --draft auto: the drafter this request does not use keeps up with the commit (its context / its K/V), so a later request can use it
@@ -19499,6 +28307,205 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            if(serving_suffix_exact_handoff){
+                auto& operation=*serving_suffix_active;
+                if(nf_hit||std::strcmp(finish,"nonfinite")==0||serving_raw_cut>=UINT64_MAX-1)
+                    strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"exact continuation cannot certify nonfinite/exhausted history");
+                strata::core::SnapshotDescriptor final;
+                if(!strata::program::ServingSuffixRepairOperation::exact_continuation_metadata(operation,consumed,last_sampled,
+                    uint64_t(produced_n),serving_raw_cut+1,final,err)||!serving_raw_session->drain_work(true,final.cut,err))
+                    strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"exact continuation final history/all-stage drain refused");
+                serving_raw_fence_running=false;serving_raw_cut=final.cut.id;
+                strata::core::BundleHandle actual_final;
+                if(!serving_raw_session->capture(final,actual_final))
+                    strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"exact continuation final capture refused");
+                bool qualified=true;
+                if(!cancelled&&!stop_req.load()&&strata::program::SuffixExperimentDriver::serving_qualification_enabled()){
+                    DriverSuffixExperimentContext qualification_context{o,g,owned_runtime,*model_budget,
+                        sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                    uint64_t oracle_next_cut=serving_raw_cut+1;
+                    qualified=strata::program::SuffixExperimentDriver::qualify_serving_frontier(
+                        qualification_context,run_serial_remote_unit,*serving_raw_session,serving_request_ordinal,
+                        sfx_qualification,actual_final,oracle_next_cut,[&]{return stop_req.load();},
+                        "final_frontier","final_continuation",uint64_t(produced_n)
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+                        ,nullptr
+#endif
+                        ,sfx_prefix_view());
+                    serving_raw_cut=std::max(serving_raw_cut,oracle_next_cut);
+                }
+                if(serving_activation_selected&&!activation_hooks.refuse_after_publication_restore){
+                    DriverSuffixExperimentContext ac{o,g,owned_runtime,*model_budget,
+                        sp,ver,ss,stages,primary_device,main_cs,n_stages,win_pool_fn,win_pool_user};
+                    uint64_t next=serving_raw_cut+1;
+                    qualified=!cancelled&&!stop_req.load()&&strata::program::SuffixExperimentDriver::qualify_activation_final(
+                        ac,run_serial_remote_unit,*serving_raw_session,serving_request_ordinal,
+                        sfx_activation_qualification,actual_final,next,[&]{return stop_req.load();},sfx_prefix_view());
+                    serving_raw_cut=std::max(serving_raw_cut,next);
+                }
+                pp_exact=true;pp_reached=p=int64_t(final.cut.forwarded);x=last_sampled;
+                if(!serving_raw_session->close_request(err))
+                    strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,"exact continuation request close refused");
+                serving_suffix_active.reset();retained_exact_cleanup_completed=true;
+                if(!qualified){std::fputs("strata serve: suffix cache (repaired): exact continuation qualification failed\n",stderr);return 2;}
+            }
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+            // ---- slice 7: certify the state this ordinary request actually produced ----------------------
+            // `ver.wait_commit` above joined the last real commit of every stage, and the fence opened before this
+            // request's first slot hand-off, restore or reset is still running: the drain below therefore certifies
+            // THIS request's own device work, at the position its own read/decode reached.  A request cancelled
+            // DURING DECODE still certifies: its prompt read finished whole and `wait_commit` joined the last
+            // committed window, so the consumed run and its pending token describe the device exactly.  A read
+            // that gave way mid-window does not, and neither does a nonfinite hit.
+            // The accepted run is the tokens the session consumed plus the one pending token it was about to
+            // consume (the same pair the conversation bookkeeping keeps), and the cut's history digest is DERIVED
+            // from that run, never stated.
+            // Exactness comes from provenance the request actually has: a zeroed start, or a state already
+            // certified exact plus this request's own forwards.  An inherited approximation keeps its gap and must
+            // name its anchor and ancestor; if it cannot, no certificate is kept.
+            // A request whose state is NOT describable (the prompt read gave way between rows, or a nonfinite hit
+            // reached the session) still holds an open work phase, and an open work phase may not be unwound. The
+            // two contract-clean moves are abandonment - which ends the process - or returning the session to a
+            // position that IS describable and draining there.  This takes the second: the same owned reset a
+            // resume==0 request performs, then a drain certifying that the session stands on NO conversation run.
+            // Nothing is claimed about the state that was lost, and no drain of work that never completed is faked.
+            if (serving_ordinary_fence) {
+                serving_ordinary_fence = false;   // settled here: the request-scope guard must not see it open
+                std::string fence_error;
+                bool certified = false;
+                if (serving_raw_session == nullptr) fence_error = "the RAW owner this request fenced is gone";
+                else if (serving_suffix_active != nullptr)
+                    fence_error = "a retained controller owns this request's state";
+                else if (serving_read_gave_way || nf_hit || consumed.empty()) {
+                    fence_error = serving_read_gave_way
+                        ? "the prompt read gave way: the session does not stand on whole forwarded rows"
+                        : nf_hit ? "the request hit a nonfinite value"
+                        : "the request forwarded no history to certify";
+                    std::string reset_error;
+                    if (!owned_runtime || !owned_runtime->reset_sessions(g, reset_error)) {
+                        std::fprintf(stderr, "strata serve: suffix cache (retained): the deliberate reset after %s "
+                                     "failed (%s): failing stop on the open RAW fence\n", fence_error.c_str(),
+                                     reset_error.empty() ? "no owned runtime" : reset_error.c_str());
+                        std::fflush(stderr);
+                        strata::core::retirement_failed(
+                            "serving reset after an undescribable state failed on an open RAW fence");
+                    }
+                    serving_session_discarded = true;   // the bookkeeping below must not adopt a discarded state
+                    // The conversation metadata goes with the state: nothing may resume from rows the session no
+                    // longer holds (the same clearing the refused-import path already does).
+                    live_ok = false;
+                    live.clear();
+                    live_imgs.clear();
+                    checks.clear();
+                    serving_pending_token = -1;
+                    live_approximate = false;
+                    strata::core::serving_raw::TrackedState tracked;
+                    const strata::core::serving_raw::TrackedStateFacts facts{
+                        serving_raw_cut + 1, std::span<const int32_t>{}, -1, true, 0,
+                        strata::core::serving_raw::ApproximationProvenance{}, true};
+                    const auto why = strata::core::serving_raw::track_state_certificate(
+                        facts, serving_raw_session->max_tokens(), tracked);
+                    if (why != strata::core::serving_raw::TrackedStateRefusal::none)
+                        fence_error = strata::core::serving_raw::tracked_state_reason(why);
+                    else if (!serving_raw_session->drain_work(true, tracked.cut, fence_error)) {
+                        // drain_work reports its own reason; the fence stays open and the close below failstops.
+                    } else {
+                        ++serving_raw_cut;
+                        if (!(serving_raw_session->cut() == tracked.cut))
+                            fence_error = "the transaction's drained cut differs from the reset state";
+                        else {
+                            // Recorded as the certificate: an empty accepted run, which every activation guard
+                            // refuses.  The session is known; what it is known to be is nothing.
+                            serving_tracked_state = std::move(tracked);
+                            serving_tracked_provenance = strata::core::serving_raw::ApproximationProvenance{};
+                            certified = true;
+                            std::fprintf(stderr, "strata serve: suffix cache (retained): ORDINARY_RESET_CERTIFY "
+                                         "req=%llu cut=%llu reason=%s\n",
+                                         (unsigned long long) serving_request_ordinal,
+                                         (unsigned long long) serving_tracked_state.cut.id,
+                                         fence_error.c_str());
+                            std::fflush(stderr);
+                        }
+                    }
+                }
+                else {
+                    const strata::core::serving_raw::TrackedStateFacts facts{
+                        serving_raw_cut + 1,
+                        std::span<const int32_t>(consumed.data(), consumed.size()),
+                        last_sampled,
+                        // Exactness is provenance, not a wish: this request's own forwards over a zeroed session,
+                        // or over a state that was itself certified exact at its own drained cut.  Anything else
+                        // (a checkpoint or slot hand-off nobody certified, a parked restore) keeps its gap, and a
+                        // gap it cannot name means no certificate at all.
+                        !live_approximate &&
+                            (serving_start_zeroed || serving_start_certified_exact),
+                        serving_tracked_state.cut.exact_frontier,
+                        serving_tracked_provenance};
+                    strata::core::serving_raw::TrackedState tracked;
+                    const auto why = strata::core::serving_raw::track_state_certificate(
+                        facts, serving_raw_session->max_tokens(), tracked);
+                    if (why != strata::core::serving_raw::TrackedStateRefusal::none)
+                        fence_error = strata::core::serving_raw::tracked_state_reason(why);
+                    else if (!serving_raw_session->drain_work(true, tracked.cut, fence_error)) {
+                        // drain_work reports its own reason; nothing was certified.
+                    } else {
+                        ++serving_raw_cut;
+                        if (!(serving_raw_session->cut() == tracked.cut))
+                            fence_error = "the transaction's drained cut differs from the certified completion";
+                        else {
+                            serving_tracked_state = std::move(tracked);
+                            if (serving_tracked_state.approximation.empty())
+                                serving_tracked_provenance = strata::core::serving_raw::ApproximationProvenance{};
+                            else
+                                serving_tracked_provenance =
+                                    strata::core::serving_raw::ApproximationProvenance{
+                                        serving_tracked_state.approximation.front().first_unresolved_unix_ms,
+                                        serving_tracked_state.approximation.front().ancestor};
+                            certified = true;
+                            std::fprintf(stderr, "strata serve: suffix cache (retained): ORDINARY_CERTIFY "
+                                         "req=%llu cut=%llu forwarded=%llu accepted=%llu exact=%d pending=%d\n",
+                                         (unsigned long long) serving_request_ordinal,
+                                         (unsigned long long) serving_tracked_state.cut.id,
+                                         (unsigned long long) serving_tracked_state.cut.forwarded,
+                                         (unsigned long long) serving_tracked_state.cut.accepted,
+                                         (int) (serving_tracked_state.approximation.empty()),
+                                         (int) (last_sampled >= 0));
+                            std::fflush(stderr);
+                        }
+                    }
+                }
+                if (!certified) {
+                    serving_tracked_state.clear();
+                    // The gap's anchor and ancestor were recorded by a real event in an earlier (or this) request's
+                    // own drain.  They stay true while the session still stands on the state that introduced them,
+                    // so they are dropped only when the session is no longer an approximate one.
+                    if (!live_approximate) serving_tracked_provenance = strata::core::serving_raw::ApproximationProvenance{};
+                    std::fprintf(stderr, "strata serve: suffix cache (retained): ORDINARY_TRACK_CLEARED "
+                                 "req=%llu reason=%s\n", (unsigned long long) serving_request_ordinal,
+                                 fence_error.c_str());
+                    std::fflush(stderr);
+                }
+                // The fence this request opened must be closed on a drained phase.  A drain that never happened
+                // leaves the work phase RUNNING, and an open work phase is the RAW contract's failstop: this
+                // process does not keep serving on state it cannot describe.
+                std::string close_error;
+                if (serving_raw_session == nullptr)
+                    strata::core::retirement_failed("an ordinary request lost its RAW owner while its fence was open");
+                if (!serving_raw_session->healthy() || (!owned_image_active&&!serving_raw_session->close_request(close_error)))
+                    strata::program::ServingSuffixRepairOperation::failstop(*serving_raw_session,
+                        "an ordinary request fence cannot be closed: the work phase it opened is uncertain");
+            } else if (serving_raw_session != nullptr && serving_raw_session->healthy()) {
+                // The request mutated the session with no RAW work fence of its own (a repaired import, an
+                // activation, or an ordinary request with no parked owner waiting).  Whatever certificate was kept
+                // for the state that stood here no longer describes the device, so nothing is claimed about it.  An
+                // approximation this request itself introduced keeps its provenance: it is a fact about the state
+                // the session still stands on, and the next request's drain is what pairs it with a cut.
+                serving_tracked_state.clear();
+                if (!live_approximate) serving_tracked_provenance = strata::core::serving_raw::ApproximationProvenance{};
+            }
+#endif
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
@@ -19540,19 +28547,27 @@ int main(int argc, char** argv) {
                 }
             }
             if (drive.d.fs) std::fprintf(stderr, "strata serve: %s\n", drive.d.fs->report().c_str());
-            if (!cancelled) {
+            if ((!cancelled
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                || retained_exact_cleanup_completed
+#endif
+                ) && !serving_session_discarded) {
+                // Retained cancellation has already certified/retired/closed actual H. Preserve its pending token;
+                // generic cancelled-prefill cur may include unread planned D and cannot replace that history.
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
                 // (the checkpoints taken while reading it are still good)
                 live.swap(consumed);
+                serving_pending_token = last_sampled;   // certified only with the session state exactly at live
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
                 if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
-            } else if (!nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
-                       pp_reached <= (int64_t) cur.size()) {
+            } else if (!serving_session_discarded && !nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 &&
+                       req_ckpt && pp_reached <= (int64_t) cur.size()) {
                 // #1620: stopped between two windows (or before the first token was read): the session is exactly at
                 // pp_reached, so it stays the live conversation - the next request continues from it or parks it.
                 // Without this a cancelled request that had restored a parked conversation dropped it.
                 live.assign(cur.begin(), cur.begin() + pp_reached);
+                serving_pending_token = -1;
                 live_imgs = imgs_below(req_imgs, pp_reached);
                 live_ok = true;
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
@@ -19580,7 +28595,7 @@ int main(int argc, char** argv) {
                              (long long) checked, std::chrono::duration<double, std::milli>(Clock::now() - rt0).count());
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
-            if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
+            if (state_hash && !cancelled && !serving_session_discarded && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
                 if (cudaDeviceSynchronize() != cudaSuccess) {
@@ -19709,6 +28724,17 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+            if(serving_cancel_qualification.target(serving_request_ordinal)&&!serving_cancel_qualification.complete()){
+                std::fputs("retained cancellation qualification failed: selected request missed site/oracle\n",stderr);
+                return 2;
+            }
+#endif
+#if defined(STRATA_SERVING_FAULT_QUALIFICATION_AVAILABLE)
+            if(serving_fault_qualification.target(serving_request_ordinal)){
+                std::fputs("serving fault qualification failed: target missed selected fault/failstop\n",stderr);return 2;
+            }
+#endif
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
                         "experts_streamed=%lld\n",
                         (long long) produced_n,
@@ -19720,11 +28746,12 @@ int main(int argc, char** argv) {
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
-                bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
+                bool cont = !cancelled && !serving_session_discarded && produced_n == 1 && admit_max_new > 1 &&
+                            std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
-                if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
-                if (cont && !copy_to_slot(admit_slot, live, err)) {
+                if (cont) park_slot(admit_slot);
+                if (cont && !copy_to_slot(admit_slot, live, err, x)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
@@ -19739,7 +28766,14 @@ int main(int argc, char** argv) {
                     BSlot& sl = bs[(size_t) admit_slot];
                     if (ckpt_pool.on())
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    auto admitted_owned_raw=std::move(sl.owned_raw);
+#endif
                     sl = BSlot{};
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    sl.owned_raw=std::move(admitted_owned_raw);
+                    if(owned_batch_allocation)sl.owned_allocation=batch_slot_handles.at(size_t(admit_slot));
+#endif
                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
                     sl.active = true;
                     sl.x = x;
@@ -19748,6 +28782,14 @@ int main(int argc, char** argv) {
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                    if(owned_batch_allocation){
+                        sl.ids.reserve(size_t(sl.owned_raw->max_tokens()));
+                        sl.http_request=req_http_request;sl.http_leg=serving_request_ordinal;
+                        strata::program::report_http2_accept(sl.http_request,sl.http_leg,size_t(admit_slot),
+                            sl.owned_raw->slot_occupancy_incarnation(),uint64_t(admit_max_new),ids,sl.owned_raw->cut());
+                    }
+#endif
                     {   // the penalty window of the slot's decode: the reply, from the last prompt token (the first window fed it), as the solo loop counts it
                         const bool slot_pen = req_sp.penalty_last_n > 0 && (req_sp.penalty_repeat != 1.0f || req_sp.penalty_freq != 0.0f || req_sp.penalty_present != 0.0f);
                         sl.pen_n = slot_pen ? std::min(req_sp.penalty_last_n, kPenaltyWindowCap) : 0;
@@ -19782,7 +28824,7 @@ int main(int argc, char** argv) {
                         sl.draft_ready = true;
                     }
                     sl.cvec = cvec_cached;
-                    sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
+                    sl.img = geni||!live_imgs.empty();   // image ownership is never a token-only cache donor
                     const ConvCheckpoint* best = nullptr;
                     size_t best_at = 0;   // its place in `checks` (STRATA_SLOT_CKPT_MOVE)
                     for (size_t i = 0; i < checks.size(); ++i) {
@@ -19839,6 +28881,20 @@ int main(int argc, char** argv) {
                                      span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
                     }
                 }
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                serving_pending_request_completed=!cont&&!cancelled&&!serving_session_discarded&&produced_n>0&&
+                    (std::strcmp(finish,"stop")==0||admit_max_new<=produced_n);
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+                if(owned_image_active){
+                    if(!strata::program::OwnedImageRequestDriver::finish_source(*serving_raw_session,err))std::terminate();
+                    serving_raw_cut=serving_raw_session->cut().id;serving_tracked_state.clear();
+                    live.clear();live_imgs.clear();checks.clear();serving_pending_token=-1;live_approximate=false;
+                    if(!cont){auto& unused=bs[size_t(admit_slot)].owned_raw;
+                        if(unused){if(unused->request_open()||!unused->retire_owned_slot(err))std::terminate();unused.reset();}}
+                }
+#endif
+                owned_admission_scope.finish(); // before acknowledgement permits a new BGEN for this slot
                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
                 if (trace && piped && cont) {
                     rows_wait = "the admission";
@@ -20048,7 +29104,63 @@ int main(int argc, char** argv) {
                 helper_blobs_before = blobs;
                 helper_bytes_before = bytes;
             }
+            } // request-local source scope
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        owned_batch_request_done: ;
+            if(serving_threads){
+                // Refused/cancelled BGEN with no physical occupancy still owns
+                // its pending graph pair until the real request scope settles.
+                for(size_t i=0;i<2;++i){const auto* binding=serving_threads->binding(i);
+                    if(binding&&binding->request==owned_admission_scope.request&&!binding->occupancy){
+                        if(serving_raw_session&&serving_raw_session->request_open())
+                            strata::core::retirement_failed("managed pending pair reached retirement with open main request");
+                        serving_release_thread_lane(i,!serving_pending_request_completed);
+                    }
+                }
+            }
+#endif
         }
+#if defined(STRATA_SERVING_CANCEL_QUALIFICATION_AVAILABLE)
+        if(serving_cancel_qualification.enabled()&&!serving_cancel_qualification.complete()){
+            std::fputs("retained cancellation qualification failed: selector unconsumed at serving exit\n",stderr);
+            return 2;
+        }
+#endif
+#if defined(STRATA_SERVING_FAULT_QUALIFICATION_AVAILABLE)
+        if(serving_fault_qualification.enabled()){
+            std::fputs("serving fault qualification failed: selector unconsumed at serving exit\n",stderr);return 2;
+        }
+#endif
+#if defined(STRATA_SERVING_SUFFIX_REPAIR_AVAILABLE)
+        // OPT-IN (slice 2): engine shutdown must not drop a parked repair owner, and must not defer its drain into
+        // the next request.  Every parked controller is retired through its own retire(), the same call finish()
+        // uses inside a request; a refusal is the deliberate failstop.  An early `return` earlier in the loop
+        // instead reaches the registry's destructor, which is the same named failstop rather than a silent drop
+        // (the alternative is the terminal controller destructor, which ends the process anyway).
+        if (serving_repair_owners != nullptr && serving_repair_owners->size() > 0) {
+            std::string shutdown_retire_error;
+            if (!serving_repair_owners->retire_all(
+                    "serving shutdown", strata::program::ServingSuffixRepairOperation::RetainRetire{},
+                    shutdown_retire_error)) {
+                std::fprintf(stderr, "strata serve: suffix cache (repaired): FAILSTOP retiring a parked repair "
+                                     "owner at shutdown: %s\n", shutdown_retire_error.c_str());
+                std::fflush(stderr);
+                strata::program::owner_registry_failstop(
+                    "parked retained repair owner could not be retired at serving shutdown");
+            }
+            std::string shutdown_close_error;
+            if (!serving_repair_owners->close(shutdown_close_error))
+                strata::program::owner_registry_failstop(
+                    "a parked retained repair owner survived shutdown retirement");
+            std::fprintf(stderr, "strata serve: suffix cache (repaired): parked repair owners retired at "
+                                 "shutdown: owners=%zu private_units=%llu repaired_tokens=%llu\n",
+                         serving_repair_owners->owners_released(),
+                         (unsigned long long)serving_repair_owners->units_advanced(),
+                         (unsigned long long)serving_repair_owners->tokens_repaired());
+            std::fflush(stderr);
+            serving_repair_owners.reset();
+        }
+#endif
         save_profile("exit");   // #477: QUIT, or the server closed stdin
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
@@ -20064,7 +29176,18 @@ int main(int argc, char** argv) {
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
     int64_t spec_pos = strata::spec::kSpecNotStarted;   // plan v0.3 P6: where the speculative loop starts (0 is a real position: a 1-token prompt on a native pack)
-    strata::prefill::Prefill prefill;
+    DriverRuntimeObject<strata::prefill::Prefill> prefill_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        owned_runtime?&owned_runtime->primary_prefill:nullptr
+#else
+        nullptr
+#endif
+        );
+    auto& prefill=prefill_storage.get();
+    if(!configure_retirement(prefill))return 1;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    strata::core::WindowConsumerDrainGuard prefill_consumers{owned_model};
+#endif
     // #1595: not by default when the cache holds every expert (nothing to take)
     strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,
         !multi_gpu && !o.no_pool && o.batch <= 0 &&
@@ -20152,6 +29275,9 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        DriverPrefillCallbacks prompt_callback_retirement{owned_model,prefill,stages};
+#endif
         if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
@@ -20511,7 +29637,18 @@ int main(int argc, char** argv) {
             return 2;
         }
         mem_mark("the head and the prompt path");
-        strata::core::Verifier ver;
+        DriverRuntimeObject<strata::core::Verifier> ver_storage(
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            owned_runtime?&owned_runtime->primary_verifier:nullptr
+#else
+            nullptr
+#endif
+            );
+        auto& ver=ver_storage.get();
+        if(!configure_retirement(ver))return 1;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        strata::core::WindowConsumerDrainGuard verifier_consumers{owned_model};
+#endif
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
@@ -20621,12 +29758,34 @@ int main(int argc, char** argv) {
             strata::core::Verifier& v;
             strata::core::ExpertDispatch& d;
             int32_t* pairs;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            std::shared_ptr<const strata::core::OwnedModelGang> model;
+#endif
             ~PreLaunchOff() {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                // Later launch-capable jobs have joined. GPU patch kernels may
+                // still read pairs: drain before clearing captures or freeing it.
+                { strata::core::WindowConsumerDrainGuard drain{model}; }
+#endif
                 v.set_pre_launch(nullptr);
                 d.dres_check = nullptr;
-                if (pairs != nullptr) cudaFreeHost(pairs);
+                if (pairs != nullptr) {
+                    const auto status=cudaFreeHost(pairs);
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    if(model && status!=cudaSuccess) {
+                        std::fputs("strata: callback patch-buffer retirement failed; worker restart required\n",stderr);
+                        std::_Exit(1);
+                    }
+#else
+                    (void)status;
+#endif
+                }
             }
-        } pre_launch_off{ver, drive.d, res_pairs};
+        } pre_launch_off{ver, drive.d, res_pairs
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            ,owned_model
+#endif
+            };
         if (drive.d.fetch_admit > 0 || drive.d.evict_sync || res_checking)
             ver.set_pre_launch([&](cudaStream_t cs, std::string& e) -> bool {
                 if (drive.d.res_dirty) {
@@ -20655,8 +29814,13 @@ int main(int argc, char** argv) {
             });
         int64_t swaps_total = 0;
         double ms_adapt = 0;
-        cudaStream_t adapt_stream = nullptr;
-        if (!drive.d.usage.empty() && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        cudaStream_t baseline_adapt_stream = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& adapt_stream=owned_runtime?owned_runtime->adaptation_stream:baseline_adapt_stream;
+#else
+        auto& adapt_stream=baseline_adapt_stream;
+#endif
+        if (!drive.d.usage.empty() && !create_driver_stream(primary_device,cudaStreamNonBlocking,adapt_stream)) {
             std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
             return 1;
         }
@@ -20664,15 +29828,21 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
-        cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        cudaEvent_t baseline_adapt_ev = nullptr;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+        auto& adapt_ev=owned_runtime?owned_runtime->adaptation_event:baseline_adapt_ev;
+#else
+        auto& adapt_ev=baseline_adapt_ev;
+#endif
+        if(o.owned_session_lifetime) {
+            if(!create_driver_event(primary_device,cudaEventDisableTiming,adapt_ev))return 1;
+        } else cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             // STRATA_TRACE_ADAPT=1: whether a round's copies had landed when the next window read the table
             static const bool trace_pending = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) {
+            if (!adaptation_completed(adapt_ev,primary_device,wait)) {
                 if (trace_pending)
                     std::fprintf(stderr, "strata: PENDING not landed, %zu stay non-resident this window\n",
                                  pending.size());
@@ -20913,17 +30083,18 @@ int main(int argc, char** argv) {
         }
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
+        DriverWatchdog spec_watchdog;
         // STRATA_SPEC_WATCH=<seconds> (diagnostics, off by default): the serve watchdog for this loop.  A run whose verify
         // windows and prompt chunks stop beating for that long prints the stage it is in and the stall report, then ends.
         if (const char* sw = std::getenv("STRATA_SPEC_WATCH"); sw != nullptr && std::atoi(sw) > 0) {
             const int limit = std::atoi(sw);
             strata::core::progress().busy.store(true);
-            std::thread([limit] {
+            spec_watchdog.start(o.owned_model_lifetime, [limit](std::shared_ptr<DriverWatchdog::Stop> stop) {
                 strata::core::Progress& pr = strata::core::progress();
                 uint64_t last = pr.beats.load(), ticks_at = pr.ticks.load();
                 auto since = std::chrono::steady_clock::now();
                 for (;;) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    if (DriverWatchdog::wait_stop(stop, std::chrono::seconds(1))) return;
                     const auto now = std::chrono::steady_clock::now();
                     const uint64_t b = pr.beats.load();
                     if (b != last) { last = b; ticks_at = pr.ticks.load(); since = now; continue; }
@@ -20934,7 +30105,7 @@ int main(int argc, char** argv) {
                     std::fflush(stderr);
                     std::abort();
                 }
-            }).detach();
+            });
         }
         // DFlash2 with a long suffix match: the draft of the next round is deferred (spec/window_rule.hpp)
 #if defined(STRATA_GPU_METAL)
@@ -21128,7 +30299,7 @@ int main(int argc, char** argv) {
             else if (strata::spec::mtp_q_applies(use_mtp, spec_uses_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp) && o.spec_corrupt <= 0)
                 ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
             const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
-            if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
+            if (!run_serial_remote_unit(ver,T,window.data(),p,decode_pool_fn,&drive,outv.data(),err)) {
                 // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs
                 // out of memory the window gets one row narrower (the widths below it are already captured) instead of the run failing.
                 if (T > 2 && !first_window && !gated_proposal && err.find("out of memory") != std::string::npos) {
@@ -21186,8 +30357,22 @@ int main(int argc, char** argv) {
             // GPU commits and drafts; it touches only the residency tables, which nothing reads until the next window
             std::thread adapt_thr;
             bool adapt_ok = true;
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+            // This serial verifier run has finished; no host-pumped adapt fence
+            // exists in the non-serving path. Outcome outlives this guard.
+            strata::core::JoinedThreadScope adapt_join(o.owned_session_lifetime,adapt_thr);
+#endif
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
-                adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+                adapt_thr = std::thread([&] {
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                    if(o.owned_session_lifetime) {
+                        try { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok=adapt(); }
+                        catch(...) { adapt_ok=false; }
+                        return;
+                    }
+#endif
+                    strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok=adapt();
+                });
             strata::core::progress_at("spec loop: commit", (int64_t) T);
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
@@ -21210,6 +30395,12 @@ int main(int argc, char** argv) {
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+                if(o.owned_session_lifetime && !adapt_ok) {
+                    std::fputs("strata generate: an adaptive refill failed before EOS\n",stderr);
+                    return 1;
+                }
+#endif
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
@@ -21550,14 +30741,18 @@ int main(int argc, char** argv) {
 
     if (dump != nullptr) std::printf("%-24s %s\n", "logits dumped", o.dump_logits.c_str());
 
+#if defined(STRATA_WINDOW_STATE_AVAILABLE)
+    checked_token_graph.retire();
+    checked_session_graphs.retire();
+#endif
     strata::core::session_graphs_free(gr);
-    strata::core::doorbell_free(db);
-    cudaFree(d_next);
-    cudaFree(d_logits);
-    cudaFree(d_emb);
-    cudaFree(d_parts);
+    if(!o.owned_session_lifetime)strata::core::doorbell_free(db);
+    if(!o.owned_session_lifetime)cudaFree(d_next);
+    if(!o.owned_session_lifetime)cudaFree(d_logits);
+    if(!o.owned_session_lifetime)cudaFree(d_emb);
+    if(!o.owned_session_lifetime)cudaFree(d_parts);
     cudaFree(sbuf);
-    cudaFree(arena);
+    if(!o.owned_model_lifetime)cudaFree(arena);
     return 0;
 }
 

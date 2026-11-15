@@ -1,10 +1,29 @@
 #pragma once
+#include <cstdint>
 
 #include "strata/kernels/rope_scaling.hpp"
 
 namespace strata::kernels {
 void native_rope_set_enabled(bool enabled);
 bool native_rope_enabled();
+
+// Partial policy observation, not table identity or dispatch evidence. Call only
+// during serialized startup/adoption: native enable can change independently,
+// and this value does not fence mutations or capture a coherent concurrent epoch.
+// First observation may initialize the same lazy environment selectors used by
+// kernels. The caller must freeze configuration before either observation/use.
+struct NativeRopePolicyObservation {
+    bool supported = false;
+    int head_dim = 0;
+    int n_rot = 0;
+    bool native_enabled = false;
+    bool table_policy_enabled = false;
+    bool fused_norm_geometry_usable = false;
+};
+// Allocation-free; no device query, table access, synchronization or launch.
+// supported=false means this backend has no observation implementation.
+NativeRopePolicyObservation native_rope_policy_observation(int head_dim, int n_rot);
+
 
 // Pinned CUDA text-only IMRoPE: F32 rows, 64 rotated channels, equal text positions in all four
 // IMRoPE sections. Each device position must be nonnegative. The position buffer remains live
@@ -17,6 +36,10 @@ bool native_rope_enabled();
 // The struct's knobs are process constants, so kernel arguments baked at graph capture stay valid.
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, const RopeScaling& scaling, const int* positions, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void native_rope_apply_owned(const float* x, float* out, int rows, int head_dim,
+                       int n_rot, const RopeScaling& scaling, const int* positions, void* stream, const int32_t* position_table);
+
 
 /// (#783 PR-f, stuchapin909) native_qsa_rms_norm_weighted + native_rope_apply in one launch, bit-identical to the pair
 /// (rope_parity check 6): x rows are `in_stride` apart (2 * head_dim reads a q row out of a q|gate row), out rows are
@@ -24,6 +47,11 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
 void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
                               int rows, int head_dim, int n_rot, float epsilon,
                               const RopeScaling& scaling, const int* positions, void* stream);
+// Explicit owned-bank entry; nonnull stable table, same cell/numerical policy.
+void native_qsa_rms_norm_rope_owned(const float* x, int in_stride, const float* gamma, float* out,
+                              int rows, int head_dim, int n_rot, float epsilon,
+                              const RopeScaling& scaling, const int* positions, void* stream, const int32_t* position_table);
+
 /// Whether callers should take the fused kernel (and the in-place rope's 32-thread launch) for this geometry. On the
 /// CUDA build it is on unless STRATA_NO_NORM_ROPE=1; on the HIP build it is off until the AMD parity check passes there
 /// (rope_parity check 6) and only STRATA_NORM_ROPE=1 turns it on.

@@ -272,6 +272,34 @@ class Policy(unittest.TestCase):
         tok = ByteTokenizer()
         return Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
 
+    def test_strict_shrink_borrows_real_owner_without_tls_or_reacquire(self):
+        from serve import server
+        from serve.test_batch_control_guard import CountLock
+        from serve.test_server import OwnedImageTransport
+        for outcome in ("success", "native_error", "body_error"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as d:
+                control = CountLock()
+                e, state = OwnedImageTransport._same_epoch_batch(self, d, control)
+                svc = self.svc(e)
+                gen = images_api.ImageGen(image_cfg(d, gpu_policy="shrink"))
+                if outcome == "native_error":state.vram_reply = "ERR native batch busy"
+                with mock.patch.object(e, "_exclusive_control", side_effect=AssertionError("strict context")), \
+                     mock.patch.object(server._RequestOwned,
+                                       "_store", side_effect=AssertionError("strict TLS")):
+                    try:
+                        with images_api.gpu_turn(svc, gen, {"width": 512, "height": 512}):
+                            self.assertTrue(control.raw.locked())
+                            self.assertEqual(control.releases, 0)
+                            if outcome == "body_error":raise RuntimeError("image body")
+                    except RuntimeError as error:
+                        self.assertEqual(outcome, "body_error")
+                        self.assertEqual(str(error), "image body")
+                self.assertFalse(control.raw.locked())
+                self.assertEqual(control.releases, 1)
+                self.assertFalse(svc.fifo.locked())
+                self.assertEqual(len([frame for frame in state.frames if frame.startswith("VRAM")]),
+                                 1 if outcome == "native_error" else 2)
+
     def test_resolve(self):
         with tempfile.TemporaryDirectory() as d:
             gen = images_api.ImageGen(image_cfg(d))
@@ -326,6 +354,70 @@ class Policy(unittest.TestCase):
             self.assertEqual([c if isinstance(c, str) else c[0] for c in eng.calls],
                              ["save", "unload", "restart", "restore"])
             self.assertTrue(eng.up)
+
+    def test_eager_parallel_reload_borrows_actual_outer_control_through_ready(self):
+        from serve.test_batch_control_guard import CountLock
+        from serve.test_server import OwnedImageTransport
+        for outcome in ("reserve", "refused_reserve", "no_reserve", "body_error"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as d:
+                control = CountLock()
+                e, state = OwnedImageTransport._same_epoch_batch(self, d, control)
+                svc = self.svc(e)
+                svc.vram_reserve = None if outcome == "no_reserve" else 512
+                gen = images_api.ImageGen(image_cfg(d, gpu_policy="unload", reload="eager"))
+                if outcome == "refused_reserve":state.vram_reply = "ERR VRAM native batch busy"
+                attempts, forwarded, returned = [], [], []
+                acquire = control.acquire
+                def acquiring(*args, **kwargs):
+                    attempts.append(1)
+                    self.assertEqual(len(attempts), 1, "re-entered actual nonreentrant outer control")
+                    return acquire(*args, **kwargs)
+                control.acquire = acquiring
+                actual_ensure = svc.ensure_loaded
+                def ensure(_control=None):
+                    forwarded.append(_control)
+                    self.assertIs(_control, control)
+                    result = actual_ensure(_control)
+                    self.assertTrue(control.raw.locked())
+                    self.assertEqual(control.releases, 0)  # borrowed owner still belongs to gpu_turn
+                    returned.append(result)
+                    return result
+                svc.ensure_loaded = ensure  # observer delegates to the real Service method
+                def ready():
+                    self.assertTrue(e.alive())
+                    self.assertIs(state.epoch.ctl, control)
+                    self.assertTrue(control.raw.locked())
+                    self.assertEqual(control.releases, 0)
+                state.on_ready = ready
+                successor = threading.Lock(); successor.acquire()
+                def reserve():
+                    self.assertTrue(control.raw.locked())
+                    e.ctl = successor  # neither borrower nor outer finally may release this attribute
+                if outcome == "reserve":state.on_vram = reserve
+                try:
+                    def body():
+                        with images_api.gpu_turn(svc, gen, {"width": 512, "height": 512}) as policy:
+                            self.assertEqual(policy, "unload")
+                            self.assertTrue(control.raw.locked())
+                            self.assertFalse(e.alive())
+                            if outcome == "body_error":raise RuntimeError("image job body")
+                    if outcome == "body_error":
+                        with self.assertRaisesRegex(RuntimeError, "image job body"):body()
+                    else:body()
+                    self.assertEqual(forwarded, [control])
+                    self.assertEqual(returned, [None])
+                    self.assertEqual(len(attempts), 1)
+                    self.assertEqual(control.releases, 1)
+                    self.assertFalse(control.raw.locked())
+                    self.assertTrue(e.alive())
+                    self.assertEqual(len(state.restarts), 1)
+                    expected = [] if outcome == "no_reserve" else ["VRAM 512"]
+                    self.assertEqual([f for f in state.frames if f.startswith("VRAM")], expected)
+                    self.assertTrue(successor.locked())
+                    self.assertFalse(svc.fifo.locked())
+                    self.assertFalse(svc.status["busy"])
+                finally:
+                    e.ctl = control; successor.release(); e.close()
 
     def test_shrink_gives_the_cache_back(self):
         with tempfile.TemporaryDirectory() as d:

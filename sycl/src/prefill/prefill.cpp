@@ -1081,7 +1081,20 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
     return res;
 }
 }  // namespace
+// Unsupported producer: absence of observed state is not a disabled policy.
+// Default record stays unresolved/unknown/incomplete; no lazy config reads.
+core::PrefillCpuShareObservation Prefill::cpu_share_policy() const noexcept {
+    return {};
+}
+
 Prefill::Prefill() : impl_(new Impl) {}
+bool Prefill::set_strict_retirement(bool enabled, std::string& error) {
+    if (retirement_init_started_) { error = "strict retirement must be configured before init"; return false; }
+    if (enabled) { error = "strict retirement is unsupported by SYCL"; return false; }
+    strict_retirement_ = enabled;
+    return true;
+}
+
 Prefill::~Prefill() {
     clear_taps();
     release();
@@ -1258,6 +1271,7 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
                    const core::ExpertCache *cache, const int32_t *host_res,
                    int64_t chunk, void *stream, std::string &err, void *borrow,
                    uint64_t borrow_bytes, bool borrow_spill) try {
+    retirement_init_started_ = true;
     if (borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout (--prefill-head-alias) is not in the SYCL port";
         return false;
@@ -1358,7 +1372,7 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
         bool files = false;
         for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
             for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, kMaxStagerThreads) : files ? kMaxStagerThreads : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
     }

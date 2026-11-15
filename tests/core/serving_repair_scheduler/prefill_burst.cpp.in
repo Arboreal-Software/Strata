@@ -1,0 +1,230 @@
+// Actual production control-flow spans and real registry; native work/time are recording.
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <span>
+ACTUAL_WORLD
+#include "strata/program/batch_read.hpp"
+
+struct Clock {
+    using duration=std::chrono::milliseconds;
+    using rep=duration::rep;using period=duration::period;
+    using time_point=std::chrono::time_point<Clock>;
+    static constexpr bool is_steady=true;
+    static inline duration ticks{0};
+    static time_point now(){const auto result=time_point(ticks);ticks+=duration(1);return result;}
+};
+namespace strata::core {
+[[noreturn]] inline void retirement_failed(const char* text){std::fprintf(stderr,"UNSUPPORTED_OR_FATAL %s\n",text);std::abort();}
+}
+namespace strata::kernels {
+ACTUAL_VERIFY_BOUND
+}
+namespace strata::program {
+// Explicit recording clock/native RAW boundary, not registry/selection logic.
+inline core::RepairMonotonicBirth serving_repair_clock_now(uint64_t domain){return {domain,uint64_t(Clock::ticks.count())*1000000};}
+struct ServingRawSession {
+    enum class Phase{running,drained};
+    uint64_t occupancy=0;struct Cut{uint64_t id=1;} state;
+    struct Key{uint64_t window_generation=9;} identity;
+    bool healthy()const{return true;}bool request_open()const{return true;}
+    Phase phase()const{return Phase::running;}
+    uint64_t slot_occupancy_incarnation()const{return occupancy;}
+    const Cut&cut()const{return state;}const Key&key()const{return identity;}
+};
+struct RecordingRepair{struct{struct{uint64_t id=0;}cut;}published;};
+// Private repair is outside this focused foreground reproduction: fail closed
+// if an unexpected path reaches it, never provide a fabricated repair receipt.
+struct ServingSuffixRepairOperation {
+    struct Age{RepairAgeInputs age;bool valid=false;uint64_t ancestry_serial=0;};
+    struct Evidence{ServingRawSession::Cut private_cut()const{core::retirement_failed("unsupported repair evidence");}};
+    static Age repair_age(const RecordingRepair&,core::RepairMonotonicBirth){core::retirement_failed("unsupported repair age");}
+    static bool private_cache_restored(const RecordingRepair&){core::retirement_failed("unsupported repair cache");}
+    static bool repair_unit(RecordingRepair&,bool,std::string&,uint64_t){core::retirement_failed("unsupported private repair");}
+    static Evidence owner_evidence(const RecordingRepair&){core::retirement_failed("unsupported repair receipt");}
+};
+}
+struct SelectionTrace {std::vector<program::ServingThreadUnit> units;program::ServingThreadSelection selected;uint64_t ticket;};
+struct Probe {
+    program::ServingThreadBridge& real;std::vector<SelectionTrace> selections;
+    auto binding(size_t n)const{return real.binding(n);}
+    auto operation(const core::OperationKey& k)const{return real.operation(k);}
+    bool cancellation_pending(size_t n)const{return real.cancellation_pending(n);}
+    bool request_ready(size_t n,uint64_t r)const{return real.request_ready(n,r);}
+    uint64_t engine()const{return real.engine();}
+    auto select(const program::ServingRepairAdmissionPolicy& p,const program::ServingRepairSelectionBoundary& b,
+                std::span<const program::ServingThreadUnit> units,uint64_t now,uint64_t ticket){
+        auto result=real.select(p,b,units,now,ticket);
+        selections.push_back({std::vector<program::ServingThreadUnit>(units.begin(),units.end()),result,ticket});
+        std::printf("TRACE select supplied=%zu ticket=%llu total=%llu selected=%zu ready=%d priority=%lld units=",
+            units.size(),(unsigned long long)ticket,(unsigned long long)result.total_weight,result.candidate,int(result.ready),(long long)result.effective_priority);
+        for(const auto& u:units)std::printf("[%zu,%s,occupancy=%llu]",u.slot,u.unit==core::AdmissionUnit::prefill?"prefill":"decode",(unsigned long long)u.occupancy);
+        std::puts("");return result;
+    }
+    auto foreground_peer(const program::ServingThreadSelection& w,const program::ServingThreadUnit& u)const{return real.foreground_peer(w,u);}
+    bool acknowledge_unit(const program::ServingThreadSelection& w,const program::ServingThreadUnit& u,uint64_t occ,uint64_t cut){return real.acknowledge_unit(w,u,occ,cut);}
+};
+struct BSlot {
+    bool active=false,alignment_unpublished=false,repair_finishing=false,cached=false,img=false,tainted=false,stop=false;
+    bool draft_ready=false;std::array<int32_t,2>draft{}; // unused actual MTP branch is compiled, never enabled
+    int32_t x=1;int64_t p=0,produced=0,max_new=64;Clock::time_point t0{};
+    std::string owned_finish_reason;
+    std::shared_ptr<program::ServingRawSession> owned_raw;
+    std::shared_ptr<program::RecordingRepair> owned_repair;
+};
+int main(int argc,char** argv){
+    check(argc==2,"named mode required");const std::string mode=argv[1];
+    check(mode=="priority"||mode=="equal"||mode=="stop"||mode=="cancel"||mode=="eof"||mode=="error"||mode=="legacy"||mode=="peer-only","unknown named mode");
+    World world;world.call("CREATE t 0");world.call("CREATE other 0");
+    const auto fg=world.open("t",1,"foreground"),repair=world.open("t",1,"live_repair");
+    const auto peer_fg=world.open("other",2,"foreground"),peer_repair=world.open("other",2,"live_repair");
+    world.bind(0,"000000000000",fg,repair);world.bind(1,"000000000001",peer_fg,peer_repair);
+    check(world.bridge->attach(1,2,11),"actual real-registry peer occupancy attach");
+    Probe probe{*world.bridge,{}};Probe* serving_threads=mode=="legacy"?nullptr:&probe;
+    std::vector<BSlot> bs(2);bs[1].active=true;bs[1].owned_raw=std::make_shared<program::ServingRawSession>();bs[1].owned_raw->occupancy=11;
+    auto serving_raw_session=std::make_shared<program::ServingRawSession>();
+    bool owned_batch_allocation=mode!="legacy",in_prompt_read=false,serving_raw_fence_running=true,serving_ordinary_fence=false;
+    bool live_approximate=false,batch_fatal=false,batch_mtp=false;uint64_t prefill_joined_end=UINT64_MAX;
+    struct{std::atomic<bool>input_error{false};}shared;auto* in_shared=&shared;
+    std::mutex in_mu;bool in_eof=false;std::atomic<bool>stop_req{false};std::string err,e;
+    bool control_pending=false;int controls=0;
+    auto serving_process_controls=[&](){++controls;
+        if(!serving_threads)return true;
+        if(!world.bridge->refresh(uint64_t(Clock::ticks.count()))){
+            in_shared->input_error.store(true);stop_req.store(true);return false;
+        }
+        if(control_pending){control_pending=false;
+            if(mode=="stop")stop_req.store(true);
+            if(mode=="eof")in_eof=true;
+            if(mode=="error")in_shared->input_error.store(true);
+            if(mode=="cancel"){world.now=uint64_t(Clock::ticks.count());world.cancel(fg);}
+        }
+        const bool refreshed=world.bridge->refresh(uint64_t(Clock::ticks.count()));
+        if(!refreshed){in_shared->input_error.store(true);stop_req.store(true);}
+        return refreshed;
+    };auto serving_thread_now_ms=[](){return uint64_t(Clock::ticks.count());};
+    uint64_t serving_repair_consecutive_escalated=0,serving_repair_random_state=2,serving_repair_idle_unit=0;
+    program::ServingRepairSchedulerConfig serving_repair_schedule;serving_repair_schedule.foreground_weight=1;
+    serving_repair_schedule.live_weight=1;serving_repair_schedule.max_consecutive=1;
+    struct{uint64_t remote_policy_incarnation=7,batch_group_operation=0;}runtime;auto* owned_runtime=&runtime;
+    std::optional<program::ServingThreadSelection>serving_selected_thread,serving_prefill_peer_winner;
+    std::optional<program::ServingThreadUnit>serving_selected_thread_unit;
+    std::array<std::optional<program::ServingThreadSelection>,2>serving_thread_cohort;
+    std::array<std::optional<program::ServingThreadUnit>,2>serving_thread_cohort_units;
+    std::function<bool()>owned_slot_maintenance;
+    auto accept_batch_stop=[](const std::string&){core::retirement_failed("unexpected cancellation boundary");};
+    struct Options{
+ACTUAL_EOS_DEFAULT
+        int64_t max_context=32768;int prompt_cache=1;
+    }o;
+    std::vector<int> group_rows;
+    const std::array<std::array<int32_t,3>,2> recorded_samples{{{{2,5983,248046}},{{2,2438,248046}}}};
+ACTUAL_BATCH_ON
+ACTUAL_ACK
+ACTUAL_COHORT
+ACTUAL_BATCH_PREFIX
+        // Physical unit is a recording boundary. Prefix above supplies the
+        // exact production cohort and row eligibility; below keeps real EOS.
+        group_rows.push_back(A);++owned_runtime->batch_group_operation;
+        std::printf("TRACE recorded_group=%llu active_rows=%d\n",(unsigned long long)owned_runtime->batch_group_operation,A);
+        for(int t=0;t<A;++t){const int b=active[t];auto& sl=bs[size_t(b)];
+            check(sl.produced<3,"bounded supplied three-output recording sequence");
+            if(sl.owned_raw)++sl.owned_raw->state.id;
+            if(serving_threads)serving_ack_foreground_lane(size_t(b));
+            for(int j=0;j<1;++j){const int32_t y=recorded_samples[size_t(b)][size_t(sl.produced)];
+ACTUAL_EOS
+            }
+            if(!sl.active&&serving_threads)check(world.bridge->foreground_finished(size_t(b),false,serving_thread_now_ms()),"actual foreground completion milestone");
+        }
+        return true;
+    };
+
+    if(mode=="peer-only"){
+        check(world.bridge->attach(0,1,10),"real second occupancy attach");bs[0].active=true;
+        bs[0].owned_raw=std::make_shared<program::ServingRawSession>();bs[0].owned_raw->occupancy=10;
+        in_prompt_read=true;check(batch_step(),"occupied peer-only positive");
+        check(group_rows.size()==1&&group_rows[0]==2,"same-tier occupied foreground cohort still mask3");
+        std::puts("PASS occupied same-tier peer positive, recording native rows");return 0;
+    }
+    if(mode!="equal"&&mode!="legacy")world.call("BASE t 1 1 10");
+    const int admit_slot=0;struct{uint64_t request=1;}owned_admission_scope;
+    int prefill_dispatches=0,choices=0;bool equal_intervals=false;
+    const auto original_main=serving_raw_session;
+    auto chosen_ticket=[&](uint64_t desired){
+        // Deterministic chosen-ticket progress, not a finite-wait probability
+        // assertion. The actual producer still draws the ticket in choose.
+        for(uint64_t seed=1;seed<=64;++seed){auto state=seed;
+            if(program::serving_repair_uniform_ticket(state,2)==desired){serving_repair_random_state=seed;return;}}
+        check(false,"bounded real PRNG seed for chosen ticket");
+    };
+    auto run=[&](int64_t q,int64_t r)->bool{
+        if(!serving_threads){++prefill_dispatches;Clock::ticks+=Clock::duration(100);return true;} // recorded legacy prefill backend
+        const int64_t quantum=1024;
+ACTUAL_ENTRY
+ACTUAL_JOINT
+            bool other_serviced=false,deferred_peer=false;
+ACTUAL_CHOOSE
+            check(count==1+size_t(bs[1].active),"actual collect includes current and active occupied peer");
+            if(mode=="equal"){
+                const auto first=world.bridge->select(serving_repair_schedule.policy,boundary,std::span(candidates.data(),count),serving_thread_now_ms(),0);
+                const auto second=world.bridge->select(serving_repair_schedule.policy,boundary,std::span(candidates.data(),count),serving_thread_now_ms(),1);
+                check(first.ready&&second.ready&&first.total_weight==2&&first.operation.key==fg&&second.operation.key==peer_fg,"real equal-tier ticket intervals include both eligible foreground units");
+                equal_intervals=true;chosen_ticket(choices==0?1:0);
+            }else{
+                const auto winner=world.bridge->select(serving_repair_schedule.policy,boundary,std::span(candidates.data(),count),serving_thread_now_ms(),0);
+                check(world.bridge->request_ready(0,1)&&winner.ready&&winner.operation.key==fg&&winner.effective_priority==10,"genuine ready higher-priority current excludes lower peer at next joint boundary");
+            }
+            ++choices;check(choices<=8,"chosen-ticket progress bound, no random wait guarantee");
+            if(!choose_and_service(false))return false;
+ACTUAL_AFTER_PEER
+            const int64_t end=at+std::min<int64_t>(quantum,r-at);
+            // Physical Prefill::run, callbacks/device drains are recording only.
+            std::array<int64_t,2> ends{end,end};program::ServingThreadPrefillBoundary completed;
+            completed.source_window_generation=9;completed.source_cut=1;completed.from=uint64_t(at);completed.to=uint64_t(end);
+            completed.stage_forwarded=ends;completed.pipeline_joined=completed.devices_drained=completed.request_fence_open=true;
+            check(world.bridge->acknowledge_prefill(selected,current,completed),"actual registry progress ACK over recorded joined endpoints");
+            ++prefill_dispatches;Clock::ticks+=Clock::duration(100);
+            if(prefill_dispatches==1&&(mode=="stop"||mode=="cancel"||mode=="eof"||mode=="error"))control_pending=true;
+ACTUAL_ADVANCE
+        }
+        return true;
+    };
+    std::vector<std::string> in_lines;
+    const int64_t a0=0,b0=3072,n=b0;int64_t il_parts=0,pipe_rows=0;double il_ms=0,pr_prev_piece_ms=0,pr_cap=0,pr_floor=0;
+    const bool pr_on=false,trace=false;
+    auto piece_now=[](){return int64_t(1024);}; // recorded resolved positive shape, actual q=r loop below
+    auto give_way=[](int,int64_t,std::string&)->bool{core::retirement_failed("unexpected BYIELD in recording case");};
+    auto piped_decode=[](double,std::string&)->bool{core::retirement_failed("unsupported pipelined mode in CPU seam");};
+ACTUAL_DECODE_SHARE
+    check(decode_share==0.5,"unchanged legacy share default, no environment override");
+    auto pieces=[&]()->bool{
+ACTUAL_PIECES
+        return true;
+    };
+    const bool result=pieces();
+    if(mode=="stop"||mode=="cancel"||mode=="eof"||mode=="error"){
+        check(!result&&prefill_dispatches==1&&group_rows.empty(),"actual next managed STOP/cancel/terminal boundary refuses every further physical dispatch");
+        check(serving_raw_session==original_main&&original_main->healthy()&&original_main->request_open()&&original_main->phase()==program::ServingRawSession::Phase::running,"refusal preserves recorded RAW owner/lifecycle; no fake retirement");
+        if(mode=="cancel")check(!world.bridge->request_ready(0,1)&&world.bridge->cancellation_pending(0),"real graph cancellation affects request readiness");
+        else check(stop_req.load(),"actual terminal/STOP path retains stop signal");
+        check(controls>=3,"actual controls serviced before reentry refusal");
+        std::puts("PASS actual managed reentry cancellation/terminal refusal, recording physical boundary");return 0;
+    }
+    check(result&&!batch_fatal&&prefill_dispatches==3,"actual q=r/at=end progression completes all recorded pieces");
+    if(mode=="legacy"){
+        check(bs[1].produced==3&&!bs[1].active&&!bs[1].repair_finishing&&group_rows.size()==3,"unmanaged burst preserves legal three-output EOS/max64 semantics");
+        std::puts("PASS legacy positive burst/EOS unchanged");return 0;
+    }
+    if(mode=="priority"){
+        if(!group_rows.empty()){
+            std::printf("COVERAGE_ASSERT lower_peer_calls=%zu expected=0 current_prefill_ready=%d\n",group_rows.size(),int(world.bridge->request_ready(0,1)));
+            return 21;
+        }
+        check(choices==3&&bs[1].produced==0,"each new managed piece rejoins actual current-prefill selection");
+        std::puts("PASS clarified high-priority managed coverage, lower_peer_calls=0");return 0;
+    }
+    check(equal_intervals&&choices==4&&group_rows.size()==1&&bs[1].produced==1,"real chosen-ticket equal-tier current AND peer progress, no fairness/overlap claim");
+    std::puts("PASS equal-tier actual tickets and bounded chosen-ticket progress");
+}

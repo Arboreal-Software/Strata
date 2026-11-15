@@ -25,6 +25,8 @@ class Gemm {
 public:
     Gemm() = default;
     ~Gemm();
+    /// CUDA/HIP: caller has selected/drained the device; failure terminates before borrowed buffers retire.
+    void retire_strict();
     Gemm(const Gemm&) = delete;
     Gemm& operator=(const Gemm&) = delete;
 
@@ -75,6 +77,8 @@ public:
     /// after every rebind (the "scratch free" events are re-armed on the compute stream).  CUDA only.
     bool set_dequant_side(uint16_t* scratch2, std::string& err);
 
+    // Paid callers use only their admitted scratch; ordinary defaults remain unchanged.
+    void freeze_weight_cache() { w16_budget_ = 0; }
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }

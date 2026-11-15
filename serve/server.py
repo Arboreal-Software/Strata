@@ -27,8 +27,11 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from types import SimpleNamespace
 import contextlib
 import collections
+import ctypes
 import base64
 import hashlib
 import hmac
@@ -42,6 +45,7 @@ import re
 import select
 import signal
 import socket
+import stat
 import socketserver
 import struct
 import shutil
@@ -1075,23 +1079,56 @@ def parse_stage_in_flight_sample(line: str) -> dict | None:
     return {"elapsed_us": elapsed_us, "in_flight_us": in_flight_us}
 
 
+@dataclass(frozen=True)
+class _EngineEpoch:
+    """Identity and queue/table references never change after publication."""
+    proc: object
+    gen: int
+    lines: object
+    slots: object
+    ctl: object
+    slot_cv: object
+    strict_owned: bool = False
+    receipt_env: tuple = ()
+    scheduler: object = None
+
+
+@dataclass
+class _BatchControl:
+    """Own exactly the acquired lock until handoff or final cleanup."""
+    lock: object = None
+    error: BaseException | None = None
+
+    def release(self):
+        lock, self.lock = self.lock, None
+        if lock is not None:
+            lock.release()
+
+
 class _RequestOwned:
     """#4451: a per-request control field of a --batch engine.  With batch slots several requests run on their own
     threads, and the control lines serve one at a time; a field every request writes (`_ctl_mode`, `_ctl_result`,
     `_yielded`, `_last_done`, `_ctl_erred`) must not be seen by another request that gets the lines next.  So each
     thread has its own copy; one request at a time, it is the one attribute as before."""
 
-    def __init__(self, default=None):
+    def __init__(self, default=None, always_thread=False):
         self.default = default
+        self.always_thread = always_thread
 
     def __set_name__(self, owner, name):
         self.name = name
 
     def _store(self, obj):
         d = obj.__dict__
-        if d.get("batch"):
-            return d.setdefault("_own_tl", threading.local()).__dict__
-        return d.setdefault("_own_plain", {})
+        if d.get("batch") or self.always_thread:
+            own = d.get("_own_tl")
+            if own is None:
+                own = d["_own_tl"] = threading.local()
+            return own.__dict__
+        plain = d.get("_own_plain")
+        if plain is None:
+            plain = d["_own_plain"] = {}
+        return plain
 
     def __get__(self, obj, owner=None):
         if obj is None:
@@ -1120,7 +1157,7 @@ class StrataEngine:
     _yielded = _RequestOwned()
     _last_done = _RequestOwned()
     _ctl_erred = _RequestOwned(False)
-    _ctl_held = _RequestOwned(False)     # this thread already holds the control lines (Service.vram takes them itself)
+    _ctl_held = _RequestOwned(False, always_thread=True)     # this thread already holds the control lines (Service.vram takes them itself)
     CONTROL_WAIT_S = 300.0               # how long vram() / session_file() wait for the control lines of a batch engine
     DRAIN_TIMEOUT_S = 300.0              # how long an interrupted request waits, with no line from its engine, for DONE / BADM
     QUARANTINE_S = 600.0                 # ... and how long a slot or the control lines stay held after that with no line
@@ -1144,12 +1181,65 @@ class StrataEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
+    _SLOT_FIELDS = ("slot_order", "slot_group", "slot_groups", "slot_gs", "slot_q", "slot_busy",
+                    "slot_claims", "slot_releasing", "_orphan_seen", "slot_held", "slot_used", "slot_live", "rid_q", "multi")
+
+    def _state_lock(self):
+        # Also supports the small __new__ fixtures used by protocol unit tests.
+        return self.__dict__.setdefault("_epoch_lock", threading.RLock())
+
+    def _capture_epoch(self, born=None):
+        with self._state_lock():
+            proc, gen = getattr(self, "proc", None), getattr(self, "gen", 0)
+            if born is not None and gen != born:
+                raise EngineDied("the engine changed after this request was admitted")
+            epoch = self.__dict__.get("_epoch")
+            if epoch is None or epoch.proc is not proc or epoch.gen != gen:
+                if proc is not None and getattr(self, "_stdin_closing", False):
+                    raise EngineDied("the engine has not published a ready process epoch")
+                # Real starts publish explicitly after READY. This path supports
+                # lazy/test engines that install their own process and queues.
+                slots = SimpleNamespace(**{k: getattr(self, k, None) for k in self._SLOT_FIELDS})
+                epoch = _EngineEpoch(proc, gen, getattr(self, "lines", None), slots,
+                                     getattr(self, "ctl", None), getattr(self, "slot_cv", None))
+                self._epoch = epoch
+            return epoch
+
+    def _epoch_current(self, epoch):
+        return (getattr(self, "proc", None) is epoch.proc and
+                getattr(self, "gen", 0) == epoch.gen and self.__dict__.get("_epoch") is epoch)
+
+    def _check_epoch(self, epoch):
+        with self._state_lock():
+            if not self._epoch_current(epoch):
+                raise EngineDied("the engine changed after this request was admitted")
+
+    @contextlib.contextmanager
+    def _epoch_state(self, epoch):
+        # Only short local status updates: never hold this over callbacks, pipe
+        # I/O, queue waits, process waits, or host-thread joins.
+        with self._state_lock():
+            self._check_epoch(epoch)
+            yield
+
+    def _epoch_update(self, epoch, **values):
+        with self._epoch_state(epoch):
+            for key, value in values.items():
+                setattr(self, key, value)
+
+    def _parse_done_epoch(self, line, epoch):
+        with self._epoch_state(epoch):
+            self._parse_done(line)
+
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
                  retry_args: list[str] | None = None, retry_vram_args: list[str] | None = None):
-        # retry_args: the arguments to start again with, once, when this start ends before the engine is ready (an Auto start that picked DFlash2: mtp_retry_args)
-        # retry_vram_args: the same start with no drafter (nodraft_retry_args), used instead when the engine ended because a card ran out of memory: swapping DFlash2 for
-        # the MTP takes MORE memory from a card that is already short, so that direction is never taken then
+        if "wlock" not in self.__dict__:
+            self.wlock = threading.Lock()  # one writer lock for this object, including every restart
+        self._state_lock()
+        previous = getattr(self, "_epoch", None)
+        if previous is not None:
+            self._reap_owned_image_transports(previous)
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
@@ -1157,7 +1247,11 @@ class StrataEngine:
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
-        self.proc, self.pump, self.log = None, None, None
+        with self.wlock, self._state_lock():
+            self.proc = None
+            self._stdin_closing = True
+            self._stdin_failed = False
+        self.pump, self.log = None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
@@ -1210,9 +1304,11 @@ class StrataEngine:
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
         try:
-            self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", errors="replace",
-                              bufsize=1, env=env, **pin)    # (#5044: a byte that is not UTF-8 killed the reader thread)
+            proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
+                              **pin)
+            with self.wlock, self._state_lock():
+                self.proc = proc
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
             if log:
@@ -1255,7 +1351,8 @@ class StrataEngine:
                     pass
             try:                                        # its pipes and our handle on its log (the log stays)
                 proc.wait(timeout=5)
-                proc.stdin.close()
+                with self.wlock:
+                    proc.stdin.close()
                 proc.stdout.close()
                 if log:
                     self.log.close()
@@ -1325,11 +1422,9 @@ class StrataEngine:
             self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
-        self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
-        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own); first, so
-        #                                                 a request that sees the new number sees the new queues (#4451)
-        self.lines: queue.Queue = queue.Queue()
+        lines = queue.Queue()
+        slots = SimpleNamespace()
         # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots", "--parallel") if k in args), 0)
@@ -1346,27 +1441,34 @@ class StrataEngine:
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
         # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
-        self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
-        self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
-        self.slot_groups = groups
+        slots.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
+        slots.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
+        slots.slot_groups = groups
         # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
         # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
         # conversation cache - see pick_slot
         groups_run = int(self.info.get("batch_groups") or groups)
-        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
-        self.slot_q = [queue.Queue() for _ in range(self.batch)]
-        self.slot_busy = [False] * self.batch
+        slots.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+        slots.slot_q = [queue.Queue() for _ in range(self.batch)]
+        slots.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
         # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
-        self.slot_claims: set[int] = set()
-        self.slot_releasing: set[int] = set()
-        self._orphan_seen: dict[int, float] = {}
+        slots.slot_claims: set[int] = set()
+        slots.slot_releasing: set[int] = set()
+        slots._orphan_seen: dict[int, float] = {}
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
-        self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
-        self.slot_used = [0.0] * self.batch
-        self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+        slots.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        slots.slot_used = [0.0] * self.batch
+        strict_owned = self._strict_owned_two()
+        child_env = self.spawn[4] if self.spawn[4] is not None else os.environ
+        receipt_env = tuple((key, child_env.get(key)) for key in
+                            ('STRATA_HTTP_NATIVE_RECEIPTS', 'STRATA_HTTP_TWO_SLOT_RECEIPTS'))
+        if strict_owned:
+            from .two_slot_receipts import OwnedSlotObservations
+            slots.owned_observations = OwnedSlotObservations()
+        slots.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
         # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
@@ -1383,29 +1485,139 @@ class StrataEngine:
         if "rid_lock" not in self.__dict__:
             self.rid_lock = threading.Lock()
             self.rid_n = 0                              # --parallel requests' ids (rid=): never reused, a restart goes on from here
-        self.rid_q: dict[int, queue.Queue] = {}         # this process's: rid -> that request's lines (T / PP / DONE / ERR, rid taken out)
+        slots.rid_q = {}
+        slots.multi = self.multi         # this process's: rid -> that request's lines (T / PP / DONE / ERR, rid taken out)
         self.multi_stat = ""                            # the engine's last STAT line over everything it wrote
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
-        self.wlock = threading.Lock()                   # stdin writes from several request threads
-        self.pump = threading.Thread(target=self._pump, daemon=True)
+        with self.wlock, self._state_lock():
+            self.gen = self.__dict__.get("gen", 0) + 1
+            self.lines = lines
+            for name in self._SLOT_FIELDS:
+                setattr(self, name, getattr(slots, name))
+            scheduler = None
+            if child_env.get('STRATA_SERVING_THREAD_POLICY_V1') is not None:
+                from .scheduler_control import SchedulerControl
+                captured_proc, captured_gen = self.proc, self.gen
+                def write_scheduler(frame):
+                    # Capture the actual process as well as generation; never retarget.
+                    if self.proc is not captured_proc:
+                        raise EngineDied('scheduler engine changed before write')
+                    self._send(frame.rstrip('\n'), born=captured_gen)
+                def fail_scheduler(reason):
+                    # The callback owns this captured process, even after replacement.
+                    try:
+                        captured_proc.terminate()
+                    except OSError:
+                        pass
+                scheduler = SchedulerControl(write_scheduler, on_failure=fail_scheduler)
+                scheduler.retirements = queue.SimpleQueue()
+            self._epoch = _EngineEpoch(self.proc, self.gen, lines, slots, self.ctl, self.slot_cv,
+                                       strict_owned, receipt_env, scheduler)
+            self._stdin_closing = False
+            self.ended = False                          # READY: publication and writer generation agree
+        self.pump = threading.Thread(target=self._pump, args=(self._epoch,), daemon=True)
         self.pump.start()
 
-    def _pump(self):
-        proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
-        slot_q = self.slot_q
-        slot_busy = self.slot_busy                      # this process's (a restart makes new ones)
-        rid_q = self.rid_q
-        multi = self.multi
+    def _strict_owned_two(self):
+        env = self.spawn[4] if self.spawn[4] is not None else os.environ
+        return self.batch == 2 and env.get("STRATA_OWNED_BATCH_ALLOCATION") == "1"
+
+    def _owned_stop(self, epoch, slot, request):
+        if not epoch.strict_owned:
+            return f"BSTOP {slot}"
+        return epoch.slots.owned_observations.stop(slot, request)
+
+    def _cancel_managed_request(self, epoch, request):
+        manager = getattr(self, 'scheduler_manager', None)
+        if epoch.scheduler is not None and manager is not None:
+            manager.schedule_cancel(request, client=epoch.scheduler)
+
+    def _send_owned_stop(self, epoch, slot, request):
+        self._send(self._owned_stop(epoch, slot, request), born=epoch.gen)
+        self._cancel_managed_request(epoch, request)
+
+    def _pump(self, epoch=None):
+        epoch = epoch or self._capture_epoch()
+        proc, lines = epoch.proc, epoch.lines             # this process's: a restart replaces both (#344)
+        slot_q = epoch.slots.slot_q
+        native_receipt = None
+        native_env = dict(epoch.receipt_env)
+        if native_env.get('STRATA_HTTP_NATIVE_RECEIPTS') == '1':
+            from .native_receipts import NativeReceipt
+            native_receipt = NativeReceipt.enabled(proc.pid, epoch.gen, native_env)
+        two_receipt = None
+        if native_env.get('STRATA_HTTP_TWO_SLOT_RECEIPTS') == '1':
+            from .two_slot_receipts import TwoSlotReceipt
+            two_receipt = TwoSlotReceipt.enabled(proc.pid, epoch.gen, native_env)
+        owned_terminals = None
+        if epoch.strict_owned:
+            from .two_slot_receipts import OwnedTerminalPairing
+            owned_terminals = OwnedTerminalPairing(epoch.slots.owned_observations)
+        slot_busy = epoch.slots.slot_busy
+        rid_q = epoch.slots.rid_q if epoch.slots.rid_q is not None else {}
+        multi = epoch.slots.multi or 0
         line = None
         for line in proc.stdout:
+            if epoch.scheduler is not None:
+                try:
+                    if epoch.scheduler.observe(line):
+                        continue
+                    if line.startswith('SCHED'):
+                        raise ValueError('Malformed scheduler record')
+                except (ValueError, RuntimeError) as error:
+                    epoch.scheduler.close(str(error))
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.silent_note = 'Scheduler protocol failure: '+str(error)
+                            self.ended = True
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    break
+            if epoch.strict_owned:
+                try:
+                    paired = owned_terminals.observe(line)
+                    if epoch.scheduler is not None and line.startswith('BOWN_DONE '):
+                        epoch.scheduler.retirements.put(json.loads(line.split(' ', 1)[1])['request'])
+                    if paired is not None:
+                        retired_slot, terminal_line = paired
+                        slot_q[retired_slot].put(terminal_line)
+                    if line.startswith("BDONE "):
+                        if two_receipt is not None:
+                            two_receipt.observe(line)
+                        continue  # no routing until BOTH real terminal and retirement arrive
+                except (ValueError, KeyError, IndexError, TypeError) as error:
+                    # Fail the captured epoch, wake all consumers below, and retire
+                    # this exact process. Never synthesize a successful BDONE.
+                    line = "BOWN_ERROR protocol_failure"
+                    if two_receipt is not None:
+                        two_receipt.observe(line)
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.silent_note = "Owned batch2 protocol failure: " + str(error)
+                            self.ended = True
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    break
+            if two_receipt is not None:
+                two_receipt.observe(line)
+            if native_receipt is not None:
+                native_receipt.observe(line)  # exact received native line, before routing/consumer filtering
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
                 # process stays alive and prints DONE afterwards.
-                if self.proc is proc:
-                    self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
-                    self.ended = True
+                with self._state_lock():
+                    if self._epoch_current(epoch):
+                        self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
+                        self.ended = True
                 try:
                     proc.terminate()
                 except OSError:
@@ -1413,13 +1625,17 @@ class StrataEngine:
                 break                           # publish EOF, never the trailing DONE
             if line.startswith("BSTAT"):
                 sample = parse_batch_window_sample(line)
-                if sample is not None and self.proc is proc:
-                    self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
+                if sample is not None:
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue                        # control telemetry never enters a request's token stream
             if line.startswith("PSTAT"):
                 sample = parse_stage_in_flight_sample(line)
-                if sample is not None and self.proc is proc:
-                    self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
+                if sample is not None:
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue
             if multi:                                   # DeepSeek --parallel: `T <rid> <id>`, `PP <rid> ...`, `DONE <rid> ...`, `ERR <rid> ...`
                 head, _, rest = line.partition(" ")
@@ -1430,7 +1646,9 @@ class StrataEngine:
                         rq.put(head + (" " + tail if tail else "\n"))
                     continue
                 if head == "STAT":                      # over everything the engine wrote, not one request's
-                    self.multi_stat = line
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self.multi_stat = line
                     continue
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
@@ -1446,10 +1664,27 @@ class StrataEngine:
                 except (IndexError, ValueError):
                     pass
             lines.put(line)
-        if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
-            self.ended = True                           # its output closed: it is gone, even before the OS says so
-            if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
-                self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
+        if epoch.scheduler is not None:
+            epoch.scheduler.close('Captured engine stdout closed', failed=False)
+        with self._state_lock():
+            if self._epoch_current(epoch):                           # a killed engine's pump must not mark its successor dead
+                self.ended = True                           # its output closed: it is gone, even before the OS says so
+                if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
+                    self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
+        if native_receipt is not None:
+            try:
+                native_exit = proc.wait(timeout=2)
+            except Exception:
+                native_exit = None
+            native_receipt.write({'kind': 'eof', 'exit_code': native_exit})
+            native_receipt.close()
+        if two_receipt is not None:
+            try:
+                two_exit = proc.wait(timeout=2)
+            except Exception:
+                two_exit = None
+            two_receipt.write({'kind': 'eof', 'exit_code': two_exit})
+            two_receipt.close()
         lines.put(None)
         for q in slot_q:
             q.put(None)
@@ -1595,50 +1830,82 @@ class StrataEngine:
         answer; run beside an admission they took its PP / T / BADM lines, and the admission its answer.  They take the
         lines like a request does.  One request at a time: nothing to take."""
         ctl = self.__dict__.get("ctl")
-        if not self.batch or ctl is None or self._ctl_held:
+        if not self.batch or ctl is None:
+            yield
+            return
+        if self._ctl_held and self._ctl_held is not ctl:
+            raise EngineDied("borrowed control does not belong to the current engine")
+        if self._ctl_held is ctl:
             yield
             return
         if not ctl.acquire(timeout=self.CONTROL_WAIT_S):
             raise ValueError("a request is still running; try again when it has finished")
         try:
+            self._ctl_held = ctl
             yield
         finally:
+            self._ctl_held = False
             ctl.release()
 
-    def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
-        with self._exclusive_control():
-            return self._vram(reserve_mib, timeout)
-
-    def _vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
+    def vram(self, reserve_mib: int | None, timeout: float = 120.0, *, _control=None) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
         expert cache until that much VRAM is free, or grows it back when more is free; None: back to the reserve it
         started with.  -> the engine's figures (expert_slots, expert_cache_mib, vram_free_mib, ...); raises ValueError
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
-        self.proc.stdin.flush()
-        deadline = time.time() + timeout
-        while True:
-            try:
-                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
-            except queue.Empty:
-                raise EngineDied("the engine did not answer the VRAM command") from None
-            if line is None:
-                raise EngineDied("the engine ended")
-            line = line.strip()
-            if line.startswith("ERR"):
-                raise ValueError(line[4:].strip() or "the engine refused the VRAM command")
-            if line.startswith("VRAM "):
-                out = {}
-                for kv in line.split()[1:]:
-                    k, _, v = kv.partition("=")
-                    out[k] = int(v) if v.lstrip("-").isdigit() else v
-                self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
-                self.info["vram"] = out
-                return out
-            if time.time() > deadline:
-                raise EngineDied("the engine did not answer the VRAM command")
+        epoch = self._capture_epoch()
+        # One original command-body frame. The borrowed argument is supplied
+        # only by an actual caller holding this captured lock; identity alone
+        # never acquires it. No strict TLS/context-manager actor is introduced.
+        acquired = _control is None
+        if not acquired:
+            if _control is not epoch.ctl:
+                raise EngineDied("borrowed control does not belong to the captured engine")
+        elif epoch.strict_owned:
+            _control = epoch.ctl
+            if _control is None or not _control.acquire(timeout=self.CONTROL_WAIT_S):
+                raise ValueError("a request is still running; try again when it has finished")
+        else:
+            _control = self._exclusive_control()
+            _control.__enter__()
+        try:
+            self._check_epoch(epoch)
+            self._send("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}"), born=epoch.gen)
+            deadline = time.time() + timeout
+            while True:
+                try:
+                    line = epoch.lines.get(timeout=max(0.1, deadline - time.time()))
+                except queue.Empty:
+                    raise EngineDied("the engine did not answer the VRAM command") from None
+                self._check_epoch(epoch)
+                if line is None:
+                    raise EngineDied("the engine ended")
+                line = line.strip()
+                if line.startswith("ERR"):
+                    raise ValueError(line[4:].strip() or "the engine refused the VRAM command")
+                if line.startswith("VRAM "):
+                    out = {}
+                    for kv in line.split()[1:]:
+                        k, _, v = kv.partition("=")
+                        out[k] = int(v) if v.lstrip("-").isdigit() else v
+                    with self._epoch_state(epoch):
+                        self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
+                        self.info["vram"] = out
+                    return out
+                if time.time() > deadline:
+                    raise EngineDied("the engine did not answer the VRAM command")
+        except BaseException:
+            if acquired and not epoch.strict_owned:
+                acquired = False  # __exit__ owns this cleanup, even if it raises
+                _control.__exit__(*sys.exc_info())
+            raise
+        finally:
+            if acquired:
+                if epoch.strict_owned:
+                    _control.release()  # actual acquired object, never a replacement attribute
+                else:
+                    _control.__exit__(None, None, None)
 
     def pen_from_key(self, orig_len: int, prompt_len: int) -> str:
         """` pen_from=N` for a leg that continues a request (prompt + what it generated): where the reply began, Strata's penalty window start. The all-cards split engine
@@ -1755,72 +2022,94 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
-    def _send(self, text: str):
+    @staticmethod
+    def _write_locked(proc, text: str, close_stdin: bool = False):
+        """Caller holds the persistent writer lock; keep each command/flush indivisible."""
+        proc.stdin.write(text + "\n")
+        proc.stdin.flush()
+        if close_stdin:
+            proc.stdin.close()
+
+    def _send(self, text: str, *, born: int | None = None):
         btrace("send>", text[:60])
+        proc = self.proc                                # capture before waiting; never retarget a queued write
+        generation = getattr(self, "gen", 0) if born is None else born
         try:
             with self.wlock:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+                if (proc is None or self.proc is not proc or getattr(self, "gen", 0) != generation or
+                        getattr(self, "_stdin_closing", False)):
+                    raise EngineDied("the engine process changed before the command was sent")
+                try:
+                    self._write_locked(proc, text)
+                except (OSError, AttributeError, ValueError):
+                    self._stdin_closing = True
+                    self._stdin_failed = True
+                    self.ended = True
+                    raise
+        except (OSError, AttributeError, ValueError):
+            # A partially written command is not safe to retry on either process.
+            code = proc.poll() if proc is not None else None
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {code})") from None
 
     def _send_for(self, born: int, text: str):
-        """#4451: a line meant for the engine process `born`.  After a restart the same slot number belongs to another
-        request of the new process: a BSTOP or BYIELD that followed the old request would end that one."""
-        if self.gen != born:
-            raise EngineDied("the engine restarted while this request was running; it was not completed")
-        self._send(text)
+        self._send(text, born=born)
 
-    def _quarantine_control(self, until: str, born: int, lines_q, slot, holding: bool) -> None:
+    def _quarantine_control(self, until: str, born: int, lines_q, slot, holding: bool, *, epoch=None, control=None, request=None) -> None:
         """#4451: a request left (cancel, disconnect, error) and the engine has not yet given the line that ends its
         exchange (`until`: DONE of a solo read, BADM of an admission) while it said nothing for DRAIN_TIMEOUT_S.  The control lines (and the
         admission's slot) stay with this exchange - nobody else is given them - until the engine confirms, so what it
         still prints can not reach a later request.  The engine silent for QUARANTINE_S more: it is ended.  (Only after a STOP or
         BSTOP, and only for silence: a generation that is still producing lines is never cut off.)"""
+        epoch = epoch or self._capture_epoch(born)
+        slots = epoch.slots
+        if lines_q is not epoch.lines:
+            raise EngineDied("control queue does not belong to the captured engine")
         if slot is not None:
-            with self.slot_cv:
-                self.slot_releasing.add(slot)           # busy stays: no request may take the slot
-                self.slot_claims.discard(slot)
+            with epoch.slot_cv:
+                slots.slot_releasing.add(slot)           # busy stays: no request may take the slot
+                slots.slot_claims.discard(slot)
 
         def run():
             try:
                 line = self._drain_control(until, timeout=self.QUARANTINE_S, born=born, lines_q=lines_q)
                 if line is None:
-                    self._end_out_of_step(born, "the engine did not end an interrupted request (STOP) in time")
+                    self._end_out_of_step(born, "the engine did not end an interrupted request (STOP) in time", epoch=epoch)
                 cont = bool(until == "BADM" and line and line.startswith("BADM ") and line.split()[2:3] == ["1"])
                 if slot is not None and self.gen == born:
                     if cont and self.alive():
-                        self._release_slot_when_done(slot, None, born)      # it went on in the slot: BSTOP, free at BDONE
+                        self._release_slot_when_done(slot, None, born=born, epoch=epoch, request=request)      # it went on in the slot: BSTOP, free at BDONE
                     else:
-                        with self.slot_cv:
-                            self.slot_busy[slot] = False
-                            self.slot_releasing.discard(slot)
-                            self.slot_cv.notify_all()
+                        with epoch.slot_cv:
+                            slots.slot_busy[slot] = False
+                            slots.slot_releasing.discard(slot)
+                            epoch.slot_cv.notify_all()
             finally:
                 if holding:
-                    self.ctl.release()
-                with self.slot_cv:
-                    self.slot_cv.notify_all()
+                    control.release() if control is not None else epoch.ctl.release()
+                with epoch.slot_cv:
+                    epoch.slot_cv.notify_all()
         threading.Thread(target=run, daemon=True).start()
 
-    def _control(self, cancel, on_token, stop_when=None, on_quiet=None, want_lp=False, lines_q=None):
+    def _control(self, cancel, on_token, stop_when=None, on_quiet=None, want_lp=False, lines_q=None, *, born=None, epoch=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE).  `on_quiet()` runs whenever the engine has been
-        quiet for half a second: between two PP lines of a read whose chunks take longer than that.
-
-        `want_lp`: a batch admission's token is the only one this reader ever sees with an `LP` line after it (a
-        slot's `BT` lines carry none), so a request asking for logprobs there is a `max_tokens` 1 one: read the
-        line here, for the request itself (its own lines: the engine's is shared by the slots' readers)."""
+        quiet for half a second: between two PP lines of a read whose chunks take longer than that."""
+        epoch = epoch or self._capture_epoch(born)
+        born, lines = epoch.gen, epoch.lines
+        self._check_epoch(epoch)
+        if lines_q is not None and lines_q is not epoch.lines:
+            raise EngineDied("control queue does not belong to the captured engine")
         stopped = False
         beat = time.monotonic()
         held = NO_LINE                               # a line read while looking for a token's LP line
-        lines_q = self.lines if lines_q is None else lines_q   # #4451: the request's own engine's lines (a restart makes new ones)
+        lines_q = epoch.lines if lines_q is None else lines_q   # #4451: the request's own engine's lines (a restart makes new ones)
 
         def send_stop():
-            if lines_q is self.lines:               # (a STOP to the engine that replaced this one would stop another request)
-                self._send("STOP")
+            self._check_epoch(epoch)
+            self._send("STOP", born=born)
         while True:
+            self._check_epoch(epoch)
             if held is not NO_LINE:
                 line, held = held, NO_LINE
             else:
@@ -1838,6 +2127,7 @@ class StrataEngine:
                         beat = time.monotonic()
                         yield None
                     continue
+            self._check_epoch(epoch)
             beat = time.monotonic()
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -1857,43 +2147,56 @@ class StrataEngine:
                         if own is not None:
                             own.append((t, held))
                         held = NO_LINE
+                self._check_epoch(epoch)
                 on_token(t)
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
-                    send_stop()
+                    self._send("STOP", born=born)
                     stopped = True
+                self._check_epoch(epoch)
                 yield False                              # a token is pending (not a heartbeat)
             elif line.startswith("PP "):
                 f = line.split()
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                    self.progress = (int(f[1]), int(f[2]))
-                    self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
-                    self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                    with self._epoch_state(epoch):
+                        self.progress = (int(f[1]), int(f[2]))
+                    with self._epoch_state(epoch):
+                        self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
+                    with self._epoch_state(epoch):
+                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                 if not stopped and cancel.is_set():
                     # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
                     # silence, which a stream of PP lines never allows): the engine read the whole prompt first
-                    send_stop()
+                    self._send("STOP", born=born)
                     stopped = True
+                self._check_epoch(epoch)
                 yield None
             elif line.startswith("DONE"):
-                self._parse_done(line)
-                self._last_done = line
+                self._parse_done_epoch(line, epoch)
+                with self._epoch_state(epoch):
+                    self._last_done = line
             elif line.startswith("BADM "):
                 f = line.split()
-                self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
+                with self._epoch_state(epoch):
+                    self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
                 return
             elif line.startswith("BCOK "):               # STRATA_COALESCE_PREFILL: <slot> <tokens>: the slot holds a waiting prompt
                 pass
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
                 f = line.split()
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
-                    self._yielded = (int(f[1]), int(f[2]))
+                    with self._epoch_state(epoch):
+                        self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
-                self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
+                with self._epoch_state(epoch):
+                    self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
                 self._raise_if_fatal_gpu(line)
                 raise ValueError(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
-                self._ctl_result = ("done", None)
+                with self._epoch_state(epoch):
+                    self._ctl_result = ("done", None)
                 return
+
+
 
     def _done_finish(self) -> str | None:
         """The finish field of the DONE line the control lines read last (None: none since it was cleared)."""
@@ -1911,7 +2214,13 @@ class StrataEngine:
         only one that says nothing for that long is."""
         wait_s = self.DRAIN_TIMEOUT_S if timeout is None else timeout
         end = time.monotonic() + wait_s
-        lines_q = self.lines if lines_q is None else lines_q
+        try:
+            epoch = self._capture_epoch(born)
+        except EngineDied:
+            return None  # the original process is already gone; never drain its replacement
+        lines_q = epoch.lines if lines_q is None else lines_q
+        if lines_q is not epoch.lines:
+            raise EngineDied("control queue does not belong to the captured engine")
         while time.monotonic() < end:
             if born is not None and (self.gen != born or not self.alive()):
                 return None
@@ -1919,11 +2228,13 @@ class StrataEngine:
                 line = lines_q.get(timeout=max(0.1, min(1.0, end - time.monotonic())))
             except queue.Empty:
                 continue
+            if not self._epoch_current(epoch):
+                return None
             if line is None:
                 return None
             end = time.monotonic() + wait_s                  # any line is progress
             if line.startswith("DONE"):
-                self._parse_done(line)
+                self._parse_done_epoch(line, epoch)
             if line.startswith(until) or line.startswith("ERR"):
                 return line
         return None
@@ -1947,19 +2258,23 @@ class StrataEngine:
         self.ended = True
         raise EngineDied("the GPU reported a fatal error and the engine ended: " + text[len("fatal GPU error:"):].strip()[:200])
 
-    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0, q=None):
+    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0, q=None, *, epoch=None):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
         in the same window).  Read it here, so the request's figures are the slot leg's (the background wait would eat it,
         and the request kept the admission's single token).  None when it does not come in `wait_s`: then the background
         wait takes over."""
-        if q is None and slot >= len(self.slot_q):
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
+        if q is None and slot >= len(slots.slot_q):
             return None
-        q = self.slot_q[slot] if q is None else q
+        q = slots.slot_q[slot] if q is None else q
         end = time.monotonic() + wait_s
         while time.monotonic() < end:
             try:
                 line = q.get(timeout=max(0.05, end - time.monotonic()))
             except queue.Empty:
+                return None
+            if not self._epoch_current(epoch):
                 return None
             if line is None:
                 return None
@@ -1967,28 +2282,33 @@ class StrataEngine:
                 return line
         return None
 
-    def _end_out_of_step(self, born: int, what: str) -> None:
+    def _end_out_of_step(self, born: int, what: str, *, epoch=None) -> None:
         """#4451: the engine did not give a line it owes (a BDONE after BSTOP, a DONE / BADM after STOP) within the
         quarantine: what it may still print can not be told from a later request's lines, so the engine is ended (the
         same end as a silent one, #481) and the next request starts it again.  Only the engine process it concerns."""
-        if self.gen == born and self.alive():
-            self._silent(what)
+        epoch = epoch or self._capture_epoch()
+        if epoch.gen == born and self._epoch_current(epoch) and self.alive():
+            self._silent(what, epoch=epoch)
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, born: int | None = None):
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, *, born: int | None = None, epoch=None, request=None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
-        if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
+        if born is not None and epoch.gen != born:
+            return
+        if slot >= len(slots.slot_q):                    # the engine restarted with fewer slots: this one is gone
             return
         if born is not None and self.gen != born:       # #4451: the engine this slot belonged to is gone; BSTOP now would stop
             return                                      # (and the wait below would read) a request of the NEW engine
         born = self.gen if born is None else born
         try:
-            self._send(f"BSTOP {slot}")
+            self._send_owned_stop(epoch, slot, request)
         except EngineDied:
-            pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing = self.slot_releasing
+            return
+        q, busy, held = slots.slot_q[slot], slots.slot_busy, slots.slot_held   # this process's: restart() replaces them
+        releasing = slots.slot_releasing
         releasing.add(slot)
 
         def wait():
@@ -2020,57 +2340,61 @@ class StrataEngine:
                 tail = []
                 # #4451: no BDONE in the quarantine from an engine that still runs: the slot is NOT handed on with its
                 # lines still to come - the engine is ended instead (a dead engine's slots are free by being gone)
-                self._end_out_of_step(born, "the engine did not end a stopped batch slot (BSTOP) in time")
+                self._end_out_of_step(born, "the engine did not end a stopped batch slot (BSTOP) in time", epoch=epoch)
             held[slot] = tail[:-1] if stream and tail else []
-            with self.slot_cv:
+            with epoch.slot_cv:
                 busy[slot] = False
                 releasing.discard(slot)
-                self.slot_cv.notify_all()
+                epoch.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
 
-    def _park_slot(self, slot: int) -> None:
+    def _park_slot(self, slot: int, *, epoch=None) -> None:
         """#1994: the engine refused a BGEN for `slot`.  Keep it busy here for SLOT_PARK_S (no request owns it), then
         give it back: the engine's view has caught up, or the next refusal parks it again."""
-        with self.slot_cv:
-            self.slot_claims.discard(slot)
-            self.slot_busy[slot] = True
-        busy = self.slot_busy
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
+        with epoch.slot_cv:
+            slots.slot_claims.discard(slot)
+            slots.slot_busy[slot] = True
+        busy = slots.slot_busy
 
         def free():
-            with self.slot_cv:
-                if slot not in self.slot_claims and slot not in self.slot_releasing:
+            with epoch.slot_cv:
+                if slot not in slots.slot_claims and slot not in slots.slot_releasing:
                     busy[slot] = False
-                self.slot_cv.notify_all()
+                epoch.slot_cv.notify_all()
         t = threading.Timer(self.SLOT_PARK_S, free)
         t.daemon = True
         t.start()
 
     ORPHAN_SLOT_S = 3.0   # #1603: a busy flag nobody owns this long is a leak and is given back
 
-    def _reap_orphan_slots(self) -> list[int]:
+    def _reap_orphan_slots(self, *, epoch=None) -> list[int]:
         """#1603: free the slots whose busy flag has no owner (no request holds or reserves them and no BDONE wait is
         running for them).  The caller holds slot_cv.  A flag that leaked kept every later request waiting for a slot
         that nothing would free - with nothing running, nothing queued and nothing for the frozen-engine check to see.
         A slot is only given back after it has looked ownerless for ORPHAN_SLOT_S, so a flag set a moment before its
         owner registers is never taken."""
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
         now = time.monotonic()
         freed = []
-        for b, busy in enumerate(self.slot_busy):
-            if busy and b not in self.slot_claims and b not in self.slot_releasing:
-                first = self._orphan_seen.setdefault(b, now)
+        for b, busy in enumerate(slots.slot_busy):
+            if busy and b not in slots.slot_claims and b not in slots.slot_releasing:
+                first = slots._orphan_seen.setdefault(b, now)
                 if now - first >= self.ORPHAN_SLOT_S:
-                    self.slot_busy[b] = False
-                    self._orphan_seen.pop(b, None)
+                    slots.slot_busy[b] = False
+                    slots._orphan_seen.pop(b, None)
                     freed.append(b)
             else:
-                self._orphan_seen.pop(b, None)
+                slots._orphan_seen.pop(b, None)
         if freed:
             print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request using them "
                   "(issue #1603); freed, the waiting request goes on", flush=True)
-            self.slot_cv.notify_all()
+            epoch.slot_cv.notify_all()
         return freed
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
@@ -2079,8 +2403,9 @@ class StrataEngine:
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
         `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
-        entry = [plen, time.monotonic(), new, prompt, cancel]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST; the prompt and request, for STRATA_COALESCE_PREFILL)
-        with self.slot_cv:
+        ctl, slot_cv = self.ctl, self.slot_cv
+        entry = [plen, time.monotonic(), new, prompt, cancel]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
+        with slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
             self.arrivals.append(entry[1])
@@ -2095,29 +2420,29 @@ class StrataEngine:
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
                     # restart is under way it keeps waiting and goes on with the new engine.
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
-                with self.slot_cv:
+                with slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
                     if turn and new and ADMIT_SHORT_FIRST > 0:
                         turn = self._admit_next() is entry
                 left = deadline - time.monotonic() if deadline is not None else 0.5
-                if turn and left > 0 and self.ctl.acquire(timeout=min(0.5, left)):
+                if turn and left > 0 and ctl.acquire(timeout=min(0.5, left)):
                     if new and ADMIT_SHORT_FIRST > 0:
-                        with self.slot_cv:              # a shorter one came while this one waited in acquire()
+                        with slot_cv:              # a shorter one came while this one waited in acquire()
                             first = self._admit_next() is entry
                         if not first:
-                            self.ctl.release()
-                            with self.slot_cv:
-                                self.slot_cv.notify_all()
+                            ctl.release()
+                            with slot_cv:
+                                slot_cv.notify_all()
                             continue
                     if self.alive():
                         if deadline is not None and time.monotonic() >= deadline:
-                            self.ctl.release()
+                            ctl.release()
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                         break
-                    self.ctl.release()                  # it died (or is being restarted) while this one was getting
+                    ctl.release()                  # it died (or is being restarted) while this one was getting
                     turn = False                        # the lines: not the engine this request was meant for
                 if not turn:
-                    with self.slot_cv:
+                    with slot_cv:
                         # #4738 (PR #4738's approach): the turn was read, and the lock given up, before this wait: a
                         # notification sent in between is gone.  Read it again under the lock and only wait when this
                         # request still has to.
@@ -2125,46 +2450,55 @@ class StrataEngine:
                         if eligible and new and ADMIT_SHORT_FIRST > 0:
                             eligible = self._admit_next() is entry
                         if not eligible or not self.alive():
-                            self.slot_cv.wait(timeout=min(0.5, max(0, left)))
+                            slot_cv.wait(timeout=min(0.5, max(0, left)))
                 if cancel.is_set():
                     return False
                 if time.monotonic() - beat >= 10.0:     # a heartbeat every 10 s, as the engine's own wait
                     beat = time.monotonic()
                     yield None
         finally:
-            with self.slot_cv:
+            with slot_cv:
                 previous_waiting = self.waiting
                 self.waiting = max(0, self.waiting - 1)
                 if entry in self.wait_lens:
                     self.wait_lens.remove(entry)
                 if (previous_waiting > 1 and self.waiting <= 1) or (new and ADMIT_SHORT_FIRST > 0):
                     # a waiter that leaves (cancelled, closed) can make another one the next in turn: tell it
-                    self.slot_cv.notify_all()
-        with self.slot_cv:
+                    slot_cv.notify_all()
+        with slot_cv:
             self.ctl_epoch += 1
-            self.slot_cv.notify_all()
-        return True
+            slot_cv.notify_all()
+        return ctl
 
     def _release_preslot(self, cancel):
-        """STRATA_COALESCE_PREFILL: the request that was given a slot ahead of its turn left before using it."""
+        """Release only the epoch that actually supplied a coalesced reservation."""
         slot = getattr(cancel, "_strata_preslot", None)
         if slot is None:
             return
+        epoch = getattr(cancel, "_strata_preslot_epoch", None)
         cancel._strata_preslot = None
-        with self.slot_cv:
-            self.slot_busy[slot] = False
-            self.slot_claims.discard(slot)
-            self.slot_cv.notify_all()
+        cancel._strata_preslot_epoch = None
+        if epoch is None:
+            raise EngineDied("coalesced slot has no process identity")
+        with epoch.slot_cv:
+            epoch.slots.slot_busy[slot] = False
+            epoch.slots.slot_claims.discard(slot)
+            epoch.slot_cv.notify_all()
 
-    def _coalesce(self, cancel, lead_prompt):
+    def _coalesce(self, cancel, lead_prompt, *, epoch=None):
         """STRATA_COALESCE_PREFILL (the caller holds the control lines and sends its BGEN right after): reserve free slots
         for requests still waiting for the control lines and send their prompts as BCO lines; the engine reads them in the
         same layer-major pass as the BGEN's prompt.  Each follower finds its slot in cancel._strata_preslot."""
+        epoch = epoch or self._capture_epoch()
+        self._check_epoch(epoch)
+        if epoch.strict_owned:
+            raise ValueError("owned slots do not admit ordinary coalesced copies")
+        slots = epoch.slots
         picked = []
         total = len(lead_prompt)
         def seen() -> int:
             now = time.monotonic()
-            with self.slot_cv:
+            with epoch.slot_cv:
                 return max(sum(1 for t in self.arrivals if now - t <= COALESCE_BURST_MS / 1000.0), 1 + len(self.wait_lens))
         recent = seen()
         if recent < COALESCE_MIN_REQS and COALESCE_WAIT_MS > 0:
@@ -2174,7 +2508,7 @@ class StrataEngine:
             return                                   # one or two requests on this engine: a plain read, at most 10 ms lost
         if COALESCE_WAIT_MS > 0:
             time.sleep(COALESCE_WAIT_MS / 1000.0)    # the requests of a burst reach the server a few ms apart
-        with self.slot_cv:
+        with epoch.slot_cv:
             for e in list(self.wait_lens):
                 if len(picked) >= COALESCE_PREFILL - 1:
                     break
@@ -2184,18 +2518,19 @@ class StrataEngine:
                     continue
                 if getattr(rq, "_strata_co", False) or len(prompt) < 32 or total + len(prompt) > COALESCE_TOKENS:
                     continue
-                slot = self.pick_slot(prompt)
+                slot = self.pick_slot(prompt, epoch=epoch)
                 if slot is None:
                     break
-                self.slot_busy[slot] = True
-                self.slot_claims.add(slot)
-                self.slot_held[slot] = []
+                slots.slot_busy[slot] = True
+                slots.slot_claims.add(slot)
+                slots.slot_held[slot] = []
+                rq._strata_preslot_epoch = epoch
                 rq._strata_preslot = slot
                 rq._strata_co = True
                 total += len(prompt)
                 picked.append((slot, prompt))
         for slot, prompt in picked:
-            self._send(f"BCO {slot} {','.join(str(int(t)) for t in prompt)}")
+            self._send(f"BCO {slot} {','.join(str(int(t)) for t in prompt)}", born=epoch.gen)
         if picked:
             print(f"[strata] coalesce: {len(picked)} waiting prompt(s) ({total - len(lead_prompt)} tokens) read with this "
                   f"request's {len(lead_prompt)}", flush=True)
@@ -2231,6 +2566,380 @@ class StrataEngine:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+        """Guard the acquired control lock through setup, streaming and cleanup."""
+        control = _BatchControl()
+        try:
+            yield from self._generate_batched(ids, max_new, sampling, cancel, embeddings, control)
+        except BaseException as error:
+            # Cleanup (including tracing) must not replace a body exception or
+            # GeneratorExit. Even an unexpected release error is secondary.
+            primary = control.error if control.error is not None else error
+            try:
+                control.release()
+            except BaseException as release_error:
+                raise primary from release_error
+            if primary is not error:
+                raise primary from error
+            raise
+        else:
+            control.release()
+
+    def _reap_owned_image_transports(self, epoch):
+        """Only these two captured-epoch private FD holds; no payload export.
+        A live/uncertain child blocks replacement. No signal, retry or healing.
+        """
+        for channel in epoch.slots.slot_q:
+            if not getattr(channel, "_owned_image_proof_lost", False):
+                continue
+            if getattr(channel, "_owned_image_close_uncertain", False):
+                raise EngineStuck("Owned image FD close is uncertain; cleanup requires its original owner")
+            if epoch.proc.poll() is None:
+                raise EngineStuck("Original owned image engine still holds uncertain work")
+            descriptor = getattr(channel, "_owned_image_transport_fd", None)
+            if descriptor is not None:
+                channel._owned_image_transport_fd = None  # never retry an ambiguous/recycled descriptor
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    channel._owned_image_close_uncertain = True
+                    raise EngineStuck("Owned image final FD close is uncertain") from None
+            channel._owned_image_proof_lost = False
+
+    def _owned_image_proof_lost(self, epoch, slot, descriptor=None):
+        """Retain descriptor BEFORE closing this input epoch. Actual native EOF
+        fails stop before ownership unwind. Reap only after observed child exit;
+        timeout keeps the FD and blocks replacement, never kills another process.
+        """
+        channel = epoch.slots.slot_q[slot]
+        if descriptor is not None:
+            if getattr(channel, "_owned_image_transport_fd", None) is not None:
+                raise EngineStuck("Duplicate owned image transport hold")
+            channel._owned_image_transport_fd = descriptor
+        channel._owned_image_proof_lost = True
+        with self.wlock:
+            try:
+                epoch.proc.stdin.close()
+            except (OSError, AttributeError, ValueError):
+                pass
+            if self.proc is epoch.proc and self.gen == epoch.gen:
+                self._stdin_closing = True
+        with self._state_lock():
+            if self._epoch_current(epoch):
+                self.ended = True
+        try:
+            epoch.proc.wait(timeout=ENGINE_STALL_S or None)
+        except (subprocess.TimeoutExpired, OSError, AttributeError):
+            return  # complete affected resource hold remains with this exact epoch
+        self._reap_owned_image_transports(epoch)
+
+    def _owned_image_reply(self, epoch, prefix, slot, request, incarnation=None):
+        heard = beat = time.monotonic()
+        while True:
+            self._check_epoch(epoch)
+            try:
+                line = epoch.lines.get(timeout=0.5)
+            except queue.Empty:
+                now = time.monotonic()
+                if ENGINE_STALL_S and now - heard >= ENGINE_STALL_S:
+                    raise EngineSilent("Private image completion proof lost")
+                if now - beat >= 10:
+                    beat = now
+                    yield None
+                continue
+            if line is None:
+                raise EngineDied("Captured engine closed during image handoff")
+            if line.startswith("INFO"):
+                continue
+            if len(line) > 1024:
+                raise EngineDied("Oversized private image control reply")
+            words = line.split()
+            if len(words) < 3 or words[0] != prefix or words[1] != str(slot):
+                raise EngineDied("Unexpected private image reply")
+            fields = {}
+            for word in words[2:]:
+                key, sep, value = word.partition("=")
+                if not sep or key in fields or (key != "request" and
+                        (not value.isascii() or not value.isdecimal() or len(value) > 20 or int(value) > (1 << 64)-1)):
+                    raise EngineDied("Malformed private image reply")
+                fields[key] = value
+            if fields.get("request") != request or (incarnation is not None and fields.get("incarnation") != str(incarnation)):
+                raise EngineDied("Stale or foreign private image reply")
+            return fields
+
+    def _copy_owned_image_source(self, destination, path, max_bytes, cancel, deadline):
+        """Synchronous same-FD exclusion; never yield/export while masked."""
+        native = sys.modules["_signal"]  # already loaded by startup signal import
+        fcntl = subprocess.fcntl
+        source_fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        prior = watched = owner = zero = notification = None
+        before = after = None
+        owner_maybe = False
+        try:
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("Image source is not a regular file")
+            before = None
+            watched = {signal.SIGIO}
+            # Query without changing the mask FIRST: native block can raise
+            # after changing it while allocating its return set.
+            prior = native.pthread_sigmask(signal.SIG_BLOCK, ())
+            native.pthread_sigmask(signal.SIG_BLOCK, watched)
+            if signal.SIGIO in native.sigpending():
+                raise ValueError("Image source thread already has pending SIGIO")
+            tid = threading.get_native_id()
+            if not 0 < tid <= 2147483647:
+                raise ValueError("Image source thread identity unavailable")
+            # Linux x86_64/aarch64 UAPI: F_[SET/GET]OWN_EX=15/16,
+            # F_OWNER_TID=0. A notification tuple cannot identify this lease.
+            # Native signed32 fields (F_OWNER_TID=0, positive tid). Exact
+            # tuple -> bytes has no compiled format or module-cache lifetime.
+            owner = (bytes((0, 0, 0, 0, tid & 255, (tid >> 8) & 255,
+                            (tid >> 16) & 255, (tid >> 24) & 255)) if sys.byteorder == "little"
+                     else bytes((0, 0, 0, 0, (tid >> 24) & 255, (tid >> 16) & 255,
+                                 (tid >> 8) & 255, tid & 255)))
+            zero = b"\0\0\0\0\0\0\0\0"
+            owner_maybe = True  # BEFORE any possibly partial native setter
+            try:
+                fcntl.fcntl(source_fd, 15, owner)
+                fcntl.fcntl(source_fd, fcntl.F_SETSIG, signal.SIGIO)
+                if (fcntl.fcntl(source_fd, 16, zero) != owner
+                        or fcntl.fcntl(source_fd, fcntl.F_GETSIG) != signal.SIGIO):
+                    raise ValueError("Image source notification owner differs")
+                if fcntl.fcntl(source_fd, fcntl.F_SETLEASE, fcntl.F_RDLCK) != 0:
+                    raise ValueError("Image source lease unavailable")
+            except OSError as error:
+                raise ValueError("Image source lease unavailable") from error
+            if (fcntl.fcntl(source_fd, 16, zero) != owner
+                    or fcntl.fcntl(source_fd, fcntl.F_GETSIG) != signal.SIGIO
+                    or fcntl.fcntl(source_fd, fcntl.F_GETLEASE) != fcntl.F_RDLCK):
+                raise ValueError("Image source lease owner changed")
+            before = os.fstat(source_fd)
+            remaining = before.st_size
+            if remaining <= 0 or remaining > max_bytes:
+                raise ValueError("Image source extent changed")
+            offset = 0
+            while offset < remaining:
+                if cancel.is_set() or (deadline is not None and time.monotonic() >= deadline):
+                    return None
+                count = os.sendfile(destination, source_fd, offset, min(remaining-offset, 1 << 20))
+                if count <= 0:
+                    raise ValueError("Short image source")
+                offset += count
+            after = os.fstat(source_fd)
+            # Pending breaks already report UNLCK; forced loss never gets a
+            # new lease. Only the original uninterrupted lease can publish.
+            if fcntl.fcntl(source_fd, fcntl.F_GETLEASE) != fcntl.F_RDLCK:
+                raise ValueError("Image source lease broken")
+            if (before.st_dev != after.st_dev or before.st_ino != after.st_ino
+                    or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns
+                    or before.st_ctime_ns != after.st_ctime_ns):
+                raise ValueError("Image source version changed during copy")
+            return offset
+        finally:
+            before = after = None
+            try:
+                if owner_maybe:
+                    # Owner write-lock waits for earlier senders; ZERO then
+                    # prevents any late callback targeting this thread.
+                    fcntl.fcntl(source_fd, 15, zero)
+                    if fcntl.fcntl(source_fd, 16, zero) != zero:
+                        os._exit(72)
+                    lease = fcntl.fcntl(source_fd, fcntl.F_GETLEASE)
+                    if lease == fcntl.F_RDLCK:
+                        fcntl.fcntl(source_fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+                        if fcntl.fcntl(source_fd, fcntl.F_GETLEASE) != fcntl.F_UNLCK:
+                            os._exit(72)
+                    elif lease != fcntl.F_UNLCK:
+                        os._exit(72)
+                closing, source_fd = source_fd, None  # never retry ambiguous close
+                os.close(closing)  # pending-break leases also end at last close
+                if owner_maybe:
+                    # A foreign open description can retain a reused fd number;
+                    # no descriptor-bearing record authenticates this lease.
+                    # Any pending notification forbids normal continuation.
+                    notification = native.sigtimedwait(watched, 0)
+                    if notification is not None:
+                        os._exit(72)
+                notification = None
+                if prior is not None:
+                    native.pthread_sigmask(signal.SIG_SETMASK, prior)
+            except BaseException:
+                os._exit(72)
+            finally:
+                prior = watched = owner = zero = notification = None
+
+    def _owned_image_delivery(self, epoch, slot, request, prompt, budget, keys, sources, cancel):
+        """Only the existing trusted producer: payment, sealed capture, actual close.
+
+        Fixed new helper/control lifetimes are paid by the genuine startup
+        root before READY. Per-request transport/join/capture peaks are admitted
+        before memfd allocation. No whole-F Python copy or escaped FD exists.
+        """
+        self._check_epoch(epoch)
+        info = self.info or {}
+        fcntl = getattr(subprocess, "fcntl", None)  # preloaded by subprocess, no lazy module allocation
+        source_version_bytes = 2*(128+32*8+64+32*80)+6*80
+        readlease_bytes = (3*(256+256*2*8+64*80)+(1024+2*64*8)+3*80+3*(80+3*80)
+                           +(128+7*8+64+7*80)+(2*128+128+128+128+16+2*8+8+1024)+8*80+2*8*128)
+        owner_encoding_bytes = 128+80+5*80+(16+8+4+8+8+16)*8
+        expected_controls = (12*(1024+64*8)+256*64+8*(4096+128)+2*4096
+                             +source_version_bytes+readlease_bytes+owner_encoding_bytes)
+        if (info.get("owned_image_prepare") != 1 or info.get("owned_image_control_bytes") != expected_controls
+                or sys.implementation.name != "cpython" or not (3, 11) <= sys.version_info[:2] <= (3, 14)
+                or sys.maxsize != (1 << 63)-1 or not sys.platform.startswith("linux") or fcntl is None
+                or sys.gettrace() is not None or sys.getprofile() is not None or sys.getsizeof("") > 80):
+            raise ValueError("Owned image producer profile unavailable")
+        for function in (type(self)._owned_image_delivery, type(self)._owned_image_reply,
+                         type(self)._copy_owned_image_source):
+            if function.__code__.co_nlocals > 64 or function.__code__.co_stacksize > 64:
+                raise ValueError("Owned image producer frame exceeds its paid profile")
+        # LP64 CPython stat_result uses real (including hidden) pointer fields.
+        # Charge base + real fields conservatively, even where hidden slots
+        # also contribute to basicsize. Native64 values/ns expansion fit the
+        # nine-digit bound below, including arithmetic construction requests.
+        if (not 10 == os.stat_result.n_sequence_fields <= os.stat_result.n_fields <= 32
+                or not 0 <= os.stat_result.n_unnamed_fields <= 10
+                or not 0 <= os.stat_result.__basicsize__ <= 128 or os.stat_result.__itemsize__ != 8
+                or not 0 <= sys.getsizeof(())-tuple.__basicsize__ <= 64-7
+                or not 0 <= int.__basicsize__ or not 0 < int.__itemsize__ <= 4
+                or sys.int_info.bits_per_digit < 15 or sys.int_info.sizeof_digit != int.__itemsize__
+                or int.__basicsize__+9*int.__itemsize__+7 > 80
+                or float.__basicsize__+7 > 80 or float.__itemsize__ != 0
+                or ctypes.sizeof(ctypes.c_long) != 8 or ctypes.sizeof(ctypes.c_longlong) != 8
+                or ctypes.sizeof(ctypes.c_void_p) != 8 or hasattr(os.stat_result, "st_fstype")):
+            raise ValueError("Owned image source metadata profile unavailable")
+        # Preloaded native signal functions return bounded integer sets, not
+        # signal.py enum wrappers/exception cycles. No lease controls yet.
+        native = sys.modules.get("_signal")
+        if (native is None or not 0 < native.NSIG <= 65
+                or type(getattr(native, "pthread_sigmask", None)) is not type(os.fstat)
+                or type(getattr(native, "sigpending", None)) is not type(os.fstat)
+                or type(getattr(native, "sigtimedwait", None)) is not type(os.fstat)
+                or set.__basicsize__+sys.getsizeof(())-tuple.__basicsize__+7 > 256 or set.__itemsize__ != 0
+                or tuple.__itemsize__ != 8 or sys.getsizeof(())+3*8+7 > 80
+                or bytes.__basicsize__+8*bytes.__itemsize__+7 > 80 or bytes.__itemsize__ != 1
+                or native.struct_siginfo.n_fields != 7 or native.struct_siginfo.n_sequence_fields != 7
+                or native.struct_siginfo.__basicsize__ > 128 or native.struct_siginfo.__itemsize__ != 8
+                or ctypes.sizeof(ctypes.c_int) != 4 or ctypes.alignment(ctypes.c_int) != 4
+                or ctypes.alignment(ctypes.c_long) != 8 or sys.byteorder not in ("little", "big")
+                or sys.getsizeof(())+8*tuple.__itemsize__+7 > 128
+                or getattr(sys.implementation, "_multiarch", "") not in
+                    ("x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-musl", "aarch64-linux-musl")
+                or not hasattr(fcntl, "F_SETLEASE") or not hasattr(fcntl, "F_GETLEASE")
+                or not hasattr(fcntl, "F_SETSIG") or not hasattr(fcntl, "F_GETSIG")):
+            raise ValueError("Owned image source lease profile unavailable")
+        if not sources or len(sources) > len(prompt) or any(type(t) is not int or t < 0 or t > 2147483647 for t in prompt):
+            raise ValueError("Invalid owned image source/token extent")
+        total = sum(os.stat(path).st_size for path, _ in sources)
+        if total <= 0 or total % 4:
+            raise ValueError("Invalid owned image byte extent")
+        deadline = getattr(cancel, "_strata_queue_deadline", None)
+        until = max(0, int(deadline*1000)) if deadline is not None else 0
+        incarnation, fd, closed, finished = None, None, False, False
+        submitted, acknowledged, protocol_lost = False, False, False
+        self._send(f"BIPREP {slot} {budget} {len(prompt)} {total} {until} http_request={request}", born=epoch.gen)
+        try:
+            paid = yield from self._owned_image_reply(epoch, "BIPAY", slot, request)
+            if paid.get("ok") == "0":
+                if set(paid) != {"request", "ok"}:
+                    raise EngineDied("Malformed image refusal")
+                finished = True
+                return None
+            if set(paid) != {"request", "incarnation", "bytes", "tokens", "budget"}:
+                raise EngineDied("Malformed private image payment")
+            incarnation = int(paid["incarnation"])
+            if incarnation <= 0 or int(paid["bytes"]) != total or int(paid["tokens"]) != len(prompt) or int(paid["budget"]) != budget:
+                raise EngineDied("Image payment differs from actual request")
+            cancel._strata_image_incarnation = incarnation
+            if cancel.is_set() or (deadline is not None and time.monotonic() >= deadline):
+                return None
+            fd = os.memfd_create("strata-image", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+            copied = 0
+            for path, _ in sources:
+                amount = self._copy_owned_image_source(fd, path, total-copied, cancel, deadline)
+                if amount is None:
+                    return None
+                copied += amount
+            if copied != total or os.fstat(fd).st_size != total:
+                raise ValueError("Image transport extent differs from payment")
+            seals = fcntl.F_SEAL_WRITE|fcntl.F_SEAL_GROW|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_SEAL
+            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+            if fcntl.fcntl(fd, fcntl.F_GET_SEALS) & seals != seals:
+                raise ValueError("Image transport not sealed")
+            submitted = True  # even a partial write may create a real borrower
+            self._send(f"BGENI {slot} {budget}{keys} /proc/{os.getpid()}/fd/{fd} "
+                       + ','.join(str(token) for token in prompt), born=epoch.gen)
+            captured = yield from self._owned_image_reply(epoch, "BICAPTURED", slot, request, incarnation)
+            if set(captured) != {"request", "incarnation", "ok"} or captured["ok"] not in ("0", "1"):
+                raise EngineDied("Malformed image capture acknowledgement")
+            acknowledged = True
+            closing, fd = fd, None
+            try:
+                os.close(closing)  # borrowed engine FD closed BEFORE ACK; no duplicates
+            except OSError:
+                epoch.slots.slot_q[slot]._owned_image_close_uncertain = True
+                self._owned_image_proof_lost(epoch, slot)
+                raise
+            abandon = captured["ok"] != "1" or cancel.is_set() or (deadline is not None and time.monotonic() >= deadline)
+            self._send(f"BICLOSE {slot} request={request} incarnation={incarnation} cancel={int(abandon)}", born=epoch.gen)
+            closed = True
+            receipt = yield from self._owned_image_reply(epoch, "BICLOSED", slot, request, incarnation)
+            if set(receipt) != {"request", "incarnation", "ready"} or receipt["ready"] not in ("0", "1"):
+                raise EngineDied("Malformed image close acknowledgement")
+            finished = True
+            return incarnation if receipt["ready"] == "1" else None
+        except EngineDied:
+            protocol_lost = True
+            raise
+        finally:
+            if submitted and not acknowledged and not protocol_lost:
+                try:
+                    # GeneratorExit must not close the producer behind an
+                    # unacknowledged native borrower. Keep the descriptor while
+                    # draining the real capture ACK within the existing bound.
+                    reply = self._owned_image_reply(epoch, "BICAPTURED", slot, request, incarnation)
+                    while True:
+                        try:
+                            next(reply)
+                        except StopIteration as done:
+                            captured = done.value
+                            break
+                    if set(captured) != {"request", "incarnation", "ok"} or captured["ok"] not in ("0", "1"):
+                        raise EngineDied("Malformed final capture acknowledgement")
+                    acknowledged = True
+                except EngineDied:
+                    protocol_lost = True
+            if protocol_lost:
+                retained, fd = fd, None
+                self._owned_image_proof_lost(epoch, slot, retained)
+            else:
+                if fd is not None:
+                    closing, fd = fd, None
+                    try:
+                        os.close(closing)
+                    except OSError:
+                        epoch.slots.slot_q[slot]._owned_image_close_uncertain = True
+                        self._owned_image_proof_lost(epoch, slot)
+                        raise
+                if not finished:
+                    try:
+                        if incarnation is not None and not closed:
+                            self._send(f"BICLOSE {slot} request={request} incarnation={incarnation} cancel=1", born=epoch.gen)
+                            receipt = self._owned_image_reply(epoch, "BICLOSED", slot, request, incarnation)
+                            while True:
+                                try:
+                                    next(receipt)
+                                except StopIteration as done:
+                                    fields = done.value
+                                    break
+                            if fields.get("ready") != "0":
+                                raise EngineDied("Cancelled preparation unexpectedly became runnable")
+                        else:
+                            self._owned_image_proof_lost(epoch, slot)
+                    except (EngineDied, OSError):
+                        self._owned_image_proof_lost(epoch, slot)
+
+    def _generate_batched(self, ids, max_new, sampling, cancel, embeddings, control):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
         its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
@@ -2258,21 +2967,48 @@ class StrataEngine:
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         yielded_legs = []    # prompt reads that gave way before producing output
         ok = yield from self._take_control(cancel, len(prompt), new=True,
-                                           prompt=prompt if (COALESCE_PREFILL > 1 and not embeddings) else None)
+                                           prompt=prompt if (COALESCE_PREFILL > 1 and not embeddings and not self._strict_owned_two()) else None)
         if not ok:
             self._release_preslot(cancel)
             return
-        holding, born = True, self.gen                  # (the engine it now has the control lines of)
-        lines_q, sq = self.lines, self.slot_q           # #4451: ... and its queues; a restart makes new ones, and a request
-        #                                                 of the old process must never read (or answer on) the new ones
+        control.lock = self.ctl if ok is True else ok
+        epoch = self._capture_epoch()
+        slots = epoch.slots
+        strict_owned = epoch.strict_owned
+        request = getattr(cancel, "_strata_request_id", None)
+        if strict_owned:
+            from .two_slot_receipts import request_key
+            if not request_key(request):
+                raise ValueError("Owned batch2 requires the existing HTTP request identity")
+            keys += " http_request=" + request
+        holding, born = True, epoch.gen                  # (the engine it now has the control lines of)
+        lines_q, sq = epoch.lines, slots.slot_q
         btrace("ctl acquired")
         slot, gen0, reserved = None, None, None
         pre = getattr(cancel, "_strata_preslot", None)
         if pre is not None:                             # STRATA_COALESCE_PREFILL: a request before this one read the prompt into this slot
+            pre_epoch = getattr(cancel, "_strata_preslot_epoch", None)
+            if pre_epoch is not epoch:
+                self._release_preslot(cancel)
+                raise EngineDied("coalesced slot belonged to a replaced engine")
             slot, cancel._strata_preslot = pre, None
+            cancel._strata_preslot_epoch = None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
-        admission_pending, admission_before = False, None   # the admission's DONE is partial until BADM 0 or BDONE
+        sent = False
+        def acquired_control():
+            nonlocal holding, born, epoch, slots, lines_q, sq
+            control.lock = self.ctl if ok is True else ok
+            holding = True
+            if sent and self.gen != born:
+                raise EngineDied("the engine changed after this request was admitted")
+            epoch = self._capture_epoch(born if sent else None)
+            if epoch.strict_owned != strict_owned:
+                raise EngineDied("the engine serving mode changed while admission waited")
+            slots = epoch.slots
+            born = epoch.gen
+            lines_q, sq = epoch.lines, slots.slot_q
+        admission_pending, admission_before = False, None
         yields, solo_again, refused = 0, 0, 0
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
@@ -2281,54 +3017,61 @@ class StrataEngine:
                     ok = yield from self._take_control(cancel, len(prompt))
                     if not ok:
                         return
-                    holding, born = True, self.gen                  # (the engine it now has the control lines of)
-                    lines_q, sq = self.lines, self.slot_q           # (it holds no slot of the engine before: nothing to lose)
-                with self.slot_cv:
-                    alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                    acquired_control()
+                self._check_epoch(epoch)
+                with epoch.slot_cv:
+                    alone = not any(slots.slot_busy) and self.waiting == 0
+                if not strict_owned and alone and left > 1:
                     pf = self.pen_from_key(orig_len, len(prompt))
                     head = f"GENI {left}{keys}{pf} {embeddings}" if embeddings else f"GEN {left}{keys}{pf}"
-                    self._last_done = None                  # (#879: this request's DONE decides below)
+                    with self._epoch_state(epoch):
+                        self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}", born=born)
+                    sent = True
                     if deadline is not None:
                         cancel._strata_queue_deadline = None
                     started = getattr(cancel, "_strata_queue_started", None)
                     if started is not None:
                         started()
                     phase = "solo"
-                    self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
-                    self._ctl_erred = False
+                    with self._epoch_state(epoch):
+                        self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                    with self._epoch_state(epoch):
+                        self._ctl_erred = False
                     def others():
-                        with self.slot_cv:
+                        with epoch.slot_cv:
                             return self.waiting > 0
 
                     def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
                         nonlocal reserved
+                        self._check_epoch(epoch)
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
-                            with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                            with epoch.slot_cv:          # the slot the part read will wait in
+                                reserved = self.pick_slot(prompt, epoch=epoch)
                                 if reserved is not None:
-                                    self.slot_busy[reserved] = True
-                                    self.slot_claims.add(reserved)
+                                    slots.slot_busy[reserved] = True
+                                    slots.slot_claims.add(reserved)
                             if reserved is not None:
-                                self._send_for(born, f"BYIELD {reserved}")
-                    for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way,
-                                           want_lp=want_lp, lines_q=lines_q):
+                                self._send(f"BYIELD {reserved}", born=born)
+                    for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way, want_lp=want_lp, lines_q=lines_q, born=born, epoch=epoch):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
+                            self._check_epoch(epoch)
                             yield t
                         if x is None:                       # a heartbeat (False: a token, flushed above)
                             give_way()
+                            self._check_epoch(epoch)
                             yield None
                     phase = "none"                          # its DONE is read
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
+                        self._check_epoch(epoch)
                         yield t
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -2336,10 +3079,10 @@ class StrataEngine:
                         yielded_legs.append(self.last)
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
-                        with self.slot_cv:
-                            self.slot_busy[reserved] = False
-                            self.slot_claims.discard(reserved)
-                            self.slot_cv.notify_all()
+                        with epoch.slot_cv:
+                            slots.slot_busy[reserved] = False
+                            slots.slot_claims.discard(reserved)
+                            epoch.slot_cv.notify_all()
                         reserved = None
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
@@ -2352,6 +3095,14 @@ class StrataEngine:
                                                             # the held prefix: prompt_read 1) and BDONE replace them
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
+                    # A managed not_ready retry continues this inner loop after
+                    # releasing control. Reacquire even when a slot is already
+                    # free; the slot-wait path below is not always entered.
+                    if not holding:
+                        ok = yield from self._take_control(cancel, len(prompt))
+                        if not ok:
+                            return
+                        acquired_control()
                     if slot is None:
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
                         # the start of this prompt (its conversation's last turn), else the one used longest ago.
@@ -2362,11 +3113,11 @@ class StrataEngine:
                             deadline = getattr(cancel, "_strata_queue_deadline", None)
                             if deadline is not None and time.monotonic() >= deadline:
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                            with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                            with epoch.slot_cv:
+                                slot = self.pick_slot(prompt, epoch=epoch)
                                 if slot is not None:
-                                    self.slot_busy[slot] = True
-                                    self.slot_claims.add(slot)
+                                    slots.slot_busy[slot] = True
+                                    slots.slot_claims.add(slot)
                                     if admit_wait:
                                         admit_wait = False
                                         self.admitting = max(0, self.admitting - 1)
@@ -2378,48 +3129,45 @@ class StrataEngine:
                                     admit_wait, admit_since = True, time.monotonic()   # control lines then)
                                     self.admitting += 1
                             if holding:
-                                self.ctl.release()
+                                control.release()
                                 holding = False
-                            with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                            with epoch.slot_cv:
+                                if self.pick_slot(prompt, epoch=epoch) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
                                         if not admit_said:
                                             admit_said = True
-                                            busy = [b for b, v in enumerate(self.slot_busy) if v]
+                                            busy = [b for b, v in enumerate(slots.slot_busy) if v]
                                             print(f"[strata] parallel: a request has waited {time.monotonic() - admit_since:.0f} s "
-                                                  f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
-                                                  f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
-                                    self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                                  f"for a free slot (busy: {busy}, in use: {sorted(slots.slot_claims)}, "
+                                                  f"ending: {sorted(slots.slot_releasing)}) (issue #1603)", flush=True)
+                                    self._reap_orphan_slots(epoch=epoch)
+                                if self.pick_slot(prompt, epoch=epoch) is None:
                                     wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
-                                    self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
+                                    epoch.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
                             if cancel.is_set():
                                 return
                             if not holding:
                                 ok = yield from self._take_control(cancel, len(prompt))
                                 if not ok:
                                     return
-                                holding, born = True, self.gen
-                                lines_q, sq = self.lines, self.slot_q   # (a slot is claimed below, on this engine)
+                                acquired_control()
                     if self._yielded is not None:           # it gave way: the others waiting then go first
-                        self.slot_held[slot] = list(prompt[:self._yielded[1]])
-                        self._yielded = None
+                        slots.slot_held[slot] = list(prompt[:self._yielded[1]])
+                        with self._epoch_state(epoch):
+                            self._yielded = None
                         yields += 1
-                        self.ctl.release()
+                        control.release()
                         holding = False
-                        with self.slot_cv:
-                            epoch = self.ctl_epoch
-                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
+                        with epoch.slot_cv:
+                            turn_epoch = self.ctl_epoch
+                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=turn_epoch)
                         if not ok:
                             return
-                        if self.gen != born:                    # #4451: the slot it holds was the old engine's
-                            holding = True
-                            raise EngineDied("the engine restarted while this request waited for it; it was not completed")
-                        holding, born = True, self.gen                  # (the engine it now has the control lines of)
-                    while not sq[slot].empty():
-                        sq[slot].get_nowait()
+                        acquired_control()
+                    while not slots.slot_q[slot].empty():
+                        slots.slot_q[slot].get_nowait()
                     pf = self.pen_from_key(orig_len, len(prompt))
                     head = f"BGENI {slot} {left}{keys}{pf} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}{pf}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
@@ -2428,28 +3176,80 @@ class StrataEngine:
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    self.slot_live[slot] = live
-                    self._last_done = None                  # (#879: this admission's DONE decides below)
-                    if COALESCE_PREFILL > 1 and not embeddings:
-                        self._coalesce(cancel, prompt)
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    slots.slot_live[slot] = live
+                    if epoch.scheduler is not None:
+                        manager = getattr(cancel, '_strata_scheduler_manager', None)
+                        thread = getattr(cancel, '_strata_scheduler_thread', None)
+                        if manager is None or thread is None:
+                            raise ValueError('Managed serving requires an issued scheduler thread handle')
+                        manager.attach(epoch.scheduler)
+                        from .scheduler_manager import SchedulerRequestCancelled
+                        try:
+                            bound = manager.bind(thread, slot, request,
+                                                 operations=getattr(cancel, '_strata_scheduler_operations', None))
+                        except SchedulerRequestCancelled:
+                            cancel.set()
+                            return  # No BGEN was sent; finally reconciles the unbound pair.
+                        if not bound:
+                            # No native binding/admission exists. Give the prerequisite
+                            # HTTP worker BOTH control and physical capacity to run.
+                            with epoch.slot_cv:
+                                slots.slot_live[slot] = None
+                                slots.slot_busy[slot] = False
+                                slots.slot_claims.discard(slot)
+                                epoch.slot_cv.notify_all()
+                            slot = None
+                            control.release()
+                            holding = False
+                            if cancel.wait(0.05):
+                                manager.schedule_cancel(request, client=epoch.scheduler)
+                                return
+                            self._check_epoch(epoch)
+                            yield None
+                            continue
+                    if strict_owned:
+                        slots.owned_observations.register(slot, request, prompt, left)
+                    with self._epoch_state(epoch):
+                        self._last_done = None                  # (#879: this admission's DONE decides below)
+                    if strict_owned and isinstance(embeddings, list):
+                        phase = "image_prepare"
+                        image_incarnation = yield from self._owned_image_delivery(epoch, slot, request, prompt,
+                            left, keys, embeddings, cancel)
+                        if image_incarnation is None:
+                            phase = "none"
+                            return
+                    else:
+                        if not strict_owned and COALESCE_PREFILL > 1 and not embeddings:
+                            self._coalesce(cancel, prompt, epoch=epoch)
+                        self._send(f"{head} {','.join(str(int(t)) for t in prompt)}", born=born)
+                    sent = True
                     if deadline is not None:
                         cancel._strata_queue_deadline = None
                     started = getattr(cancel, "_strata_queue_started", None)
                     if started is not None:
                         started()
-                    self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    slots.slot_held[slot] = []               # the admission overwrites what the slot held
                     admission_pending, admission_before = True, self.last
                     phase = "admit"
-                    self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
-                    self._ctl_erred = False
+                    with self._epoch_state(epoch):
+                        self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                    with self._epoch_state(epoch):
+                        self._ctl_erred = False
                     asked = False
+                    admission_cancel_sent = False
 
                     def ask():        # as give_way above, for the slot this admission reads into
-                        nonlocal asked
-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                        nonlocal asked, admission_cancel_sent
+                        self._check_epoch(epoch)
+                        if strict_owned and cancel.is_set() and not admission_cancel_sent:
+                            self._send((f"BICANCEL {slot} request={request} incarnation={cancel._strata_image_incarnation} cancel=1"
+                                        if isinstance(embeddings, list) and getattr(cancel, "_strata_image_incarnation", None)
+                                        else f"BCANCEL {slot} request={request}"), born=born)
+                            self._cancel_managed_request(epoch, request)
+                            admission_cancel_sent = True
+                        if (not strict_owned and not asked and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
-                            self._send_for(born, f"BYIELD {slot}")
+                            self._send(f"BYIELD {slot}", born=born)
                             asked = True
 
                     def note_progress():
@@ -2457,15 +3257,16 @@ class StrataEngine:
                         if self.progress and live["state"] == "reading":
                             live["prompt_read"] = self.progress[0]
                     try:
-                        for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()),
-                                               want_lp=want_lp, lines_q=lines_q):
+                        for x in self._control(threading.Event() if strict_owned else cancel, pending.append, on_quiet=lambda: (ask(), note_progress()), want_lp=want_lp, lines_q=lines_q, born=born, epoch=epoch):
                             while pending:
                                 t = pending.pop(0)
                                 out.append(t)
+                                self._check_epoch(epoch)
                                 yield t
                             if x is None:
                                 ask()
                                 note_progress()
+                                self._check_epoch(epoch)
                                 yield None
                     except ValueError as e:
                         # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
@@ -2479,11 +3280,12 @@ class StrataEngine:
                         if refused > self.BGEN_REFUSALS_MAX:
                             raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
                                       retry_after=5) from e
-                        self.slot_live[slot] = None
-                        self.slot_held[slot] = []
+                        slots.slot_live[slot] = None
+                        slots.slot_held[slot] = []
                         phase = "none"
-                        self._ctl_erred = False
-                        self._park_slot(slot)
+                        with self._epoch_state(epoch):
+                            self._ctl_erred = False
+                        self._park_slot(slot, epoch=epoch)
                         slot = None
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
@@ -2492,6 +3294,7 @@ class StrataEngine:
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
+                        self._check_epoch(epoch)
                         yield t
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -2499,25 +3302,28 @@ class StrataEngine:
                         yielded_legs.append(self.last)
                         continue                            # gave way: again once the shorter request is in
                     break
-                self.ctl.release()
+                control.release()
                 holding = False
                 if not cont:
                     return
                 live.update(state="decoding", first_token=time.time(), generated=len(out))
-                gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
+                gen0 = max(0, len(out) - 1) if strict_owned else len(out) - 1  # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
+                    self._check_epoch(epoch)
                     try:
-                        line = sq[slot].get(timeout=10.0)
+                        line = slots.slot_q[slot].get(timeout=10.0)
                     except queue.Empty:
                         if self.gen != born:                # #4451: the engine it was admitted on is gone (and so is its slot)
                             phase = "none"
                             raise EngineDied("the engine restarted while this request was running; it was not completed")
                         if cancel.is_set() and not stop_sent:
-                            self._send_for(born, f"BSTOP {slot}")
+                            self._send_owned_stop(epoch, slot, request)
                             stop_sent = True
+                        self._check_epoch(epoch)
                         yield None
                         continue
+                    self._check_epoch(epoch)
                     if line is None:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -2527,35 +3333,37 @@ class StrataEngine:
                         live["generated"] = len(out)
                         if cancel.is_set():
                             if not stop_sent:
-                                self._send_for(born, f"BSTOP {slot}")
+                                self._send_owned_stop(epoch, slot, request)
                                 stop_sent = True
                             continue
+                        self._check_epoch(epoch)
                         yield t
-                        if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
+                        if not strict_owned and not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
-                            self._send_for(born, f"BSTOP {slot}")   # alone now: on with the drafts (below)
+                            self._send_owned_stop(epoch, slot, request)         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
-                        self._apply_bdone(f)
+                        with self._epoch_state(epoch):
+                            self._apply_bdone(f)
                         admission_pending = False
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
-                        self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        slots.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
-                            self.slot_held[slot] = []
+                            slots.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
                             carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
-                            self.slot_live[slot] = None
-                            self.slot_used[slot] = time.time()
-                            with self.slot_cv:
-                                self.slot_busy[slot] = False
-                                self.slot_claims.discard(slot)
-                                self.slot_cv.notify_all()
+                            slots.slot_live[slot] = None
+                            slots.slot_used[slot] = time.time()
+                            with epoch.slot_cv:
+                                slots.slot_busy[slot] = False
+                                slots.slot_claims.discard(slot)
+                                epoch.slot_cv.notify_all()
                             slot, gen0 = None, None
                             if reused0 is None:
                                 reused0 = (self.last or {}).get("reused")
@@ -2564,23 +3372,34 @@ class StrataEngine:
                             btrace("back to the solo path")
                             break
                         return
+        except BaseException as error:
+            control.error = error
+            raise
         finally:
             # a consumer that left early (or an error): keep the engine and this server in step
-            btrace("finally phase", phase, "slot", slot, "holding", holding)
-            same = self.gen == born                     # #4451: the slot state below is this engine's; after a restart it is the NEW
-            #                                             engine's lists and flags, which belong to other requests
-            undrained = None                            # the line this request's exchange still owes, from an engine that runs
+            trace_error = None
+            try:
+                btrace("finally phase", phase, "slot", slot, "holding", holding)
+            except BaseException as error:
+                trace_error = error  # Diagnostics must not skip protocol cleanup.
+            same = self._epoch_current(epoch)
+            undrained = None
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
                     phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
                 if phase in ("solo", "admit") and self._ctl_erred:
                     phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
                 if phase == "solo":
-                    self._send("STOP")
-                    if self._drain_control("DONE", born=born, lines_q=lines_q) is None and self.gen == born and self.alive():
+                    self._send("STOP", born=born)
+                    if self._drain_control("DONE", born=born) is None and self._epoch_current(epoch) and self.alive():
                         undrained = "DONE"
                 elif phase == "admit":
-                    line = self._drain_control("BADM", born=born, lines_q=lines_q)
+                    if strict_owned:
+                        self._send((f"BICANCEL {slot} request={request} incarnation={cancel._strata_image_incarnation} cancel=1"
+                                        if isinstance(embeddings, list) and getattr(cancel, "_strata_image_incarnation", None)
+                                        else f"BCANCEL {slot} request={request}"), born=born)
+                        self._cancel_managed_request(epoch, request)
+                    line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM "):
                         admission_pending = line.split()[2:3] == ["1"]
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
@@ -2593,70 +3412,82 @@ class StrataEngine:
             if undrained is not None:
                 # #4451: the engine has not said it is done with this request; whatever it prints later must not be read
                 # by the next one.  The control lines (and the admission's slot) stay quarantined until it does.
-                self._quarantine_control(undrained, born, lines_q, slot if undrained == "BADM" else None, holding)
+                self._quarantine_control(undrained, born, lines_q, slot if undrained == "BADM" else None, holding, epoch=epoch, control=control.lock, request=request)
+                control.lock = None  # the background drain now owns this exact lock
                 holding, handed = False, True
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and same:
-                bd = self._bdone_after_eos(slot, q=sq[slot])    # (#1869) the slot's figures, not the admission's
+            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
+                bd = self._bdone_after_eos(slot, epoch=epoch)            # (#1869) the slot's figures, not the admission's
                 if bd is not None:
-                    self._apply_bdone(bd.split())
-                    admission_pending = False
-                    bdone_in = True
-            ended_on_yield = bool(yielded_legs and self.last is yielded_legs[-1])
-            if admission_pending and isinstance(self.last, dict) and (self.last is not admission_before or carry):
-                # A background drain owns the rest. The admission's one token and time are not this request's totals.
-                self.last = {**self.last, "generated": None, "decode_ms": None}
-            if reused0 is not None and isinstance(self.last, dict):
-                self.last = {**self.last, "reused": reused0}
-            if carry and isinstance(self.last, dict):
-                self.last = add_carry(carry, self.last)
-            earlier_reads = yielded_legs[:-1] if ended_on_yield else yielded_legs
-            if earlier_reads and isinstance(self.last, dict):
-                self.last = prefill_leg_stats(earlier_reads, self.last, len(ids))
+                    with self._state_lock():
+                        if self._epoch_current(epoch):
+                            self._apply_bdone(bd.split())
+                            admission_pending = False
+                            bdone_in = True
+            with self._state_lock():
+                if self._epoch_current(epoch):
+                    ended_on_yield = bool(yielded_legs and self.last is yielded_legs[-1])
+                    if admission_pending and isinstance(self.last, dict) and (self.last is not admission_before or carry):
+                        # A background drain owns the rest. The admission's one token and time are not this request's totals.
+                        self.last = {**self.last, "generated": None, "decode_ms": None}
+                    if reused0 is not None and isinstance(self.last, dict):
+                        self.last = {**self.last, "reused": reused0}
+                    if carry and isinstance(self.last, dict):
+                        self.last = add_carry(carry, self.last)
+                    earlier_reads = yielded_legs[:-1] if ended_on_yield else yielded_legs
+                    if earlier_reads and isinstance(self.last, dict):
+                        self.last = prefill_leg_stats(earlier_reads, self.last, len(ids))
             if holding:
-                self.ctl.release()
+                control.release()
             if admit_wait:
-                with self.slot_cv:
+                with epoch.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
-            if reserved is not None and same:
-                with self.slot_cv:
-                    self.slot_busy[reserved] = False
-                    self.slot_claims.discard(reserved)
-                    self.slot_cv.notify_all()
-            if slot is not None and same and not handed:
-                self.slot_live[slot] = None
-                self.slot_used[slot] = time.time()
+            if reserved is not None:
+                with epoch.slot_cv:
+                    slots.slot_busy[reserved] = False
+                    slots.slot_claims.discard(reserved)
+                    epoch.slot_cv.notify_all()
+            if slot is not None and not handed:
+                slots.slot_live[slot] = None
+                slots.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
-                    with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+                    slots.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+                    with epoch.slot_cv:
+                        slots.slot_busy[slot] = False
+                        slots.slot_claims.discard(slot)
+                        epoch.slot_cv.notify_all()
                 elif phase == "slot":
-                    self.slot_held[slot] = []
+                    slots.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream, born)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    self._release_slot_when_done(slot, stream, born=born, epoch=epoch, request=request)    # freed at its BDONE
+                    slots.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
-                    with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+                    with epoch.slot_cv:
+                        slots.slot_busy[slot] = False
+                        slots.slot_claims.discard(slot)
+                        epoch.slot_cv.notify_all()
+            if epoch.scheduler is not None and not sent:
+                self._cancel_managed_request(epoch, request)
+            if trace_error is not None:
+                raise trace_error
+
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     BRANCH_BOUNDARY_MIN = 8192   # the engine's message-boundary checkpoint (STRATA_CACHE_MESSAGE_BOUNDARY) starts at this many tokens
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], *, epoch=None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
         conversations other slots hold stay for their next turns.  None: every slot is busy."""
-        free = [b for b in self.slot_order if not self.slot_busy[b]]
+        epoch = epoch or self._capture_epoch()
+        slots = epoch.slots
+        free = [b for b in slots.slot_order if not slots.slot_busy[b]]
         if not free:
             return None
-        gs = getattr(self, "slot_gs", 0)
+        gs = getattr(slots, "slot_gs", 0)
         if gs > 1:
             # pipelined groups of several slots: the engine keeps no idle slot below a busy one as a conversation cache
             # (its pad row writes the slot), so nothing is worth keeping free for a next turn.  A group's window spans
@@ -2665,13 +3496,13 @@ class StrataEngine:
             # (reported on #793: least-recently-used picks left leading holes, [_ B], that cost a whole row each)
             def fills_hole(b):
                 g0 = b - b % gs
-                return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
-            return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
+                return any(slots.slot_busy[x] for x in range(b + 1, g0 + gs))
+            return min(free, key=lambda b: (not fills_hole(b), slots.slot_order.index(b)))
         agreed = {}
         def agree(b):
             # how many leading tokens slot b's held stream and the prompt share (slice compares: streams reach 100k tokens)
             if b not in agreed:
-                h = self.slot_held[b]
+                h = slots.slot_held[b]
                 lo, hi = 0, min(len(h), len(prompt))
                 while lo < hi:
                     mid = (lo + hi + 1) // 2
@@ -2688,7 +3519,7 @@ class StrataEngine:
             # assistant header), so a prompt that agrees with the held tokens up to there is that chat's next turn
             # too (#2518: it was only found by the engine's own source search, after pick_slot had sent it to another
             # slot and the request in that slot had overwritten the chat whose cache the next one needed)
-            h = self.slot_held[b]
+            h = slots.slot_held[b]
             if not h:
                 return 0
             if len(h) < len(prompt) and prompt[:len(h)] == h:
@@ -2717,24 +3548,27 @@ class StrataEngine:
             return i
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
-        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
+        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if slots.slot_groups > 1 else 1):
             return best
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
         busy_in = {}
-        for b in range(self.batch):
-            if self.slot_busy[b]:
-                busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
-        return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
-                                        bool(self.slot_held[b]), self.slot_used[b]))
+        for b in range(len(slots.slot_busy)):
+            if slots.slot_busy[b]:
+                busy_in[slots.slot_group[b]] = busy_in.get(slots.slot_group[b], 0) + 1
+        return min(free, key=lambda b: (busy_in.get(slots.slot_group[b], 0) if slots.slot_groups > 1 else 0,
+                                        bool(slots.slot_held[b]), slots.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
+        if not self.batch:
+            return []
+        slots = self._capture_epoch().slots
         now, view = time.time(), []
-        for b in range(self.batch):
-            r = self.slot_live[b]
+        for b in range(len(slots.slot_q)):
+            r = slots.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
+                view.append({"slot": b, "state": "idle", "held_tokens": len(slots.slot_held[b])})
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
@@ -2754,17 +3588,19 @@ class StrataEngine:
         if getattr(self, "batch", 0) and not self.multi:
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
+        epoch = self._capture_epoch()
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         # DeepSeek --parallel: the engine holds several conversations; this request is one of them (GEN ... rid=<id>), its
         # lines come on a queue of their own and its STOP names it.  One at a time (self.multi 0): the one queue, as before.
-        rid, lines_q, stop_line = None, self.lines, "STOP\n"
+        rid, lines_q, stop_line = None, epoch.lines, "STOP\n"
         if self.multi:
             with self.rid_lock:
                 self.rid_n += 1
                 rid = self.rid_n
             lines_q = queue.Queue()
-            self.rid_q[rid] = lines_q
+            with self._epoch_state(epoch):
+                epoch.slots.rid_q[rid] = lines_q
             stop_line = f"STOP {rid}\n"
         # logprobs: the engine writes "LP <logprob> [id:logprob ...]" right after each "T <id>" (the same
         # flush), read here before the token is yielded, so whoever takes the token finds its line in
@@ -2780,15 +3616,13 @@ class StrataEngine:
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = f"GEN 0 prefill=1{rid_key}"
+        self._check_epoch(epoch)
+        born = epoch.gen
         try:
-            if rid is not None:                          # several requests write to the engine at once
-                self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
-            else:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-                self.proc.stdin.flush()
-        except (OSError, EngineDied):                    # the pipe is gone: the engine died (not the client)
+            self._send(f"{head} {','.join(str(int(t)) for t in ids)}", born=born)
+        except (OSError, EngineDied):
             if rid is not None:
-                self.rid_q.pop(rid, None)
+                epoch.slots.rid_q.pop(rid, None)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
@@ -2801,24 +3635,26 @@ class StrataEngine:
         stall_state: dict = {}
         try:
             while True:
+                self._check_epoch(epoch)
                 wait = 10.0
                 if allow > 0:
                     wait = min(wait, allow - (time.monotonic() - heard))
                     if wait <= 0:
                         done = True                       # no STOP and no drain: nothing is listening
                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
-                                           "the request")
+                                           "the request", epoch=epoch)
                 try:
                     if carry is not NO_LINE:              # the line read after a token for its LP line
                         line, carry = carry, NO_LINE
                     else:
                         line = lines_q.get(timeout=min(wait, 0.5))
                 except queue.Empty:
+                    self._check_epoch(epoch)
                     if cancel.is_set():
                         return
                     if stall_s > 0:
                         try:
-                            self._stall_check(heard, stall_state, stall_s)
+                            self._stall_check(heard, stall_state, stall_s, epoch=epoch)
                         except EngineSilent:
                             done = True                   # as above: nothing is listening
                             raise
@@ -2826,8 +3662,10 @@ class StrataEngine:
                         continue                          # enforce the expired deadline before another heartbeat
                     if time.monotonic() - beat >= 10.0:
                         beat = time.monotonic()
+                        self._check_epoch(epoch)
                         yield None                        # polling cancellation does not add HTTP heartbeats
                     continue
+                self._check_epoch(epoch)
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -2839,6 +3677,7 @@ class StrataEngine:
                     allow = silence
                     if cancel.is_set():
                         return
+                    self._check_epoch(epoch)
                     t = int(line[2:])
                     if want_lp:
                         # the engine writes the token and its `LP` line in one flush, so the line is
@@ -2850,27 +3689,33 @@ class StrataEngine:
                         if isinstance(carry, str) and carry.startswith("LP "):
                             self.lp_lines.append((t, carry))
                             carry = NO_LINE
+                    self._check_epoch(epoch)
                     yield t
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
-                        self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
-                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                        with self._epoch_state(epoch):
+                            self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        with self._epoch_state(epoch):
+                            self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
+                        with self._epoch_state(epoch):
+                            self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
                         if silence > 0 and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
                             allow = max(silence, PP_SLACK * chunk / rate)
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
+                    self._check_epoch(epoch)
                     yield None
                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
                     try:
-                        read_to = self.reused = int(line.split()[1])
+                        with self._epoch_state(epoch):
+                            read_to = self.reused = int(line.split()[1])
                     except (IndexError, ValueError):
                         pass
                 elif line.startswith("DONE"):
-                    self._parse_done(line)
+                    self._parse_done_epoch(line, epoch)
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -2881,22 +3726,17 @@ class StrataEngine:
                     self._swallow_trailing_done(lines_q)  # an engine that ended the request on ERR may still print its DONE
                     raise ValueError(line[4:].strip())
         finally:
-            if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                # the engine can be ended or restarted on another thread meanwhile: Engine.close() closes stdin (a
-                # write then raises ValueError) before it clears `proc` (None then) - the STOP has nobody to reach, and
-                # the request's own outcome must not be replaced by that error
-                proc = self.proc
-                if self.can_stop and proc is not None:
+            if not done and self._epoch_current(epoch):
+                if self.can_stop:
                     try:
-                        proc.stdin.write(stop_line)
-                        proc.stdin.flush()
-                    except (OSError, ValueError):
+                        self._send(stop_line.rstrip("\n"), born=born)
+                    except EngineDied:
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
                 # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
                 heard = time.monotonic()
-                while True:
+                while self._epoch_current(epoch):
                     left = allow - (time.monotonic() - heard) if allow > 0 else None
                     try:
                         if carry is not NO_LINE:          # read already, after the last token
@@ -2907,16 +3747,18 @@ class StrataEngine:
                             line = lines_q.get(timeout=left)
                     except queue.Empty:
                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
-                                           f"within {allow:.0f} s") from None
+                                           f"within {allow:.0f} s", epoch=epoch) from None
+                    if not self._epoch_current(epoch):
+                        break
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
-                        self._parse_done(line)
+                        self._parse_done_epoch(line, epoch)
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
             if rid is not None:                           # this request's lines are over (a late one goes nowhere)
-                self.rid_q.pop(rid, None)
+                epoch.slots.rid_q.pop(rid, None)
 
     @staticmethod
     def _swallow_trailing_done(lines_q, wait: float = 0.3) -> None:
@@ -2936,6 +3778,8 @@ class StrataEngine:
             if late is None or late.startswith(("DONE", "ERR")):
                 return
 
+
+
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
         try:
@@ -2947,7 +3791,7 @@ class StrataEngine:
         except Exception:  # noqa: BLE001 - psutil missing, the process gone, no permission: no reading
             return None
 
-    def _stall_check(self, heard: float, state: dict, stall_s: float) -> None:
+    def _stall_check(self, heard: float, state: dict, stall_s: float, *, epoch=None) -> None:
         """#1317: called while the engine is silent.  Takes a baseline soon after the last line, and at stall_s of silence
         compares: no CPU and no I/O in all that time -> the engine is ended (EngineSilent); work going on -> one warning."""
         age = time.monotonic() - heard
@@ -2963,7 +3807,7 @@ class StrataEngine:
             gpu_working = False
         if now is not None and not gpu_working and engine_frozen(state["base"], now):
             raise self._silent(f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time (frozen; "
-                               "STRATA_ENGINE_STALL_S sets this, 0 = off)")
+                               "STRATA_ENGINE_STALL_S sets this, 0 = off)", epoch=epoch)
         if now is not None:   # working: look again after another window from here, and say so once
             state["base"], state["next"] = now, age + stall_s
             if not state.get("warned"):
@@ -2973,17 +3817,19 @@ class StrataEngine:
         else:
             state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
 
-    def _silent(self, what: str) -> EngineSilent:
-        """#481: end an engine that lost step with the server (its main thread waits for a command the server never
-        sends), so the next request starts it again: killed now, its GPU and RAM go back with the process."""
-        self.silent_note = ("The engine and the server lost step (issue #481; a very slow PC can raise "
-                            "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, please add "
-                            "the end of the engine log to github.com/Niko1221/Strata/issues/481.")
-        self.ended = True                               # not alive from now: the next request restarts it
-        proc = self.proc
+    def _silent(self, what: str, *, epoch=None) -> EngineSilent:
+        """End only the child whose request timed out, never its replacement."""
+        epoch = epoch or self._capture_epoch()
+        with self._state_lock():
+            if not self._epoch_current(epoch):
+                return EngineSilent(f"{what}; the original engine was replaced")
+            self.silent_note = ("The engine and the server lost step (issue #481; a very slow PC can raise "
+                                "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, please add "
+                                "the end of the engine log to github.com/Niko1221/Strata/issues/481.")
+            self.ended = True
         try:
-            proc.kill()
-            proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
+            epoch.proc.kill()
+            epoch.proc.wait(timeout=20)
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
         return EngineSilent(f"{what}; the server ended the engine")
@@ -2998,11 +3844,7 @@ class StrataEngine:
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
 
-    def session_file(self, action: str, path: str) -> dict:
-        with self._exclusive_control():
-            return self._session_file(action, path)
-
-    def _session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, *, _control=None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -3016,132 +3858,220 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        epoch = self._capture_epoch()
+        # One original command-body frame. The borrowed argument is supplied
+        # only by an actual caller holding this captured lock; identity alone
+        # never acquires it. No strict TLS/context-manager actor is introduced.
+        acquired = _control is None
+        if not acquired:
+            if _control is not epoch.ctl:
+                raise EngineDied("borrowed control does not belong to the captured engine")
+        elif epoch.strict_owned:
+            _control = epoch.ctl
+            if _control is None or not _control.acquire(timeout=self.CONTROL_WAIT_S):
+                raise ValueError("a request is still running; try again when it has finished")
+        else:
+            _control = self._exclusive_control()
+            _control.__enter__()
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
-        except OSError:
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
-        silence = float(self.silence_s or 0)
-        heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+            self._check_epoch(epoch)
+            self._send(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}", born=epoch.gen)
+            silence = float(self.silence_s or 0)
+            heard = time.monotonic()
 
-        def out_of_step(line: str) -> EngineDied:
-            self.ended = True                               # not alive from now: the next request restarts it
-            try:
-                self.proc.kill()
-                self.proc.wait(timeout=20)
-            except (OSError, AttributeError, subprocess.TimeoutExpired):
-                pass
-            return EngineDied(f"the engine answered a session {action} with {line.strip()[:200]!r}; "
-                              "the server ended the engine")
+            def out_of_step(line: str) -> EngineDied:
+                with self._state_lock():
+                    if not self._epoch_current(epoch):
+                        return EngineDied("the engine changed during the session exchange")
+                    self.ended = True
+                try:
+                    epoch.proc.kill()
+                    epoch.proc.wait(timeout=20)
+                except (OSError, AttributeError, subprocess.TimeoutExpired):
+                    pass
+                return EngineDied(f"the engine answered a session {action} with {line.strip()[:200]!r}; "
+                                  "the server ended the engine")
 
-        def count(s: str) -> int:
-            if not s.isdigit():                             # no sign, no blank, no fraction
-                raise ValueError
-            return int(s)
+            def count(s: str) -> int:
+                if not s.isdigit():                             # no sign, no blank, no fraction
+                    raise ValueError
+                return int(s)
 
-        last_done = -1
-        allow = 0.0                                         # the announced blocking step's allowance, seconds
-        while True:
-            limit = max(silence, allow)
-            left = limit - (time.monotonic() - heard) if silence > 0 else None
-            try:
-                if left is not None and left <= 0:
-                    raise queue.Empty
-                line = self.lines.get(timeout=left)
-            except queue.Empty:
-                raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
-                                   + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
-            if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-            f = line.split()
-            head = f[0] if f else ""
-            if head == "SESSION":                          # a large file moving: progress, and a heartbeat
+            last_done = -1
+            allow = 0.0                                         # the announced blocking step's allowance, seconds
+            while True:
+                self._check_epoch(epoch)
+                limit = max(silence, allow)
+                left = limit - (time.monotonic() - heard) if silence > 0 else None
                 try:
-                    if len(f) != 3:
-                        raise ValueError
-                    done, total = count(f[1]), count(f[2])
-                    if done > total or done < last_done:
-                        raise ValueError
-                except ValueError:
-                    raise out_of_step(line) from None
-                last_done = done
-                heard, allow = time.monotonic(), 0.0
-                continue
-            if head == "SWAIT":                            # a blocking step starts: its bounded allowance
-                try:
-                    if len(f) != 3 or not f[1].isalpha() or not f[1].isascii():
-                        raise ValueError
-                    seconds = count(f[2])
-                    if not 0 < seconds <= SESSION_WAIT_MAX_S:
-                        raise ValueError
-                except ValueError:
-                    raise out_of_step(line) from None
-                heard, allow = time.monotonic(), float(seconds)
-                continue
-            if head == "FATAL":
-                raise EngineDied(line[6:].strip() or "the engine ended during a session restore")
-            if head == "SERR":
-                parts = line.rstrip("\r\n").split(" ", 3)
-                if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
-                    raise out_of_step(line)
-                raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
-            if head == want:
-                try:
-                    if len(f) != 4:
-                        raise ValueError
-                    tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
-                    if not math.isfinite(ms) or ms < 0:
-                        raise ValueError
-                except ValueError:
-                    raise out_of_step(line) from None
-                return {"tokens": tokens, "bytes": size, "ms": ms}
-            if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
-                heard = time.monotonic()
-                continue
-            raise out_of_step(line)
+                    if left is not None and left <= 0:
+                        raise queue.Empty
+                    line = epoch.lines.get(timeout=left)
+                except queue.Empty:
+                    raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
+                                       + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else ""), epoch=epoch) from None
+                self._check_epoch(epoch)
+                if line is None:
+                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                f = line.split()
+                if (f[0] if f else "") == "SESSION":                          # a large file moving: progress, and a heartbeat
+                    try:
+                        if len(f) != 3:
+                            raise ValueError
+                        done, total = count(f[1]), count(f[2])
+                        if done > total or done < last_done:
+                            raise ValueError
+                    except ValueError:
+                        raise out_of_step(line) from None
+                    last_done = done
+                    heard, allow = time.monotonic(), 0.0
+                    continue
+                if (f[0] if f else "") == "SWAIT":                            # a blocking step starts: its bounded allowance
+                    try:
+                        if len(f) != 3 or not f[1].isalpha() or not f[1].isascii():
+                            raise ValueError
+                        seconds = count(f[2])
+                        if not 0 < seconds <= SESSION_WAIT_MAX_S:
+                            raise ValueError
+                    except ValueError:
+                        raise out_of_step(line) from None
+                    heard, allow = time.monotonic(), float(seconds)
+                    continue
+                if (f[0] if f else "") == "FATAL":
+                    raise EngineDied(line[6:].strip() or "the engine ended during a session restore")
+                if (f[0] if f else "") == "SERR":
+                    parts = line.rstrip("\r\n").split(" ", 3)
+                    if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
+                        raise out_of_step(line)
+                    raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+                if (f[0] if f else "") == ("SAVED" if action == "save" else "RESTORED"):
+                    try:
+                        if len(f) != 4:
+                            raise ValueError
+                        tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
+                        if not math.isfinite(ms) or ms < 0:
+                            raise ValueError
+                    except ValueError:
+                        raise out_of_step(line) from None
+                    return {"tokens": tokens, "bytes": size, "ms": ms}
+                if (f[0] if f else "") == "INFO" or (f[0] if f else "") == "WARN":          # engine log lines may interleave; they are not answers
+                    heard = time.monotonic()
+                    continue
+                raise out_of_step(line)
+        except BaseException:
+            if acquired and not epoch.strict_owned:
+                acquired = False  # __exit__ owns this cleanup, even if it raises
+                _control.__exit__(*sys.exc_info())
+            raise
+        finally:
+            if acquired:
+                if epoch.strict_owned:
+                    _control.release()  # actual acquired object, never a replacement attribute
+                else:
+                    _control.__exit__(None, None, None)
 
     def close(self):
-        """End the engine process: STOP + QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
-        EngineStuck when it still runs after all three."""
-        if self.proc is None:
-            return
+        """Bounded shutdown of the captured child, even if its writer is blocked."""
+        deadline = time.monotonic() + ENGINE_QUIT_WAIT_S + ENGINE_TERM_WAIT_S + ENGINE_KILL_WAIT_S
+        def remaining(cap):
+            return max(0.0, min(cap, deadline - time.monotonic()))
+
+        # Capture before waiting for another closer: a queued old close must
+        # never select a child published while it was waiting.
+        with self._state_lock():
+            proc, pump, log = self.proc, self.pump, self.log
+            if proc is None:
+                return
+            write_failed = getattr(self, "_stdin_failed", False)
+            captured_epoch = self.__dict__.get('_epoch')
+        if captured_epoch is not None and captured_epoch.proc is proc and captured_epoch.scheduler is not None:
+            captured_epoch.scheduler.close('Captured engine closing', failed=False)
+        closer = self.__dict__.setdefault("_close_lock", threading.Lock())
+        if not closer.acquire(timeout=remaining(ENGINE_QUIT_WAIT_S)):
+            raise EngineStuck("another engine shutdown is still in progress")
         try:
-            if self.proc.poll() is None:
+            with self._state_lock():
+                if self.proc is proc:
+                    self._stdin_closing = True
+            written = threading.Event()
+            errors = []
+
+            def shutdown_write():
                 try:
-                    # STOP first: a request still running ends at its next step instead of being waited for (the
-                    # engine reads stdin on its own thread; QUIT behind a long answer would sit in its queue)
-                    self.proc.stdin.write("STOP\nQUIT\n")
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    self.proc.terminate()
-                    self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+                    with self.wlock:
+                        # This worker never retargets a successor or appends bytes
+                        # after a failed earlier write acquired the lock first.
+                        with self._state_lock():
+                            valid = self.proc is proc and not getattr(self, "_stdin_failed", False)
+                        if valid and proc.poll() is None:
+                            self._write_locked(proc, "STOP\nQUIT", close_stdin=True)
+                except (OSError, AttributeError, ValueError) as error:
+                    errors.append(error)
+                finally:
+                    written.set()
+
+            writer = None
+            if proc.poll() is None:
+                graceful_deadline = min(deadline, time.monotonic() + ENGINE_QUIT_WAIT_S)
+                if not write_failed:
+                    writer = threading.Thread(target=shutdown_write, daemon=True)
+                    writer.start()
+                graceful = (not write_failed and written.wait(max(0, graceful_deadline - time.monotonic()))
+                            and not errors)
+                try:
+                    if not graceful:
+                        proc.terminate()
+                        proc.wait(timeout=remaining(ENGINE_TERM_WAIT_S))
+                    else:
+                        proc.wait(timeout=max(0, graceful_deadline - time.monotonic()))
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=remaining(ENGINE_TERM_WAIT_S))
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=remaining(ENGINE_KILL_WAIT_S))
+                        except subprocess.TimeoutExpired:
+                            raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
+                    except OSError:
+                        pass
+            # Killing the child normally breaks a blocked pipe write. Never
+            # publish another child while a writer still owns the old pipe.
+            if writer is not None:
+                writer.join(timeout=remaining(ENGINE_TERM_WAIT_S))
+                if writer.is_alive():
+                    raise EngineStuck("the old engine pipe writer has not stopped; restart is fenced")
+            # A descendant may retain stdout after the child exits. Closing a
+            # buffered reader while its pump blocks in read can wait forever on
+            # Python's reader lock. Keep the captured process/epoch retired only
+            # after that reader has drained; a later close can retry safely.
+            if pump is not None and pump.ident is not None:
+                pump.join(timeout=remaining(2))
+                if pump.is_alive():
+                    raise EngineStuck("the old engine output reader has not stopped; restart is fenced")
+            if not self.wlock.acquire(timeout=remaining(ENGINE_TERM_WAIT_S)):
+                raise EngineStuck("the old engine pipe writer has not stopped; restart is fenced")
             try:
-                self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
-            except subprocess.TimeoutExpired:
-                raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
-        except OSError:
-            pass
-        finally:
-            if self.proc.poll() is not None:
-                if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
-                    self.pump.join(timeout=2)
+                if proc.poll() is None:
+                    raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits")
                 try:
-                    self.proc.stdin.close()             # buffered data may flush again after the engine has exited
-                except OSError:
+                    proc.stdin.close()
+                except (OSError, ValueError):
                     pass
-                self.proc.stdout.close()
-                if self.log not in (None, subprocess.DEVNULL):
-                    self.log.close()
-                self.proc = None
-                self.ended = True
-                self.progress, self.last = None, {}
-                self.progress_ms, self.reused = 0, 0
+                with self._state_lock():
+                    if self.proc is proc:
+                        self.proc = None
+                        self.ended = True
+                        self.progress, self.last = None, {}
+                        self.progress_ms, self.reused = 0, 0
+            finally:
+                self.wlock.release()
+            proc.stdout.close()
+            if log not in (None, subprocess.DEVNULL):
+                log.close()
+        finally:
+            closer.release()
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
@@ -4902,6 +5832,49 @@ def slot_save_dir(value, base: str | None = None) -> str:
     return path
 
 class Service:
+    def scheduler_manager(self):
+        if not self.api_key:
+            raise ValueError('Scheduler controls require an authenticated service owner')
+        engine = self.engine
+        epoch = engine._capture_epoch() if isinstance(engine, StrataEngine) else None
+        if epoch is None or epoch.scheduler is None:
+            raise ValueError('Managed scheduler is disabled')
+        path = os.environ.get('STRATA_SERVING_THREAD_STATE_V1')
+        if not path:
+            raise ValueError('Managed scheduler requires an explicit durable state path')
+        with self.status_lock:
+            manager = getattr(self, '_scheduler_manager', None)
+            if manager is None:
+                from .scheduler_manager import SchedulerManager
+                manager = self._scheduler_manager = SchedulerManager(path)
+                engine.scheduler_manager = manager
+        manager.attach(epoch.scheduler)
+        configured_base = os.environ.get('STRATA_SERVING_THREAD_DEFAULT_BASE_V1')
+        if configured_base is None or re.fullmatch(r'-?(0|[1-9][0-9]*)', configured_base) is None:
+            raise ValueError('Managed scheduler requires an explicit default base')
+        manager.ensure_default(int(configured_base))
+        return manager
+
+    def scheduler_request(self, req, cancel):
+        selected = req.get('strata_scheduler')
+        epoch = self.engine._capture_epoch() if isinstance(self.engine, StrataEngine) else None
+        enabled = epoch is not None and epoch.scheduler is not None
+        if not enabled and selected is None:
+            return
+        if not enabled:
+            raise ValueError('Managed scheduler is disabled')
+        manager = self.scheduler_manager()
+        if selected is None:
+            selected = {'thread': manager.default_thread}
+        if type(selected) is not dict or set(selected) not in ({'thread'}, {'thread', 'foreground', 'repair'}):
+            raise ValueError('strata_scheduler requires issued thread and optional operation handles')
+        operations = (selected['foreground'], selected['repair']) if 'foreground' in selected else None
+        manager.validate_selection(selected['thread'], operations)
+        cancel._strata_scheduler_manager = manager
+        cancel._strata_scheduler_thread = selected['thread']
+        if 'foreground' in selected:
+            cancel._strata_scheduler_operations = (selected['foreground'], selected['repair'])
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = True):
@@ -5286,24 +6259,38 @@ class Service:
         return self.vram_reserve if self.vram_reserve_asked else 0
 
     def _vision_up(self):
-        """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
-        cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
-        warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM mode)
-        the encoder starts anyway, as a non-elastic one would."""
+        """The FIFO-owned image turn reserves the expert cache before encoder startup.
+        Parallel admission also owns the control lines: take FIFO then captured
+        control, with the existing bounded wait, for the actual VRAM exchange.
+        An engine without elastic VRAM still starts its encoder as before.
+        """
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
         if hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
+            ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+            if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
+                raise ModelBusy("a request is still running; try again when it has finished")
             try:
-                out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
-                self.vision_held = True
-                print(f"[strata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
-                      f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB left)", flush=True)
-            except ValueError as e:
-                self.vision_no_shrink = "--vram-elastic" in str(e)     # an engine that never shrinks: not asked again
-                note = "" if self.vision_no_shrink and self.vision_no_shrink_said else f" ({e})"
-                self.vision_no_shrink_said = True
-                self._vision_room_check(v, note)
+                if not isinstance(self.engine, StrataEngine):
+                    self.engine._ctl_held = ctl
+                try:
+                    free0 = (self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib, _control=ctl)
+                           if ctl is not None and isinstance(self.engine, StrataEngine)
+                           else self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib))
+                    self.vision_held = True
+                    print(f"[strata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
+                          f"({free0.get('expert_cache_mib')} of {free0.get('expert_cache_full_mib')} MiB left)", flush=True)
+                except ValueError as e:
+                    self.vision_no_shrink = "--vram-elastic" in str(e)     # an engine that never shrinks: not asked again
+                    t0 = "" if self.vision_no_shrink and self.vision_no_shrink_said else f" ({e})"
+                    self.vision_no_shrink_said = True
+                    self._vision_room_check(v, t0)
+            finally:
+                if not isinstance(self.engine, StrataEngine):
+                    self.engine._ctl_held = False
+                if ctl is not None:
+                    ctl.release()
         elif self.vision_no_shrink:
             self._vision_room_check(v, "")
         if self.vision_held:
@@ -5315,9 +6302,9 @@ class Service:
             raise EngineDied(f"the image encoder failed to start: {e}") from e
         free1 = self.free_vram_mib()
         took = f", {free0 - free1} MiB of VRAM" if free0 is not None and free1 is not None else ""
-        on_cpu = getattr(v, "on_cpu", False)
-        print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s{', on the CPU' if on_cpu else took}", flush=True)
-        if on_cpu and self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+        ctl = getattr(v, "on_cpu", False)
+        print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s{', on the CPU' if ctl else took}", flush=True)
+        if ctl and self.vision_held and hasattr(self.engine, "vram") and self.loaded():
             # the CPU reader needs no VRAM: the cache takes back what it made room for
             try:
                 self.engine.vram(self._engine_reserve())
@@ -5337,9 +6324,9 @@ class Service:
             print(f"[strata] images: the expert cache did not make room for the image encoder{note}; starting it anyway", flush=True)
 
     def _vision_idle_down(self, force: bool = False) -> str:
-        """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
-        "down", "busy" (a request holds the turn, or a picture came more recently) or "nothing" (not elastic or not
-        holding anything)."""
+        """Stop the idle encoder only after FIFO and parallel control ownership.
+        A busy control owner keeps the encoder and its VRAM share untouched.
+        """
         v = self.vision
         if not getattr(v, "elastic", False) or not (self.vision_held or v.alive()):
             return "nothing"
@@ -5348,17 +6335,30 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            v.unload()
-            back = ""
-            if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
-                out = self.engine.vram(self._engine_reserve())
-                back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
-                        f"{out.get('expert_cache_full_mib')} MiB)")
-            # also when the cache never made room (a layer split, an engine without --vram-elastic): the stop happened
-            print(f"[strata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{back}",
-                  flush=True)
-            self.vision_held = False
-            return "down"
+            ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+            if ctl is not None and not ctl.acquire(blocking=False):
+                return "busy"
+            try:
+                if not isinstance(self.engine, StrataEngine):
+                    self.engine._ctl_held = ctl
+                v.unload()
+                force = ""
+                if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+                    force = (self.engine.vram(self._engine_reserve(), _control=ctl)
+                           if ctl is not None and isinstance(self.engine, StrataEngine)
+                           else self.engine.vram(self._engine_reserve()))
+                    force = (f"; the expert cache took its VRAM back ({force.get('expert_cache_mib')} of "
+                            f"{force.get('expert_cache_full_mib')} MiB)")
+                # also when the cache never made room (a layer split, an engine without --vram-elastic): the stop happened
+                print(f"[strata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{force}",
+                      flush=True)
+                self.vision_held = False
+                return "down"
+            finally:
+                if not isinstance(self.engine, StrataEngine):
+                    self.engine._ctl_held = False
+                if ctl is not None:
+                    ctl.release()
         finally:
             self.fifo.release()
 
@@ -5421,9 +6421,11 @@ class Service:
                              "card's temperature and power, and the log; a request after "
                              f"{self.FATAL_GPU_WINDOW_S / 60:g} minutes tries again")
 
-    def ensure_loaded(self):
-        """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
+    def ensure_loaded(self, _control=None):
+        """Load under FIFO; protect post-READY control replies as well.
+        Only gpu_turn forwards its actually acquired _control through _give_back.
+        That owner remains borrowed here; other callers acquire their own lock.
+        """
         if self.loaded() and not self._vision_down():
             return
         hook_failed = None
@@ -5490,9 +6492,9 @@ class Service:
         if getattr(self.engine, "unloaded", False):
             print("[strata] loading the model again (it was unloaded) ...", flush=True)
         else:
-            code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            self._note_fatal_gpu_exit(code)
-            print(f"[strata] the engine had stopped (exit code {code}); starting it again "
+            r = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
+            self._note_fatal_gpu_exit(r)
+            print(f"[strata] the engine had stopped (exit code {r}); starting it again "
                   "(a minute or two) ...", flush=True)
         try:
             self.engine.restart()
@@ -5505,13 +6507,39 @@ class Service:
                 raise EngineDied(f"the engine could not be started: {e}") from e
             raise
         print("[strata] the engine is running again", flush=True)
-        if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
-            images_api.restore_session(self)
-        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
-            try:
-                self.engine.vram(self.vram_reserve)
-            except (ValueError, EngineDied) as e:
-                print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+        if not self.restore_after_load and (self.vram_reserve is None or not hasattr(self.engine, "vram")):
+            return
+        # READY permits already-prepared batch requests to bypass FIFO. The
+        # startup boolean has had its last use: reuse its slot for this owner.
+        vision_started = _control
+        if _control is not None and _control is not getattr(self.engine, "ctl", None):
+            raise EngineDied("the engine changed after this request was admitted")
+        if vision_started is None and getattr(self.engine, "batch", 0):
+            vision_started = getattr(self.engine, "ctl", None)
+            if vision_started is not None and not vision_started.acquire(timeout=self.vram_wait_s):
+                raise ModelBusy("a request is still running; try again when it has finished")
+        try:
+            if not isinstance(self.engine, StrataEngine):
+                self.engine._ctl_held = vision_started
+            if self.restore_after_load:
+                if vision_started is not None and isinstance(self.engine, StrataEngine):
+                    images_api.restore_session(self, _control=vision_started)
+                else:
+                    images_api.restore_session(self)
+            if self.vram_reserve is not None and hasattr(self.engine, "vram"):
+                try:
+                    if vision_started is not None and isinstance(self.engine, StrataEngine):
+                        self.engine.vram(self.vram_reserve, _control=vision_started)
+                    else:
+                        self.engine.vram(self.vram_reserve)
+                except (ValueError, EngineDied) as e:
+                    print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+        finally:
+            if not isinstance(self.engine, StrataEngine):
+                self.engine._ctl_held = False
+            if vision_started is not None and _control is None:
+                vision_started.release()  # captured acquired object, never borrowed/current attribute
+            vision_started = None
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
@@ -5530,24 +6558,30 @@ class Service:
         if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
             self.fifo.release()
             raise ModelBusy("a request is still running; try again when it has finished")
-        if ctl is not None:
-            self.engine._ctl_held = True                 # engine.vram() below must not wait for the lines this call holds
         try:
+            if ctl is not None and not isinstance(self.engine, StrataEngine):
+                self.engine._ctl_held = ctl  # legacy duck-typed engine only
             if not self.loaded():
                 self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
                         "note": "applied when the model loads"}
             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
-            out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
+            out = (self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib,
+                                    _control=ctl)
+                   if ctl is not None and isinstance(self.engine, StrataEngine)
+                   else self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib))
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
             print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
         finally:
-            if ctl is not None:
-                self.engine._ctl_held = False
-                ctl.release()
-            self.fifo.release()
+            try:
+                if ctl is not None and not isinstance(self.engine, StrataEngine):
+                    self.engine._ctl_held = False
+            finally:
+                if ctl is not None:
+                    ctl.release()
+                self.fifo.release()
 
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
@@ -6138,13 +7172,15 @@ class Service:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
-            self.embeddings.path = combined             # first, so a half-written one is found as well
+            combined = encoded if isinstance(self.engine, StrataEngine) and self.engine._strict_owned_two() else combined_embeddings_path(
+                self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
+            self.embeddings.path = combined
             # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
             # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
-            write_temporary(combined, [p for p, _ in encoded])
+            if not isinstance(combined, list):
+                write_temporary(combined, [p for p, _ in encoded])
         if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images and not ds_pics:
             lead = self.deepseek_shared_start(messages)
             if lead:
@@ -6281,7 +7317,7 @@ class Service:
         ends): a request can end before its answer starts - its client gone, anything raised after prepare() - and
         then nothing else would.  The handler calls this when a request is done."""
         path, self.embeddings.path = getattr(self.embeddings, "path", None), None
-        if path is not None:
+        if path is not None and not isinstance(path, list):
             Path(path).unlink(missing_ok=True)
 
     def _note(self, n, evs, st=None, rate=None):
@@ -6412,7 +7448,7 @@ class Service:
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
-        if emb and img_keys:
+        if emb and img_keys and not isinstance(emb, list):
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
@@ -6859,7 +7895,7 @@ class Service:
                 event = {"stop": "finished", "length": "finished", "cancel": "cancelled",
                          "disconnect": "disconnected", "timeout": "timeout", "error": "error"}.get(finish, "error")
                 self._terminal_event_locked(request_id, event, finish)
-            if emb:
+            if emb and not isinstance(emb, list):
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
             yield "event", ev
@@ -8358,6 +9394,14 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
+            if path == '/v1/scheduler':
+                try:
+                    manager = svc.scheduler_manager()
+                    body = json.loads(self._body() or b'{}')
+                    self._json(200, manager.action(body))
+                except (ValueError, RuntimeError, OSError) as error:
+                    self._json(400, {'error': {'type': 'invalid_request_error', 'message': str(error)}})
+                return
             reserved = False
             try:
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
@@ -8788,6 +9832,7 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
+            svc.scheduler_request(req, cancel)
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -8853,6 +9898,7 @@ def make_handler(svc: Service):
             if title is not None:
                 return self._responses_ready(req, title)
             cancel = threading.Event()
+            svc.scheduler_request(req, cancel)
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
@@ -9025,6 +10071,7 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
+            svc.scheduler_request(req, cancel)
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
                 ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)

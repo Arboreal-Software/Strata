@@ -1,0 +1,7 @@
+{
+  "src/core/remote_expert_opt.cu": "db4700ef079aadb4775c3a290a19a4ea46a4d4a650cb5aff7ef937d4c14bdd0e",
+  "include/strata/core/remote_expert_opt.hpp": "9eb71f50ca3775cfe98842c0875f77300228d731f18bcd325b44d2c80589c0ee",
+  "include/strata/core/strict_retirement.hpp": "9defda3ff8545936ed99a16e680316e5d3affe841cfb08fca646ccadb2be3bad",
+  "sycl/include/strata/core/remote_experts.hpp": "f21e29f56a797a32e3c7359aa4c3d6c2fcb5fb8ea632e9ba44a3fe2ef6557218",
+  "sycl/src/core/remote_expert_opt_stub.cpp": "a203fa825ada876126353d71864b746163b47c091557b15c3315d76cc8d3472b"
+}

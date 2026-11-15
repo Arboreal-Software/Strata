@@ -1,0 +1,6 @@
+{
+  "include/strata/core/expert_source.hpp": "589a88fccc664bb7a2a3176247cdd9045e510f819cb7044574ac21f22c97a043",
+  "src/core/expert_source.cpp": "4b27f5e600947cef36aca79f1ede5c10ae5bcf6900e10403db0ef9659490b140",
+  "include/strata/core/window_budget.hpp": "dec3b95c838f31fa7f483d828e1f49c58788ea4d8c9a4bfb01c0e5a6519ec3c9",
+  "src/core/window_budget.cpp": "e613a9b91db3345d3478927cc3f35376054fbb4d2404b9a8e3a41ce340c72a94"
+}

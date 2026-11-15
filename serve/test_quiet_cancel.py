@@ -167,6 +167,7 @@ class QuietPromptCancel(unittest.TestCase):
 class QuietWaitPolicy(unittest.TestCase):
     def test_expired_silence_is_not_a_heartbeat(self):
         engine = object.__new__(server.StrataEngine)
+        engine.wlock = threading.Lock()
         engine.proc = mock.Mock()
         engine.proc.poll.return_value = None
         engine.proc.stdin = io.StringIO()
@@ -194,6 +195,7 @@ class QuietWaitPolicy(unittest.TestCase):
         for control in (False, True):
             with self.subTest(control=control):
                 engine = object.__new__(server.StrataEngine)
+                engine.wlock = threading.Lock()
                 engine.proc = mock.Mock()
                 engine.proc.poll.return_value = None
                 engine.proc.stdin = io.StringIO()
@@ -218,7 +220,10 @@ class QuietWaitPolicy(unittest.TestCase):
                     heartbeats = list(gen)
                 self.assertEqual(heartbeats, [None, None], 'a quiet 21 seconds emits two heartbeats, not 42')
                 self.assertTrue(all(0 < wait <= .5 for wait in waits), 'cancellation uses bounded blocking waits')
-                engine._send.assert_not_called()
+                if control:
+                    engine._send.assert_not_called()
+                else:
+                    engine._send.assert_called_once_with("GEN 1 1", born=0)
                 self.assertNotIn('STOP', engine.proc.stdin.getvalue())
 
 
