@@ -39,6 +39,26 @@ def replace(e):
 
 
 class EngineEpochTests(unittest.TestCase):
+    def test_captured_close_mismatch_cannot_touch_successor(self):
+        e = batch_engine()
+        old = e.proc
+        replace(e)
+        successor = e.proc
+        e._state_lock()
+        before = dict(e.__dict__)
+        with mock.patch.object(successor, "poll", side_effect=AssertionError("successor polled")), \
+             mock.patch.object(successor.stdin, "close", side_effect=AssertionError("successor stdin closed")), \
+             mock.patch.object(successor.stdout, "close", side_effect=AssertionError("successor stdout closed")):
+            with self.assertRaises(server.EngineStuck):
+                e.close(_expected_proc=old)
+        self.assertIs(e.proc, successor)
+        self.assertEqual(e.__dict__, before)
+        # Even the no-child early return must reject a different captured target.
+        e.proc = None
+        with self.assertRaises(server.EngineStuck):
+            e.close(_expected_proc=old)
+        self.assertIsNone(e.proc)
+
     def test_never_started_ordinary_reap_does_not_invent_channels(self):
         e = server.StrataEngine("missing-executable", [], lazy=True)
         epoch = e._capture_epoch()

@@ -1237,6 +1237,16 @@ class StrataEngine:
         if "wlock" not in self.__dict__:
             self.wlock = threading.Lock()  # one writer lock for this object, including every restart
         self._state_lock()
+        with self._state_lock():
+            previous_proc = getattr(self, "proc", None)
+            previous_owner = self.__dict__.get("_close_owner")
+        if previous_proc is not None:
+            StrataEngine.close(self, _expected_proc=previous_proc)
+        elif previous_owner is not None:
+            StrataEngine.close(self, _expected_proc=previous_owner[0])
+        previous_reader = getattr(self, "pump", None)
+        if previous_reader is not None and (previous_reader.ident is None or previous_reader.is_alive()):
+            raise EngineStuck("the previous engine reader has not retired; restart is fenced")
         previous = getattr(self, "_epoch", None)
         if previous is not None:
             self._reap_owned_image_transports(previous)
@@ -1314,11 +1324,16 @@ class StrataEngine:
             if log:
                 self.log.close()
             raise
-        proc = self.proc                                 # THIS start's process: a close() from another thread may set self.proc to None meanwhile (#4792)
+        # Keep popen's actual captured child even if self.proc changes meanwhile.
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
-        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
+        ready_reader = threading.Thread(target=self._ready_pump, args=(proc, ready_q), daemon=True)
+        with self.wlock, self._state_lock():
+            if self.proc is not proc:
+                raise EngineStuck("captured startup changed before READY reader publication")
+            self.pump = ready_reader  # Publish actual ownership BEFORE start.
+        ready_reader.start()
         ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
         timed_out = False
         while True:
@@ -1349,15 +1364,16 @@ class StrataEngine:
                     proc.kill()
                 except OSError:
                     pass
-            try:                                        # its pipes and our handle on its log (the log stays)
+            try:
                 proc.wait(timeout=5)
-                with self.wlock:
-                    proc.stdin.close()
-                proc.stdout.close()
-                if log:
-                    self.log.close()
             except (OSError, subprocess.TimeoutExpired):
-                pass
+                if proc.poll() is None:
+                    raise EngineStuck("failed READY child has not exited; restart is fenced") from None
+            if proc.poll() is None:
+                raise EngineStuck("failed READY child exit is not confirmed; restart is fenced")
+            # Exit alone is insufficient: retain/join the actual READY reader,
+            # pipe-close worker and log before ANY recursive fallback below.
+            StrataEngine.close(self, _expected_proc=proc)
             if not timed_out and _attempt < START_RETRIES and \
                     transient_start_failure(log, log_start, time.monotonic() - spawned_at, proc.returncode):
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
@@ -1787,11 +1803,23 @@ class StrataEngine:
                 try:
                     self.__init__(*self.spawn)
                     break
+                except EngineStuck:
+                    raise  # Uncertain retirement never authorizes a constructor.
                 except RuntimeError:
-                    try:
-                        self.proc.wait(timeout=60)
-                    except (subprocess.TimeoutExpired, OSError):
-                        pass
+                    with self._state_lock():
+                        failed_proc = self.proc
+                        failed_owner = self.__dict__.get("_close_owner")
+                    if failed_proc is not None:
+                        try:
+                            failed_proc.wait(timeout=60)
+                        except (subprocess.TimeoutExpired, OSError):
+                            if failed_proc.poll() is None:
+                                raise EngineStuck("failed startup child has not exited; restart is fenced") from None
+                        if failed_proc.poll() is None:
+                            raise EngineStuck("failed startup child exit is not confirmed; restart is fenced")
+                        StrataEngine.close(self, _expected_proc=failed_proc)
+                    elif failed_owner is not None:
+                        StrataEngine.close(self, _expected_proc=failed_owner[0])
                     if i == tries - 1:
                         raise
                     print(f"[strata] the engine did not start (try {i + 1} of {tries}); again in "
@@ -3979,7 +4007,7 @@ class StrataEngine:
                 else:
                     _control.__exit__(None, None, None)
 
-    def close(self):
+    def close(self, *, _expected_proc=None):
         """Bound caller waits; retain the captured pipe owner across uncertain retries."""
         deadline = time.monotonic() + ENGINE_QUIT_WAIT_S + ENGINE_TERM_WAIT_S + ENGINE_KILL_WAIT_S
         def remaining(cap):
@@ -3989,10 +4017,12 @@ class StrataEngine:
         with self._state_lock():
             proc, pump, log = self.proc, self.pump, self.log
             pending = self.__dict__.get("_close_owner")
-            if proc is None:
-                if pending is None:
-                    return
+            if proc is None and pending is not None:
                 proc, stdin, pump, log, writer, written, errors = pending
+            if _expected_proc is not None and proc is not _expected_proc:
+                raise EngineStuck("captured engine changed before retirement; successor is fenced")
+            if proc is None:
+                return
             write_failed = getattr(self, "_stdin_failed", False)
             captured_epoch = self.__dict__.get('_epoch')
         if captured_epoch is not None and captured_epoch.proc is proc and captured_epoch.scheduler is not None:
