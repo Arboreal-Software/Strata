@@ -198,6 +198,131 @@ class PumpTests(unittest.TestCase):
                 with self.subTest(phase=phase, terminal_first=terminal_first):
                     OwnedImageTransport._lease_case(self, exercise)
 
+    @unittest.skipUnless(sys.platform.startswith('linux') and hasattr(os, 'memfd_create'),
+                         'Linux sealed transport boundary')
+    def test_stale_diagnostics_during_expected_image_and_accepted_continuation(self):
+        # Actual caller/pump/sealed FD; native records and diagnostic write sinks
+        # are recorded. Callback delivery is not artifact inclusion or credit.
+        import tempfile
+        from serve.test_server import OwnedImageTransport
+        from serve.test_batch_control_guard import CountLock
+        from serve.native_receipts import NativeReceipt
+        from serve.two_slot_receipts import TwoSlotReceipt, PREFIXES
+        for phase in ('BIPAY', 'BICAPTURED', 'BICLOSED'):
+            for terminal_first in (False, True):
+                def exercise():
+                    with tempfile.TemporaryDirectory() as directory:
+                        e, state = OwnedImageTransport._same_epoch_batch(
+                            self, directory, CountLock(), phase, pause_request=C, defer_admit_request=C)
+                        epoch = state.epoch
+                        epoch.proc.pid = 4321
+                        epoch = dataclasses.replace(epoch, receipt_env=(
+                            ('STRATA_HTTP_NATIVE_RECEIPTS', '1'), ('STRATA_HTTP_TWO_SLOT_RECEIPTS', '1')))
+                        e._epoch = epoch
+                        first, _ = state.generator(C)
+                        native_diagnostic, two_diagnostic = mock.Mock(), mock.Mock()
+                        native_diagnostic.observe.side_effect = lambda line: NativeReceipt.observe(native_diagnostic, line)
+                        two_diagnostic.observe.side_effect = lambda line: TwoSlotReceipt.observe(two_diagnostic, line)
+                        received = []
+                        old_commit = dict(request=A, slot=0, occupancy=11, op=1, cut=2,
+                                          forwarded=2, accepted=3, watermark=1, history=history_digest([7,8,9]))
+                        stale = (event('BOWN_COMMIT', **old_commit, sample=9),
+                                 event('BOWN_KNOWN', **old_commit, next_known=9))
+                        with mock.patch.object(server.time, 'monotonic', state.clock), \
+                             mock.patch('serve.native_receipts.NativeReceipt.enabled', return_value=native_diagnostic), \
+                             mock.patch('serve.two_slot_receipts.TwoSlotReceipt.enabled', return_value=two_diagnostic):
+                            try:
+                                epoch.slots.owned_observations.register(0, A, [7], 8)
+                                def native():
+                                    received.append(accept(0, A, 11)); yield received[-1]
+                                    terminal, done = 'BDONE 0 1 cancel 0.0\n', retired(0, A, 11)
+                                    for line in ((terminal, done) if terminal_first else (done, terminal)):
+                                        received.append(line); yield line
+                                    self.assertEqual(epoch.slots.slot_q[0].get_nowait(), terminal)
+                                    self.assertTrue(epoch.slots.slot_q[0].empty())
+                                    self.assertNotIn(0, epoch.slots.owned_observations.active)
+                                    self.assertIsNone(next(first))
+                                    self.assertEqual(state.phase, phase)
+                                    observations = epoch.slots.owned_observations
+                                    self.assertEqual(observations.expected[0]['request'], C)
+                                    self.assertNotIn(0, observations.active)
+                                    with self.assertRaises(ValueError): observations.stop(0, C)
+                                    before = (dict(observations.active), {key: dict(value) for key, value in observations.expected.items()},
+                                              dict(observations.retired), dict(vars(epoch.slots.slot_q[0])),
+                                              observations.stop(0, A), state.pending, tuple(state.frames))
+                                    for line in stale:
+                                        received.append(line); yield line
+                                    self.assertEqual((dict(observations.active), {key: dict(value) for key, value in observations.expected.items()},
+                                                      dict(observations.retired), dict(vars(epoch.slots.slot_q[0])),
+                                                      observations.stop(0, A), state.pending, tuple(state.frames)), before)
+                                    self.assertTrue(epoch.lines.empty())
+                                    self.assertTrue(epoch.slots.slot_q[0].empty())
+                                    # This advances the actual waiter without any C acknowledgement.
+                                    self.assertIsNone(next(first))
+                                    self.assertEqual(state.phase, phase)
+                                    self.assertEqual(state.pending, before[5])
+                                    state.release()  # Existing genuine ACK/FD handshake.
+                                    self.assertIsNone(next(first))
+                                    self.assertIsNotNone(state.deferred_admit)
+                                    self.assertEqual(state.deferred_admit[1], 0)
+                                    self.assertTrue(epoch.lines.empty())
+                                    self.assertTrue(epoch.slots.slot_q[0].empty())
+                                    self.assertEqual(observations.expected[0]['request'], C)
+                                    self.assertNotIn(0, observations.active)
+                                    self.assertTrue(any(frame.startswith('BICLOSE ') for frame in state.frames))
+                                    with self.assertRaises(OSError): os.fstat(state.records[0]['producer'])
+                                    # Native order: image handoff, ACCEPT, then BADM/token data.
+                                    accepted = event('BOWN_ACCEPT', slot=0, request=C, occupancy=33, leg=2,
+                                                     input_count=3, input_sha256=history_digest([1,1,2]), full_budget=32768,
+                                                     cut=1, forwarded=3, accepted=4, watermark=1,
+                                                     history=history_digest([1,1,2,7]))
+                                    received.append(accepted); yield accepted
+                                    self.assertEqual(observations.active[0].request, C)
+                                    self.assertEqual(observations.stop(0, C), 'BSTOP 0 occupancy=33')
+                                    before = (dict(observations.active), {key: dict(value) for key, value in observations.expected.items()},
+                                              dict(observations.retired), dict(vars(epoch.slots.slot_q[0])),
+                                              observations.stop(0, C), tuple(state.frames))
+                                    for line in stale:
+                                        received.append(line); yield line
+                                    self.assertEqual((dict(observations.active), {key: dict(value) for key, value in observations.expected.items()},
+                                                      dict(observations.retired), dict(vars(epoch.slots.slot_q[0])),
+                                                      observations.stop(0, C), tuple(state.frames)), before)
+                                    self.assertTrue(epoch.lines.empty())
+                                    self.assertTrue(epoch.slots.slot_q[0].empty())
+                                    admit, slot = state.deferred_admit
+                                    state.deferred_admit = None
+                                    admit(slot)  # Release the existing BADM/BT producer only now.
+                                    self.assertEqual(next(first), 7)
+                                    for line in ('BDONE 0 1 length 0\n',
+                                                 event('BOWN_DONE', slot=0, request=C, occupancy=33, reason='length',
+                                                       watermark=1, history=history_digest([1,1,2,7]))):
+                                        received.append(line); yield line
+                                    self.assertEqual(list(first), [])
+                                    self.assertFalse(e.ctl.raw.locked())
+                                    self.assertNotIn(0, observations.active)
+                                    self.assertEqual(e.vram(None)['vram_free_mib'], 4)
+                                    self.assertTrue(epoch.lines.empty())
+                                epoch.proc.stdout = native()
+                                e._pump(epoch)
+                                for diagnostic in (native_diagnostic, two_diagnostic):
+                                    self.assertEqual([call.args[0] for call in diagnostic.observe.call_args_list], received)
+                                    diagnostic.close.assert_called_once()
+                                # Execute actual artifact filters with recording write sinks:
+                                # TwoSlotReceipt includes BOWN; NativeReceipt excludes it.
+                                self.assertEqual([call.args[0]['line'] for call in two_diagnostic.write.call_args_list
+                                                  if call.args[0]['kind'] == 'native'],
+                                                 [line.rstrip('\n') for line in received if line.startswith(PREFIXES)])
+                                self.assertEqual([call.args[0]['line'] for call in native_diagnostic.write.call_args_list
+                                                  if call.args[0]['kind'] == 'native'],
+                                                 [line.rstrip('\n') for line in received
+                                                  if line.startswith(('HTTP_ACCEPT ', 'T ', 'DONE', 'ERR', 'BT ', 'BDONE '))])
+                                self.assertFalse(epoch.slots.owned_observations.failed)
+                            finally:
+                                state.abort()
+                                first.close()
+                with self.subTest(phase=phase, terminal_first=terminal_first):
+                    OwnedImageTransport._lease_case(self, exercise)
+
     def test_scheduler_sink_gets_only_validated_actual_retired_request(self):
         import queue
         from types import SimpleNamespace

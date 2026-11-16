@@ -97,6 +97,229 @@ class EngineEpochTests(unittest.TestCase):
         self.assertTrue(old.stdin.closed)
         old.wait.assert_called_once()
 
+    def test_close_initially_exited_closes_stdin_before_eof_reader_join(self):
+        e = engine()
+        proc = e.proc
+        proc.code = 0
+        input_read, input_write = os.pipe()
+        output_read, output_write = os.pipe()
+        proc.stdin.close()
+        proc.stdout.close()
+        proc.stdin = os.fdopen(input_write, "wb")
+        proc.stdout = os.fdopen(output_read, "rb")
+        entered = threading.Event()
+        def child_input():
+            try:
+                while os.read(input_read, 4096):
+                    pass
+            finally:
+                os.close(input_read)
+                os.close(output_write)
+        def read():
+            entered.set()
+            proc.stdout.readline()
+        consumer = threading.Thread(target=child_input, daemon=True)
+        e.pump = threading.Thread(target=read, daemon=True)
+        consumer.start()
+        e.pump.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            with mock.patch.object(server, "ENGINE_QUIT_WAIT_S", .02), \
+                 mock.patch.object(server, "ENGINE_TERM_WAIT_S", .1), \
+                 mock.patch.object(server, "ENGINE_KILL_WAIT_S", .1):
+                e.close()
+            self.assertIsNone(e.proc)
+            self.assertTrue(proc.stdin.closed)
+            self.assertFalse(e.pump.is_alive())
+            self.assertIsNone(e._close_owner)
+        finally:
+            proc.stdin.close()
+            consumer.join(1)
+            e.pump.join(1)
+            if not e.pump.is_alive():
+                proc.stdout.close()
+        self.assertFalse(consumer.is_alive())
+        self.assertFalse(e.pump.is_alive())
+
+    def test_close_failed_writer_waits_for_exit_before_buffered_eof(self):
+        e = engine()
+        proc = e.proc
+        e._stdin_failed = True
+        input_read, input_write = os.pipe()
+        output_read, output_write = os.pipe()
+        proc.stdin.close()
+        proc.stdout.close()
+        proc.stdin = os.fdopen(input_write, "wb")
+        proc.stdout = os.fdopen(output_read, "rb")
+        proc.stdin.write(b"partial")  # Real bytes still buffered until close.
+        exited, entered = threading.Event(), threading.Event()
+        received = bytearray()
+        original_close, original_wait = proc.stdin.close, proc.wait
+        original_terminate = proc.terminate
+        def terminate():
+            original_terminate()
+            exited.set()
+        def wait(timeout=None):
+            if not exited.wait(1):
+                raise AssertionError("captured child was not terminated")
+            return original_wait(timeout=timeout)
+        def checked_close():
+            self.assertTrue(exited.is_set())
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(e.wlock.locked())
+            original_close()
+        def child_input():
+            try:
+                while True:
+                    chunk = os.read(input_read, 4096)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+            finally:
+                os.close(input_read)
+                os.close(output_write)
+        def read():
+            entered.set()
+            proc.stdout.readline()
+        consumer = threading.Thread(target=child_input, daemon=True)
+        e.pump = threading.Thread(target=read, daemon=True)
+        consumer.start()
+        e.pump.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            with mock.patch.object(proc, "terminate", side_effect=terminate), \
+                 mock.patch.object(proc, "wait", side_effect=wait), \
+                 mock.patch.object(proc.stdin, "close", side_effect=checked_close), \
+                 mock.patch.object(server, "ENGINE_QUIT_WAIT_S", .02), \
+                 mock.patch.object(server, "ENGINE_TERM_WAIT_S", .1), \
+                 mock.patch.object(server, "ENGINE_KILL_WAIT_S", .1):
+                e.close()
+            consumer.join(1)
+            self.assertIsNone(e.proc)
+            self.assertEqual(received, b"partial")
+            self.assertNotIn(b"STOP", received)
+            self.assertNotIn(b"QUIT", received)
+            self.assertIsNone(e._close_owner)
+        finally:
+            original_close()
+            consumer.join(1)
+            e.pump.join(1)
+            if not e.pump.is_alive():
+                proc.stdout.close()
+        self.assertFalse(consumer.is_alive())
+        self.assertFalse(e.pump.is_alive())
+
+    def test_close_blocked_buffer_retry_retains_same_worker_and_pipe(self):
+        e = engine()
+        proc = e.proc
+        proc.code = 0
+        proc.stdin.close()
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        try:
+            while True:
+                os.write(write_fd, b"x" * 4096)
+        except BlockingIOError:
+            pass
+        try:
+            while True:
+                os.write(write_fd, b"x")
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_fd, True)
+        proc.stdin = os.fdopen(write_fd, "wb", buffering=4096)
+        proc.stdin.write(b"tail")  # Actual close flush blocks on the full pipe.
+        e.pump = None
+        real_thread = threading.Thread
+        workers, callers, outcomes = [], [], []
+        entered = threading.Event()
+        original_close = proc.stdin.close
+        def observed_close():
+            entered.set()
+            original_close()
+        def thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            workers.append(worker)
+            return worker
+        def attempt(returned):
+            try:
+                e.close()
+            except BaseException as error:
+                outcomes.append(error)
+            finally:
+                returned.set()
+        drained = bytearray()
+        def drain():
+            try:
+                while True:
+                    chunk = os.read(read_fd, 4096)
+                    if not chunk:
+                        break
+                    drained.extend(chunk)
+            finally:
+                os.close(read_fd)
+        drainer = None
+        try:
+            with mock.patch.object(server.threading, "Thread", side_effect=thread), \
+                 mock.patch.object(proc.stdin, "close", side_effect=observed_close), \
+                 mock.patch.object(server, "ENGINE_QUIT_WAIT_S", .02), \
+                 mock.patch.object(server, "ENGINE_TERM_WAIT_S", .02), \
+                 mock.patch.object(server, "ENGINE_KILL_WAIT_S", .02):
+                returned = threading.Event()
+                caller = real_thread(target=attempt, args=(returned,), daemon=True)
+                callers.append(caller)
+                caller.start()
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(returned.wait(.5), "caller blocked in buffered stdin.close")
+                caller.join(1)
+                self.assertEqual(len(outcomes), 1)
+                self.assertIsInstance(outcomes[0], server.EngineStuck)
+                owner = e._close_owner
+                self.assertIs(owner[0], proc)
+                self.assertIs(owner[1], proc.stdin)
+                self.assertEqual(len(workers), 1)
+                self.assertIs(owner[4], workers[0])
+                self.assertTrue(workers[0].is_alive())
+                os.fstat(write_fd)
+                returned = threading.Event()
+                caller = real_thread(target=attempt, args=(returned,), daemon=True)
+                callers.append(caller)
+                caller.start()
+                self.assertTrue(returned.wait(.5))
+                caller.join(1)
+                self.assertEqual(len(outcomes), 2)
+                self.assertIsInstance(outcomes[1], server.EngineStuck)
+                self.assertIs(e._close_owner, owner)
+                self.assertEqual(len(workers), 1)
+                self.assertIs(e.proc, proc)
+                self.assertFalse(proc.stdin.closed)
+                os.fstat(write_fd)
+            drainer = real_thread(target=drain, daemon=True)
+            drainer.start()
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())
+            e.close()
+            drainer.join(1)
+            self.assertIsNone(e.proc)
+            self.assertIsNone(e._close_owner)
+            self.assertTrue(drained.endswith(b"tail"))
+            with self.assertRaises(OSError):
+                os.fstat(write_fd)
+        finally:
+            if drainer is None:
+                drainer = real_thread(target=drain, daemon=True)
+                drainer.start()
+            for caller in callers:
+                caller.join(1)
+            for worker in workers:
+                worker.join(1)
+            if not proc.stdin.closed and not any(worker.is_alive() for worker in workers):
+                original_close()
+            drainer.join(1)
+        self.assertFalse(drainer.is_alive())
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertTrue(all(not caller.is_alive() for caller in callers))
+
     def test_strict_admin_single_frame_acquire_borrow_busy_and_errors(self):
         import dataclasses
         from serve.test_batch_control_guard import CountLock

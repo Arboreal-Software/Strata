@@ -3980,17 +3980,19 @@ class StrataEngine:
                     _control.__exit__(None, None, None)
 
     def close(self):
-        """Bounded shutdown of the captured child, even if its writer is blocked."""
+        """Bound caller waits; retain the captured pipe owner across uncertain retries."""
         deadline = time.monotonic() + ENGINE_QUIT_WAIT_S + ENGINE_TERM_WAIT_S + ENGINE_KILL_WAIT_S
         def remaining(cap):
             return max(0.0, min(cap, deadline - time.monotonic()))
 
-        # Capture before waiting for another closer: a queued old close must
-        # never select a child published while it was waiting.
+        # Capture before another closer can publish or retire a different child.
         with self._state_lock():
             proc, pump, log = self.proc, self.pump, self.log
+            pending = self.__dict__.get("_close_owner")
             if proc is None:
-                return
+                if pending is None:
+                    return
+                proc, stdin, pump, log, writer, written, errors = pending
             write_failed = getattr(self, "_stdin_failed", False)
             captured_epoch = self.__dict__.get('_epoch')
         if captured_epoch is not None and captured_epoch.proc is proc and captured_epoch.scheduler is not None:
@@ -4000,36 +4002,73 @@ class StrataEngine:
             raise EngineStuck("another engine shutdown is still in progress")
         try:
             with self._state_lock():
+                owner = self.__dict__.get("_close_owner")
+                if owner is not None and owner[0] is not proc:
+                    raise EngineStuck("another captured engine pipe is still awaiting retirement")
                 if self.proc is proc:
                     self._stdin_closing = True
-            written = threading.Event()
-            errors = []
+                    write_failed = write_failed or getattr(self, "_stdin_failed", False)
+                else:
+                    write_failed = True
+            running = proc.poll() is None
+            graceful_deadline = min(deadline, time.monotonic() + ENGINE_QUIT_WAIT_S)
+            if owner is None:
+                stdin = proc.stdin
+                written = threading.Event()
+                errors = []
 
-            def shutdown_write():
-                try:
-                    with self.wlock:
-                        # This worker never retargets a successor or appends bytes
-                        # after a failed earlier write acquired the lock first.
-                        with self._state_lock():
-                            valid = self.proc is proc and not getattr(self, "_stdin_failed", False)
-                        if valid:
+                def shutdown_write():
+                    try:
+                        with self.wlock:
+                            with self._state_lock():
+                                valid = (self.proc is proc and not write_failed and
+                                         not getattr(self, "_stdin_failed", False))
+                            if valid and proc.poll() is None:
+                                try:
+                                    self._write_locked(proc, "STOP\nQUIT", close_stdin=True)
+                                    return
+                                except (OSError, AttributeError, ValueError) as error:
+                                    errors.append(error)
+                                    if (getattr(stdin, "closed", False) is True and
+                                            not isinstance(error, (BrokenPipeError, ValueError))):
+                                        errors.append(EngineStuck("captured stdin close outcome is uncertain"))
+                                    # Let the caller terminate the child while this
+                                    # same worker retains its partially written pipe.
+                                    written.set()
+                            if getattr(stdin, "closed", False) is True:
+                                return
                             if proc.poll() is None:
-                                self._write_locked(proc, "STOP\nQUIT", close_stdin=True)
-                            else:
-                                # The captured child exited between polls. EOF still
-                                # precedes wait/reader join, on this bounded worker.
-                                proc.stdin.close()
-                except (OSError, AttributeError, ValueError) as error:
-                    errors.append(error)
-                finally:
-                    written.set()
+                                if not errors:
+                                    errors.append(EngineDied("captured child must exit before buffered close"))
+                                written.set()
+                                # close() may flush the failed frame. Only confirmed
+                                # exit makes that safe; the caller's waits stay bounded.
+                                proc.wait()
+                                if proc.poll() is None:
+                                    raise EngineStuck("captured child exit is not confirmed")
+                            stdin.close()
+                    except (OSError, AttributeError, ValueError, EngineStuck) as error:
+                        if (getattr(stdin, "closed", False) is True and
+                                isinstance(error, (BrokenPipeError, ValueError))):
+                            errors.append(error)  # Real known-closed broken pipe.
+                        else:
+                            errors.append(EngineStuck("captured stdin close outcome is uncertain"))
+                    finally:
+                        written.set()
 
-            writer = None
-            if proc.poll() is None:
-                graceful_deadline = min(deadline, time.monotonic() + ENGINE_QUIT_WAIT_S)
-                if not write_failed:
-                    writer = threading.Thread(target=shutdown_write, daemon=True)
-                    writer.start()
+                writer = threading.Thread(target=shutdown_write, daemon=True)
+                # Seven fixed references, not a paid cell or a growable registry.
+                # Publish BEFORE start; even an interrupted start retains ownership.
+                owner = (proc, stdin, pump, log, writer, written, errors)
+                with self._state_lock():
+                    self._close_owner = owner
+                # If start raises or is interrupted, the published owner stays
+                # retained; a retry cannot spawn a replacement behind it.
+                writer.start()
+            else:
+                proc, stdin, pump, log, writer, written, errors = owner
+
+            if running:
                 graceful = (not write_failed and written.wait(max(0, graceful_deadline - time.monotonic()))
                             and not errors)
                 try:
@@ -4050,16 +4089,18 @@ class StrataEngine:
                             raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
                     except OSError:
                         pass
-            # Killing the child normally breaks a blocked pipe write. Never
-            # publish another child while a writer still owns the old pipe.
-            if writer is not None:
+            # Event publication is not worker retirement: an error can signal it
+            # before waiting for captured-child exit and performing buffered close.
+            try:
                 writer.join(timeout=remaining(ENGINE_TERM_WAIT_S))
-                if writer.is_alive():
-                    raise EngineStuck("the old engine pipe writer has not stopped; restart is fenced")
-            # A descendant may retain stdout after the child exits. Closing a
-            # buffered reader while its pump blocks in read can wait forever on
-            # Python's reader lock. Keep the captured process/epoch retired only
-            # after that reader has drained; a later close can retry safely.
+            except RuntimeError:
+                raise EngineStuck("captured shutdown worker start is unresolved; restart is fenced") from None
+            if writer.is_alive():
+                raise EngineStuck("the old engine pipe writer has not stopped; restart is fenced")
+            if (getattr(stdin, "closed", False) is not True or
+                    any(isinstance(error, EngineStuck) for error in errors)):
+                # Do not blindly retry a close with an ambiguous descriptor outcome.
+                raise EngineStuck("captured engine stdin close is uncertain; restart is fenced")
             if pump is not None and pump.ident is not None:
                 pump.join(timeout=remaining(2))
                 if pump.is_alive():
@@ -4069,24 +4110,21 @@ class StrataEngine:
             try:
                 if proc.poll() is None:
                     raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits")
-                try:
-                    proc.stdin.close()
-                except (OSError, ValueError):
-                    pass
-                with self._state_lock():
-                    if self.proc is proc:
-                        self.proc = None
-                        self.ended = True
-                        self.progress, self.last = None, {}
-                        self.progress_ms, self.reused = 0, 0
             finally:
                 self.wlock.release()
             proc.stdout.close()
             if log not in (None, subprocess.DEVNULL):
                 log.close()
+            with self._state_lock():
+                if self.proc is proc:
+                    self.proc = None
+                    self.ended = True
+                    self.progress, self.last = None, {}
+                    self.progress_ms, self.reused = 0, 0
+                if self.__dict__.get("_close_owner") is owner:
+                    self._close_owner = None
         finally:
             closer.release()
-
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
 

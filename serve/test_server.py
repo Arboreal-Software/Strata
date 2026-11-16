@@ -163,7 +163,7 @@ class OwnedImageTransport(unittest.TestCase):
         engine._send = send
         return engine, epoch, [(str(source), image_tokens)]*copies, state, events
 
-    def _same_epoch_batch(self, directory, control, pause="BIPAY"):
+    def _same_epoch_batch(self, directory, control, pause="BIPAY", pause_request="aaaaaaaaaaaa", defer_admit_request=None):
         """Actual Python caller/lock/transport; native protocol/slot output recorded.
         One engine/epoch/queue, no fabricated payment root or native authority.
         """
@@ -187,7 +187,7 @@ class OwnedImageTransport(unittest.TestCase):
         epoch.slots.owned_observations = OwnedSlotObservations()
         e._epoch = epoch
         state = SimpleNamespace(epoch=epoch, source=[(str(source), 2)], frames=[], reads=[], records={},
-                                pending=None, paused=False, phase=None, on_vram=None, on_ready=None,
+                                pending=None, deferred_admit=None, paused=False, phase=None, on_vram=None, on_ready=None,
                                 vram_reply="VRAM expert_slots=1 expert_cache_mib=2 expert_cache_full_mib=3 vram_free_mib=4",
                                 restarts=[])
         raw_get, original_send = queue.Queue.get.__get__(epoch.lines), e._send
@@ -205,10 +205,13 @@ class OwnedImageTransport(unittest.TestCase):
         def publish(line, slot):
             epoch.lines.put(line)
             if line.startswith("BICLOSED ") and line.endswith("ready=1"):
-                admit(slot)
+                if state.records[slot]["request"] == defer_admit_request:
+                    state.deferred_admit = (admit, slot)
+                else:
+                    admit(slot)
         def reply(line, slot):
             record = state.records[slot]
-            if record["request"] == "aaaaaaaaaaaa" and line.split()[0] == pause and not state.paused:
+            if record["request"] == pause_request and line.split()[0] == pause and not state.paused:
                 state.paused, state.phase, state.pending = True, pause, (line, slot)
             else:
                 publish(line, slot)
