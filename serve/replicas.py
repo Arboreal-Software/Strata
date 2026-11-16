@@ -505,9 +505,11 @@ class ReplicaEngine:
                 e.close()
             except BaseException as x:           # noqa: BLE001
                 err = err or x
-        remove_arena(self.__dict__.get("arena_file"))   # (an engine that still maps it keeps its pages)
         if err:
+            err.startup_engines = self.engines
+            err.startup_arena = self.__dict__.get("arena_file")
             raise err
+        remove_arena(self.__dict__.get("arena_file"))
 
     # ---- routing
     def route(self, ids) -> int:

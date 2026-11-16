@@ -17,14 +17,28 @@ import serve.server as S  # noqa: E402
 NORMAL = os.path.abspath("/e/strata")
 
 
-class FakeEngine:
+_REAL_STRATA_ENGINE = S.StrataEngine
+
+
+class FakeEngine(_REAL_STRATA_ENGINE):
     started = []
     fail_exes = set()
+
+    def _refuse_retired(self, message):
+        if any(self.__dict__.get(name) is not None for name in
+               ("proc", "pump", "log", "_close_owner", "_startup_attempt")):
+            raise AssertionError("no-spawn refusal fixture owns unexpected resources")
+        attempt = self._begin_startup()
+        try:
+            self._retire_startup(attempt)  # this fixture has genuinely never spawned
+            raise self._startup_error(S.EngineDied(message), attempt)
+        finally:
+            self._finish_startup(attempt)
 
     def __init__(self, exe, args, cwd=None, log=None, env=None, lazy=False, **kw):
         FakeEngine.started.append((exe, list(args), cwd, dict(env or {})))
         if exe in FakeEngine.fail_exes:
-            raise S.EngineDied("the engine exited before it was ready: card 0 is compute capability 8.9 and this build is for sm_86")
+            self._refuse_retired("the engine exited before it was ready: card 0 is compute capability 8.9 and this build is for sm_86")
         self.info = {}
 
 
@@ -86,7 +100,7 @@ class Fallback(unittest.TestCase):
             def __init__(self, exe, args, cwd=None, log=None, env=None, lazy=False, **kw):
                 FakeEngine.started.append((exe, list(args), cwd, dict(env or {})))
                 if exe == "/e/strata-split-2":
-                    raise S.EngineDied("the engine exited before it was ready (see x)\n" + Path(log).read_text())
+                    self._refuse_retired("the engine exited before it was ready (see x)\n" + Path(log).read_text())
                 self.info = {}
         with mock.patch.object(S, "StrataEngine", Refusing):
             engine, out = self.run_start(cfg)

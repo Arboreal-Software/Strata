@@ -74,8 +74,10 @@ class FailedStart(unittest.TestCase):
         holder = {}
 
         class Pipe:
+            closed = False
+
             def close(self):
-                pass
+                self.closed = True
 
             def __iter__(self):
                 return iter(())                      # the engine's output ends: no READY
@@ -86,7 +88,9 @@ class FailedStart(unittest.TestCase):
             pid = 0
 
             def wait(self, timeout=None):
-                holder["engine"].proc = None         # restart()'s close() on another thread
+                engine = holder["engine"]
+                engine.pump.join(timeout=5)          # the actual READY reader reached EOF
+                engine.close(_expected_proc=self)   # genuine captured pipe/reader retirement
                 return 1
 
             def poll(self):
@@ -102,6 +106,38 @@ class FailedStart(unittest.TestCase):
                 mock.patch.object(server, "transient_start_failure", lambda *a, **k: False):
             with self.assertRaises(server.EngineDied):
                 engine.__init__("strata", [], retry_args=None)
+    def test_missing_child_without_close_is_not_retirement(self):
+        import serve.server as server
+        holder = {}
+        class Pipe:
+            closed = False
+            def close(self):
+                self.closed = True
+            def __iter__(self):
+                return iter(())
+        class Proc:
+            returncode, pid = 1, 0
+            stdin, stdout = Pipe(), Pipe()
+            def wait(self, timeout=None):
+                holder["engine"].proc = None  # deliberately NOT a closer
+                return 1
+            def poll(self):
+                return 1
+        engine = StrataEngine.__new__(StrataEngine)
+        holder["engine"] = engine
+        with mock.patch.object(server, "popen", lambda *a, **k: Proc()), \
+             mock.patch.object(server, "end_leftover_engines", lambda exe: None), \
+             mock.patch.object(server, "transient_start_failure", lambda *a, **k: False):
+            with self.assertRaises(server.EngineStuck) as raised:
+                engine.__init__("strata", [], retry_args=None)
+        self.assertIs(raised.exception.startup_engine, engine)
+        self.assertIsNotNone(engine._startup_attempt.proc)
+        self.assertFalse(engine._startup_attempt.retired)
+        self.assertFalse(engine._startup_attempt.proc.stdin.closed)
+        self.assertFalse(engine._startup_attempt.proc.stdout.closed)
+        with self.assertRaises(server.EngineStuck):
+            engine.__init__("strata", [], lazy=True)
+
 
 
 class ControlNotify(unittest.TestCase):

@@ -1,6 +1,12 @@
 """Split serving (serve/split.py): the config, the decision, the hand-over with two fake engines, and every fallback.
 The engine-side proof (the continuation after a hand-over equals a single engine's) is tests/split_serve_exact.py."""
 import os
+import contextlib
+import shutil
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 import tempfile
 import threading
 import unittest
@@ -265,6 +271,162 @@ class Handover(unittest.TestCase):
         self.e.close()
         self.assertFalse(os.path.exists(self.dir))
         self.assertFalse(self.p.up or self.d.up)
+
+
+@unittest.skipUnless(os.name != "nt" and os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK),
+                     "private executable-child/generated-arena profile requires writable Linux /dev/shm")
+class StartupOwnerRetirement(unittest.TestCase):
+    @contextlib.contextmanager
+    def pair(self, mode="healthy"):
+        import serve.server as server
+        # Local class import avoids collecting a second copy of its test cases.
+        from serve.test_ready_timeout import ReadyTimeout
+        directory = tempfile.mkdtemp(prefix="split-owner-test-")
+        cleanup_complete = False
+        try:
+            root = Path(directory)
+            work = root / "work"
+            fd, arena_name = tempfile.mkstemp(prefix="strata-split-", dir="/dev/shm")
+            os.write(fd, b"private generated-arena recording backing")
+            os.close(fd)
+            arena = Path(arena_name)
+            script = root / "engine.py"
+            script.write_text("#!" + sys.executable + "\nimport sys\n"
+                + ("if sys.argv[sys.argv.index('--role')+1]=='decode': raise SystemExit(1)\n" if mode == "second_exit" else "")
+                + "print('READY 4096 stop', flush=True)\n"
+                + "for line in sys.stdin:\n    if line.startswith('QUIT'): break\n")
+            script.chmod(0o700)
+            cfg = {"args": [], "split_serve": {"prefill_gpu": 0, "decode_gpu": 1,
+                   "dir": str(work), "shared_arena": True,
+                   "prefill_args": ["--role", "prefill"], "decode_args": ["--role", "decode"]}}
+            spec = sp.split_spec(cfg)
+            state = SimpleNamespace(server=server, cfg=cfg, spec=spec, script=script, work=work,
+                                    arena=arena, engines=[], adapters=[], prevented=[])
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+                 mock.patch.object(sp, "arena_path", return_value=(str(arena), "private recording backing")), \
+                 mock.patch.object(server, "engine_args", side_effect=lambda cfg, *a, **k: cfg.get("args", [])), \
+                 mock.patch.object(server, "child_env", return_value={}), \
+                 mock.patch.object(server, "mtp_retry_args", return_value=None), \
+                 mock.patch.object(server, "nodraft_retry_args", return_value=None), \
+                 mock.patch.object(server, "warn_budget_over_ram"), \
+                 ReadyTimeout.captured_start(self, str(script)) as (_, children, readers, _):
+                state.children, state.readers = children, readers
+                try:
+                    yield state
+                finally:
+                    # Explicitly end/wait the real private children BEFORE
+                    # resolving only the starts our deliberate injector prevented.
+                    for proc, wait, kill, _, _, _ in children:
+                        if proc.poll() is None:
+                            kill()
+                        wait(timeout=5)
+                    for reader, original_start in state.prevented:
+                        original_start(reader)
+                        reader.join(5)
+                        self.assertFalse(reader.is_alive())
+                    for engine in state.engines:
+                        engine.close()
+                    for adapter in state.adapters:
+                        adapter.close()
+            cleanup_complete = True
+        finally:
+            if cleanup_complete:
+                # Never remove fixture-owned backing after an unresolved cleanup.
+                if arena.exists():
+                    arena.unlink()
+                shutil.rmtree(directory, ignore_errors=True)
+
+    def start_pair(self, state):
+        return state.server.start_split(state.cfg, state.spec, str(state.script), [], False)
+
+    def test_second_role_start_failure_retains_concrete_roles_and_borrowed_paths(self):
+        with self.pair() as state:
+            cls = type(threading.Thread(target=lambda: None))
+            original_start = cls.start
+            def start(thread):
+                target = getattr(thread, "_target", None)
+                if target == state.server.StrataEngine._ready_pump:
+                    proc = thread._args[0]
+                    if proc.args[proc.args.index("--role") + 1] == "decode":
+                        state.prevented.append((thread, original_start))
+                        raise RuntimeError("deliberately prevented actual decode READY start")
+                return original_start(thread)
+            with mock.patch.object(cls, "start", start):
+                with self.assertRaises(state.server.EngineStuck) as caught:
+                    self.start_pair(state)
+            error = caught.exception
+            owners = error.startup_engines
+            state.engines.extend(owners.values())
+            self.assertEqual(set(owners), {"prefill", "decode"})
+            self.assertEqual(len(state.children), 2)
+            self.assertIs(owners["prefill"]._epoch.proc, state.children[0][0])
+            self.assertIs(owners["decode"].proc, state.children[1][0])
+            self.assertIs(owners["decode"]._startup_attempt.ready_reader, state.prevented[0][0])
+            self.assertIs(error.startup_failure.startup_engine, owners["decode"])
+            self.assertIsInstance(error.__cause__, state.server.EngineStuck)
+            self.assertEqual(error.startup_work_dir, str(state.work))
+            self.assertEqual(error.startup_arena, str(state.arena))
+            self.assertTrue(state.work.is_dir())
+            self.assertTrue(state.arena.is_file())
+            self.assertFalse(owners["decode"]._startup_attempt.retired)
+
+    def test_split_close_uncertainty_retains_adapter_roles_work_and_arena(self):
+        with self.pair() as state:
+            adapter = self.start_pair(state)
+            state.adapters.append(adapter)
+            first = adapter.prefill
+            first.wlock.acquire()
+            try:
+                with mock.patch.object(state.server, "ENGINE_QUIT_WAIT_S", .05), \
+                     mock.patch.object(state.server, "ENGINE_TERM_WAIT_S", .1), \
+                     mock.patch.object(state.server, "ENGINE_KILL_WAIT_S", .1):
+                    with self.assertRaises(state.server.EngineStuck) as caught:
+                        adapter.close()
+                error = caught.exception
+                self.assertIs(error.startup_adapter, adapter)
+                self.assertEqual(error.startup_engines, (adapter.prefill, adapter.decode))
+                self.assertIsInstance(error.__cause__, state.server.EngineStuck)
+                self.assertIsNotNone(first.__dict__.get("_close_owner"))
+                self.assertTrue(state.work.is_dir())
+                self.assertTrue(state.arena.is_file())
+                self.assertEqual(len(state.children), 2)
+            finally:
+                first.wlock.release()
+                adapter.close()
+            self.assertFalse(state.work.exists())
+            self.assertFalse(state.arena.exists())
+            self.assertTrue(all(proc.poll() is not None and stdin.closed and stdout.closed
+                                for proc, _, _, stdin, stdout, _ in state.children))
+
+    def test_healthy_split_close_retires_both_children_before_generated_paths(self):
+        with self.pair() as state:
+            adapter = self.start_pair(state)
+            state.adapters.append(adapter)
+            self.assertEqual(len(state.children), 2)
+            self.assertIs(adapter.prefill.proc, state.children[0][0])
+            self.assertIs(adapter.decode.proc, state.children[1][0])
+            self.assertTrue(state.work.is_dir())
+            self.assertTrue(state.arena.is_file())
+            adapter.close()
+            self.assertTrue(all(proc.poll() is not None and stdin.closed and stdout.closed
+                                for proc, _, _, stdin, stdout, _ in state.children))
+            self.assertIsNone(adapter.prefill.proc)
+            self.assertIsNone(adapter.decode.proc)
+            self.assertFalse(state.work.exists())
+            self.assertFalse(state.arena.exists())
+
+    def test_fully_retired_second_role_failure_preserves_original_engine_died(self):
+        with self.pair("second_exit") as state:
+            with self.assertRaises(state.server.EngineDied) as caught:
+                self.start_pair(state)
+            state.engines.append(caught.exception.startup_engine)
+            self.assertEqual(len(state.children), 2)
+            self.assertTrue(all(proc.poll() is not None and stdin.closed and stdout.closed
+                                for proc, _, _, stdin, stdout, _ in state.children))
+            self.assertFalse(state.work.exists())
+            # Preserve original startup-failure arena policy; adapter close has
+            # the separate generated-arena cleanup contract above.
+            self.assertTrue(state.arena.exists())
 
 
 if __name__ == "__main__":

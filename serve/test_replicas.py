@@ -1,6 +1,8 @@
 """Data-parallel replicas (serve/replicas.py): the config, the router, and the real Service over HTTP with two fake
 engines (the fake of test_parallel.py) behind a ReplicaEngine."""
 import json
+import contextlib
+import os
 import sys
 import tempfile
 import threading
@@ -432,6 +434,281 @@ class SharedArena(unittest.TestCase):
             r.__dict__["arena_file"] = str(f)
             r.close()
             self.assertFalse(f.exists())
+
+
+@unittest.skipIf(os.name == "nt", "the executable script uses the existing POSIX fake-engine boundary")
+class StartupArenaRetirement(unittest.TestCase):
+    @contextlib.contextmanager
+    def group(self, mode):
+        import serve.server as server
+        from serve import replicas as rp
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arena = root / "arena"
+            arena.write_bytes(b"actual parent-owned arena fixture")
+            script = root / "engine.py"
+            script.write_text("#!" + sys.executable + "\nimport sys,time\n"
+                + ("if '--shared-expert-arena' in sys.argv: raise SystemExit(1)\n" if mode == "fallback" else "")
+                + ("if sys.argv[sys.argv.index('--index')+1]=='0': raise SystemExit(1)\n" if mode == "cleanup" else "")
+                + (("from pathlib import Path\nmarker=Path(" + repr(str(root / "first")) + ")\n"
+                    "if '--index' in sys.argv and sys.argv[sys.argv.index('--index')+1]=='0' and not marker.exists():\n"
+                    "    marker.touch()\n    raise SystemExit(1)\n") if mode == "same" else "")
+                + "print('READY 4096 stop', flush=True)\n"
+                + "for line in sys.stdin:\n    if line.startswith('QUIT'): break\n")
+            script.chmod(0o700)
+            children, readers, prevented = [], [], []
+            real_popen, real_thread = server.popen, threading.Thread
+            def popen(*args, **kwargs):
+                proc = real_popen(*args, **kwargs)
+                children.append(proc)
+                return proc
+            def thread(*args, **kwargs):
+                result = real_thread(*args, **kwargs)
+                if kwargs.get("target") == StrataEngine._ready_pump:
+                    readers.append(result)
+                    proc = kwargs["args"][0]
+                    index = proc.args[proc.args.index("--index") + 1]
+                    if mode == "mixed" and index == "0":
+                        prevented.append((result, result.start))
+                        result.start = mock.Mock(side_effect=RuntimeError("injected actual READY start failure"))
+                return result
+            cfg = {"replica_shared_arena": True, "args": [], "replica_cpus": False,
+                   "replicas": [{"args": ["--index", "0"]}, {"args": ["--index", "1"]}]}
+            remove = rp.remove_arena
+            with mock.patch.dict(os.environ, {"STRATA_REPLICA_START": "serial"}), \
+                 mock.patch.object(server, "popen", side_effect=popen), \
+                 mock.patch.object(server.threading, "Thread", side_effect=thread), \
+                 mock.patch.object(rp, "shared_arena_plan", side_effect=lambda cfg, n:
+                                   (str(arena), "") if cfg.get("replica_shared_arena") else (None, "")), \
+                 mock.patch.object(rp, "cpu_sets", return_value=None), \
+                 mock.patch.object(server, "engine_args", side_effect=lambda cfg, *a, **k: cfg.get("args", [])), \
+                 mock.patch.object(server, "child_env", return_value={}), \
+                 mock.patch.object(server, "mtp_retry_args", return_value=None), \
+                 mock.patch.object(server, "nodraft_retry_args", return_value=None), \
+                 mock.patch.object(server, "warn_budget_over_ram"), \
+                 mock.patch.object(rp, "remove_arena", wraps=remove) as removal:
+                try:
+                    yield server, cfg, script, arena, children, removal
+                finally:
+                    for proc in children:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.wait(timeout=5)
+                    for reader, start in prevented:
+                        reader.start = start
+                        if reader.ident is None:
+                            reader.start()
+                    for reader in readers:
+                        if reader.ident is not None:
+                            reader.join(5)
+                            self.assertFalse(reader.is_alive())
+                    for proc in children:
+                        proc.stdin.close()
+                        proc.stdout.close()
+
+    def test_array_owns_concrete_engine_before_constructor_entry(self):
+        import serve.server as server
+        engines = [None]
+        original = StrataEngine.__init__
+        entered = []
+        def initialize(engine, *args, **kwargs):
+            self.assertIs(engines[0], engine)
+            entered.append(engine)
+            return original(engine, *args, **kwargs)
+        with mock.patch.object(StrataEngine, "__init__", initialize):
+            result = server._construct_startup_engine("missing", [], lazy=True, _engines=engines, _index=0)
+        self.assertEqual(entered, [result])
+        self.assertIs(engines[0], result)
+        self.assertIsNone(result.proc)
+        result.close()
+
+    def test_mixed_shared_arena_failure_retains_group_without_retry_or_unlink(self):
+        with self.group("mixed") as (server, cfg, script, arena, children, removal):
+            failed = None
+            try:
+                with self.assertRaises(server.EngineStuck) as caught:
+                    server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+                failed = caught.exception
+                self.assertEqual(len(children), 2)
+                self.assertEqual(len(failed.startup_engines), 2)
+                self.assertIs(failed.startup_engines[0].proc, children[0])
+                self.assertIs(failed.startup_engines[1].proc, children[1])
+                self.assertEqual(failed.startup_arena, str(arena))
+                self.assertTrue(arena.exists())
+                removal.assert_not_called()
+            finally:
+                # group() first resolves the real processes/readers; retain owners
+                # until that context cleanup, rather than inventing retirement.
+                if failed is not None:
+                    self.addCleanup(self.retire_group, failed.startup_engines)
+
+    def retire_group(self, engines):
+        for engine in engines:
+            if engine is not None:
+                engine.close()
+
+    def test_later_launcher_start_failure_retains_live_child_and_all_owners(self):
+        with self.group("healthy") as (server, cfg, script, arena, children, removal):
+            admitted, release = threading.Event(), threading.Event()
+            actual_thread_class = type(threading.Thread(target=lambda: None))
+            original_start, popen = actual_thread_class.start, server.popen
+            attempted, started, prevented = [], [], []
+            failed = None
+            def spawn(*args, **kwargs):
+                proc = popen(*args, **kwargs)
+                admitted.set()  # A REAL child exists before the later start fault.
+                if not release.wait(5):
+                    raise AssertionError("child publication barrier not released")
+                return proc
+            def start(thread):
+                if getattr(getattr(thread, "_target", None), "__name__", "") == "one":
+                    attempted.append(thread)
+                    if len(attempted) == 2:
+                        self.assertTrue(admitted.wait(5))
+                        prevented.append(thread)  # Deliberate fault BEFORE native start.
+                        raise RuntimeError("deliberately prevented second launcher start")
+                    result = original_start(thread)
+                    started.append(thread)
+                    return result
+                return original_start(thread)
+            try:
+                with mock.patch.dict(os.environ, {"STRATA_REPLICA_START": ""}), \
+                     mock.patch.object(actual_thread_class, "start", start), \
+                     mock.patch.object(server, "popen", side_effect=spawn):
+                    with self.assertRaises(server.EngineStuck) as caught:
+                        server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+                    failed = caught.exception
+                    self.assertIsInstance(failed.__cause__, RuntimeError)
+                    self.assertEqual(len(children), 1)
+                    self.assertIsNone(children[0].poll())
+                    self.assertEqual(failed.startup_threads, attempted)
+                    self.assertIs(failed.startup_threads[0], started[0])
+                    self.assertIs(failed.startup_threads[1], prevented[0])
+                    self.assertTrue(started[0].is_alive())
+                    self.assertIsNotNone(failed.startup_engines[0])
+                    self.assertTrue(failed.startup_engines[0]._startup_attempt.in_flight)
+                    self.assertIsNone(failed.startup_engines[1])
+                    self.assertEqual(failed.startup_arena, str(arena))
+                    self.assertIsInstance(failed.startup_errors, list)
+                    self.assertTrue(arena.exists())
+                    removal.assert_not_called()
+            finally:
+                release.set()
+                # Join only the launches we actually invoked. The other is known
+                # absent from the deliberate injector, not from ident==None.
+                for worker in started:
+                    worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                if failed is not None:
+                    try:
+                        self.assertIs(failed.startup_engines[0].proc, children[0])
+                        self.assertEqual(len(children), 1)
+                    finally:
+                        self.retire_group(failed.startup_engines)
+                    self.assertIsNotNone(children[0].poll())
+                    self.assertTrue(children[0].stdin.closed)
+                    self.assertTrue(children[0].stdout.closed)
+                    removal.assert_not_called()
+
+    def test_parallel_launcher_success_retires_children_before_arena_release(self):
+        with self.group("healthy") as (server, cfg, script, arena, children, removal):
+            with mock.patch.dict(os.environ, {"STRATA_REPLICA_START": ""}):
+                group = server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            try:
+                self.assertEqual(len(children), 2)
+                self.assertEqual({engine.proc for engine in group.engines}, set(children))
+                self.assertTrue(all(proc.poll() is None for proc in children))
+                self.assertTrue(arena.exists())
+                removal.assert_not_called()
+            finally:
+                group.close()
+            self.assertTrue(all(proc.poll() is not None for proc in children))
+            self.assertTrue(all(proc.stdin.closed and proc.stdout.closed for proc in children))
+            self.assertFalse(arena.exists())
+            removal.assert_called_once_with(str(arena))
+
+    def test_retired_failure_retries_same_arena_without_replacing_healthy_sibling(self):
+        with self.group("same") as (server, cfg, script, arena, children, removal):
+            group = server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            try:
+                self.assertEqual(len(children), 3)
+                self.assertIsNotNone(children[0].poll())
+                self.assertTrue(children[0].stdin.closed)
+                self.assertTrue(children[0].stdout.closed)
+                self.assertIs(group.engines[1].proc, children[1])
+                self.assertIs(group.engines[0].proc, children[2])
+                self.assertTrue(all("--shared-expert-arena" in proc.args for proc in children))
+                self.assertTrue(arena.exists())
+                removal.assert_not_called()
+            finally:
+                group.close()
+            self.assertFalse(arena.exists())
+
+    def test_fully_retired_arena_failure_allows_private_fallback(self):
+        with self.group("fallback") as (server, cfg, script, arena, children, removal):
+            group = server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            try:
+                self.assertEqual(len(children), 4)
+                self.assertTrue(all(proc.poll() is not None for proc in children[:2]))
+                self.assertTrue(all(proc.stdin.closed and proc.stdout.closed for proc in children[:2]))
+                self.assertFalse(arena.exists())
+                removal.assert_called_once_with(str(arena))
+                self.assertEqual(len(group.engines), 2)
+                self.assertTrue(all(engine.alive() for engine in group.engines))
+            finally:
+                group.close()
+
+    def test_all_arena_fallback_stops_when_healthy_sibling_cannot_retire(self):
+        with self.group("cleanup") as (server, cfg, script, arena, children, removal):
+            construct = server._construct_startup_engine
+            held, failed = [], None
+            def retain_writer(*args, **kwargs):
+                engine = construct(*args, **kwargs)
+                if "--index" in engine.spawn[1] and engine.spawn[1][engine.spawn[1].index("--index") + 1] == "1":
+                    engine.wlock.acquire()  # Actual close worker cannot acquire its real writer lock.
+                    held.append(engine)
+                return engine
+            try:
+                with mock.patch.object(server, "_construct_startup_engine", side_effect=retain_writer), \
+                     mock.patch.object(server, "ENGINE_QUIT_WAIT_S", .05), \
+                     mock.patch.object(server, "ENGINE_TERM_WAIT_S", .1), \
+                     mock.patch.object(server, "ENGINE_KILL_WAIT_S", .1):
+                    with self.assertRaises(server.EngineStuck) as caught:
+                        server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+                failed = caught.exception
+                self.assertEqual(len(children), 3)  # first failure, live sibling, retired retry
+                self.assertEqual(len(held), 1)
+                self.assertIs(failed.startup_engines[1], held[0])
+                self.assertEqual(failed.startup_arena, str(arena))
+                self.assertIsNotNone(held[0].__dict__.get("_close_owner"))
+                self.assertTrue(arena.exists())
+                removal.assert_not_called()
+            finally:
+                for engine in held:
+                    engine.wlock.release()
+                if failed is not None:
+                    self.retire_group(failed.startup_engines)
+
+    def test_actual_child_close_uncertainty_preserves_parent_arena(self):
+        with self.group("healthy") as (server, cfg, script, arena, children, removal):
+            group = server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            first = group.engines[0]
+            first.wlock.acquire()
+            try:
+                with mock.patch.object(server, "ENGINE_QUIT_WAIT_S", .05), \
+                     mock.patch.object(server, "ENGINE_TERM_WAIT_S", .1), \
+                     mock.patch.object(server, "ENGINE_KILL_WAIT_S", .1):
+                    with self.assertRaises(server.EngineStuck) as caught:
+                        group.close()
+                self.assertTrue(arena.exists())
+                self.assertIs(caught.exception.startup_engines, group.engines)
+                self.assertEqual(caught.exception.startup_arena, str(arena))
+                self.assertIsNotNone(first.__dict__.get("_close_owner"))
+                removal.assert_not_called()
+            finally:
+                first.wlock.release()
+                group.close()
+            self.assertFalse(arena.exists())
 
 
 if __name__ == "__main__":

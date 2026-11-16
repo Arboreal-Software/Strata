@@ -39,6 +39,24 @@ def replace(e):
 
 
 class EngineEpochTests(unittest.TestCase):
+    def test_unfinished_attempt_blocks_lazy_constructor_without_replacing_owner(self):
+        e = server.StrataEngine("missing-executable", [], lazy=True)
+        attempt = e._begin_startup()
+        try:
+            with mock.patch.object(server, "popen", side_effect=AssertionError("competitor spawned")):
+                with self.assertRaises(server.EngineStuck):
+                    e.__init__("other-executable", [], lazy=True)
+            self.assertIs(e._startup_attempt, attempt)
+            self.assertIsNone(e.proc)
+            self.assertFalse(attempt.retired)
+            e.close()
+            self.assertTrue(attempt.retired)
+            self.assertTrue(attempt.cancelled)
+        finally:
+            e._finish_startup(attempt)
+        e.__init__("missing-executable", [], lazy=True)
+        self.assertIsNone(e.__dict__.get("_startup_attempt"))
+
     def test_captured_close_mismatch_cannot_touch_successor(self):
         e = batch_engine()
         old = e.proc

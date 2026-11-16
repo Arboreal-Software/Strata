@@ -503,6 +503,18 @@ class EngineStuck(RuntimeError):
     reporting its GPU and RAM as given back."""
 
 
+class _StartupAttempt:
+    """Fixed ordinary startup ownership; no funding or global-bound claim."""
+    __slots__ = ("phase", "proc", "ready_reader", "data_reader", "cancelled",
+                 "in_flight", "retired", "gate")
+
+    def __init__(self):
+        self.phase = "RESERVED"
+        self.proc = self.ready_reader = self.data_reader = None
+        self.cancelled = self.in_flight = self.retired = False
+        self.gate = threading.Event()
+
+
 class GpuBusy(RuntimeError):
     """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
     model server) is using it, so the engine is not started into the little that is left.  `retry_after`: seconds
@@ -1231,22 +1243,138 @@ class StrataEngine:
         with self._epoch_state(epoch):
             self._parse_done(line)
 
+    def _begin_startup(self, supplied=None):
+        # Build the fixed ordinary record outside the state lock. No measured fee.
+        attempt = _StartupAttempt() if supplied is None else supplied
+        with self._state_lock():
+            current = self.__dict__.get("_startup_attempt")
+            if supplied is not None:
+                if (current is not supplied or supplied.cancelled or supplied.in_flight or
+                        not (supplied.retired or supplied.phase == "RESERVED")):
+                    error = EngineStuck("startup admission cannot be borrowed before retirement")
+                    error.startup_engine = self
+                    raise error
+                return supplied
+            if current is not None:
+                error = EngineStuck("another startup still owns this engine")
+                error.startup_engine = self
+                raise error
+            attempt.proc = getattr(self, "proc", None)
+            attempt.ready_reader = getattr(self, "pump", None)
+            pending = self.__dict__.get("_close_owner")
+            if attempt.proc is None and pending is not None:
+                attempt.proc, attempt.ready_reader = pending[0], pending[2]
+            self._startup_attempt = attempt
+        return attempt
+
+    def _finish_startup(self, attempt):
+        with self._state_lock():
+            if (self.__dict__.get("_startup_attempt") is attempt and not attempt.in_flight and
+                    (attempt.retired or (attempt.phase == "PUBLISHED" and not attempt.cancelled))):
+                self._startup_attempt = None
+            elif self.__dict__.get("_startup_attempt") is attempt:
+                # The invocation has ended, but its unresolved resources remain.
+                attempt.phase = "UNCERTAIN"
+
+    def _startup_error(self, error, attempt):
+        # Explicit ownership, independent of whether a caller retains traceback.
+        error.startup_engine = self
+        error.startup_attempt = attempt
+        error.startup_retired = attempt.retired
+        error.startup_cancelled = attempt.cancelled
+        return error
+
+    def _retire_startup(self, attempt):
+        with self._state_lock():
+            if self.__dict__.get("_startup_attempt") is not attempt:
+                raise EngineStuck("startup owner changed before retirement")
+            if attempt.retired:
+                if getattr(self, "proc", None) is not None or self.__dict__.get("_close_owner") is not None:
+                    raise EngineStuck("retired startup no longer matches the captured cleanup")
+                return
+            if attempt.in_flight:
+                raise EngineStuck("startup spawn or reader start is unresolved")
+            proc = attempt.proc
+            if proc is None and getattr(self, "proc", None) is not None:
+                raise EngineStuck("uncaptured startup process appeared")
+        if proc is not None:
+            try:
+                self.close(_expected_proc=proc, _startup=attempt)
+            except EngineStuck:
+                # A different captured closer may have completed AFTER our read
+                # but BEFORE the strict expected-proc check. Only its real tail's
+                # exact record receipt permits acknowledgement of that cleanup.
+                with self._state_lock():
+                    if (self.__dict__.get("_startup_attempt") is attempt and attempt.proc is proc and
+                            attempt.retired and attempt.phase == "RETIRED" and not attempt.in_flight and
+                            getattr(self, "proc", None) is None and self.__dict__.get("_close_owner") is None):
+                        return
+                raise
+            return
+        # No spawn has returned or remains in flight; retire only real local setup.
+        log = getattr(self, "log", None)
+        if log not in (None, subprocess.DEVNULL):
+            log.close()
+        with self._state_lock():
+            if self._startup_attempt is not attempt or attempt.in_flight:
+                raise EngineStuck("startup changed during local setup retirement")
+            attempt.retired, attempt.phase = True, "RETIRED"
+
+    def _startup_pump(self, attempt, epoch):
+        attempt.gate.wait()
+        with self._state_lock():
+            ready = (attempt.phase == "PUBLISHED" and not attempt.cancelled and
+                     self.proc is epoch.proc and self.__dict__.get("_epoch") is epoch and
+                     self.pump is attempt.data_reader)
+        if not ready:
+            return
+        # READY puts its line before returning; never overlap its stdout reader.
+        attempt.ready_reader.join()
+        with self._state_lock():
+            ready = (not attempt.cancelled and self.proc is epoch.proc and
+                     self.__dict__.get("_epoch") is epoch and self.pump is attempt.data_reader)
+        if ready:
+            self._pump(epoch)
+
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
-                 retry_args: list[str] | None = None, retry_vram_args: list[str] | None = None):
+                 retry_args: list[str] | None = None, retry_vram_args: list[str] | None = None, *, _startup=None):
+        attempt = self._begin_startup(_startup)
+        try:
+            self._initialize(exe, args, cwd, log, env, lazy, cpus, _attempt, retry_args,
+                             retry_vram_args, _startup=attempt)
+        except EngineStuck as error:
+            attempt.gate.set()
+            raise self._startup_error(error, attempt)
+        except BaseException as error:
+            with self._state_lock():
+                if attempt.phase == "INITIALIZING":
+                    # The setup invocation has unwound; no spawn/start occurred.
+                    attempt.in_flight = False
+            attempt.gate.set()  # Release a prepared reader on cancelled/failed commit.
+            try:
+                self._retire_startup(attempt)
+            except BaseException as cleanup:
+                stuck = EngineStuck("startup ownership is unresolved; no successor may start")
+                raise self._startup_error(stuck, attempt) from cleanup
+            raise self._startup_error(error, attempt)
+        finally:
+            if _startup is None:
+                self._finish_startup(attempt)
+
+    def _initialize(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
+                 retry_args: list[str] | None = None, retry_vram_args: list[str] | None = None, *, _startup):
         if "wlock" not in self.__dict__:
             self.wlock = threading.Lock()  # one writer lock for this object, including every restart
-        self._state_lock()
+        self._retire_startup(_startup)
+        _startup.gate.clear()  # Previous attempt's readers are actually retired.
         with self._state_lock():
-            previous_proc = getattr(self, "proc", None)
-            previous_owner = self.__dict__.get("_close_owner")
-        if previous_proc is not None:
-            StrataEngine.close(self, _expected_proc=previous_proc)
-        elif previous_owner is not None:
-            StrataEngine.close(self, _expected_proc=previous_owner[0])
-        previous_reader = getattr(self, "pump", None)
-        if previous_reader is not None and (previous_reader.ident is None or previous_reader.is_alive()):
-            raise EngineStuck("the previous engine reader has not retired; restart is fenced")
+            if self._startup_attempt is not _startup or _startup.cancelled:
+                raise EngineDied("startup was cancelled before initialization")
+            _startup.phase, _startup.in_flight = "INITIALIZING", True
+            _startup.proc = _startup.ready_reader = _startup.data_reader = None
+            _startup.retired = False
         previous = getattr(self, "_epoch", None)
         if previous is not None:
             self._reap_owned_image_transports(previous)
@@ -1281,259 +1409,306 @@ class StrataEngine:
         except (OSError, ValueError):
             self.info["version"] = None
         if lazy:
+            with self._state_lock():
+                _startup.in_flight = False
+            self._retire_startup(_startup)
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
-        log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
-        self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
-        if log:
-            threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
-                             daemon=True).start()
-            # once per log: the follower keeps reading the same (appended) log across restarts and reloads
-            if os.environ.get("STRATA_REQUEST_LINES") and os.path.abspath(log) not in _echoing:
-                _echoing.add(os.path.abspath(log))
-                threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
-        if log:                                          # #779: when an engine started (a crash report has the time)
-            try:
-                self.log.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
-                               f"{' '.join(args)}\n")
-                self.log.flush()
-            except OSError:
-                pass
-        self.max_context = 0                             # before the new process is visible: never its predecessor's
-        pin = {}
-        if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
-            pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
-        nice = engine_nice(env)                          # Linux with built-in Radeon graphics: the desktop keeps its share of the CPU
-        if nice:
-            say_nice = pin.get("preexec_fn")
-            pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
-            print(f"[strata] engine priority: nice +{nice} (this PC has built-in Radeon graphics that usually draw the desktop; "
-                  "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
-        end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
-        spawned_at = time.monotonic()
         try:
-            proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
-                              **pin)
-            with self.wlock, self._state_lock():
-                self.proc = proc
-        except OSError:                                  # nothing started: the narrator stops, the log handle goes back
-            loading.set()
+            log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
+            self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
             if log:
-                self.log.close()
-            raise
-        # Keep popen's actual captured child even if self.proc changes meanwhile.
-        # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
-        # stays for _pump (one reader at a time)
-        ready_q: queue.Queue = queue.Queue()
-        ready_reader = threading.Thread(target=self._ready_pump, args=(proc, ready_q), daemon=True)
-        with self.wlock, self._state_lock():
-            if self.proc is not proc:
-                raise EngineStuck("captured startup changed before READY reader publication")
-            self.pump = ready_reader  # Publish actual ownership BEFORE start.
-        ready_reader.start()
-        ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
-        timed_out = False
-        while True:
-            left = None if ready_deadline is None else ready_deadline - time.monotonic()
-            if left is not None and left <= 0:
-                timed_out = True
-                break
-            try:
-                line = ready_q.get(timeout=left)
-            except queue.Empty:
-                continue
-            if line is None:
-                break
-            if line.startswith("INFO "):
-                for kv in line.split()[1:]:
-                    k, _, v = kv.partition("=")
-                    self.info[k] = int(v) if v.lstrip("-").isdigit() else v
-            if line.startswith("READY"):
-                f = line.split()
-                self.max_context = int(f[1])
-                self.can_stop = "stop" in f[2:]
-                self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
-                break
-        loading.set()
-        if self.max_context <= 0:
-            if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
+                threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
+                                 daemon=True).start()
+                # once per log: the follower keeps reading the same (appended) log across restarts and reloads
+                if os.environ.get("STRATA_REQUEST_LINES") and os.path.abspath(log) not in _echoing:
+                    _echoing.add(os.path.abspath(log))
+                    threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
+            if log:                                          # #779: when an engine started (a crash report has the time)
                 try:
-                    proc.kill()
+                    self.log.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
+                                   f"{' '.join(args)}\n")
+                    self.log.flush()
                 except OSError:
                     pass
+            self.max_context = 0                             # before the new process is visible: never its predecessor's
+            pin = {}
+            if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
+                pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+            nice = engine_nice(env)                          # Linux with built-in Radeon graphics: the desktop keeps its share of the CPU
+            if nice:
+                say_nice = pin.get("preexec_fn")
+                pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
+                print(f"[strata] engine priority: nice +{nice} (this PC has built-in Radeon graphics that usually draw the desktop; "
+                      "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
+            end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
+            spawned_at = time.monotonic()
+            with self._state_lock():
+                if _startup.cancelled:
+                    _startup.in_flight = False
+                    raise EngineDied("startup was cancelled before spawn")
+                _startup.phase, _startup.in_flight = "SPAWNING", True
             try:
-                proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
+                proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
+                             **pin)
+            except OSError:
+                # Popen's ordinary failure owns no returned child. Other interruptions
+                # stay in-flight: absence of a returned process is not exit evidence.
+                with self._state_lock():
+                    _startup.in_flight = False
+                loading.set()
+                raise
+            with self.wlock, self._state_lock():
+                _startup.proc = proc
+                self.proc = proc
+                _startup.in_flight = False
+            # A racing close cannot discard the real return from this admitted spawn.
+            if _startup.cancelled:
+                loading.set()
+                raise EngineDied("startup was cancelled while spawning")
+            ready_q: queue.Queue = queue.Queue()
+            ready_reader = threading.Thread(target=self._ready_pump, args=(proc, ready_q), daemon=True)
+            with self.wlock, self._state_lock():
+                if self._startup_attempt is not _startup or self.proc is not proc or _startup.cancelled:
+                    raise EngineDied("captured startup changed before READY reader publication")
+                _startup.ready_reader = ready_reader
+                self.pump = ready_reader
+                _startup.phase, _startup.in_flight = "READING", True
+            try:
+                ready_reader.start()
+            except BaseException as error:
+                # A raised start is not proof that this concrete reader retired.
+                raise EngineStuck("READY reader start is unresolved; startup is retained") from error
+            finally:
+                with self._state_lock():
+                    _startup.in_flight = False
+            ready_context, ready_can_stop, ready_multi = 0, False, 0
+            ready_info = dict(self.info)
+            ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
+            timed_out = False
+            while True:
+                left = None if ready_deadline is None else ready_deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    timed_out = True
+                    break
+                try:
+                    line = ready_q.get(timeout=left)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
+                if line.startswith("INFO "):
+                    for kv in line.split()[1:]:
+                        k, _, v = kv.partition("=")
+                        ready_info[k] = int(v) if v.lstrip("-").isdigit() else v
+                if line.startswith("READY"):
+                    f = line.split()
+                    ready_context = int(f[1])
+                    ready_can_stop = "stop" in f[2:]
+                    ready_multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
+                    break
+            loading.set()
+            if ready_context <= 0:
+                if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                try:
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    if proc.poll() is None:
+                        raise EngineStuck("failed READY child has not exited; restart is fenced") from None
                 if proc.poll() is None:
-                    raise EngineStuck("failed READY child has not exited; restart is fenced") from None
-            if proc.poll() is None:
-                raise EngineStuck("failed READY child exit is not confirmed; restart is fenced")
-            # Exit alone is insufficient: retain/join the actual READY reader,
-            # pipe-close worker and log before ANY recursive fallback below.
-            StrataEngine.close(self, _expected_proc=proc)
-            if not timed_out and _attempt < START_RETRIES and \
-                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, proc.returncode):
-                wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
-                exit_words = engine_exit_words(proc.returncode)
-                if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
-                    print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after "
-                          f"another engine exited, whose GPU queues were still being released"
-                          f"{'; ' + exit_words if exit_words else ''}): starting it again in {wait_s:.0f} s "
-                          f"(try {_attempt + 2} of {START_RETRIES + 1})", flush=True)
-                else:                                       # an exit with nothing in the log: say only what is known
-                    print(f"[strata] the engine exited before it wrote anything to its log"
-                          f"{' (' + exit_words + ')' if exit_words else ''}; it may be a GPU runtime that was not "
-                          f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
-                          flush=True)
-                time.sleep(wait_s)
-                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1, retry_args, retry_vram_args)
-                return
-            short_reason = None if timed_out else vram_fit.engine_stop_reason(start_log_text(log, log_start).splitlines())
-            if short_reason and retry_vram_args and retry_vram_args != list(args):
-                # a card ran out of memory (the engine's own reason is in its log): one more start with no drafter, in one quiet line
-                print(f"[strata] {drafting.line('off', drafting.SHORT_OF_VRAM)}: starting again without a drafter ({short_reason})", flush=True)
-                try:
-                    with open(log, "a", encoding="utf-8") as handle:
-                        handle.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} the engine ended before it was ready because a card was short of memory "
-                                     f"(exit code {proc.returncode}); starting it again without a drafter\n")
-                except (OSError, TypeError):
-                    pass
-                drafting.remember_note(drafting.SHORT_OF_VRAM)
-                StrataEngine.__init__(self, exe, retry_vram_args, cwd, log, env, lazy, cpus, 0, None, None)
-                return
-            if not timed_out and not short_reason and retry_args and retry_args != list(args):
-                # Auto picked DFlash2 and the engine ended before it was ready (an engine that does not take one of its flags, a drafter file it cannot read...):
-                # one more start with the MTP, said in one quiet line. The person named DFlash2 themselves: no retry, the start fails with its reason below.
-                print(f"[strata] {drafting.line('mtp', drafting.DIDNT_START)}: starting again with the MTP", flush=True)
-                try:
-                    with open(log, "a", encoding="utf-8") as handle:
-                        handle.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} the engine ended before it was ready with the DFlash2 drafter "
-                                     f"(exit code {proc.returncode}); starting it again with the MTP\n")
-                except (OSError, TypeError):
-                    pass
-                drafting.remember_note(drafting.DIDNT_START)
-                StrataEngine.__init__(self, exe, retry_args, cwd, log, env, lazy, cpus, 0, None, None)
-                return
-            why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
-                   "the engine exited before it was ready")
-            # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
-            # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
-            note = "" if timed_out else start_exit_note(proc.returncode, exe)
-            tail = start_log_tail(log, log_start)
-            lines = [x for x in tail.split("\n")[2:] if x.strip()]
-            if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
-                tail += "\n  (those are the launcher's own lines: the engine itself wrote nothing)"
-            raise EngineDied(why + (f" (see {log})" if log else "") + note +
-                             start_failure_hint(log, log_start) + tail)
-        self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
-        # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
-        # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
-        if self.info.get("engine"):
-            self.info["version"] = str(self.info["engine"])
-        self.terminal_stages = read_engine_stage_log(log, log_start) if log else []
-        try:                                            # which drafter runs, and in plain words why not the one that was asked for
-            self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
-        except Exception:                               # noqa: BLE001 - a note must never stop a start
-            pass
-        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
-        lines = queue.Queue()
-        slots = SimpleNamespace()
-        # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
-        # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
-        asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots", "--parallel") if k in args), 0)
-        self.batch = int(self.info.get("batch_slots") or 0)
-        if self.multi:                                  # DeepSeek --parallel: several requests at once, in its own protocol
-            self.batch = self.multi                     # (the server's parallel paths key on it: no FIFO, a request's own figures)
-        if asked and self.batch != asked:
-            print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
-                  "(its log says why)", flush=True)
-        _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
-        # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
-        # (INFO batch_groups=G); a number is the group count asked for (1 = off)
-        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
-        groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
-        gs = self.batch // groups if self.batch else 0
-        # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
-        slots.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
-        slots.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
-        slots.slot_groups = groups
-        # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
-        # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
-        # conversation cache - see pick_slot
-        groups_run = int(self.info.get("batch_groups") or groups)
-        slots.slot_gs = gs if groups > 1 and groups_run > 1 else 0
-        slots.slot_q = [queue.Queue() for _ in range(self.batch)]
-        slots.slot_busy = [False] * self.batch
-        # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
-        # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
-        # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
-        slots.slot_claims: set[int] = set()
-        slots.slot_releasing: set[int] = set()
-        slots._orphan_seen: dict[int, float] = {}
-        # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
-        # the slot that has its start (the engine checks it again); when the slot was last used
-        slots.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
-        slots.slot_used = [0.0] * self.batch
-        strict_owned = self._strict_owned_two()
-        child_env = self.spawn[4] if self.spawn[4] is not None else os.environ
-        receipt_env = tuple((key, child_env.get(key)) for key in
-                            ('STRATA_HTTP_NATIVE_RECEIPTS', 'STRATA_HTTP_TWO_SLOT_RECEIPTS'))
-        if strict_owned:
-            from .two_slot_receipts import OwnedSlotObservations
-            slots.owned_observations = OwnedSlotObservations()
-        slots.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
-        # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
-        # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
-        # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
-        # new lists.
-        if "slot_cv" not in self.__dict__:
-            self.slot_cv = threading.Condition()
-            self.waiting = 0                            # requests waiting for the control lines (ctl)
-            self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
-            self.par_counters = {"queued": 0, "queue_wait_s": 0.0}
-            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
-            self.arrivals = collections.deque(maxlen=64)   # monotonic times of the last requests that came for the control lines (STRATA_COALESCE_*)
-            self.ctl_epoch = 0                          # how often the control lines were taken
-            self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
-        if "rid_lock" not in self.__dict__:
-            self.rid_lock = threading.Lock()
-            self.rid_n = 0                              # --parallel requests' ids (rid=): never reused, a restart goes on from here
-        slots.rid_q = {}
-        slots.multi = self.multi         # this process's: rid -> that request's lines (T / PP / DONE / ERR, rid taken out)
-        self.multi_stat = ""                            # the engine's last STAT line over everything it wrote
-        self._ctl_erred = False                         # #1059: the control lines ended on an ERR
-        self._yielded = None                            # (slot, tokens read): the last request on them gave way
-        with self.wlock, self._state_lock():
-            self.gen = self.__dict__.get("gen", 0) + 1
-            self.lines = lines
-            for name in self._SLOT_FIELDS:
-                setattr(self, name, getattr(slots, name))
+                    raise EngineStuck("failed READY child exit is not confirmed; restart is fenced")
+                # Exit alone is insufficient: retain/join the actual READY reader,
+                # pipe-close worker and log before ANY recursive fallback below.
+                self._retire_startup(_startup)
+                if _startup.cancelled:
+                    raise EngineDied("startup was closed before READY")
+                if not timed_out and _attempt < START_RETRIES and \
+                        transient_start_failure(log, log_start, time.monotonic() - spawned_at, proc.returncode):
+                    wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
+                    exit_words = engine_exit_words(proc.returncode)
+                    if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
+                        print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after "
+                              f"another engine exited, whose GPU queues were still being released"
+                              f"{'; ' + exit_words if exit_words else ''}): starting it again in {wait_s:.0f} s "
+                              f"(try {_attempt + 2} of {START_RETRIES + 1})", flush=True)
+                    else:                                       # an exit with nothing in the log: say only what is known
+                        print(f"[strata] the engine exited before it wrote anything to its log"
+                              f"{' (' + exit_words + ')' if exit_words else ''}; it may be a GPU runtime that was not "
+                              f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
+                              flush=True)
+                    time.sleep(wait_s)
+                    StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1, retry_args, retry_vram_args, _startup=_startup)
+                    return
+                short_reason = None if timed_out else vram_fit.engine_stop_reason(start_log_text(log, log_start).splitlines())
+                if short_reason and retry_vram_args and retry_vram_args != list(args):
+                    # a card ran out of memory (the engine's own reason is in its log): one more start with no drafter, in one quiet line
+                    print(f"[strata] {drafting.line('off', drafting.SHORT_OF_VRAM)}: starting again without a drafter ({short_reason})", flush=True)
+                    try:
+                        with open(log, "a", encoding="utf-8") as handle:
+                            handle.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} the engine ended before it was ready because a card was short of memory "
+                                         f"(exit code {proc.returncode}); starting it again without a drafter\n")
+                    except (OSError, TypeError):
+                        pass
+                    drafting.remember_note(drafting.SHORT_OF_VRAM)
+                    StrataEngine.__init__(self, exe, retry_vram_args, cwd, log, env, lazy, cpus, 0, None, None, _startup=_startup)
+                    return
+                if not timed_out and not short_reason and retry_args and retry_args != list(args):
+                    # Auto picked DFlash2 and the engine ended before it was ready (an engine that does not take one of its flags, a drafter file it cannot read...):
+                    # one more start with the MTP, said in one quiet line. The person named DFlash2 themselves: no retry, the start fails with its reason below.
+                    print(f"[strata] {drafting.line('mtp', drafting.DIDNT_START)}: starting again with the MTP", flush=True)
+                    try:
+                        with open(log, "a", encoding="utf-8") as handle:
+                            handle.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} the engine ended before it was ready with the DFlash2 drafter "
+                                         f"(exit code {proc.returncode}); starting it again with the MTP\n")
+                    except (OSError, TypeError):
+                        pass
+                    drafting.remember_note(drafting.DIDNT_START)
+                    StrataEngine.__init__(self, exe, retry_args, cwd, log, env, lazy, cpus, 0, None, None, _startup=_startup)
+                    return
+                why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
+                       "the engine exited before it was ready")
+                # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
+                # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
+                note = "" if timed_out else start_exit_note(proc.returncode, exe)
+                tail = start_log_tail(log, log_start)
+                lines = [x for x in tail.split("\n")[2:] if x.strip()]
+                if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
+                    tail += "\n  (those are the launcher's own lines: the engine itself wrote nothing)"
+                raise EngineDied(why + (f" (see {log})" if log else "") + note +
+                                 start_failure_hint(log, log_start) + tail)
+            # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
+            # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
+            if ready_info.get("engine"):
+                ready_info["version"] = str(ready_info["engine"])
+            self.terminal_stages = read_engine_stage_log(log, log_start) if log else []
+            try:                                            # which drafter runs, and in plain words why not the one that was asked for
+                ready_info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
+            except Exception:                               # noqa: BLE001 - a note must never stop a start
+                pass
+            # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
+            lines = queue.Queue()
+            slots = SimpleNamespace()
+            # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
+            # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
+            asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots", "--parallel") if k in args), 0)
+            self.batch = int(ready_info.get("batch_slots") or 0)
+            if ready_multi:                                  # DeepSeek --parallel: several requests at once, in its own protocol
+                self.batch = ready_multi                     # (the server's parallel paths key on it: no FIFO, a request's own figures)
+            if asked and self.batch != asked:
+                print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
+                      "(its log says why)", flush=True)
+            _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
+            # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
+            # (INFO batch_groups=G); a number is the group count asked for (1 = off)
+            groups = int(ready_info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
+            groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
+            gs = self.batch // groups if self.batch else 0
+            # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
+            slots.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
+            slots.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
+            slots.slot_groups = groups
+            # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
+            # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
+            # conversation cache - see pick_slot
+            groups_run = int(ready_info.get("batch_groups") or groups)
+            slots.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+            slots.slot_q = [queue.Queue() for _ in range(self.batch)]
+            slots.slot_busy = [False] * self.batch
+            # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
+            # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
+            # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
+            slots.slot_claims: set[int] = set()
+            slots.slot_releasing: set[int] = set()
+            slots._orphan_seen: dict[int, float] = {}
+            # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
+            # the slot that has its start (the engine checks it again); when the slot was last used
+            slots.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+            slots.slot_used = [0.0] * self.batch
+            strict_owned = self._strict_owned_two()
+            child_env = self.spawn[4] if self.spawn[4] is not None else os.environ
+            receipt_env = tuple((key, child_env.get(key)) for key in
+                                ('STRATA_HTTP_NATIVE_RECEIPTS', 'STRATA_HTTP_TWO_SLOT_RECEIPTS'))
+            if strict_owned:
+                from .two_slot_receipts import OwnedSlotObservations
+                slots.owned_observations = OwnedSlotObservations()
+            slots.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+            # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
+            # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
+            # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
+            # new lists.
+            if "slot_cv" not in self.__dict__:
+                self.slot_cv = threading.Condition()
+                self.waiting = 0                            # requests waiting for the control lines (ctl)
+                self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
+                self.par_counters = {"queued": 0, "queue_wait_s": 0.0}
+                self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+                self.arrivals = collections.deque(maxlen=64)   # monotonic times of the last requests that came for the control lines (STRATA_COALESCE_*)
+                self.ctl_epoch = 0                          # how often the control lines were taken
+                self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
+            if "rid_lock" not in self.__dict__:
+                self.rid_lock = threading.Lock()
+                self.rid_n = 0                              # --parallel requests' ids (rid=): never reused, a restart goes on from here
+            slots.rid_q = {}
+            slots.multi = ready_multi         # this process's: rid -> that request's lines (T / PP / DONE / ERR, rid taken out)
+            ready_multi_stat = ""                            # the engine's last STAT line over everything it wrote
+            self._ctl_erred = False                         # #1059: the control lines ended on an ERR
+            self._yielded = None                            # (slot, tokens read): the last request on them gave way
+            with self._state_lock():
+                next_gen = self.__dict__.get("gen", 0) + 1
             scheduler = None
             if child_env.get('STRATA_SERVING_THREAD_POLICY_V1') is not None:
                 from .scheduler_control import SchedulerControl
-                captured_proc, captured_gen = self.proc, self.gen
+                captured_proc, captured_gen = proc, next_gen
                 def write_scheduler(frame):
-                    # Capture the actual process as well as generation; never retarget.
                     if self.proc is not captured_proc:
                         raise EngineDied('scheduler engine changed before write')
                     self._send(frame.rstrip('\n'), born=captured_gen)
                 def fail_scheduler(reason):
-                    # The callback owns this captured process, even after replacement.
                     try:
                         captured_proc.terminate()
                     except OSError:
                         pass
                 scheduler = SchedulerControl(write_scheduler, on_failure=fail_scheduler)
                 scheduler.retirements = queue.SimpleQueue()
-            self._epoch = _EngineEpoch(self.proc, self.gen, lines, slots, self.ctl, self.slot_cv,
-                                       strict_owned, receipt_env, scheduler)
-            self._stdin_closing = False
-            self.ended = False                          # READY: publication and writer generation agree
-        self.pump = threading.Thread(target=self._pump, args=(self._epoch,), daemon=True)
-        self.pump.start()
+            epoch = _EngineEpoch(proc, next_gen, lines, slots, self.ctl, self.slot_cv,
+                                 strict_owned, receipt_env, scheduler)
+            data_reader = threading.Thread(target=self._startup_pump, args=(_startup, epoch), daemon=True)
+            with self._state_lock():
+                if (self._startup_attempt is not _startup or self.proc is not proc or
+                        self.pump is not ready_reader or _startup.cancelled or _startup.in_flight):
+                    raise EngineDied("captured READY changed before data reader start")
+                _startup.data_reader = data_reader
+                _startup.phase, _startup.in_flight = "PREPARED", True
+            try:
+                data_reader.start()
+            except BaseException as error:
+                raise EngineStuck("data reader start is unresolved; startup is retained") from error
+            finally:
+                with self._state_lock():
+                    _startup.in_flight = False
+            with self.wlock, self._state_lock():
+                if (self._startup_attempt is not _startup or self.proc is not proc or
+                        self.pump is not ready_reader or _startup.cancelled or _startup.in_flight):
+                    raise EngineDied("captured READY changed before epoch publication")
+                self.gen, self.lines = next_gen, lines
+                self.max_context, self.can_stop, self.multi = ready_context, ready_can_stop, ready_multi
+                self.known_ctx, self.info = ready_context, ready_info
+                for name in self._SLOT_FIELDS:
+                    setattr(self, name, getattr(slots, name))
+                self._epoch, self.pump = epoch, data_reader
+                self._stdin_closing = False
+                self.ended = False
+                _startup.phase = "PUBLISHED"
+            _startup.gate.set()
+        finally:
+            loading.set()
 
     def _strict_owned_two(self):
         env = self.spawn[4] if self.spawn[4] is not None else os.environ
@@ -1787,6 +1962,15 @@ class StrataEngine:
                 out.put(None)
 
     def restart(self, tries: int = 3):
+        attempt = self._begin_startup()
+        try:
+            self._restart(tries, attempt)
+        except BaseException as error:
+            raise self._startup_error(error, attempt)
+        finally:
+            self._finish_startup(attempt)
+
+    def _restart(self, tries: int, attempt):
         """Start the engine again (the same command) after it died; the new process has its own line queue.
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
@@ -1794,32 +1978,32 @@ class StrataEngine:
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
-            self.close()
+            self._retire_startup(attempt)
             for i in range(tries):
                 # #344: not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
                 # READY, and a request that saw alive() in that window skipped load() and failed with "context
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(*self.spawn)
+                    self.__init__(*self.spawn, _startup=attempt)
                     break
                 except EngineStuck:
                     raise  # Uncertain retirement never authorizes a constructor.
                 except RuntimeError:
-                    with self._state_lock():
-                        failed_proc = self.proc
-                        failed_owner = self.__dict__.get("_close_owner")
-                    if failed_proc is not None:
-                        try:
-                            failed_proc.wait(timeout=60)
-                        except (subprocess.TimeoutExpired, OSError):
+                    if not attempt.retired:
+                        with self._state_lock():
+                            failed_proc = attempt.proc
+                        if failed_proc is not None:
+                            try:
+                                failed_proc.wait(timeout=60)
+                            except (subprocess.TimeoutExpired, OSError):
+                                if failed_proc.poll() is None:
+                                    raise EngineStuck("failed startup child has not exited; restart is fenced") from None
                             if failed_proc.poll() is None:
-                                raise EngineStuck("failed startup child has not exited; restart is fenced") from None
-                        if failed_proc.poll() is None:
-                            raise EngineStuck("failed startup child exit is not confirmed; restart is fenced")
-                        StrataEngine.close(self, _expected_proc=failed_proc)
-                    elif failed_owner is not None:
-                        StrataEngine.close(self, _expected_proc=failed_owner[0])
+                                raise EngineStuck("failed startup child exit is not confirmed; restart is fenced")
+                    self._retire_startup(attempt)
+                    if attempt.cancelled:
+                        raise
                     if i == tries - 1:
                         raise
                     print(f"[strata] the engine did not start (try {i + 1} of {tries}); again in "
@@ -4007,24 +4191,39 @@ class StrataEngine:
                 else:
                     _control.__exit__(None, None, None)
 
-    def close(self, *, _expected_proc=None):
+    def close(self, *, _expected_proc=None, _startup=None):
         """Bound caller waits; retain the captured pipe owner across uncertain retries."""
         deadline = time.monotonic() + ENGINE_QUIT_WAIT_S + ENGINE_TERM_WAIT_S + ENGINE_KILL_WAIT_S
         def remaining(cap):
             return max(0.0, min(cap, deadline - time.monotonic()))
 
-        # Capture before another closer can publish or retire a different child.
+        # Capture and cancel only this engine's actual admitted attempt.
         with self._state_lock():
-            proc, pump, log = self.proc, self.pump, self.log
+            proc, pump, log = getattr(self, "proc", None), getattr(self, "pump", None), getattr(self, "log", None)
             pending = self.__dict__.get("_close_owner")
             if proc is None and pending is not None:
                 proc, stdin, pump, log, writer, written, errors = pending
             if _expected_proc is not None and proc is not _expected_proc:
                 raise EngineStuck("captured engine changed before retirement; successor is fenced")
-            if proc is None:
-                return
+            attempt = self.__dict__.get("_startup_attempt")
+            inactive_attempt = attempt is not None and attempt.phase == "UNCERTAIN"
+            if _startup is not None and attempt is not _startup:
+                raise EngineStuck("captured startup owner changed before close")
+            if attempt is not None and _startup is None:
+                attempt.cancelled = True
+            blocked = attempt is not None and attempt.in_flight
             write_failed = getattr(self, "_stdin_failed", False)
             captured_epoch = self.__dict__.get('_epoch')
+        if attempt is not None:
+            attempt.gate.set()
+        if blocked:
+            raise self._startup_error(EngineStuck("startup spawn or reader start is unresolved"), attempt)
+        if proc is None:
+            if attempt is not None:
+                if attempt.proc is not None and not attempt.retired:
+                    raise self._startup_error(EngineStuck("captured startup process disappeared without retirement"), attempt)
+                self._retire_startup(attempt)
+            return
         if captured_epoch is not None and captured_epoch.proc is proc and captured_epoch.scheduler is not None:
             captured_epoch.scheduler.close('Captured engine closing', failed=False)
         closer = self.__dict__.setdefault("_close_lock", threading.Lock())
@@ -4131,9 +4330,16 @@ class StrataEngine:
                     any(isinstance(error, EngineStuck) for error in errors)):
                 # Do not blindly retry a close with an ambiguous descriptor outcome.
                 raise EngineStuck("captured engine stdin close is uncertain; restart is fenced")
-            if pump is not None and pump.ident is not None:
-                pump.join(timeout=remaining(2))
-                if pump.is_alive():
+            readers = (pump,) if attempt is None else (attempt.ready_reader, attempt.data_reader)
+            for reader in readers:
+                if reader is None:
+                    continue
+                if reader.ident is None:
+                    if attempt is not None:
+                        raise EngineStuck("captured reader start is unresolved; restart is fenced")
+                    continue
+                reader.join(timeout=remaining(2))
+                if reader.is_alive():
                     raise EngineStuck("the old engine output reader has not stopped; restart is fenced")
             if not self.wlock.acquire(timeout=remaining(ENGINE_TERM_WAIT_S)):
                 raise EngineStuck("the old engine pipe writer has not stopped; restart is fenced")
@@ -4153,6 +4359,22 @@ class StrataEngine:
                     self.progress_ms, self.reused = 0, 0
                 if self.__dict__.get("_close_owner") is owner:
                     self._close_owner = None
+                if attempt is not None:
+                    if self.__dict__.get("_startup_attempt") is not attempt or attempt.proc is not proc or attempt.in_flight:
+                        raise EngineStuck("startup changed before positive retirement publication")
+                    attempt.retired, attempt.phase = True, "RETIRED"
+                    if inactive_attempt:
+                        self._startup_attempt = None
+                else:
+                    # This closer captured no startup owner. A restart may have
+                    # reserved exactly its old child while actual cleanup ran.
+                    current = self.__dict__.get("_startup_attempt")
+                    if (current is not None and proc is not None and current.phase == "RESERVED" and
+                            current.proc is proc and current.ready_reader is pump and
+                            current.data_reader is None and not current.in_flight and not current.retired and
+                            self.proc is None and self.__dict__.get("_close_owner") is None):
+                        current.retired, current.phase = True, "RETIRED"
+                        # Keep cancellation and active-invocation admission intact.
         finally:
             closer.release()
 
@@ -10740,6 +10962,19 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 SPLIT_KEYS = ("split_fallback", "split_engine_note")
 
 
+def _construct_startup_engine(*args, _engines=None, _index=None, **kwargs):
+    # The caller's existing array owns this concrete instance BEFORE __init__.
+    engine = StrataEngine.__new__(StrataEngine)
+    if _engines is not None:
+        _engines[_index] = engine
+    try:
+        engine.__init__(*args, **kwargs)
+    except BaseException as error:
+        error.startup_engine = engine
+        raise
+    return engine
+
+
 def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, env: dict, lazy: bool, tok, *, offline: bool = False,
                              batch_telemetry=None):
     """Start the run config's engine. A config written for the all-cards split engine (strata_control/split_engine.py) carries the
@@ -10747,9 +10982,12 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
     normal one instead, so a start never fails because of the option. Any other config starts exactly as before."""
     fb = cfg.get("split_fallback")
     try:
-        return StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
+        return _construct_startup_engine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
                             retry_args=mtp_retry_args(cfg, exe, effort_end), retry_vram_args=nodraft_retry_args(cfg, exe, effort_end))
     except Exception as e:
+        if (isinstance(e, EngineStuck) or not getattr(e, "startup_retired", False) or
+                getattr(e, "startup_cancelled", False)):
+            raise
         if not isinstance(fb, dict) or not fb.get("exe"):
             raise
         msg = str(e).strip()
@@ -10775,7 +11013,7 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
     env2 = child_env(cfg2, offline=offline)
     configure_batch_telemetry_env(env2, cfg2, batch_telemetry)
     effort2 = effort_end_args(cfg2, exe2, tok)
-    engine = StrataEngine(exe2, engine_args(cfg2, exe2) + (effort2 or []), cwd=cfg2.get("cwd"), log=cfg2.get("log"), env=env2, lazy=lazy,
+    engine = _construct_startup_engine(exe2, engine_args(cfg2, exe2) + (effort2 or []), cwd=cfg2.get("cwd"), log=cfg2.get("log"), env=env2, lazy=lazy,
                           retry_args=mtp_retry_args(cfg2, exe2, effort2), retry_vram_args=nodraft_retry_args(cfg2, exe2, effort2))
     engine.info["split_fallback"] = True
     return engine
@@ -10802,10 +11040,12 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         if arena:
             rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
         try:
-            engines[i] = StrataEngine(exe, engine_args(rc, exe) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            engines[i] = _construct_startup_engine(exe, engine_args(rc, exe) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None,
-                                      retry_args=mtp_retry_args(rc, exe, effort_end), retry_vram_args=nodraft_retry_args(rc, exe, effort_end))
+                                      retry_args=mtp_retry_args(rc, exe, effort_end), retry_vram_args=nodraft_retry_args(rc, exe, effort_end),
+                                      _engines=engines, _index=i)
         except BaseException as e:        # noqa: BLE001
+            # _construct_startup_engine already installed any partial instance.
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
     warn_budget_over_ram(engine_args(rc0, announce=False) if "args" in rc0 else [])
@@ -10813,11 +11053,30 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         for i in range(n):
             one(i)
     else:
-        ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join()
+        ts = []
+        try:
+            for i in range(n):
+                ts.append(threading.Thread(target=one, args=(i,)))
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        except BaseException as cause:
+            # A raised start/join is not evidence that a launcher did not run.
+            # Keep the ORIGINAL mutable arrays: an active worker can still
+            # publish its concrete instance/child/error after this propagation.
+            error = EngineStuck("replica launchers have unresolved ownership; no retry or arena release")
+            error.startup_engines, error.startup_errors = engines, errors
+            error.startup_threads, error.startup_arena = ts, arena
+            raise error from cause
+    def require_retired_errors():
+        for _, error in errors:
+            if (not isinstance(error, Exception) or isinstance(error, EngineStuck) or not getattr(error, "startup_retired", False) or
+                    getattr(error, "startup_cancelled", False)):
+                # Retain the actual partial group and parent arena, not traceback alone.
+                error.startup_engines, error.startup_arena = engines, arena
+                raise error
+    require_retired_errors()
     if errors and arena and len(errors) < n:
         # a replica that died while it was reading the experts into the shared arena (or any other one that failed) while
         # another one is up: the living engine took the read over (the state word in the arena), so start the failed ones
@@ -10828,13 +11087,18 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
               flush=True)
         for i in failed:
             one(i)
+    require_retired_errors()
     if errors:
+        cleanup_error = None
         for e in engines:
             if e is not None:
                 try:
                     e.close()
-                except Exception:        # noqa: BLE001
-                    pass
+                except BaseException as error:        # noqa: BLE001
+                    cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            cleanup_error.startup_engines, cleanup_error.startup_arena = engines, arena
+            raise cleanup_error
         rp.remove_arena(arena)
         i, e = errors[0]
         if arena:       # a shared arena that could not be made (no room in /dev/shm, a file of another pack): as before
@@ -10870,18 +11134,28 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
                 rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
             if role == "prefill":
                 warn_budget_over_ram(engine_args(rc, announce=False) if "args" in rc else [])
-            engines[role] = StrataEngine(exe, engine_args(rc, exe) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                         env=child_env(rc, offline=offline), lazy=lazy, retry_args=mtp_retry_args(rc, exe, effort_end), retry_vram_args=nodraft_retry_args(rc, exe, effort_end))
-    except BaseException:
+            engines[role] = _construct_startup_engine(exe, engine_args(rc, exe) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+                                         env=child_env(rc, offline=offline), lazy=lazy, retry_args=mtp_retry_args(rc, exe, effort_end), retry_vram_args=nodraft_retry_args(rc, exe, effort_end),
+                                         _engines=engines, _index=role)
+        return sp.SplitEngine(engines["prefill"], engines["decode"], min_tokens=spec["min_prompt_tokens"], work_dir=work,
+                              arena_file=arena)
+    except BaseException as startup_failure:
+        cleanup_failure = None
         for e in engines.values():
             try:
                 e.close()
-            except Exception:        # noqa: BLE001
-                pass
+            except BaseException as error:        # noqa: BLE001
+                cleanup_failure = cleanup_failure or error
+        if cleanup_failure is not None:
+            error = EngineStuck("split startup owners have not retired; work and arena are retained")
+            error.startup_engines, error.startup_arena = engines, arena
+            error.startup_work_dir = work
+            error.startup_failure = startup_failure
+            raise error from cleanup_failure
+        # Only real complete child cleanup permits the existing work cleanup.
+        # As before, startup failure does not unlink the arena itself here.
         shutil.rmtree(work, ignore_errors=True)
         raise
-    return sp.SplitEngine(engines["prefill"], engines["decode"], min_tokens=spec["min_prompt_tokens"], work_dir=work,
-                          arena_file=arena)
 
 
 def check_request_sampling(req) -> None:

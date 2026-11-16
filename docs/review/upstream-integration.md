@@ -1,6 +1,6 @@
 # Owned-serving integration review
 
-The published code snapshot `9e275416af8063debf50bd722690de8cfea64e29` has single public upstream parent `13eedf552417a6a791a7d13c6597e24300ee3a09`. The fixed-family design correction is published as `5696fa7c1ec1db10233be268f80093c244f76013`, a single-parent child of that snapshot. The serving correction `7a37d42adb18342abd1710192c136be9b62e1a9e` is a child of that design commit. Its shutdown and stale-notification follow-up is `24df796bd3ac62df595bfba61a5d9fa85fdf1210`; the present failed-READY repair is based on that follow-up. The snapshot combines that upstream with work derived from local commit `17efb9e1480ec07232c124b27e2ad8f56f51301b`; it is not a completed two-parent merge. The source snapshot manifest is `4c85b275c8d177b12995747bcfa9847a0313c4f3bd4945051f77e017fdaa9418`. Existing repository attributes govern Git line-ending normalization. These review documents are the only additions to that snapshot. Two documentation-only files are omitted: `docs/qualification/owned-suffix-repair/README.md` and `docs/qualification/owned-suffix-repair/evidence-index.json`. They describe an older recovery checkpoint and index local operational receipts; they are not current qualification evidence. No product, test or runtime DATA file is omitted. The originals and both unrelated dirty-document versions remain local. No direct runtime or test reference to either omitted file was found in the bounded static audit; generic Markdown checks would otherwise enumerate the README.
+The published code snapshot `9e275416af8063debf50bd722690de8cfea64e29` has single public upstream parent `13eedf552417a6a791a7d13c6597e24300ee3a09`. The fixed-family design correction is published as `5696fa7c1ec1db10233be268f80093c244f76013`, a single-parent child of that snapshot. The serving correction `7a37d42adb18342abd1710192c136be9b62e1a9e` is a child of that design commit. Its shutdown and stale-notification follow-up is `24df796bd3ac62df595bfba61a5d9fa85fdf1210`; the failed-READY repair `e663d4a0009f9424031be0418f1630259d060863` is based on that follow-up. The present startup-admission successor is based on that repair. The snapshot combines that upstream with work derived from local commit `17efb9e1480ec07232c124b27e2ad8f56f51301b`; it is not a completed two-parent merge. The source snapshot manifest is `4c85b275c8d177b12995747bcfa9847a0313c4f3bd4945051f77e017fdaa9418`. Existing repository attributes govern Git line-ending normalization. These review documents are the only additions to that snapshot. Two documentation-only files are omitted: `docs/qualification/owned-suffix-repair/README.md` and `docs/qualification/owned-suffix-repair/evidence-index.json`. They describe an older recovery checkpoint and index local operational receipts; they are not current qualification evidence. No product, test or runtime DATA file is omitted. The originals and both unrelated dirty-document versions remain local. No direct runtime or test reference to either omitted file was found in the bounded static audit; generic Markdown checks would otherwise enumerate the README.
 
 The implemented changes concern owned serving, capture/restore lifetimes, paid startup/prefill and position storage, image request transfer, and verified model/input loading. Review the actual diff from the parent, including tests. The separate [request/result proposal](owned-request-result-proposal.md) remains unimplemented; it is not a claim that current Python logprob results have final-free payment. [API compatibility](logprob-api-compatibility.md) describes that boundary.
 
@@ -75,3 +75,32 @@ seven-reference retained owner are reused; additional borrowed references and
 call-frame costs remain unmeasured, without a new payment or global-bound claim.
 Notification routing, strict FD fences, retry policy and production deadlines
 are unchanged. No native, device, RSS or whole-engine qualification follows.
+
+
+### Startup admission successor (focused CPU validation)
+
+A fixed ordinary per-engine attempt now reserves entry before constructor or
+restart side effects. It retains captured spawn/readers, rejects competitors,
+and gates the data reader until exact-child READY epoch/slots/pump publication.
+External close cancels an active attempt; unresolved spawn/start, reader or pipe
+cleanup retains it and refuses successors. Only actual completed captured cleanup
+records retirement. Split and shared-arena fallbacks require that evidence;
+uncertain groups keep their engine owners and parent arena. Successful complete
+retirement still permits the original retry and fallback policies.
+
+The hosted FailedStart setup now calls genuine captured close with observable
+pipe closure; its EngineDied assertion is retained. Additive controls distinguish
+unknown disappearance, direct initial startup faults, concurrent pre-spawn entry,
+cancelled READY publication, shared-arena failure and later legal startup. One bounded CPU run passed all 47 selected methods in 12.179 seconds, with
+zero skips, errors or failures: 24 baseline guards, 22 new startup regressions
+and the existing paused-reader successor guard. Source/package/startup and
+device-audit guards passed before and after; independent process/container
+absence and input readback closed in 17.794 seconds. The profile used bound
+CPython 3.12.3, private Python children, threads, pipes and a tiny backing file
+in private container shared memory. Controlled faults are not actual
+uninterruptible-child or native trials. Earlier eighteen-case PASS and the
+e663 hosted result of 1,761 tests with one error and 24 skips remain separate.
+This successor still requires its own hosted CI and exact-commit review. The eight-slot record, one Event, borrowed
+parameters, reader-entry closure and bounded exception/group references have
+unmeasured ordinary costs under unchanged caps; this is no payment, ABI/RSS,
+native, final-free or all-eight certificate. No helper/bootstrap work is enabled.

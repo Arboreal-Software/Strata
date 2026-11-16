@@ -313,19 +313,25 @@ class SplitEngine:
 
     def close(self):
         err = None
-        for e in (self.prefill, self.decode):
+        engines = (self.prefill, self.decode)
+        for e in engines:
             try:
                 e.close()
             except BaseException as x:           # noqa: BLE001
                 err = err or x
+        if err:
+            # Local import avoids adding a server/split initialization cycle.
+            from .server import EngineStuck
+            error = EngineStuck("split child retirement is unresolved; work and arena are retained")
+            error.startup_adapter, error.startup_engines = self, engines
+            error.startup_work_dir, error.startup_arena = self.work_dir, self.arena_file
+            raise error from err
         shutil.rmtree(self.work_dir, ignore_errors=True)
         if self.arena_file and self.arena_file.startswith("/dev/shm/strata-split-"):
             try:
                 os.unlink(self.arena_file)       # RAM until it is gone
             except OSError:
                 pass
-        if err:
-            raise err
 
     def heal(self) -> None:
         """Start a prefill engine that died again, in the background (the decode engine serves meanwhile)."""
