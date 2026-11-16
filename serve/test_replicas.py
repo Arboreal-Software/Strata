@@ -710,6 +710,220 @@ class StartupArenaRetirement(unittest.TestCase):
                 group.close()
             self.assertFalse(arena.exists())
 
+    def test_replica_foreground_worker_blocks_close_before_first_child_and_retains_backing(self):
+        with self.group("healthy") as (server, cfg, script, arena, children, removal):
+            adapter = server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            target = adapter.engines[0]
+            backing = arena
+            target.proc.kill()
+            target.proc.wait(timeout=5)
+            entered, release = threading.Event(), threading.Event()
+            actual_restart = target.restart
+            workers, errors = [], []
+            def restart(*args, **kwargs):
+                workers.append(threading.current_thread())
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test barrier was not released")
+                return actual_restart(*args, **kwargs)
+            def invoke():
+                try:
+                    adapter.restart()
+                except BaseException as error:
+                    errors.append(error)
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+                 mock.patch.object(target, "restart", side_effect=restart), \
+                 mock.patch.object(target, "close", wraps=target.close) as child_close:
+                controller = None
+                try:
+                    controller = threading.Thread(target=invoke)
+                    controller.start()
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(server.EngineStuck) as caught:
+                        adapter.close()
+                    self.assertIs(caught.exception.startup_adapter, adapter)
+                    self.assertTrue(backing.exists())
+                    child_close.assert_not_called()
+                    self.assertTrue(any(workers[0] in op.threads for op in
+                        caught.exception.startup_operations if op is not None))
+                    with self.assertRaises(server.EngineStuck):
+                        adapter.restart()
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                    if controller is not None:
+                        controller.join(5)
+                        self.assertFalse(controller.is_alive())
+                self.assertEqual(errors, [])
+            adapter.close()
+            self.assertFalse(backing.exists())
+            adapter.close()
+            with self.assertRaises(server.EngineStuck):
+                adapter.restart()
+
+    def test_replica_heal_worker_blocks_close_before_first_child_and_retains_backing(self):
+        with self.group("healthy") as (server, cfg, script, arena, children, removal):
+            adapter = server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            target = adapter.engines[0]
+            backing = arena
+            target.proc.kill()
+            target.proc.wait(timeout=5)
+            entered, release = threading.Event(), threading.Event()
+            actual_restart = target.restart
+            workers, errors = [], []
+            def restart(*args, **kwargs):
+                workers.append(threading.current_thread())
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test barrier was not released")
+                return actual_restart(*args, **kwargs)
+            def invoke():
+                try:
+                    adapter.restart()
+                except BaseException as error:
+                    errors.append(error)
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+                 mock.patch.object(target, "restart", side_effect=restart), \
+                 mock.patch.object(target, "close", wraps=target.close) as child_close:
+                controller = None
+                try:
+                    adapter.heal()
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(server.EngineStuck) as caught:
+                        adapter.close()
+                    self.assertIs(caught.exception.startup_adapter, adapter)
+                    self.assertTrue(backing.exists())
+                    child_close.assert_not_called()
+                    self.assertTrue(any(workers[0] in op.threads for op in
+                        caught.exception.startup_operations if op is not None))
+                    with self.assertRaises(server.EngineStuck):
+                        adapter.restart()
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                    if controller is not None:
+                        controller.join(5)
+                        self.assertFalse(controller.is_alive())
+                self.assertEqual(errors, [])
+            adapter.close()
+            self.assertFalse(backing.exists())
+            adapter.close()
+            with self.assertRaises(server.EngineStuck):
+                adapter.restart()
+
+    def test_replica_close_seals_late_entries_and_success_is_terminal(self):
+        with self.group("healthy") as (server, cfg, script, arena, children, removal):
+            adapter = server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            target = adapter.engines[0]
+            backing = arena
+            # Ordinary unload/reload retains the backing and the same adapter.
+            adapter.unload()
+            self.assertTrue(backing.exists())
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}):
+                adapter.restart()
+            self.assertTrue(adapter.alive())
+            entered, release = threading.Event(), threading.Event()
+            errors = []
+            real_close = target.close
+            def close(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test close barrier was not released")
+                return real_close(*args, **kwargs)
+            def invoke():
+                try:
+                    adapter.close()
+                except BaseException as error:
+                    errors.append(error)
+            with mock.patch.object(target, "close", side_effect=close), \
+                 mock.patch.object(target, "restart", wraps=target.restart) as child_restart:
+                closer = threading.Thread(target=invoke)
+                closer.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(server.EngineStuck):
+                        adapter.restart()
+                    adapter.heal()
+                    child_restart.assert_not_called()
+                    self.assertTrue(backing.exists())
+                finally:
+                    release.set()
+                    closer.join(5)
+                    self.assertFalse(closer.is_alive())
+            self.assertEqual(errors, [])
+            self.assertFalse(backing.exists())
+            adapter.close()
+
+    def test_replica_raised_after_actual_healer_start_retains_worker_until_join(self):
+        with self.group("healthy") as (server, cfg, script, arena, children, removal):
+            adapter = server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            target = adapter.engines[0]
+            backing = arena
+            target.proc.kill()
+            target.proc.wait(timeout=5)
+            entered, release = threading.Event(), threading.Event()
+            actual_restart, actual_start = target.restart, type(target.pump).start
+            workers = []
+            def restart(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test worker barrier was not released")
+                return actual_restart(*args, **kwargs)
+            def start(thread):
+                workers.append(thread)
+                actual_start(thread)
+                raise RuntimeError("raised after actual worker start")
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+                 mock.patch.object(target, "restart", side_effect=restart):
+                try:
+                    with mock.patch.object(type(target.pump), "start", new=start):
+                        with self.assertRaises(server.EngineStuck):
+                            adapter.heal()
+                    self.assertTrue(entered.wait(5))
+                    with mock.patch.object(target, "close", wraps=target.close) as child_close:
+                        with self.assertRaises(server.EngineStuck):
+                            adapter.close()
+                        child_close.assert_not_called()
+                    self.assertTrue(backing.exists())
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+            adapter.close()
+            self.assertFalse(backing.exists())
+
+    def test_partial_adapter_metadata_failure_retains_actual_group_and_arena(self):
+        from serve import replicas as rp
+        with self.group("healthy") as (server, cfg, script, arena, children, removal):
+            partial = []
+            original_init = rp.ReplicaEngine.__init__
+            def initialize(adapter, *args, **kwargs):
+                partial.append(adapter)
+                original_init(adapter, *args, **kwargs)
+                raise MemoryError("injected after actual adapter metadata construction")
+            with mock.patch.object(rp.ReplicaEngine, "__init__", new=initialize):
+                with self.assertRaises(server.EngineStuck) as caught:
+                    server.start_replicas(cfg, [[0], [1]], str(script), [], False)
+            error = caught.exception
+            self.assertIsInstance(error.__cause__, MemoryError)
+            self.assertIs(error.startup_adapter, partial[0])
+            self.assertEqual(len(error.startup_engines), 2)
+            self.assertEqual(len(children), 2)
+            self.assertTrue(all(engine.alive() for engine in error.startup_engines))
+            self.assertEqual(error.startup_arena, str(arena))
+            self.assertTrue(arena.exists())
+            removal.assert_not_called()
+            for engine in error.startup_engines:
+                engine.close()
+            self.assertTrue(all(proc.poll() is not None for proc in children))
+            rp.remove_arena(error.startup_arena)
+            self.assertFalse(arena.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

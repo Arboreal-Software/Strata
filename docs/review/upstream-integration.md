@@ -1,6 +1,6 @@
 # Owned-serving integration review
 
-The published code snapshot `9e275416af8063debf50bd722690de8cfea64e29` has single public upstream parent `13eedf552417a6a791a7d13c6597e24300ee3a09`. The fixed-family design correction is published as `5696fa7c1ec1db10233be268f80093c244f76013`, a single-parent child of that snapshot. The serving correction `7a37d42adb18342abd1710192c136be9b62e1a9e` is a child of that design commit. Its shutdown and stale-notification follow-up is `24df796bd3ac62df595bfba61a5d9fa85fdf1210`; the failed-READY repair `e663d4a0009f9424031be0418f1630259d060863` is based on that follow-up. The present startup-admission successor is based on that repair. The snapshot combines that upstream with work derived from local commit `17efb9e1480ec07232c124b27e2ad8f56f51301b`; it is not a completed two-parent merge. The source snapshot manifest is `4c85b275c8d177b12995747bcfa9847a0313c4f3bd4945051f77e017fdaa9418`. Existing repository attributes govern Git line-ending normalization. These review documents are the only additions to that snapshot. Two documentation-only files are omitted: `docs/qualification/owned-suffix-repair/README.md` and `docs/qualification/owned-suffix-repair/evidence-index.json`. They describe an older recovery checkpoint and index local operational receipts; they are not current qualification evidence. No product, test or runtime DATA file is omitted. The originals and both unrelated dirty-document versions remain local. No direct runtime or test reference to either omitted file was found in the bounded static audit; generic Markdown checks would otherwise enumerate the README.
+The published code snapshot `9e275416af8063debf50bd722690de8cfea64e29` has single public upstream parent `13eedf552417a6a791a7d13c6597e24300ee3a09`. The fixed-family design correction is published as `5696fa7c1ec1db10233be268f80093c244f76013`, a single-parent child of that snapshot. The serving correction `7a37d42adb18342abd1710192c136be9b62e1a9e` is a child of that design commit. Its shutdown and stale-notification follow-up is `24df796bd3ac62df595bfba61a5d9fa85fdf1210`; the failed-READY repair `e663d4a0009f9424031be0418f1630259d060863` is based on that follow-up. The startup-admission successor `186b6d32e923873c67f918cf1bd6fa0d7e7f797b` is based on that repair; the completed-close and adapter-retirement follow-up is based on that successor. The snapshot combines that upstream with work derived from local commit `17efb9e1480ec07232c124b27e2ad8f56f51301b`; it is not a completed two-parent merge. The source snapshot manifest is `4c85b275c8d177b12995747bcfa9847a0313c4f3bd4945051f77e017fdaa9418`. Existing repository attributes govern Git line-ending normalization. These review documents are the only additions to that snapshot. Two documentation-only files are omitted: `docs/qualification/owned-suffix-repair/README.md` and `docs/qualification/owned-suffix-repair/evidence-index.json`. They describe an older recovery checkpoint and index local operational receipts; they are not current qualification evidence. No product, test or runtime DATA file is omitted. The originals and both unrelated dirty-document versions remain local. No direct runtime or test reference to either omitted file was found in the bounded static audit; generic Markdown checks would otherwise enumerate the README.
 
 The implemented changes concern owned serving, capture/restore lifetimes, paid startup/prefill and position storage, image request transfer, and verified model/input loading. Review the actual diff from the parent, including tests. The separate [request/result proposal](owned-request-result-proposal.md) remains unimplemented; it is not a claim that current Python logprob results have final-free payment. [API compatibility](logprob-api-compatibility.md) describes that boundary.
 
@@ -104,3 +104,44 @@ This successor still requires its own hosted CI and exact-commit review. The eig
 parameters, reader-entry closure and bounded exception/group references have
 unmeasured ordinary costs under unchanged caps; this is no payment, ABI/RSS,
 native, final-free or all-eight certificate. No helper/bootstrap work is enabled.
+
+
+### Completed-close and adapter retirement follow-up (focused CPU validation)
+
+The engine close tail now observes whether the actual startup invocation has
+ended before replacing its phase with the positive retirement receipt. A closer
+that captured no startup record also recognizes an ended, exact-old-process
+reservation after genuine physical cleanup. The expected-process guard,
+exception hierarchy and retirement recheck are unchanged.
+
+Replica and split adapters seal admission before the first child close. They
+retain actual restart/heal workers and refuse close while an invocation is
+active or an attempted worker cannot be joined without waiting. A later close
+may retry the same retained owner after actual settlement. Successful adapter
+close is terminal and idempotent; reopening requires a fresh adapter and backing.
+Ordinary unload/restart remains reloadable and retains the backing. Split
+requests also retain the actual file worker and session path across generator
+unwind until the worker has joined and no generator work can follow. Replica
+publication failure retains the concrete partial adapter, child array and arena.
+
+One bounded CPU run passed all 28 selected methods in 1.450 seconds, with
+zero skips, errors or failures: 15 retained guards and 13 new regressions.
+Source, package, startup-origin and device-audit guards passed before and after;
+independent process/container absence and input readback closed in 4.925 seconds.
+The bound CPython 3.12.3 profile used private Python children, actual threads and
+pipes, tiny private backing and recorded native/session boundaries. The audit
+recorded zero real NVML attempts and zero other named GPU events. An earlier
+attempt stopped before container creation; the next run passed 15 guards but
+errored on a new fixture callback that conflated old admission absence before
+restart with required new admission before Popen, leaving 12 methods unrun.
+That fixture-only correction retains all earlier retirement assertions and
+checks the distinct new owner. Those failures remain separate. The earlier
+47-case CPU pass and parent hosted result of 1,783 tests with 24 skips, zero
+failures/errors in 641.480 seconds are also historical; independent review of
+that parent required these corrections. This successor still requires its own
+hosted CI and exact-commit review. Added short-held locks, fixed owner
+slots, operation records, actual-thread references and error/frame storage have
+unmeasured ordinary cost under unchanged caps. There are no new Events, cleanup
+threads, global registry or funding claims. Busy or ambiguous starts may retain
+backing indefinitely until an explicit retry can prove real retirement; no
+native, uninterruptible-child, ABI/RSS, all-caller or payment proof follows.

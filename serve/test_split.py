@@ -273,6 +273,93 @@ class Handover(unittest.TestCase):
         self.assertFalse(self.p.up or self.d.up)
 
 
+    def test_generator_unwind_retains_actual_save_worker_and_session_path(self):
+        from serve.server import EngineStuck
+        entered, release = threading.Event(), threading.Event()
+        worker, paths = [], []
+        target = self.p if "save" == "save" else self.d
+        original = target.session_file
+        def session(action, path):
+            if action == "save":
+                with open(path, "ab"):
+                    pass
+                paths.append(path)
+                worker.append(threading.current_thread())
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test file-worker barrier was not released")
+            return original(action, path)
+        generator = self.e.generate(list(range(500)), 3, {}, self.cancel)
+        with mock.patch.object(target, "session_file", side_effect=session), \
+             mock.patch.object(sp, "HEARTBEAT_S", .01):
+            try:
+                while not entered.is_set():
+                    next(generator)
+                generator.close()
+                self.assertTrue(os.path.exists(paths[0]))
+                self.assertTrue(os.path.isdir(self.dir))
+                with mock.patch.object(self.p, "close", wraps=self.p.close) as child_close:
+                    with self.assertRaises(EngineStuck) as caught:
+                        self.e.close()
+                    child_close.assert_not_called()
+                operation = caught.exception.startup_operations[-1]
+                self.assertIn(worker[0], operation.threads)
+                self.assertEqual(operation.path, paths[0])
+                self.assertTrue(worker[0].is_alive())
+            finally:
+                release.set()
+                for thread in worker:
+                    thread.join(5)
+                    self.assertFalse(thread.is_alive())
+                generator.close()
+            self.e.close()
+            self.assertFalse(os.path.exists(paths[0]))
+            self.assertFalse(os.path.exists(self.dir))
+
+    def test_generator_unwind_retains_actual_restore_worker_and_session_path(self):
+        from serve.server import EngineStuck
+        entered, release = threading.Event(), threading.Event()
+        worker, paths = [], []
+        target = self.p if "restore" == "save" else self.d
+        original = target.session_file
+        def session(action, path):
+            if action == "restore":
+                with open(path, "ab"):
+                    pass
+                paths.append(path)
+                worker.append(threading.current_thread())
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test file-worker barrier was not released")
+            return original(action, path)
+        generator = self.e.generate(list(range(500)), 3, {}, self.cancel)
+        with mock.patch.object(target, "session_file", side_effect=session), \
+             mock.patch.object(sp, "HEARTBEAT_S", .01):
+            try:
+                while not entered.is_set():
+                    next(generator)
+                generator.close()
+                self.assertTrue(os.path.exists(paths[0]))
+                self.assertTrue(os.path.isdir(self.dir))
+                with mock.patch.object(self.p, "close", wraps=self.p.close) as child_close:
+                    with self.assertRaises(EngineStuck) as caught:
+                        self.e.close()
+                    child_close.assert_not_called()
+                operation = caught.exception.startup_operations[-1]
+                self.assertIn(worker[0], operation.threads)
+                self.assertEqual(operation.path, paths[0])
+                self.assertTrue(worker[0].is_alive())
+            finally:
+                release.set()
+                for thread in worker:
+                    thread.join(5)
+                    self.assertFalse(thread.is_alive())
+                generator.close()
+            self.e.close()
+            self.assertFalse(os.path.exists(paths[0]))
+            self.assertFalse(os.path.exists(self.dir))
+
+
 @unittest.skipUnless(os.name != "nt" and os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK),
                      "private executable-child/generated-arena profile requires writable Linux /dev/shm")
 class StartupOwnerRetirement(unittest.TestCase):
@@ -427,6 +514,205 @@ class StartupOwnerRetirement(unittest.TestCase):
             # Preserve original startup-failure arena policy; adapter close has
             # the separate generated-arena cleanup contract above.
             self.assertTrue(state.arena.exists())
+
+    def test_split_foreground_worker_blocks_close_before_first_child_and_retains_backing(self):
+        with self.pair() as state:
+            server = state.server
+            adapter = self.start_pair(state)
+            state.engines.extend((adapter.prefill, adapter.decode))
+            state.adapters.append(adapter)
+            target = adapter.prefill
+            backing = state.arena
+            target.proc.kill()
+            target.proc.wait(timeout=5)
+            entered, release = threading.Event(), threading.Event()
+            actual_restart = target.restart
+            workers, errors = [], []
+            def restart(*args, **kwargs):
+                workers.append(threading.current_thread())
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test barrier was not released")
+                return actual_restart(*args, **kwargs)
+            def invoke():
+                try:
+                    adapter.restart()
+                except BaseException as error:
+                    errors.append(error)
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+                 mock.patch.object(target, "restart", side_effect=restart), \
+                 mock.patch.object(target, "close", wraps=target.close) as child_close:
+                controller = None
+                try:
+                    controller = threading.Thread(target=invoke)
+                    controller.start()
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(server.EngineStuck) as caught:
+                        adapter.close()
+                    self.assertIs(caught.exception.startup_adapter, adapter)
+                    self.assertTrue(backing.exists())
+                    child_close.assert_not_called()
+                    self.assertTrue(any(op.caller is workers[0] or workers[0] in op.threads for op in
+                        caught.exception.startup_operations if op is not None))
+                    with self.assertRaises(server.EngineStuck):
+                        adapter.restart()
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                    if controller is not None:
+                        controller.join(5)
+                        self.assertFalse(controller.is_alive())
+                self.assertEqual(errors, [])
+            adapter.close()
+            self.assertFalse(backing.exists())
+            adapter.close()
+            with self.assertRaises(server.EngineStuck):
+                adapter.restart()
+
+    def test_split_heal_worker_blocks_close_before_first_child_and_retains_backing(self):
+        with self.pair() as state:
+            server = state.server
+            adapter = self.start_pair(state)
+            state.engines.extend((adapter.prefill, adapter.decode))
+            state.adapters.append(adapter)
+            target = adapter.prefill
+            backing = state.arena
+            target.proc.kill()
+            target.proc.wait(timeout=5)
+            entered, release = threading.Event(), threading.Event()
+            actual_restart = target.restart
+            workers, errors = [], []
+            def restart(*args, **kwargs):
+                workers.append(threading.current_thread())
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test barrier was not released")
+                return actual_restart(*args, **kwargs)
+            def invoke():
+                try:
+                    adapter.restart()
+                except BaseException as error:
+                    errors.append(error)
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+                 mock.patch.object(target, "restart", side_effect=restart), \
+                 mock.patch.object(target, "close", wraps=target.close) as child_close:
+                controller = None
+                try:
+                    adapter.heal()
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(server.EngineStuck) as caught:
+                        adapter.close()
+                    self.assertIs(caught.exception.startup_adapter, adapter)
+                    self.assertTrue(backing.exists())
+                    child_close.assert_not_called()
+                    self.assertTrue(any(op.caller is workers[0] or workers[0] in op.threads for op in
+                        caught.exception.startup_operations if op is not None))
+                    with self.assertRaises(server.EngineStuck):
+                        adapter.restart()
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                    if controller is not None:
+                        controller.join(5)
+                        self.assertFalse(controller.is_alive())
+                self.assertEqual(errors, [])
+            adapter.close()
+            self.assertFalse(backing.exists())
+            adapter.close()
+            with self.assertRaises(server.EngineStuck):
+                adapter.restart()
+
+    def test_split_close_seals_late_entries_and_success_is_terminal(self):
+        with self.pair() as state:
+            server = state.server
+            adapter = self.start_pair(state)
+            state.engines.extend((adapter.prefill, adapter.decode))
+            state.adapters.append(adapter)
+            target = adapter.prefill
+            backing = state.arena
+            # Ordinary unload/reload retains the backing and the same adapter.
+            adapter.unload()
+            self.assertTrue(backing.exists())
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}):
+                adapter.restart()
+            self.assertTrue(adapter.alive())
+            entered, release = threading.Event(), threading.Event()
+            errors = []
+            real_close = target.close
+            def close(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test close barrier was not released")
+                return real_close(*args, **kwargs)
+            def invoke():
+                try:
+                    adapter.close()
+                except BaseException as error:
+                    errors.append(error)
+            with mock.patch.object(target, "close", side_effect=close), \
+                 mock.patch.object(target, "restart", wraps=target.restart) as child_restart:
+                closer = threading.Thread(target=invoke)
+                closer.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(server.EngineStuck):
+                        adapter.restart()
+                    adapter.heal()
+                    child_restart.assert_not_called()
+                    self.assertTrue(backing.exists())
+                finally:
+                    release.set()
+                    closer.join(5)
+                    self.assertFalse(closer.is_alive())
+            self.assertEqual(errors, [])
+            self.assertFalse(backing.exists())
+            adapter.close()
+
+    def test_split_raised_after_actual_healer_start_retains_worker_until_join(self):
+        with self.pair() as state:
+            server = state.server
+            adapter = self.start_pair(state)
+            state.engines.extend((adapter.prefill, adapter.decode))
+            state.adapters.append(adapter)
+            target = adapter.prefill
+            backing = state.arena
+            target.proc.kill()
+            target.proc.wait(timeout=5)
+            entered, release = threading.Event(), threading.Event()
+            actual_restart, actual_start = target.restart, type(target.pump).start
+            workers = []
+            def restart(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test worker barrier was not released")
+                return actual_restart(*args, **kwargs)
+            def start(thread):
+                workers.append(thread)
+                actual_start(thread)
+                raise RuntimeError("raised after actual worker start")
+            with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+                 mock.patch.object(target, "restart", side_effect=restart):
+                try:
+                    with mock.patch.object(type(target.pump), "start", new=start):
+                        with self.assertRaises(server.EngineStuck):
+                            adapter.heal()
+                    self.assertTrue(entered.wait(5))
+                    with mock.patch.object(target, "close", wraps=target.close) as child_close:
+                        with self.assertRaises(server.EngineStuck):
+                            adapter.close()
+                        child_close.assert_not_called()
+                    self.assertTrue(backing.exists())
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+            adapter.close()
+            self.assertFalse(backing.exists())
 
 
 if __name__ == "__main__":

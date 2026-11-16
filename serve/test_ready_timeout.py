@@ -597,6 +597,206 @@ class ReadyTimeout(unittest.TestCase):
             self.assertIsNot(eng.log, old["log"])
             self.assertFalse(eng.log.closed)
 
+    def test_active_close_observes_actual_owner_end_before_retirement_phase_change(self):
+        script = self.make_script("owner_ends_during_close", "import sys\nprint('READY 4096 stop', flush=True)\n"
+                                  "for line in sys.stdin:\n    if line.startswith('QUIT'): break\n")
+        published, release_owner = threading.Event(), threading.Event()
+        at_tail, release_tail = threading.Event(), threading.Event()
+        old, start_errors, close_errors = {}, [], []
+        def before_spawn(eng, children, readers, *, admitted=True):
+            if children:
+                self.assertEqual(len(children), 1)
+                self.assertIsNotNone(old["proc"].poll())
+                self.assertTrue(old["proc"].stdin.closed)
+                self.assertTrue(old["proc"].stdout.closed)
+                self.assertTrue(old["log"].closed)
+                self.assertFalse(old["reader"].is_alive())
+                self.assertFalse(readers[0].is_alive())
+                self.assertFalse(old["owner"][4].is_alive())
+                self.assertIsNone(eng.__dict__.get("_close_owner"))
+                if admitted:
+                    # _initialize publishes this real new admission before Popen.
+                    current = eng.__dict__.get("_startup_attempt")
+                    self.assertIsNotNone(current)
+                    self.assertIsNot(current, old["attempt"])
+                    self.assertTrue(old["attempt"].retired)
+                    self.assertEqual(current.phase, "SPAWNING")
+                    self.assertTrue(current.in_flight)
+                    self.assertFalse(current.cancelled)
+                    self.assertFalse(current.retired)
+                    self.assertIsNone(current.proc)
+                    self.assertIsNone(current.ready_reader)
+                    self.assertIsNone(current.data_reader)
+                    self.assertIsNone(eng.proc)
+                    self.assertIsNone(eng.pump)
+                else:
+                    # Previous admission is gone BEFORE asking for a successor.
+                    self.assertIsNone(eng.__dict__.get("_startup_attempt"))
+        with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+             self.captured_start(script, before_spawn=before_spawn,
+                                 log=str(self.root / "owner_ends_during_close.log")) as (eng, children, readers, _):
+            actual_finish = eng._finish_startup
+            def finish(attempt):
+                if not published.is_set():
+                    old.update(proc=eng.proc, reader=eng.pump, log=eng.log, attempt=attempt, gen=eng.gen)
+                    self.assertEqual(attempt.phase, "PUBLISHED")
+                    published.set()
+                    if not release_owner.wait(5):
+                        raise AssertionError("published owner barrier not released")
+                return actual_finish(attempt)
+            def start():
+                try:
+                    eng.restart(tries=1)
+                except BaseException as error:
+                    start_errors.append(error)
+            def close():
+                try:
+                    eng.close()
+                except BaseException as error:
+                    close_errors.append(error)
+            starter = threading.Thread(target=start, daemon=True)
+            closer = threading.Thread(target=close, daemon=True)
+            with mock.patch.object(eng, "_finish_startup", side_effect=finish):
+                try:
+                    starter.start()
+                    self.assertTrue(published.wait(5))
+                    actual_close_stdout = old["proc"].stdout.close
+                    def close_stdout():
+                        actual_close_stdout()
+                        old["owner"] = eng._close_owner
+                        at_tail.set()
+                        if not release_tail.wait(5):
+                            raise AssertionError("physical tail barrier not released")
+                    with mock.patch.object(old["proc"].stdout, "close", side_effect=close_stdout):
+                        closer.start()
+                        self.assertTrue(at_tail.wait(5))
+                        self.assertTrue(old["attempt"].cancelled)
+                        release_owner.set()
+                        starter.join(5)
+                        self.assertFalse(starter.is_alive())
+                        self.assertEqual(start_errors, [])
+                        self.assertEqual(old["attempt"].phase, "UNCERTAIN")
+                        release_tail.set()
+                        closer.join(5)
+                        self.assertFalse(closer.is_alive())
+                finally:
+                    release_owner.set()
+                    release_tail.set()
+                    for worker in (starter, closer):
+                        if worker.ident is not None:
+                            worker.join(5)
+                            self.assertFalse(worker.is_alive())
+            self.assertEqual(close_errors, [])
+            self.assertTrue(old["attempt"].retired)
+            before_spawn(eng, children, readers, admitted=False)
+            eng.restart(tries=1)
+            self.assertEqual(len(children), 2)
+            self.assertIs(eng.proc, children[1][0])
+            self.assertIs(eng._epoch.proc, eng.proc)
+            self.assertEqual(eng.gen, old["gen"] + 1)
+            self.assertIsNot(eng.pump, old["reader"])
+            self.assertFalse(eng.proc.stdin.closed)
+            self.assertFalse(eng.proc.stdout.closed)
+
+    def test_restart_timeout_ends_before_original_closer_late_retirement(self):
+        script = self.make_script("timeout_before_real_tail", "import sys\nprint('READY 4096 stop', flush=True)\n"
+                                  "for line in sys.stdin:\n    if line.startswith('QUIT'): break\n")
+        at_tail, release_tail = threading.Event(), threading.Event()
+        old, close_errors, restart_errors = {}, [], []
+        def before_spawn(eng, children, readers, *, admitted=True):
+            if children:
+                self.assertEqual(len(children), 1)
+                self.assertIsNotNone(old["proc"].poll())
+                self.assertTrue(old["proc"].stdin.closed)
+                self.assertTrue(old["proc"].stdout.closed)
+                self.assertTrue(old["log"].closed)
+                self.assertFalse(old["reader"].is_alive())
+                self.assertFalse(readers[0].is_alive())
+                self.assertFalse(old["owner"][4].is_alive())
+                self.assertIsNone(eng.__dict__.get("_close_owner"))
+                if admitted:
+                    # _initialize publishes this real new admission before Popen.
+                    current = eng.__dict__.get("_startup_attempt")
+                    self.assertIsNotNone(current)
+                    self.assertIsNot(current, ended)
+                    self.assertTrue(ended.retired)
+                    self.assertEqual(current.phase, "SPAWNING")
+                    self.assertTrue(current.in_flight)
+                    self.assertFalse(current.cancelled)
+                    self.assertFalse(current.retired)
+                    self.assertIsNone(current.proc)
+                    self.assertIsNone(current.ready_reader)
+                    self.assertIsNone(current.data_reader)
+                    self.assertIsNone(eng.proc)
+                    self.assertIsNone(eng.pump)
+                else:
+                    # Previous admission is gone BEFORE asking for a successor.
+                    self.assertIsNone(eng.__dict__.get("_startup_attempt"))
+        with mock.patch.dict(os.environ, {"STRATA_KEEP_LEFTOVERS": "1"}), \
+             self.captured_start(script, before_spawn=before_spawn,
+                                 log=str(self.root / "timeout_before_real_tail.log")) as (eng, children, readers, _):
+            eng.restart(tries=1)
+            old.update(proc=eng.proc, reader=eng.pump, log=eng.log, gen=eng.gen)
+            self.assertIsNone(eng.__dict__.get("_startup_attempt"))
+            actual_close_stdout = old["proc"].stdout.close
+            def close_stdout():
+                actual_close_stdout()
+                old["owner"] = eng._close_owner
+                at_tail.set()
+                if not release_tail.wait(5):
+                    raise AssertionError("original closer barrier not released")
+            def close():
+                try:
+                    eng.close()
+                except BaseException as error:
+                    close_errors.append(error)
+            def restart():
+                try:
+                    eng.restart(tries=1)
+                except BaseException as error:
+                    restart_errors.append(error)
+            closer = threading.Thread(target=close, daemon=True)
+            starter = threading.Thread(target=restart, daemon=True)
+            with mock.patch.object(old["proc"].stdout, "close", side_effect=close_stdout):
+                try:
+                    closer.start()
+                    self.assertTrue(at_tail.wait(5))
+                    self.assertTrue(eng._close_lock.locked())
+                    # Real lock timeout, not an injected EngineStuck or fake receipt.
+                    with mock.patch.object(server, "ENGINE_QUIT_WAIT_S", .05):
+                        starter.start()
+                        starter.join(5)
+                    self.assertFalse(starter.is_alive())
+                    self.assertEqual(len(restart_errors), 1)
+                    self.assertIsInstance(restart_errors[0], server.EngineStuck)
+                    self.assertIn("another engine shutdown", str(restart_errors[0]))
+                    ended = eng._startup_attempt
+                    self.assertEqual(ended.phase, "UNCERTAIN")
+                    self.assertIs(ended.proc, old["proc"])
+                    self.assertIs(ended.ready_reader, old["reader"])
+                    self.assertFalse(ended.retired)
+                    self.assertEqual(len(children), 1)
+                    release_tail.set()
+                    closer.join(5)
+                    self.assertFalse(closer.is_alive())
+                finally:
+                    release_tail.set()
+                    for worker in (closer, starter):
+                        if worker.ident is not None:
+                            worker.join(5)
+                            self.assertFalse(worker.is_alive())
+            self.assertEqual(close_errors, [])
+            self.assertTrue(ended.retired)
+            before_spawn(eng, children, readers, admitted=False)
+            eng.restart(tries=1)
+            self.assertEqual(len(children), 2)
+            self.assertIs(eng.proc, children[1][0])
+            self.assertIs(eng._epoch.proc, eng.proc)
+            self.assertEqual(eng.gen, old["gen"] + 1)
+            self.assertIsNot(eng.pump, old["reader"])
+            self.assertFalse(eng.proc.stdin.closed)
+            self.assertFalse(eng.proc.stdout.closed)
+
     def test_ready_timeout_on_lazy_load_answers_the_request(self):
         # lazy start: restart()'s own bookkeeping must not crash on the missing slot_cv either (#1527)
         svc = self.service(self.make_script('silent', SILENT))

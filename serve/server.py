@@ -4206,7 +4206,6 @@ class StrataEngine:
             if _expected_proc is not None and proc is not _expected_proc:
                 raise EngineStuck("captured engine changed before retirement; successor is fenced")
             attempt = self.__dict__.get("_startup_attempt")
-            inactive_attempt = attempt is not None and attempt.phase == "UNCERTAIN"
             if _startup is not None and attempt is not _startup:
                 raise EngineStuck("captured startup owner changed before close")
             if attempt is not None and _startup is None:
@@ -4362,18 +4361,24 @@ class StrataEngine:
                 if attempt is not None:
                     if self.__dict__.get("_startup_attempt") is not attempt or attempt.proc is not proc or attempt.in_flight:
                         raise EngineStuck("startup changed before positive retirement publication")
+                    # Observe invocation end HERE, not at entry: the owner may
+                    # have unwound while actual physical cleanup was running.
+                    ended = attempt.phase == "UNCERTAIN"
                     attempt.retired, attempt.phase = True, "RETIRED"
-                    if inactive_attempt:
+                    if ended:
                         self._startup_attempt = None
                 else:
                     # This closer captured no startup owner. A restart may have
                     # reserved exactly its old child while actual cleanup ran.
                     current = self.__dict__.get("_startup_attempt")
-                    if (current is not None and proc is not None and current.phase == "RESERVED" and
+                    if (current is not None and proc is not None and current.phase in ("RESERVED", "UNCERTAIN") and
                             current.proc is proc and current.ready_reader is pump and
                             current.data_reader is None and not current.in_flight and not current.retired and
                             self.proc is None and self.__dict__.get("_close_owner") is None):
+                        ended = current.phase == "UNCERTAIN"
                         current.retired, current.phase = True, "RETIRED"
+                        if ended:
+                            self._startup_attempt = None
                         # Keep cancellation and active-invocation admission intact.
         finally:
             closer.release()
@@ -11106,13 +11111,21 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                   "its own copy of the experts instead", flush=True)
             return start_replicas({**cfg, "replica_shared_arena": False}, groups, exe, effort_end, lazy, offline=offline)
         raise SystemExit(f"[strata] replica {i} did not start: {e}")
-    load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
-    eng = rp.ReplicaEngine(engines, load_tokens=load)
-    if arena:
-        eng.__dict__["arena_file"] = arena
-        import atexit
-        atexit.register(rp.remove_arena, arena)             # (a killed server leaves the file: the next start sweeps it)
-    return eng
+    eng = None
+    try:
+        load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
+        eng = rp.ReplicaEngine.__new__(rp.ReplicaEngine)
+        rp.ReplicaEngine.__init__(eng, engines, load_tokens=load)
+        if arena:
+            eng.__dict__["arena_file"] = arena
+            import atexit
+            atexit.register(rp.remove_arena, arena)         # Same successful-publication shutdown policy.
+        return eng
+    except BaseException as cause:
+        error = EngineStuck("replica adapter publication failed; actual group and arena are retained")
+        error.startup_engines, error.startup_arena = engines, arena
+        error.startup_adapter = eng
+        raise error from cause
 
 
 def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bool, *, offline: bool = False):

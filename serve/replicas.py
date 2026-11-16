@@ -331,6 +331,140 @@ class Router:
                     del self.blocks[h]
 
 
+class _AdapterOperation:
+    """Actual adapter work, not a funded cell or a thread-exit certificate."""
+    __slots__ = ("caller", "threads", "attempted", "returned", "phase", "path")
+
+    def __init__(self):
+        self.caller = threading.current_thread()
+        self.threads = []
+        self.attempted = self.returned = 0
+        self.phase = "ACTIVE"
+        self.path = None
+
+
+def _adapter_init(owner, heal_count, *, handover=False):
+    d = owner.__dict__
+    d["_lifecycle_lock"] = threading.Lock()
+    d["_lifecycle_phase"] = "OPEN"
+    d["_restart_owner"] = None
+    d["_heal_owners"] = [None] * heal_count
+    if handover:
+        d["_handover_owner"] = None
+
+
+def _adapter_error(owner, message):
+    from .server import EngineStuck
+    d = owner.__dict__
+    with d["_lifecycle_lock"]:
+        operations = (d.get("_restart_owner"), *d["_heal_owners"], d.get("_handover_owner"))
+        engines = d["engines"] if "engines" in d else (d["prefill"], d["decode"])
+        work, arena = d.get("work_dir"), d.get("arena_file")
+    error = EngineStuck(message)
+    error.startup_adapter, error.startup_engines = owner, engines
+    error.startup_operations = operations  # Actual mutable records, not status copies.
+    error.startup_work_dir, error.startup_arena = work, arena
+    return error
+
+
+def _adapter_operation_settled(operation):
+    if operation is None:
+        return True
+    if operation.phase not in ("DRAINING", "REAPING", "ENDED"):
+        return False
+    # Invocation end proves the unattempted suffix cannot start later. Every
+    # attempted actual Thread still requires a real join, including raised starts.
+    for thread in operation.threads[:operation.attempted]:
+        try:
+            thread.join(timeout=0)
+        except RuntimeError:
+            return False
+        if thread.is_alive():
+            return False
+    return True
+
+
+def _adapter_begin(owner, kind, index=None):
+    d = owner.__dict__
+    with d["_lifecycle_lock"]:
+        previous = d["_restart_owner"] if kind == "restart" else d["_heal_owners"][index]
+    settled = _adapter_operation_settled(previous)  # Never join under the gate.
+    operation = _AdapterOperation()
+    with d["_lifecycle_lock"]:
+        current = d["_restart_owner"] if kind == "restart" else d["_heal_owners"][index]
+        allowed = d["_lifecycle_phase"] == "OPEN" and current is previous and settled
+        if allowed:
+            if previous is not None:
+                previous.phase = "ENDED"
+            if kind == "restart":
+                d["_restart_owner"] = operation
+            else:
+                d["_heal_owners"][index] = operation
+    if not allowed:
+        if kind == "heal":
+            return None
+        raise _adapter_error(owner, "adapter restart admission is closed or still owned")
+    return operation
+
+
+def _adapter_start(owner, operation, thread):
+    d = owner.__dict__
+    with d["_lifecycle_lock"]:
+        if operation.attempted == len(operation.threads):
+            operation.threads.append(thread)
+        elif operation.threads[operation.attempted] is not thread:
+            raise RuntimeError("adapter worker provenance changed")
+        operation.attempted += 1
+    try:
+        thread.start()
+    except BaseException as cause:
+        raise _adapter_error(owner, "adapter worker start is unresolved; owners are retained") from cause
+    with d["_lifecycle_lock"]:
+        operation.returned += 1
+
+
+def _adapter_finish(owner, operation):
+    d = owner.__dict__
+    with d["_lifecycle_lock"]:
+        operation.phase = "DRAINING"
+    settled = _adapter_operation_settled(operation)
+    if settled:
+        with d["_lifecycle_lock"]:
+            if d.get("_restart_owner") is operation:
+                d["_restart_owner"] = None
+                operation.phase = "ENDED"
+
+
+def _adapter_seal(owner):
+    d = owner.__dict__
+    with d["_lifecycle_lock"]:
+        if d["_lifecycle_phase"] == "CLOSED":
+            return False
+        d["_lifecycle_phase"] = "CLOSING"
+    return True
+
+
+def _adapter_close_ready(owner):
+    if not _adapter_seal(owner):
+        return False
+    d = owner.__dict__
+    with d["_lifecycle_lock"]:
+        operations = (d.get("_restart_owner"), *d["_heal_owners"])
+        handover_pending = d.get("_handover_owner") is not None
+    if handover_pending or not all(_adapter_operation_settled(op) for op in operations):
+        raise _adapter_error(owner, "adapter work has not retired; children and backing are retained")
+    return True
+
+
+def _adapter_closed(owner):
+    d = owner.__dict__
+    with d["_lifecycle_lock"]:
+        d["_lifecycle_phase"] = "CLOSED"
+        d["_restart_owner"] = None
+        for i in range(len(d["_heal_owners"])):
+            d["_heal_owners"][i] = None
+
+
 class ReplicaEngine:
     """Stands in for one engine (the interface Service uses), over several."""
 
@@ -352,6 +486,7 @@ class ReplicaEngine:
         d["heal_at"] = [0.0] * len(engines)
         d["routed"] = [0] * len(engines)
         d["gen_seen"] = [getattr(e, "gen", 0) for e in engines]
+        _adapter_init(self, len(engines))
 
     # ---- attribute plumbing
     @property
@@ -473,6 +608,13 @@ class ReplicaEngine:
 
     # ---- life cycle
     def restart(self, tries: int = 3):
+        operation = _adapter_begin(self, "restart")
+        try:
+            return self._restart_owned(tries, operation)
+        finally:
+            _adapter_finish(self, operation)
+
+    def _restart_owned(self, tries, operation):
         dead = [k for k, e in enumerate(self.engines) if not e.alive()]
         errors: dict[int, BaseException] = {}
 
@@ -483,10 +625,15 @@ class ReplicaEngine:
             except BaseException as e:           # noqa: BLE001
                 errors[k] = e
         ts = [threading.Thread(target=one, args=(k,), daemon=True) for k in dead]
+        with self.__dict__["_lifecycle_lock"]:
+            operation.threads = ts  # Keep the actual existing launch list.
         for t in ts:
-            t.start()
+            _adapter_start(self, operation, t)
         for t in ts:
-            t.join()
+            try:
+                t.join()
+            except BaseException as cause:
+                raise _adapter_error(self, "replica restart workers have not settled") from cause
         if errors and not self.alive():
             raise next(iter(errors.values()))
         for k, e in errors.items():
@@ -499,6 +646,8 @@ class ReplicaEngine:
             self.router.forget(k)
 
     def close(self):
+        if not _adapter_close_ready(self):
+            return
         err = None
         for e in self.engines:
             try:
@@ -506,10 +655,9 @@ class ReplicaEngine:
             except BaseException as x:           # noqa: BLE001
                 err = err or x
         if err:
-            err.startup_engines = self.engines
-            err.startup_arena = self.__dict__.get("arena_file")
-            raise err
+            raise _adapter_error(self, "replica child retirement is unresolved; backing is retained") from err
         remove_arena(self.__dict__.get("arena_file"))
+        _adapter_closed(self)
 
     # ---- routing
     def route(self, ids) -> int:
@@ -529,18 +677,26 @@ class ReplicaEngine:
         return k
 
     def heal(self) -> None:
-        """Start a replica that died again, in the background (the others keep serving)."""
+        """Start at most one actual healer per child, retaining it through join."""
         now = time.monotonic()
         for k, e in enumerate(self.engines):
             if e.alive() or getattr(e, "unloaded", False) or getattr(e, "starting", False) or self.healing.get(k):
                 continue
             if now < self.heal_at[k]:
                 continue
-            self.heal_at[k] = now + HEAL_COOLDOWN_S
-            self.healing[k] = True
+            operation = _adapter_begin(self, "heal", k)
+            if operation is None:
+                continue
+            with self.__dict__["_lifecycle_lock"]:
+                self.heal_at[k] = now + HEAL_COOLDOWN_S
+                self.healing[k] = True
 
-            def run(k=k):
+            def run(k=k, operation=operation):
                 try:
+                    with self.__dict__["_lifecycle_lock"]:
+                        allowed = self.__dict__["_lifecycle_phase"] == "OPEN"
+                    if not allowed:
+                        return
                     print(f"[strata] replica {k} had stopped; starting it again", flush=True)
                     self.engines[k].restart()
                     self.router.forget(k)
@@ -548,8 +704,18 @@ class ReplicaEngine:
                 except BaseException as x:       # noqa: BLE001
                     print(f"[strata] replica {k} did not start again: {x}", flush=True)
                 finally:
+                    with self.__dict__["_lifecycle_lock"]:
+                        self.healing[k] = False
+                        operation.phase = "DRAINING"
+            try:
+                thread = threading.Thread(target=run, daemon=True)
+                operation.caller = thread
+                _adapter_start(self, operation, thread)
+            except BaseException as cause:
+                with self.__dict__["_lifecycle_lock"]:
                     self.healing[k] = False
-            threading.Thread(target=run, daemon=True).start()
+                    operation.phase = "DRAINING"
+                raise _adapter_error(self, "replica heal start did not complete; worker is retained") from cause
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         # imported here: serve.server imports this module

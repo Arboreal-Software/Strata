@@ -213,6 +213,8 @@ class SplitEngine:
         d["heal_at"] = 0.0
         d["healing"] = False
         d["lock"] = threading.Lock()
+        from .replicas import _adapter_init
+        _adapter_init(self, 1, handover=True)
         d["stats"] = {"requests": 0, "handed_over": 0, "fallbacks": 0, "short": 0, "bytes": 0, "prefill_ms": 0.0,
                       "save_ms": 0.0, "restore_ms": 0.0, "last": None}
 
@@ -292,6 +294,14 @@ class SplitEngine:
 
     # ---- life cycle
     def restart(self, tries: int = 3):
+        from .replicas import _adapter_begin, _adapter_finish
+        operation = _adapter_begin(self, "restart")
+        try:
+            return self._restart_owned(tries)
+        finally:
+            _adapter_finish(self, operation)
+
+    def _restart_owned(self, tries):
         errors = {}
         for name, e in (("decode", self.decode), ("prefill", self.prefill)):      # one at a time: the arena fills once
             if e.alive():
@@ -312,6 +322,12 @@ class SplitEngine:
         self.__dict__["held"] = []
 
     def close(self):
+        from .replicas import _adapter_seal, _adapter_close_ready, _adapter_closed
+        if not _adapter_seal(self):
+            return
+        self._finish_handover()
+        if not _adapter_close_ready(self):
+            return
         err = None
         engines = (self.prefill, self.decode)
         for e in engines:
@@ -332,26 +348,46 @@ class SplitEngine:
                 os.unlink(self.arena_file)       # RAM until it is gone
             except OSError:
                 pass
+        _adapter_closed(self)
 
     def heal(self) -> None:
         """Start a prefill engine that died again, in the background (the decode engine serves meanwhile)."""
+        from .replicas import _adapter_begin, _adapter_start, _adapter_error
         e = self.prefill
         now = time.monotonic()
         if e.alive() or getattr(e, "unloaded", False) or getattr(e, "starting", False) or self.healing or now < self.heal_at:
             return
-        self.__dict__["heal_at"] = now + HEAL_COOLDOWN_S
-        self.__dict__["healing"] = True
+        operation = _adapter_begin(self, "heal", 0)
+        if operation is None:
+            return
+        with self._lifecycle_lock:
+            self.__dict__["heal_at"] = now + HEAL_COOLDOWN_S
+            self.__dict__["healing"] = True
 
         def run():
             try:
+                with self._lifecycle_lock:
+                    allowed = self._lifecycle_phase == "OPEN"
+                if not allowed:
+                    return
                 self.say("[strata] split: the prefill engine had stopped; starting it again")
                 e.restart()
                 self.say("[strata] split: the prefill engine is running again")
             except BaseException as x:           # noqa: BLE001
                 self.say(f"[strata] split: the prefill engine did not start again: {x}")
             finally:
+                with self._lifecycle_lock:
+                    self.__dict__["healing"] = False
+                    operation.phase = "DRAINING"
+        try:
+            thread = threading.Thread(target=run, daemon=True)
+            operation.caller = thread
+            _adapter_start(self, operation, thread)
+        except BaseException as cause:
+            with self._lifecycle_lock:
                 self.__dict__["healing"] = False
-        threading.Thread(target=run, daemon=True).start()
+                operation.phase = "DRAINING"
+            raise _adapter_error(self, "split healer start is unresolved") from cause
 
     # ---- the request
     def wants_handover(self, ids) -> tuple[bool, int]:
@@ -362,17 +398,18 @@ class SplitEngine:
         need = (n - 1) - min(common_prefix(self.held, ids), n - 1)
         return need >= max(1, self.min_tokens) and self.prefill.alive(), need
 
-    def _wait(self, fn):
+    def _wait(self, fn, operation):
         """Run a blocking engine call on a thread; yields None as a keep-alive while it runs.  -> its result."""
         box = {}
 
-        def run():
+        def run(_owner=self):
             try:
                 box["r"] = fn()
             except BaseException as e:           # noqa: BLE001
                 box["e"] = e
         th = threading.Thread(target=run, daemon=True)
-        th.start()
+        from .replicas import _adapter_start
+        _adapter_start(self, operation, th)
         while th.is_alive():
             th.join(HEARTBEAT_S)
             if th.is_alive():
@@ -381,7 +418,7 @@ class SplitEngine:
             raise box["e"]
         return box.get("r")
 
-    def _hand_over(self, ids, cancel, rec: dict):
+    def _hand_over(self, ids, cancel, rec: dict, operation):
         """Prefill engine reads the prompt, saves the session; the decode engine restores it.  Yields keep-alives.
         rec['ok'] is True when the decode engine now holds the prompt's first n-1 tokens."""
         from serve.server import EngineDied, SessionRefused
@@ -389,6 +426,7 @@ class SplitEngine:
         n = len(ids)
         self.__dict__["seq"] += 1
         path = os.path.join(self.work_dir, f"handover-{os.getpid()}-{self.seq}.session")
+        operation.path = path
         rec.update(ok=False)
         t0 = time.monotonic()
         self.__dict__["cur"] = P
@@ -406,9 +444,9 @@ class SplitEngine:
             rec["prefill_ms"] = (time.monotonic() - t0) * 1000.0
             rec["p_last"] = p_last
             try:
-                saved = yield from self._wait(lambda: P.session_file("save", path))
+                saved = yield from self._wait(lambda: P.session_file("save", path), operation)
                 self.__dict__["cur"] = D
-                restored = yield from self._wait(lambda: D.session_file("restore", path))
+                restored = yield from self._wait(lambda: D.session_file("restore", path), operation)
             except SessionRefused as e:
                 self.say(f"[strata] split: the session file was refused ({e}); the decode engine reads the prompt itself")
                 return
@@ -427,12 +465,56 @@ class SplitEngine:
                 rec["ok"] = restored["tokens"] > 0
         finally:
             self.__dict__["cur"] = D
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            # The owning generator retires the path only after its real IO
+            # threads have joined, including cancellation during a heartbeat.
+
+    def _finish_handover(self):
+        from .replicas import _adapter_operation_settled
+        with self._lifecycle_lock:
+            operation = self._handover_owner
+            if operation is None:
+                return True
+            if operation.phase != "DRAINING":
+                return False
+            operation.phase = "REAPING"
+        try:
+            if not _adapter_operation_settled(operation):
+                return False
+            if operation.path is not None:
+                try:
+                    os.unlink(operation.path)
+                except OSError:
+                    pass
+            with self._lifecycle_lock:
+                if self._handover_owner is operation:
+                    operation.phase = "ENDED"
+                    self.__dict__["_handover_owner"] = None
+            return True
+        finally:
+            with self._lifecycle_lock:
+                if self._handover_owner is operation:
+                    operation.phase = "DRAINING"
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        from .replicas import _AdapterOperation, _adapter_error
+        self._finish_handover()
+        operation = _AdapterOperation()
+        with self._lifecycle_lock:
+            allowed = self._lifecycle_phase == "OPEN" and self._handover_owner is None
+            if allowed:
+                self.__dict__["_handover_owner"] = operation
+        if not allowed:
+            raise _adapter_error(self, "split request admission is closed or still owned")
+        try:
+            inner = self._generate_owned(ids, max_new, sampling, cancel, embeddings, operation)
+            operation.caller = inner
+            yield from inner
+        finally:
+            with self._lifecycle_lock:
+                operation.phase = "DRAINING"
+            self._finish_handover()
+
+    def _generate_owned(self, ids, max_new, sampling, cancel, embeddings, operation):
         D = self.decode
         ids = list(ids)
         st = self.stats
@@ -444,7 +526,7 @@ class SplitEngine:
         if use:
             if not self.prefill.alive():
                 self.heal()
-            yield from self._hand_over(ids, cancel, rec)
+            yield from self._hand_over(ids, cancel, rec, operation)
             if cancel.is_set():
                 self.__dict__["held"] = []
                 return
